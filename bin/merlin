@@ -1,0 +1,2465 @@
+#!/usr/bin/env node
+// merlin — Merlin system self-awareness CLI
+// Registry at system/. Use `merlin help` for subcommands.
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
+const os = require('os');
+
+// --- Paths ---
+const HOME = os.homedir();
+// MERLIN_HOME resolves the user's clone of the repo. Set explicitly via env;
+// otherwise default to $HOME/Dev/merlin (the canonical convention). Tools
+// outside this repo (CI, cron) should always export MERLIN_HOME — the env
+// var also propagates to every child process the supervisor spawns.
+const MERLIN_HOME = process.env.MERLIN_HOME || path.join(HOME, 'Dev/merlin');
+const ROOT = MERLIN_HOME;
+// Backwards compat: TOOLS used to be a separate dir wrapper. The layout drop
+// in Phase 2 means TOOLS now equals ROOT — keep the constant so the rest of
+// this file doesn't churn.
+const TOOLS = ROOT;
+const SYSTEM = path.join(ROOT, 'system');
+const TASKS_JSON = path.join(SYSTEM, 'tasks.json');
+const SERVICES_JSON = path.join(SYSTEM, 'services.json');
+const ARCH_MD = path.join(SYSTEM, 'architecture.md');
+const OPS_CLAUDE = path.join(ROOT, 'agent/ops-agent/CLAUDE.md');
+const AGENT_LOGS = path.join(ROOT, 'agent/logs');
+const TOP_LOGS = path.join(ROOT, 'logs');
+const TRIAGE_LOG = path.join(TOP_LOGS, 'triage.log');
+const PAUSE_FLAG = path.join(ROOT, 'data/.triage-paused');
+const TRIAGE_PLAYBOOK = path.join(ROOT, 'data/email-triage-playbook.md');
+const SPAM_FILTER_BIN = path.join(ROOT, 'bin/spam-filter');
+const EMAIL_MEM_BIN = path.join(ROOT, 'bin/email-mem');
+
+// --- TTY + colors ---
+const NO_COLOR = !process.stdout.isTTY || process.env.NO_COLOR || process.argv.includes('--no-color');
+const c = {
+  dim: s => NO_COLOR ? s : `\x1b[2m${s}\x1b[0m`,
+  bold: s => NO_COLOR ? s : `\x1b[1m${s}\x1b[0m`,
+  green: s => NO_COLOR ? s : `\x1b[32m${s}\x1b[0m`,
+  red: s => NO_COLOR ? s : `\x1b[31m${s}\x1b[0m`,
+  yellow: s => NO_COLOR ? s : `\x1b[33m${s}\x1b[0m`,
+  cyan: s => NO_COLOR ? s : `\x1b[36m${s}\x1b[0m`,
+  gray: s => NO_COLOR ? s : `\x1b[90m${s}\x1b[0m`,
+};
+
+// --- Utilities ---
+function die(msg, code = 1) { console.error(c.red('Error: ') + msg); process.exit(code); }
+
+function shSafe(cmd, opts = {}) {
+  try { return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }); }
+  catch (e) { return null; }
+}
+
+function loadTasks() { return JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8')).tasks; }
+function loadServices() { return JSON.parse(fs.readFileSync(SERVICES_JSON, 'utf8')).services; }
+
+function hasFlag(args, ...names) { return names.some(n => args.includes(n)); }
+function getFlag(args, name, def = null) {
+  const i = args.indexOf(name);
+  return i >= 0 && i < args.length - 1 ? args[i + 1] : def;
+}
+function expandHome(p) { return p.startsWith('~/') ? path.join(HOME, p.slice(2)) : p; }
+
+// --- Table formatter (ANSI-aware) ---
+function visibleLen(s) { return String(s ?? '').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').length; }
+function padVisible(s, width) { const str = String(s ?? ''); const pad = Math.max(0, width - visibleLen(str)); return str + ' '.repeat(pad); }
+function table(rows, headers) {
+  if (!rows.length) return c.dim('(empty)');
+  const cols = headers || Object.keys(rows[0]);
+  const widths = cols.map(h => Math.max(h.length, ...rows.map(r => visibleLen(r[h]))));
+  const sep = '  ';
+  const out = [];
+  out.push(cols.map((h, i) => c.bold(padVisible(h, widths[i]))).join(sep));
+  out.push(cols.map((h, i) => c.dim('─'.repeat(widths[i]))).join(sep));
+  for (const r of rows) out.push(cols.map((h, i) => padVisible(r[h], widths[i])).join(sep));
+  return out.join('\n');
+}
+
+// ========================================================================
+// SUBCOMMANDS
+// ========================================================================
+
+function cmdHelp() {
+  console.log(c.bold('merlin') + ' — Merlin system self-awareness CLI\n');
+  console.log('Usage: merlin <subcommand> [args...] [--flags]\n');
+  console.log(c.bold('BOOTSTRAP / RUN'));
+  console.log('  init [--force]                interactive config wizard → writes .env + token');
+  console.log('  up                            start process-manager in the foreground (Ctrl-C to stop)');
+  console.log('  dispatch <job> [--task ...]   POST a job to the ops-supervisor webhook');
+  console.log('  tail [ops|chat|<job>]         tail the ops/chat supervisor stream (or a job log)\n');
+  console.log(c.bold('TASKS'));
+  console.log('  tasks [list] [--json]         list automated tasks');
+  console.log('  tasks show <name>             show full task detail');
+  console.log('  tasks match "<phrase>"        find task by natural-language phrase');
+  console.log('  tasks run <name>              dispatch task via webhook\n');
+  console.log(c.bold('HEALTH'));
+  console.log('  status                        system health dashboard');
+  console.log('  services [--json]             LaunchAgents + tmux status');
+  console.log('  doctor [--json] [--repair]    run drift checks; --repair auto-fixes schedule drift + orphan scripts');
+  console.log('  activity [--json]             the user\'s inferred state (active/winding_down/sleeping)');
+  console.log('  context [--json] [--fresh]    unified merlin knowledge — profile + tastes + sources + recent\n');
+  console.log(c.bold('TRIAGE'));
+  console.log('  triage <subcmd>               email triage subsystem (see: triage help)');
+  console.log('  triage status                 running? paused? last event?');
+  console.log('  triage recent [N] | pending | rules | playbook');
+  console.log('  triage pause | resume | reclassify <msgId>');
+  console.log('  triage memory ... | spam ...  (wrap email-mem / spam-filter)\n');
+  console.log(c.bold('HUM'));
+  console.log('  hum status                  next run, pings today, cool-down, pause state');
+  console.log('  hum pause <duration>        "2h" | "today" | "until-morning" | "weekend"');
+  console.log('  hum resume                  unpause');
+  console.log('  hum feedback <id> <reaction>  record reaction (id="last" for latest)');
+  console.log('  hum runs [--tail N]         tail hum-runs.jsonl');
+  console.log('  hum review [--since Nd]     what was surfaced / reacted to');
+  console.log('  hum test                    fire a one-shot run (bypasses cron + jitter)\n');
+  console.log(c.bold('STATE'));
+  console.log('  logs <component> [--tail N]   tail log file');
+  console.log('  cron                          crontab with descriptions from tasks.json');
+  console.log('  git                           branch + status + recent commits');
+  console.log('  ci [--limit N]                GitHub Actions runs\n');
+  console.log(c.bold('CONTROL'));
+  console.log('  restart <ops|chat|hookdeck|session>  restart tmux pane or whole session\n');
+  console.log(c.bold('DISCOVERY'));
+  console.log('  arch                          print architecture.md');
+  console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)\n');
+  console.log(c.dim('Flags: --json  --no-color  --help'));
+}
+
+// --- tasks ---
+function cmdTasks(args) {
+  const sub = args[0];
+  if (!sub || sub === 'list' || sub.startsWith('--')) return cmdTasksList(args);
+  if (sub === 'show') return cmdTasksShow(args.slice(1));
+  if (sub === 'match') return cmdTasksMatch(args.slice(1));
+  if (sub === 'run') return cmdTasksRun(args.slice(1));
+  if (sub === 'pause') return cmdTasksPause(args.slice(1));
+  if (sub === 'resume') return cmdTasksResume(args.slice(1));
+  die(`unknown: tasks ${sub}. Try: merlin tasks`);
+}
+
+function writeTasks(tasks) {
+  // Preserve the top-level envelope ({ tasks: [...] }) when rewriting.
+  const raw = JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8'));
+  raw.tasks = tasks;
+  fs.writeFileSync(TASKS_JSON, JSON.stringify(raw, null, 2) + '\n');
+}
+
+function cmdTasksPause(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks pause: missing <name>. Usage: merlin tasks pause <name> --until YYYY-MM-DD [--reason "..."]');
+  const untilIdx = args.indexOf('--until');
+  if (untilIdx < 0 || !args[untilIdx + 1]) die('tasks pause: --until YYYY-MM-DD required');
+  const until = args[untilIdx + 1];
+  if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:?\d{2})?)?$/.test(until)) {
+    die(`tasks pause: invalid --until "${until}" (expect YYYY-MM-DD or full ISO)`);
+  }
+  const reasonIdx = args.indexOf('--reason');
+  const reason = reasonIdx >= 0 ? args[reasonIdx + 1] : null;
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: merlin tasks`);
+  task.paused_until = until;
+  if (reason) task.paused_reason = reason;
+  else if (!task.paused_reason) task.paused_reason = `Paused ${new Date().toISOString().slice(0, 10)} via merlin tasks pause.`;
+  writeTasks(tasks);
+  console.log(`${name}: paused until ${until}${reason ? ` (${reason})` : ''}`);
+  console.log(`Doctor will skip this task's crontab check until then. Resume with: merlin tasks resume ${name}`);
+}
+
+function cmdTasksResume(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks resume: missing <name>. Usage: merlin tasks resume <name>');
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: merlin tasks`);
+  if (!task.paused_until && !task.paused_reason) {
+    console.log(`${name}: not paused (nothing to do)`);
+    return;
+  }
+  delete task.paused_until;
+  delete task.paused_reason;
+  writeTasks(tasks);
+  console.log(`${name}: resumed. Doctor will now enforce this task's crontab check.`);
+}
+
+function cmdTasksList(args) {
+  const tasks = loadTasks();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(tasks, null, 2)); return; }
+  const rows = tasks.map(t => ({
+    name: t.name,
+    schedule: t.schedule_human || t.schedule || 'manual',
+    description: t.description,
+  }));
+  console.log(table(rows, ['name', 'schedule', 'description']));
+}
+
+function cmdTasksShow(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks show: missing <name>. Try: merlin tasks');
+  const task = loadTasks().find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: merlin tasks`);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(task, null, 2)); return; }
+  console.log(c.bold(task.name));
+  console.log(c.dim('  schedule:         ') + (task.schedule_human || 'manual'));
+  console.log(c.dim('  cron:             ') + (task.schedule || '—'));
+  console.log(c.dim('  trigger_script:   ') + task.trigger_script);
+  console.log(c.dim('  webhook:          ') + `POST ${task.webhook_url}`);
+  console.log(c.dim('  webhook_task:     ') + task.webhook_task);
+  console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
+  console.log(c.dim('  delivers_to:      ') + task.delivers_to);
+  if (task.paused_until) {
+    console.log(c.dim('  paused_until:     ') + task.paused_until + (task.paused_reason ? ` — ${task.paused_reason}` : ''));
+  }
+  console.log(c.dim('  phrases:          ') + task.phrases.join(', '));
+  console.log(c.dim('  description:      ') + task.description);
+}
+
+function matchTask(phrase) {
+  const needle = ' ' + phrase.toLowerCase().trim() + ' ';
+  const matches = [];
+  for (const t of loadTasks()) {
+    let best = null;
+    for (const p of t.phrases) {
+      if (needle.includes(' ' + p.toLowerCase() + ' ') || needle.trim() === p.toLowerCase()) {
+        best = p; break;
+      }
+    }
+    if (!best) {
+      for (const p of t.phrases) {
+        if (needle.includes(p.toLowerCase())) { best = p; break; }
+      }
+    }
+    if (best) matches.push({ task: t, matched_phrase: best });
+  }
+  return matches;
+}
+
+function cmdTasksMatch(args) {
+  const flagless = args.filter(a => !a.startsWith('--'));
+  const phrase = flagless.join(' ');
+  if (!phrase) die('tasks match: missing phrase');
+  const matches = matchTask(phrase);
+  const confidence = matches.length === 1 ? 'high' : matches.length > 1 ? 'ambiguous' : 'none';
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({
+      phrase, confidence, count: matches.length,
+      matches: matches.map(m => ({
+        name: m.task.name,
+        matched_phrase: m.matched_phrase,
+        webhook_task: m.task.webhook_task,
+        description: m.task.description,
+      })),
+    }, null, 2));
+    process.exit(confidence === 'high' ? 0 : confidence === 'ambiguous' ? 2 : 1);
+  }
+  if (matches.length === 0) { console.log(c.yellow('no match')); process.exit(1); }
+  if (matches.length === 1) {
+    const m = matches[0];
+    console.log(c.green('high confidence: ') + c.bold(m.task.name));
+    console.log(c.dim('matched phrase: ') + `"${m.matched_phrase}"`);
+    console.log(c.dim('run with:       ') + `merlin tasks run ${m.task.name}`);
+    return;
+  }
+  console.log(c.yellow(`ambiguous — ${matches.length} matches:`));
+  for (const m of matches) console.log(`  ${c.bold(m.task.name)} (matched "${m.matched_phrase}")`);
+  process.exit(2);
+}
+
+function taskBody(task) {
+  // If the task has a job field, use {"job": "..."} so the webhook handler
+  // loads full instructions from the jobs/*.md file at dispatch time.
+  if (task.job) return JSON.stringify({ job: task.job });
+  // Legacy fallback for tasks without a job file.
+  const bodyText = task.webhook_body
+    || `${task.webhook_task}: ${task.description} Follow the ${task.ops_playbook_section} instructions in CLAUDE.md.`;
+  return JSON.stringify({ task: bodyText });
+}
+
+function postWebhook(url, body) {
+  const result = spawnSync('curl', [
+    '-s', '-o', '/dev/null', '-w', '%{http_code}',
+    '--max-time', '10',
+    '-X', 'POST', url,
+    '-H', 'Content-Type: application/json',
+    '-d', body,
+  ], { encoding: 'utf8' });
+  return { code: (result.stdout || '').trim() || '000', stderr: (result.stderr || '').trim(), error: result.error };
+}
+
+function cmdTasksRun(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks run: missing <name>. Try: merlin tasks');
+  const task = loadTasks().find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: merlin tasks`);
+  const body = taskBody(task);
+  if (hasFlag(args, '--dry-run')) {
+    console.log(c.dim('(dry-run — no dispatch)'));
+    console.log(c.bold('would POST ') + task.webhook_url);
+    console.log(c.bold('body: ') + body);
+    return;
+  }
+  const { code, stderr, error } = postWebhook(task.webhook_url, body);
+  if (code.startsWith('2')) {
+    console.log(c.green('✓ dispatched: ') + c.bold(task.name) + c.dim(` (HTTP ${code})`));
+    console.log(c.dim('  webhook_task: ') + task.webhook_task);
+    console.log(c.dim('  delivers to:  ') + task.delivers_to);
+  } else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    console.error(c.dim('  webhook: ') + task.webhook_url);
+    if (error) console.error(c.dim('  error:   ') + error.message);
+    if (stderr) console.error(c.dim('  stderr:  ') + stderr);
+    if (code === '000') console.error(c.dim('  hint: is the ops-supervisor listening? (merlin triage status)'));
+    process.exit(1);
+  }
+}
+
+// --- status ---
+function cmdStatus(args) {
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(collectStatus(), null, 2)); return; }
+  const s = collectStatus();
+  console.log(c.bold('SYSTEM STATUS') + c.dim('  ' + new Date().toISOString()) + '\n');
+
+  // Process Manager
+  const pm = s.processManager;
+  if (pm) {
+    const upStr = pm.uptimeMs > 3600000 ? `${(pm.uptimeMs / 3600000).toFixed(1)}h` : `${Math.floor(pm.uptimeMs / 60000)}m`;
+    console.log(c.bold('Process Manager:') + c.dim(`  pid ${pm.pid}, uptime ${upStr}`));
+    for (const ch of pm.children || []) {
+      const mark = ch.alive ? c.green('✓') : c.red('✗');
+      const upMs = ch.uptimeMs || 0;
+      const up = upMs > 3600000 ? `${(upMs / 3600000).toFixed(1)}h` : `${Math.floor(upMs / 60000)}m`;
+      console.log(`  ${mark} ${ch.name.padEnd(20)} ${c.dim(`pid=${ch.pid || '-'} restarts=${ch.restarts} up=${up}`)}`);
+    }
+  } else {
+    console.log(c.bold('Process Manager:') + '  ' + c.red('unreachable on :9095'));
+  }
+
+  // Chat Agent
+  const ch = s.chat;
+  if (ch) {
+    const sid = ch.sessionId?.slice(0, 8) || '?';
+    console.log('\n' + c.bold('Chat Agent:') + c.dim(`  session ${sid}, ${ch.model}`));
+    const aliveMark = ch.childAlive ? c.green('✓') : c.red('✗');
+    console.log(`  ${aliveMark} child alive${c.dim(`       turns=${ch.totalTurns} cost=$${(ch.totalCostUsd || 0).toFixed(2)}`)}`);
+    const hbAge = ch.phoneChannelHeartbeatAgeMs;
+    if (hbAge !== null && hbAge !== undefined) {
+      const hbMark = hbAge < 120000 ? c.green('✓') : c.yellow('○');
+      console.log(`  ${hbMark} phone-channel${c.dim(`     heartbeat ${Math.floor(hbAge / 1000)}s ago`)}`);
+    } else {
+      console.log(`  ${c.yellow('○')} phone-channel${c.dim('     no heartbeat yet')}`);
+    }
+    const qd = ch.queueDepth || 0;
+    const inf = ch.inFlight ? 'in-flight' : 'idle';
+    console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
+  } else {
+    console.log('\n' + c.bold('Chat Agent:') + '  ' + c.red('unreachable on :9094'));
+  }
+
+  // Ops Agent
+  const op = s.ops;
+  if (op) {
+    const sid = op.sessionId?.slice(0, 8) || '?';
+    console.log('\n' + c.bold('Ops Agent:') + c.dim(`  session ${sid}, ${op.model}`));
+    const aliveMark = op.childAlive ? c.green('✓') : c.red('✗');
+    console.log(`  ${aliveMark} child alive${c.dim(`       turns=${op.totalTurns} cost=$${(op.totalCostUsd || 0).toFixed(2)}`)}`);
+    const qd = op.queueDepth || 0;
+    const inf = op.inFlight ? 'in-flight' : 'idle';
+    console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
+  } else {
+    console.log('\n' + c.bold('Ops Agent:') + '  ' + c.red('unreachable on :9093'));
+  }
+
+  // Services
+  console.log('\n' + c.bold('Services:'));
+  for (const sv of s.services) {
+    const mark = sv.status === 'running' ? c.green('✓') : sv.status === 'loaded' ? c.yellow('○') : c.red('✗');
+    const detail = sv.pid ? `pid ${sv.pid}` : sv.status;
+    console.log(`  ${mark} ${sv.label.padEnd(50)} ${c.dim(detail)}`);
+  }
+
+  // Heartbeat
+  console.log('\n' + c.bold('Heartbeat:'));
+  if (s.heartbeat_age_seconds !== null) {
+    const mins = Math.floor(s.heartbeat_age_seconds / 60);
+    const age = mins === 0 ? `${s.heartbeat_age_seconds}s ago` : `${mins}m ago`;
+    const mark = s.heartbeat_age_seconds < 300 ? c.green('✓') : c.yellow('○');
+    console.log(`  ${mark} last post ${age}`);
+  } else {
+    console.log('  ' + c.yellow('○') + ' log empty / no heartbeat yet');
+  }
+
+  // Triage today
+  console.log('\n' + c.bold('Triage (today):'));
+  const pauseMark = s.triage.paused ? '  ' + c.yellow('PAUSED') + '\n' : '';
+  console.log(pauseMark + `  ${s.triage.received} received, ${s.triage.actions} actions taken`);
+
+  // Next cron task
+  console.log('\n' + c.bold('Next scheduled task:'));
+  if (s.next_task) {
+    console.log(`  ${c.bold(s.next_task.name)} in ${s.next_task.in_human} ${c.dim('(' + s.next_task.schedule + ')')}`);
+  } else {
+    console.log('  ' + c.dim('(none)'));
+  }
+}
+
+function fetchJson(url) {
+  try { return JSON.parse(execSync(`curl -sf --max-time 3 "${url}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+  catch { return null; }
+}
+
+function collectStatus() {
+  const status = { processManager: null, chat: null, ops: null, services: [], heartbeat_age_seconds: null, triage: { received: 0, actions: 0, paused: fs.existsSync(PAUSE_FLAG) }, next_task: null };
+
+  // process-manager health
+  status.processManager = fetchJson('http://127.0.0.1:9095/health');
+
+  // supervisor health
+  status.chat = fetchJson('http://127.0.0.1:9094/health');
+  status.ops = fetchJson('http://127.0.0.1:9093/health');
+
+  // services from launchctl
+  const lc = shSafe('launchctl list') || '';
+  const svcLabels = loadServices().filter(s => s.type === 'launchagent').map(s => s.label);
+  for (const label of svcLabels) {
+    const line = lc.split('\n').find(l => l.endsWith('\t' + label));
+    if (!line) { status.services.push({ label, status: 'not loaded', pid: null }); continue; }
+    const [pid, exit, lbl] = line.split('\t');
+    status.services.push({
+      label,
+      status: pid === '-' ? 'loaded' : 'running',
+      pid: pid === '-' ? null : Number(pid),
+      last_exit: exit,
+    });
+  }
+
+  // heartbeat age
+  try {
+    const st = fs.statSync(path.join(TOP_LOGS, 'heartbeat.log'));
+    const errSt = fs.statSync(path.join(TOP_LOGS, 'heartbeat.err.log'));
+    const newest = Math.max(st.mtimeMs, errSt.mtimeMs);
+    status.heartbeat_age_seconds = Math.floor((Date.now() - newest) / 1000);
+  } catch {}
+
+  // triage today
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const log = fs.readFileSync(TRIAGE_LOG, 'utf8');
+    for (const line of log.split('\n')) {
+      if (!line.startsWith(today)) continue;
+      if (line.includes('EMAIL-RECEIVED')) status.triage.received++;
+      else if (line.includes('|')) status.triage.actions++;
+    }
+  } catch {}
+
+  // next cron task
+  const tasks = loadTasks().filter(t => t.schedule && t.schedule.split(/\s+/).length === 5);
+  const now = new Date();
+  let best = null;
+  for (const t of tasks) {
+    const next = nextCronFire(t.schedule, now);
+    if (next && (!best || next < best.when)) best = { task: t, when: next };
+  }
+  if (best) {
+    const diff = Math.floor((best.when - now) / 1000);
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    status.next_task = {
+      name: best.task.name,
+      schedule: best.task.schedule,
+      in_seconds: diff,
+      in_human: h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`,
+    };
+  }
+
+  return status;
+}
+
+// Minimal 5-field cron parser (no step/range exotica needed for our schedules).
+function nextCronFire(expr, from) {
+  const [mm, hh, dom, mon, dow] = expr.split(/\s+/);
+  const parse = (s, min, max) => {
+    if (s === '*') return null; // any
+    return new Set(s.split(',').flatMap(p => {
+      const [a, b] = p.split('-').map(Number);
+      if (b === undefined) return [a];
+      const out = []; for (let i = a; i <= b; i++) out.push(i); return out;
+    }));
+  };
+  const mins = parse(mm, 0, 59), hours = parse(hh, 0, 23), doms = parse(dom, 1, 31), mons = parse(mon, 1, 12), dows = parse(dow, 0, 6);
+  const d = new Date(from);
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() + 1);
+  for (let i = 0; i < 60 * 24 * 8; i++) { // 8 days out
+    const M = d.getMinutes(), H = d.getHours(), Dm = d.getDate(), Mo = d.getMonth() + 1, Dw = d.getDay();
+    if ((!mins || mins.has(M)) && (!hours || hours.has(H)) && (!mons || mons.has(Mo)) && (!doms || doms.has(Dm)) && (!dows || dows.has(Dw))) return d;
+    d.setMinutes(d.getMinutes() + 1);
+  }
+  return null;
+}
+
+// --- services ---
+function cmdServices(args) {
+  const services = loadServices();
+  const lc = shSafe('launchctl list') || '';
+  const enriched = services.map(sv => {
+    if (sv.type === 'tmux') {
+      const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
+      return { ...sv, status: tmuxOut ? 'running' : 'not running' };
+    }
+    const line = lc.split('\n').find(l => l.endsWith('\t' + sv.label));
+    if (!line) return { ...sv, status: 'not loaded', pid: null };
+    const [pid] = line.split('\t');
+    return { ...sv, status: pid === '-' ? 'loaded' : 'running', pid: pid === '-' ? null : Number(pid) };
+  });
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(enriched, null, 2)); return; }
+  const rows = enriched.map(s => ({
+    name: s.name,
+    type: s.type,
+    status: s.status,
+    pid: s.pid ?? '—',
+    description: s.description.slice(0, 60),
+  }));
+  console.log(table(rows, ['name', 'type', 'status', 'pid', 'description']));
+}
+
+// --- logs ---
+function cmdLogs(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('logs: missing <component>. Available: chat-agent, ops-agent, hookdeck, wiki-server, watchdog, heartbeat, triage, claude-launchagent');
+  const tail = Number(getFlag(args, '--tail', '50'));
+  const candidates = {
+    'chat-agent': path.join(AGENT_LOGS, 'chat-agent.log'),
+    'ops-agent': path.join(AGENT_LOGS, 'ops-agent.log'),
+    'hookdeck': path.join(AGENT_LOGS, 'hookdeck.log'),
+    'wiki-server': path.join(AGENT_LOGS, 'wiki-server.log'),
+    'watchdog': path.join(AGENT_LOGS, 'watchdog.log'),
+    'claude-launchagent': path.join(AGENT_LOGS, 'claude-launchagent.log'),
+    'heartbeat': path.join(TOP_LOGS, 'heartbeat.log'),
+    'heartbeat-err': path.join(TOP_LOGS, 'heartbeat.err.log'),
+    'triage': TRIAGE_LOG,
+    'webhooks': path.join(AGENT_LOGS, 'webhooks.log'),
+    'resilience': path.join(AGENT_LOGS, 'resilience-test.log'),
+  };
+  const p = candidates[name];
+  if (!p) die(`unknown log '${name}'. Available: ${Object.keys(candidates).join(', ')}`);
+  if (!fs.existsSync(p)) die(`log file does not exist: ${p}`);
+  const out = shSafe(`tail -n ${tail} "${p}"`) || '';
+  // Strip ANSI from terminal capture logs
+  const clean = out.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  process.stdout.write(clean);
+}
+
+// --- cron ---
+function cmdCron(args) {
+  const cron = shSafe('crontab -l') || '';
+  const lines = cron.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const tasks = loadTasks();
+  const rows = lines.map(line => {
+    const m = line.match(/^([\d*,/\- ]+) (.+)$/);
+    if (!m) return { schedule: '(?)', script: line.slice(0, 60), task: '' };
+    const schedule = m[1].trim();
+    const cmd = m[2];
+    // Find matching task by trigger_script path
+    const task = tasks.find(t => cmd.includes(path.basename(t.trigger_script)));
+    // Extract script name: find first arg that ends in .sh/.mjs/.js, else first path-like arg
+    let script = '';
+    for (const part of cmd.split(/\s+/)) {
+      if (part.startsWith('-') || part.includes('=')) continue;
+      if (part.match(/\.(sh|mjs|js)$/) || part.includes('/tools/')) { script = path.basename(part); break; }
+    }
+    if (!script) script = cmd.slice(0, 40);
+    return { schedule, script, task: task ? task.name : c.dim('—') };
+  });
+  console.log(table(rows, ['schedule', 'script', 'task']));
+}
+
+// --- git ---
+function cmdGit(args) {
+  const opts = { cwd: ROOT };
+  const branch = (shSafe('git rev-parse --abbrev-ref HEAD', opts) || '').trim();
+  const status = shSafe('git status --short', opts) || '';
+  const log = shSafe('git log --oneline -5', opts) || '';
+  const ahead = (shSafe('git rev-list --count @{u}..HEAD 2>/dev/null', opts) || '0').trim();
+  const behind = (shSafe('git rev-list --count HEAD..@{u} 2>/dev/null', opts) || '0').trim();
+  console.log(c.bold('Branch: ') + branch + c.dim(` (ahead ${ahead}, behind ${behind})`));
+  console.log('\n' + c.bold('Working tree:'));
+  console.log(status.trim() || c.dim('  (clean)'));
+  console.log('\n' + c.bold('Recent commits:'));
+  console.log(log.trim());
+}
+
+// --- ci ---
+function cmdCi(args) {
+  const raw = getFlag(args, '--limit', '5');
+  const limit = Number.parseInt(raw, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) die(`ci: --limit must be an integer 1-100 (got "${raw}")`);
+  const out = shSafe(`gh run list --limit ${limit} --json name,status,conclusion,createdAt,headBranch,displayTitle`, { cwd: ROOT });
+  if (!out) die('gh run list failed (check: gh auth status)');
+  const runs = JSON.parse(out);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(runs, null, 2)); return; }
+  const rows = runs.map(r => ({
+    status: r.status === 'completed'
+      ? (r.conclusion === 'success' ? c.green('✓ success') : r.conclusion === 'failure' ? c.red('✗ failure') : r.conclusion)
+      : c.yellow(r.status),
+    workflow: r.name,
+    branch: r.headBranch,
+    title: (r.displayTitle || '').slice(0, 50),
+    when: new Date(r.createdAt).toISOString().slice(5, 16).replace('T', ' '),
+  }));
+  console.log(table(rows, ['status', 'workflow', 'branch', 'title', 'when']));
+}
+
+// --- triage (subsystem) ---
+function cmdTriage(args) {
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help') return cmdTriageHelp();
+  const subs = {
+    status: cmdTriageStatus, stats: cmdTriageStats, recent: cmdTriageRecent,
+    pending: cmdTriagePending, rules: cmdTriageRules, playbook: cmdTriagePlaybook,
+    memory: cmdTriageMemory, spam: cmdTriageSpam, pause: cmdTriagePause,
+    resume: cmdTriageResume, reclassify: cmdTriageReclassify, resolve: cmdTriageResolve,
+  };
+  const fn = subs[sub];
+  if (!fn) die(`unknown: triage ${sub}. Try: merlin triage help`);
+  fn(args.slice(1));
+}
+
+function cmdTriageHelp() {
+  console.log(c.bold('merlin triage') + ' — email triage subsystem\n');
+  console.log('  status                   is triage running? paused? last event?');
+  console.log('  stats [--today|--since Nh]   event counts by action');
+  console.log('  recent [N]               last N triage events, color-coded');
+  console.log('  pending                  drafts awaiting the user\'s review (last 24h)');
+  console.log('  rules                    print § Email Triage Rules from ops-agent/CLAUDE.md');
+  console.log('  playbook                 print email-triage-playbook.md');
+  console.log('  memory <search|list> ... wrap email-mem (classification memory)');
+  console.log('  spam <list|block|unblock|check> ... wrap spam-filter');
+  console.log('  pause                    stop forwarding Gmail events to ops-agent');
+  console.log('  resume                   re-enable + dispatch CATCH UP to process missed');
+  console.log('  reclassify <messageId>   dispatch RECLASSIFY: <msgId> to ops-agent');
+  console.log('  resolve "<topic>"        dispatch RESOLVE P1: <topic> — matches + downgrades');
+  console.log('');
+  console.log(c.dim('To change rules: edit agent/ops-agent/CLAUDE.md, then `merlin restart ops`'));
+}
+
+function cmdTriageStatus(args) {
+  const s = {
+    paused: fs.existsSync(PAUSE_FLAG),
+    supervisor_up: false,
+    supervisor_health: null,
+    ops_agent_running: false,
+    last_event: null,
+    last_event_age_seconds: null,
+  };
+  // Check supervisor health
+  const health = shSafe('curl -s --max-time 3 http://127.0.0.1:9093/health');
+  if (health) {
+    s.supervisor_up = true;
+    try { s.supervisor_health = JSON.parse(health); } catch {}
+  }
+  // ops-agent process in pane 1
+  const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
+  if (tmuxOut) {
+    const line = tmuxOut.split('\n').find(l => l.startsWith('1 '));
+    if (line) {
+      const cmd = line.slice(2);
+      s.ops_agent_running = cmd !== 'zsh' && cmd !== 'bash';
+    }
+  }
+  // last event from triage log
+  if (fs.existsSync(TRIAGE_LOG)) {
+    const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n');
+    const last = lines[lines.length - 1];
+    if (last) {
+      const ts = last.split('|')[0].trim();
+      const dt = Date.parse(ts);
+      if (!isNaN(dt)) {
+        s.last_event = last;
+        s.last_event_age_seconds = Math.floor((Date.now() - dt) / 1000);
+      }
+    }
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(s, null, 2)); return; }
+  const h = s.supervisor_health;
+  console.log(c.bold('Email Triage Status') + '\n');
+  console.log(`  ${s.paused ? c.yellow('⏸ PAUSED') : c.green('▶ active')}`);
+  console.log(`  supervisor (HTTP 9093):     ${s.supervisor_up ? c.green('up') : c.red('down')}`);
+  console.log(`  ops-agent (pane 1):         ${s.ops_agent_running ? c.green('running') : c.red('not running')}`);
+  if (h) {
+    console.log(`  model:                      ${h.model || 'unknown'}`);
+    console.log(`  child alive:                ${h.childAlive ? c.green('yes') : c.red('no')}`);
+    console.log(`  queue depth:                ${h.queueDepth || 0}`);
+    console.log(`  turns completed:            ${h.completed || 0}`);
+    if (h.totalCostUsd != null) console.log(`  cost (session):             $${h.totalCostUsd.toFixed(4)}`);
+    if (h.lastEventAgeMs != null) {
+      const sec = Math.floor(h.lastEventAgeMs / 1000);
+      const age = sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.floor(sec/60)}m` : `${Math.floor(sec/3600)}h${Math.floor((sec%3600)/60)}m`;
+      console.log(`  last event:                 ${age} ago`);
+    }
+  }
+  if (s.last_event_age_seconds !== null) {
+    const m = Math.floor(s.last_event_age_seconds / 60);
+    const age = m < 1 ? `${s.last_event_age_seconds}s` : m < 60 ? `${m}m` : `${Math.floor(m/60)}h${m%60}m`;
+    console.log(`  last triage log:            ${age} ago`);
+    console.log(c.dim(`  ${s.last_event}`));
+  }
+}
+
+function cmdTriageStats(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const today = new Date().toISOString().slice(0, 10);
+  const since = getFlag(args, '--since'); // e.g. "24h" or "3h"
+  const useToday = hasFlag(args, '--today') || !since;
+  let cutoff = null;
+  if (since) {
+    const m = since.match(/^(\d+)h$/);
+    if (!m) die('--since must be like "24h"');
+    cutoff = Date.now() - Number(m[1]) * 3600 * 1000;
+  }
+  const counts = {};
+  let total = 0;
+  const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').split('\n');
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const [ts, action] = line.split('|').map(s => s.trim());
+    if (!ts || !action) continue;
+    if (useToday && !ts.startsWith(today)) continue;
+    if (cutoff !== null) { const d = Date.parse(ts); if (isNaN(d) || d < cutoff) continue; }
+    counts[action] = (counts[action] || 0) + 1;
+    total++;
+  }
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ window: since || 'today', total, counts }, null, 2));
+    return;
+  }
+  console.log(c.bold(`Triage (${since ? 'last ' + since : 'today'}):  ${total} events`));
+  const rows = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ action: k, count: v }));
+  console.log(table(rows, ['action', 'count']));
+}
+
+function cmdTriageRecent(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const n = Number(args.find(a => !a.startsWith('--')) || 20);
+  const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n').slice(-n);
+  if (hasFlag(args, '--json')) {
+    const events = lines.map(line => {
+      const [ts, action, ...rest] = line.split('|').map(s => s.trim());
+      return { ts, action, detail: rest.join(' | ') };
+    });
+    console.log(JSON.stringify(events, null, 2));
+    return;
+  }
+  const actionColor = { 'EMAIL-RECEIVED': c.dim, 'DRAFT-REPLY': c.yellow, 'STAR': c.yellow, 'LABEL': c.cyan, 'LABEL+ARCHIVE': c.cyan, 'MARK-READ': c.gray, 'PAUSED-SKIP': c.yellow, 'UNLABEL': c.cyan };
+  for (const line of lines) {
+    const parts = line.split('|').map(s => s.trim());
+    const ts = parts[0], action = parts[1], rest = parts.slice(2).join(' | ');
+    const clr = actionColor[action] || (x => x);
+    const time = ts.slice(11, 19);
+    console.log(`${c.dim(time)} ${clr(action.padEnd(15))} ${c.dim(rest.slice(0, 100))}`);
+  }
+}
+
+function cmdTriagePending(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const drafts = [];
+  for (const line of fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n')) {
+    if (!line.includes('DRAFT-REPLY')) continue;
+    const parts = line.split('|').map(s => s.trim());
+    const ts = parts[0]; const dt = Date.parse(ts);
+    if (isNaN(dt) || dt < cutoff) continue;
+    const detail = parts.slice(2).join(' | ');
+    const msgIdM = detail.match(/messageId=([a-f0-9]+)/);
+    const subjectM = detail.match(/subject=(.+?)(?: \| |$)/);
+    const toM = detail.match(/to="?([^"|]+)"?/);
+    drafts.push({ ts, messageId: msgIdM?.[1], to: toM?.[1]?.trim(), subject: subjectM?.[1]?.trim() });
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(drafts, null, 2)); return; }
+  if (!drafts.length) { console.log(c.dim('(no drafts created in last 24h)')); return; }
+  console.log(c.bold(`Drafts awaiting review (last 24h): ${drafts.length}`) + '\n');
+  for (const d of drafts) {
+    console.log(`  ${c.dim(d.ts.slice(11,19))} ${c.yellow(d.messageId || '?')} ${c.dim('→')} ${(d.to || '').slice(0, 40)}`);
+    console.log(`    ${(d.subject || '').slice(0, 90)}`);
+  }
+}
+
+function cmdTriageRules() {
+  if (!fs.existsSync(OPS_CLAUDE)) die('ops-agent/CLAUDE.md not found');
+  const md = fs.readFileSync(OPS_CLAUDE, 'utf8');
+  const m = md.match(/## Email Triage Rules\s*\n([\s\S]*?)(?=\n## |\n---\n|$)/);
+  if (!m) die('Email Triage Rules section not found');
+  process.stdout.write('## Email Triage Rules\n' + m[1]);
+}
+
+function cmdTriagePlaybook() {
+  if (!fs.existsSync(TRIAGE_PLAYBOOK)) die('email-triage-playbook.md not found at ' + TRIAGE_PLAYBOOK);
+  process.stdout.write(fs.readFileSync(TRIAGE_PLAYBOOK, 'utf8'));
+}
+
+function cmdTriageMemory(args) {
+  if (!fs.existsSync(EMAIL_MEM_BIN)) die('email-mem not found at ' + EMAIL_MEM_BIN);
+  // pass through to email-mem
+  try {
+    execFileSync(EMAIL_MEM_BIN, args, { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriageSpam(args) {
+  if (!fs.existsSync(SPAM_FILTER_BIN)) die('spam-filter not found at ' + SPAM_FILTER_BIN);
+  try {
+    execFileSync(SPAM_FILTER_BIN, args, { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriagePause() {
+  if (fs.existsSync(PAUSE_FLAG)) { console.log(c.yellow('already paused')); return; }
+  fs.writeFileSync(PAUSE_FLAG, new Date().toISOString() + '\n');
+  console.log(c.yellow('⏸ triage paused'));
+  console.log(c.dim('  gmail-channel will drop notifications (historyId still saved).'));
+  console.log(c.dim('  Note: takes effect immediately for NEW gmail-channel events.'));
+  console.log(c.dim('  Use `merlin triage resume` to re-enable.'));
+}
+
+function cmdTriageResume() {
+  if (!fs.existsSync(PAUSE_FLAG)) { console.log(c.dim('not paused')); return; }
+  const since = fs.readFileSync(PAUSE_FLAG, 'utf8').trim();
+  fs.unlinkSync(PAUSE_FLAG);
+  console.log(c.green('▶ triage resumed') + c.dim(` (was paused since ${since})`));
+  // Dispatch CATCH UP task so ops-agent processes emails missed during pause
+  const body = JSON.stringify({ task: `CATCH UP: Triage was paused since ${since}. Fetch all emails received since the last saved historyId and triage each one.` });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('  ✓ dispatched CATCH UP to ops-agent'));
+  else {
+    console.log(c.yellow(`  catch-up dispatch failed (HTTP ${code}) — ops-agent may not be listening`));
+    if (stderr) console.log(c.dim('  stderr: ') + stderr);
+  }
+}
+
+function cmdTriageReclassify(args) {
+  const msgId = args.find(a => !a.startsWith('--'));
+  if (!msgId) die('reclassify: missing <messageId>');
+  // messageId validation: Gmail IDs are hex, 14-20 chars typically
+  if (!/^[a-zA-Z0-9_-]{8,40}$/.test(msgId)) die(`reclassify: messageId looks invalid (got "${msgId}")`);
+  const body = JSON.stringify({ task: `RECLASSIFY: ${msgId}` });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RECLASSIFY ${msgId}`));
+  else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    if (stderr) console.error(c.dim('  stderr: ') + stderr);
+    process.exit(1);
+  }
+}
+
+function cmdTriageResolve(args) {
+  const topic = args.filter(a => !a.startsWith('--')).join(' ').trim();
+  if (!topic) die('resolve: missing <topic>. Usage: merlin triage resolve "<topic text>"');
+  if (topic.length > 300) die('resolve: topic too long (>300 chars)');
+  const body = JSON.stringify({ task: `RESOLVE P1: ${topic}`, source: 'merlin-triage-resolve' });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RESOLVE P1: ${topic}`));
+  else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    if (stderr) console.error(c.dim('  stderr: ') + stderr);
+    process.exit(1);
+  }
+}
+
+// --- restart ---
+const TMUX = '/opt/homebrew/bin/tmux';
+
+// Wrappers that send raw argv to tmux — no shell interpolation.
+function tmuxRun(args) {
+  const r = spawnSync(TMUX, args, { encoding: 'utf8' });
+  return { ok: r.status === 0, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+function tmuxSend(target, keys) { return tmuxRun(['send-keys', '-t', target, ...keys]); }
+function tmuxPaneCommand(paneIdx) {
+  const r = tmuxRun(['list-panes', '-t', 'claude:0', '-F', '#{pane_index} #{pane_current_command}']);
+  if (!r.ok) return null;
+  const line = r.stdout.split('\n').find(l => l.startsWith(paneIdx + ' '));
+  return line ? line.slice(2) : null;
+}
+function tmuxPaneCount() {
+  const r = tmuxRun(['list-panes', '-t', 'claude:0']);
+  return r.ok ? r.stdout.trim().split('\n').length : 0;
+}
+
+// Check if a TCP port is free by attempting to listen with `nc`.
+function portFree(port, timeoutSec = 3) {
+  const r = spawnSync('nc', ['-z', '-w', '1', 'localhost', String(port)], { encoding: 'utf8' });
+  // nc exits 0 if connection succeeds (port IN USE). exits non-0 if free.
+  return r.status !== 0;
+}
+
+function waitPortFree(port, maxSec = 4) {
+  for (let i = 0; i < maxSec; i++) {
+    if (portFree(port)) return true;
+    execFileSync('sleep', ['1']);
+  }
+  return portFree(port);
+}
+
+function cmdRestart(args) {
+  const target = args.find(a => !a.startsWith('--'));
+  if (!target) die('restart: usage: merlin restart <ops|chat|hookdeck|session>');
+  const CLAUDE = path.join(HOME, '.local/bin/claude');
+  const NODE = '/opt/homebrew/bin/node';
+  const AGENT_DIR = path.join(TOOLS, 'agent');
+  const SUPERVISOR_DIR = path.join(AGENT_DIR, 'supervisor');
+  const CONFIG_DIR = path.join(AGENT_DIR, 'config');
+
+  // Load config dynamically
+  function loadAgentConfig(name) {
+    const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'agents.json'), 'utf8')).agents[name];
+    if (!cfg) die(`restart: agent '${name}' not in agents.json`);
+    return cfg;
+  }
+
+  const configs = {
+    chat: { idx: 0, cwd: path.join(AGENT_DIR, 'chat-agent'), ports_to_free: [] },
+    ops: { idx: 1, cwd: SUPERVISOR_DIR, ports_to_free: [9090, 9092, 9093] },
+    hookdeck: { idx: 2, cwd: AGENT_DIR, launch: 'hookdeck listen 9090 gmail-source', ports_to_free: [] },
+  };
+
+  // Session-level restart: kill tmux session, launchd rebuilds it.
+  if (target === 'session') {
+    console.log(c.dim('killing tmux session "claude" — launchd (ai.claude.session) will respawn with fresh panes...'));
+    const killed = tmuxRun(['kill-session', '-t', 'claude']);
+    if (!killed.ok && !killed.stderr.includes("can't find session")) {
+      die(`kill-session failed: ${killed.stderr}`);
+    }
+    console.log(c.green('✓ session killed. Wait ~30s, then: merlin status'));
+    return;
+  }
+
+  if (!tmuxRun(['has-session', '-t', 'claude']).ok) {
+    die('tmux session "claude" is not running. Start: launchctl kickstart gui/$(id -u)/ai.claude.session OR merlin restart session');
+  }
+
+  const cfg = configs[target];
+  if (!cfg) die(`restart: unknown target '${target}'. Use ops, chat, hookdeck, or session.`);
+
+  const paneCount = tmuxPaneCount();
+  const paneTarget = `claude:0.${cfg.idx}`;
+  if (cfg.idx >= paneCount) {
+    if (target === 'hookdeck') {
+      console.log(c.yellow(`pane ${cfg.idx} missing (only ${paneCount} panes) — creating...`));
+      const split = tmuxRun(['split-window', '-t', 'claude', '-v', '-c', cfg.cwd]);
+      if (!split.ok) die(`split-window failed: ${split.stderr}`);
+      tmuxRun(['select-layout', '-t', 'claude', 'even-vertical']);
+    } else {
+      die(`restart: pane ${cfg.idx} does not exist (session has only ${paneCount} panes)`);
+    }
+  } else {
+    console.log(c.dim(`force-killing pane ${cfg.idx} (${target}) via tmux respawn-pane -k...`));
+    const respawn = tmuxRun(['respawn-pane', '-k', '-c', cfg.cwd, '-t', paneTarget, 'zsh']);
+    if (!respawn.ok) die(`respawn-pane failed: ${respawn.stderr}`);
+  }
+
+  execFileSync('sleep', ['1']);
+  for (const port of cfg.ports_to_free) {
+    if (!waitPortFree(port, 4)) {
+      console.log(c.yellow(`  warning: port ${port} still held after 4s — launch may fail to bind`));
+    }
+  }
+
+  let launchCmd;
+  if (target === 'hookdeck') {
+    launchCmd = cfg.launch;
+  } else if (target === 'ops') {
+    launchCmd = `${NODE} ${SUPERVISOR_DIR}/index.mjs --agent ops`;
+  } else {
+    // chat: interactive claude with dev-channels
+    const acfg = loadAgentConfig('chat');
+    const tools = acfg.allowedTools.map(t => /[*]/.test(t) ? `"${t}"` : t).join(' ');
+    const channels = (acfg.devChannels || []).map(c => 'server:' + c).join(' ');
+    launchCmd = `${CLAUDE} --model ${acfg.model} --dangerously-load-development-channels ${channels} --permission-mode ${acfg.permissionMode} --remote-control-session-name-prefix ${acfg.remoteControlPrefix} --allowedTools ${tools}`;
+  }
+  tmuxSend(paneTarget, [launchCmd, 'Enter']);
+
+  console.log(c.green(`✓ ${target} relaunched in pane ${cfg.idx}`));
+  if (target === 'chat') {
+    console.log(c.dim('  launcher will auto-accept dev-channels prompt within ~5s'));
+  }
+  if (target === 'ops') {
+    console.log(c.dim('  supervisor handles startup catchup automatically'));
+  }
+}
+
+// --- arch ---
+function cmdArch() {
+  if (!fs.existsSync(ARCH_MD)) die('architecture.md not found');
+  process.stdout.write(fs.readFileSync(ARCH_MD, 'utf8'));
+}
+
+// --- where ---
+function cmdWhere(args) {
+  const q = args.find(a => !a.startsWith('--'));
+  if (!q) die('where: missing <name>');
+  const ql = q.toLowerCase();
+  const hits = [];
+  // tasks
+  for (const t of loadTasks()) {
+    if (t.name.includes(ql) || t.webhook_task.toLowerCase().includes(ql) || t.phrases.some(p => p.includes(ql)))
+      hits.push({ kind: 'task', name: t.name, location: t.trigger_script });
+  }
+  // services
+  for (const s of loadServices()) {
+    if ((s.name || '').includes(ql) || (s.label || '').toLowerCase().includes(ql))
+      hits.push({ kind: 'service', name: s.name, location: s.plist || s.session || '' });
+  }
+  // files
+  const findOut = shSafe(`find "${TOOLS}" -maxdepth 6 -type f -name "*${q}*" -not -path "*/node_modules/*" -not -path "*/vendor/*" -not -path "*/.git/*" -not -path "*/SourcePackages/*" 2>/dev/null`) || '';
+  for (const line of findOut.trim().split('\n').filter(Boolean).slice(0, 20)) {
+    hits.push({ kind: 'file', name: path.basename(line), location: line.replace(ROOT + '/', '') });
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(hits, null, 2)); return; }
+  if (!hits.length) { console.log(c.yellow('no matches')); process.exit(1); }
+  console.log(table(hits, ['kind', 'name', 'location']));
+}
+
+// --- doctor ---
+function cmdDoctor(args) {
+  const checks = [];
+  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+  const tasks = loadTasks();
+  const services = loadServices();
+
+  // 1. cron entries → scripts exist
+  const cron = shSafe('crontab -l') || '';
+  const cronLines = cron.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const missingScripts = [];
+  for (const line of cronLines) {
+    const m = line.match(/(\/Users\/[^\s>]+\.(sh|mjs|js))/);
+    if (!m) continue;
+    if (!fs.existsSync(m[1])) missingScripts.push(m[1]);
+  }
+  add('cron → scripts exist', missingScripts.length === 0, missingScripts.length ? `missing: ${missingScripts.join(', ')}` : `${cronLines.length} cron entries, all targets exist`);
+
+  // 2. trigger-*.sh → tasks.json
+  const scriptsDir = path.join(TOOLS, 'agent/scripts');
+  const triggerScripts = fs.readdirSync(scriptsDir).filter(f => f.startsWith('trigger-') && f.endsWith('.sh'));
+  // check-*.sh that hit webhook also count as triggers
+  const checkScripts = fs.readdirSync(scriptsDir).filter(f => f.startsWith('check-') && f.endsWith('.sh'));
+  const allTriggers = [...triggerScripts, ...checkScripts];
+  // Exclude event-driven scripts (not scheduled tasks) from orphan check
+  const eventDriven = new Set(['trigger-startup-catchup.sh']);
+  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
+  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered`);
+
+  // A task with paused_until = YYYY-MM-DD (or full ISO) is expected to be
+  // absent from crontab until that date. When it passes, the check starts
+  // enforcing again — forcing a resume/retire decision. Bare YYYY-MM-DD is
+  // anchored to end-of-day in America/New_York (not UTC midnight, which
+  // resumes ~4h early during EDT).
+  const nowMs = Date.now();
+  const ET_OFFSET_FMT = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset',
+  });
+  const pausedUntilMs = (val) => {
+    if (!val) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+      const ms = Date.parse(val);
+      return Number.isFinite(ms) ? ms : null;
+    }
+    const [y, m, d] = val.split('-').map(Number);
+    const nextUtc = Date.UTC(y, m - 1, d + 1);
+    const tzPart = ET_OFFSET_FMT.formatToParts(new Date(nextUtc)).find(p => p.type === 'timeZoneName')?.value || 'GMT-5';
+    const match = tzPart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    const sign = match?.[1] === '-' ? -1 : 1;
+    const hrs = match ? parseInt(match[2], 10) : 5;
+    const mins = match?.[3] ? parseInt(match[3], 10) : 0;
+    return nextUtc - sign * (hrs * 60 + mins) * 60 * 1000;
+  };
+  const isPaused = (t) => {
+    const until = pausedUntilMs(t.paused_until);
+    return until !== null && until > nowMs;
+  };
+  const scheduledTasks = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && !isPaused(t));
+  const pausedCount = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && isPaused(t)).length;
+  const unscheduled = [];
+  for (const t of scheduledTasks) {
+    const want = path.basename(t.trigger_script);
+    // Multi-schedule separator is " / " (space-slash-space). Require
+    // whitespace on both sides so we don't split on the step-value "/" inside
+    // "*/20 * * * *" etc.
+    const schedParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).filter(Boolean);
+    const found = schedParts.every(sched => cronLines.some(l => l.includes(want) && l.startsWith(sched)));
+    if (!found) unscheduled.push(t.name);
+  }
+  const pausedSuffix = pausedCount ? `, ${pausedCount} paused` : '';
+  add('tasks.json schedules ↔ crontab', unscheduled.length === 0, unscheduled.length ? `missing cron: ${unscheduled.join(', ')}` : `${scheduledTasks.length} scheduled tasks, all in cron${pausedSuffix}`);
+
+  // 4. ops_playbook_section headers exist
+  const opsMd = fs.existsSync(OPS_CLAUDE) ? fs.readFileSync(OPS_CLAUDE, 'utf8') : '';
+  const missingSections = tasks.filter(t => t.ops_playbook_section && !t.job && !new RegExp(`^## ${escRe(t.ops_playbook_section)}( \\(.*\\))?\\s*$`, 'm').test(opsMd)).map(t => `${t.name} → ${t.ops_playbook_section}`);
+  add('ops playbook sections exist', missingSections.length === 0, missingSections.length ? `missing: ${missingSections.join('; ')}` : `${tasks.length} sections verified in ops-agent/CLAUDE.md`);
+
+  // 5. services.json plists → exist
+  const missingPlists = [];
+  for (const s of services) {
+    if (s.type !== 'launchagent') continue;
+    const p = expandHome(s.plist);
+    if (!fs.existsSync(p)) missingPlists.push(s.label);
+  }
+  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent').length} plists verified`);
+
+  // 6. no old Dev/Tools paths in tracked text files
+  // Use git grep — it natively skips binary files and respects .gitignore.
+  // Exclude files that legitimately contain the pattern (this tool + its test harness).
+  const grepOut = shSafe('git grep -l -E "${MERLIN_HOME_USER}/Dev/Tools/|~/Dev/Tools/|\\$HOME/Dev/Tools/" -- ":!*.png" ":!*.jpg" ":!*.pdf" ":!*.p8" ":!*.provisionprofile" ":!bin/merlin" ":!system/test-merlin.sh" ":!system/architecture.md" || true', { cwd: ROOT }) || '';
+  const badPaths = grepOut.split('\n').filter(Boolean);
+  add('no Dev/Tools/ residuals in tracked files', badPaths.length === 0,
+      badPaths.length ? `found in: ${badPaths.slice(0, 5).join(', ')}${badPaths.length > 5 ? ` (+${badPaths.length-5})` : ''}` : 'clean');
+
+  // 7. phrase uniqueness
+  const phraseMap = new Map();
+  for (const t of tasks) for (const p of t.phrases) {
+    const k = p.toLowerCase();
+    if (!phraseMap.has(k)) phraseMap.set(k, []);
+    phraseMap.get(k).push(t.name);
+  }
+  const dupes = [...phraseMap.entries()].filter(([_, v]) => v.length > 1);
+  add('task phrases are unique', dupes.length === 0, dupes.length ? `shared: ${dupes.map(([p, ts]) => `"${p}" in [${ts.join(',')}]`).join('; ')}` : `${phraseMap.size} unique phrases`);
+
+  // 8. trigger_script paths exist (skip tasks with null trigger_script — those are on-demand dispatch-only entries like mkt-outreach-apply)
+  const missingTrigs = tasks.filter(t => t.trigger_script && !fs.existsSync(path.join(ROOT, t.trigger_script))).map(t => t.name);
+  add('trigger_script paths exist', missingTrigs.length === 0, missingTrigs.length ? `missing: ${missingTrigs.join(', ')}` : `${tasks.filter(t => t.trigger_script).length} trigger scripts verified`);
+
+  // 9. process-manager running (check HTTP health endpoint — pgrep can't see cross-session processes on macOS)
+  const pmHealth = shSafe('curl -sf --max-time 3 http://127.0.0.1:9095/health');
+  add('process-manager running', !!pmHealth, pmHealth ? 'HTTP 200' : 'unreachable on :9095 — check launchd');
+
+  // 10. supervisor health endpoints reachable
+  const chatHealth = fetchJson('http://127.0.0.1:9094/health');
+  add('chat supervisor reachable', !!chatHealth, chatHealth ? 'HTTP 200' : 'unreachable on :9094');
+  const opsHealth = fetchJson('http://127.0.0.1:9093/health');
+  add('ops supervisor reachable', !!opsHealth, opsHealth ? 'HTTP 200' : 'unreachable on :9093');
+
+  // 11. MCP configs are valid JSON
+  for (const name of ['chat-mcp-config.json', 'mcp-config.json']) {
+    const p = path.join(TOOLS, 'agent/supervisor', name);
+    let valid = false;
+    try { JSON.parse(fs.readFileSync(p, 'utf8')); valid = true; } catch {}
+    add(`${name} valid`, valid, valid ? 'valid JSON' : 'missing or invalid');
+  }
+
+  // 12. CLAUDE.md freshness — each agent's CLAUDE.md shouldn't be newer than
+  // its current session. The supervisor exposes sessionStartedAt (set on each
+  // startSession call including graceful restarts) — prefer that over the
+  // supervisor-process startedAt so graceful restarts clear the STALE state.
+  // Very recent edits (< CLAUDE_MD_GRACE_MIN) are treated as "pending restart"
+  // rather than STALE: they're an active-editing state, not a stale-config
+  // running-in-production state. True operational staleness means the file
+  // was changed long ago and the supervisor was never bounced to pick it up.
+  const CLAUDE_MD_GRACE_MIN = 10;
+  for (const [name, port, relPath] of [
+    ['chat', 9094, 'agent/chat-agent/CLAUDE.md'],
+    ['ops', 9093, 'agent/ops-agent/CLAUDE.md'],
+  ]) {
+    const cmdPath = path.join(TOOLS, relPath);
+    let ok = false;
+    let status = null;
+    try {
+      const health = fetchJson(`http://127.0.0.1:${port}/health`) || {};
+      const sessionTs = health.sessionStartedAt || health.startedAt;
+      const ref = sessionTs ? new Date(sessionTs).getTime() : 0;
+      const mtime = fs.statSync(cmdPath).mtimeMs;
+      const ageMin = (Date.now() - mtime) / 60000;
+      if (!ref) { ok = false; status = 'supervisor unreachable'; }
+      else if (mtime <= ref) { ok = true; status = 'fresh'; }
+      else if (ageMin < CLAUDE_MD_GRACE_MIN) {
+        ok = true;
+        status = `fresh (edited ${ageMin.toFixed(0)}min ago — within ${CLAUDE_MD_GRACE_MIN}min grace, pending restart)`;
+      } else {
+        ok = false;
+        status = `STALE — CLAUDE.md edited ${ageMin.toFixed(0)}min ago, session started ${new Date(ref).toISOString()}`;
+      }
+    } catch (err) { ok = false; status = `check failed: ${err.message}`; }
+    add(`${name} CLAUDE.md fresh`, ok, status);
+  }
+
+  // 13. hum liveness — hum fires 5x/day at 10:30, 12:30, 15:30, 17:30, 22:30 local.
+  // Longest natural gap inside waking hours is ~5h (17:30 → 22:30) + jitter, so 7h stale is broken.
+  // Check only inside 11:00-22:59 local to avoid false positives during overnight sleep window.
+  const humRunsPath = path.join(TOOLS, 'data/hum-runs.jsonl');
+  const hour = new Date().getHours();
+  const inWakingCheck = hour >= 11 && hour < 23;
+  if (!inWakingCheck) {
+    add('hum liveness', true, `skipped (outside 11:00–23:00 check window, now ${hour}:00)`);
+  } else {
+    let raw = null;
+    try { raw = fs.readFileSync(humRunsPath, 'utf8'); }
+    catch (e) { if (e.code !== 'ENOENT') add('hum liveness', false, `read failed: ${e.message}`); }
+    if (raw !== null) {
+      const lines = raw.split('\n').filter(Boolean);
+      let lastTs = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try { const r = JSON.parse(lines[i]); if (r.ts) { lastTs = r.ts; break; } } catch {}
+      }
+      if (!lastTs) {
+        add('hum liveness', true, 'no runs yet (fresh install)');
+      } else {
+        const ageH = (Date.now() - new Date(lastTs).getTime()) / 3600000;
+        const stale = ageH > 7;
+        add('hum liveness', !stale, stale
+          ? `STALE — last run ${ageH.toFixed(1)}h ago; expect a run every ~2h during waking hours`
+          : `last run ${ageH.toFixed(1)}h ago (${new Date(lastTs).toLocaleString()})`);
+      }
+    } else if (raw === null && !checks.some(c => c.name === 'hum liveness')) {
+      add('hum liveness', true, 'hum not installed (no hum-runs.jsonl)');
+    }
+  }
+
+  // 14. Chrome DevTools Protocol reachable (port 9222).
+  // The ops-agent's chrome-devtools MCP uses --autoConnect, which requires
+  // Chrome to be running with --remote-debugging-port enabled on a non-default
+  // user data directory. Without CDP reachable, any mcp__chrome-devtools__*
+  // tool call hangs until the supervisor's 10-min TURN WATCHDOG trips.
+  // Detecting this up-front in doctor surfaces the state anytime the user
+  // runs it; the chrome-cdp-watch cron owns transition-triggered alerting.
+  // Probe uses `localhost` (not 127.0.0.1): Chrome 147 silently binds an IPv4
+  // stub on :9222 from the user's interactive profile that 404s on every CDP
+  // path. `localhost` resolves to ::1 first on macOS and hits the LaunchAgent
+  // automation Chrome (com.merlin.chrome-cdp) which binds IPv6 :9222.
+  const cdpProbe = shSafe('curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9222/json/version 2>/dev/null') || '000';
+  const cdpUp = cdpProbe === '200';
+  add('chrome CDP port reachable', cdpUp, cdpUp
+    ? 'HTTP 200 on :9222/json/version'
+    : `HTTP ${cdpProbe} on :9222 — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.merlin.chrome-cdp. Browser-automation jobs (broadway-lottery etc.) will skip until this clears.`);
+
+  // 15. gog tasks CLI reachable. The 2026-04-29 review documented memories
+  // #914/#920 falsely flagging "gog CLI unavailable" because the symlink
+  // target was inspected instead of the actual binary. Probe by invoking a
+  // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
+  // (renamed binary, expired token bucket) without reading the symlink.
+  const gogProbe = shSafe('/opt/homebrew/bin/gog tasks lists --plain --account=${MERLIN_OWNER_EMAIL} --no-input 2>&1 | head -3');
+  const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
+  add('gog tasks CLI reachable', !!gogOk, gogOk
+    ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
+    : `gog tasks list failed: ${(gogProbe || '<empty>').slice(0, 160)}. Re-auth via 'gog auth add ${MERLIN_OWNER_EMAIL} --services tasks' or fall back to service account.`);
+
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(checks, null, 2)); process.exit(checks.every(c => c.ok) ? 0 : 1); }
+
+  // --repair: auto-fix repairable drift (schedule mismatches + orphan scripts in cron)
+  if (hasFlag(args, '--repair')) {
+    const raw = JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8'));
+    const mutableTasks = raw.tasks;
+    let repaired = 0;
+
+    // Build cron map: triggerBasename -> [schedule strings]
+    const cronMapR = {};
+    for (const line of cronLines) {
+      const scriptMatch = line.match(/trigger-[\w-]+\.sh/);
+      if (!scriptMatch) continue;
+      const bname = scriptMatch[0];
+      const parts = line.trim().split(/\s+/);
+      const sched = parts.slice(0, 5).join(' ');
+      if (!cronMapR[bname]) cronMapR[bname] = [];
+      cronMapR[bname].push(sched);
+    }
+
+    // Fix schedule mismatches
+    for (const t of mutableTasks) {
+      if (!t.trigger_script || !t.schedule || t.schedule === 'on-demand') continue;
+      const bname = t.trigger_script.split('/').pop();
+      const actual = cronMapR[bname];
+      if (!actual) continue;
+      const taskParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).sort();
+      const actualParts = actual.slice().sort();
+      if (JSON.stringify(taskParts) !== JSON.stringify(actualParts)) {
+        const newSched = actual.length === 1 ? actual[0] : actual.join(' / ');
+        console.log(`  repair: ${t.name} schedule "${t.schedule}" → "${newSched}"`);
+        t.schedule = newSched;
+        repaired++;
+      }
+    }
+
+    // Register orphan scripts (in cron, not in tasks.json)
+    const taskScriptsR = new Set(mutableTasks.map(t => t.trigger_script && t.trigger_script.split('/').pop()).filter(Boolean));
+    for (const [bname, scheds] of Object.entries(cronMapR)) {
+      if (taskScriptsR.has(bname)) continue;
+      const scriptPath = path.join(TOOLS, 'agent/scripts', bname);
+      if (!fs.existsSync(scriptPath)) continue;
+      // Read the first comment line for a description
+      let desc = '';
+      try { const lines = fs.readFileSync(scriptPath, 'utf8').split('\n'); for (const l of lines) { const m = l.match(/^#\s*(.+)/); if (m && !m[1].startsWith('!')) { desc = m[1].trim(); break; } } } catch {}
+      const taskName = bname.replace(/^trigger-/, '').replace(/\.sh$/, '');
+      const newSched = scheds.length === 1 ? scheds[0] : scheds.join(' / ');
+      const entry = {
+        name: taskName,
+        schedule: newSched,
+        schedule_human: newSched,
+        trigger_script: `agent/scripts/${bname}`,
+        webhook_url: 'http://localhost:9092',
+        webhook_task: taskName.toUpperCase().replace(/-/g, ' '),
+        ops_playbook_section: null,
+        delivers_to: 'unknown',
+        phrases: [],
+        description: desc || `Auto-registered by doctor --repair on ${new Date().toISOString().slice(0,10)}.`,
+        job: taskName,
+      };
+      console.log(`  repair: registered orphan ${taskName} @ ${newSched}`);
+      mutableTasks.push(entry);
+      repaired++;
+    }
+
+    if (repaired > 0) {
+      fs.writeFileSync(TASKS_JSON, JSON.stringify(raw, null, 2) + '\n');
+      console.log(c.green(`\n  ${repaired} repair(s) applied to tasks.json. Run 'merlin doctor' to verify.`));
+    } else {
+      console.log(c.dim('  nothing to repair'));
+    }
+    process.exit(0);
+  }
+
+  let failed = 0;
+  for (const ck of checks) {
+    const mark = ck.ok ? c.green('✓') : c.red('✗');
+    console.log(`${mark} ${c.bold(ck.name)}`);
+    console.log(`  ${c.dim(ck.detail)}`);
+    if (!ck.ok) failed++;
+  }
+  console.log('');
+  if (failed === 0) console.log(c.green(`${checks.length}/${checks.length} checks passed`));
+  else { console.log(c.red(`${failed}/${checks.length} checks FAILED`)); process.exit(1); }
+}
+
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// --- hum ---
+const HUM_STATE   = path.join(TOOLS, 'data/hum-state.json');
+const HUM_SEEN    = path.join(TOOLS, 'data/hum-seen.json');
+const HUM_FEEDBK  = path.join(TOOLS, 'data/hum-feedback.jsonl');
+const HUM_RUNS    = path.join(TOOLS, 'data/hum-runs.jsonl');
+const HUM_REACTION_ALIASES = {
+  '👍':'helpful', 'helpful':'helpful', 'good':'helpful', 'yes':'helpful',
+  '👎':'skip', 'skip':'skip', 'bad':'skip', 'no':'skip',
+  '💤':'snooze', 'snooze':'snooze',
+  'more':'more', 'more_of_these':'more', 'more of these':'more',
+  // iOS tapback tokens (phone-channel forwards these raw from
+  // merlin_messages.reaction). Match the semantic intent the client exposes
+  // (Great / Useful / Not Useful) to the existing hum vocabulary.
+  '❤️':'more', 'heart':'more',
+  'thumbs_up':'helpful',
+  'thumbs_down':'skip',
+};
+
+function loadHumState() {
+  try { return JSON.parse(fs.readFileSync(HUM_STATE, 'utf8')); }
+  catch (e) {
+    if (e.code === 'ENOENT') die(`hum state not found at ${HUM_STATE}. Is hum installed?`);
+    throw e;
+  }
+}
+function saveHumState(s) {
+  const tmp = HUM_STATE + '.tmp.' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, HUM_STATE);
+}
+function parseHumDuration(s) {
+  if (!s) return null;
+  const now = Date.now();
+  const lc = s.toLowerCase().trim();
+  if (lc === 'today' || lc === 'end-of-day') {
+    const d = new Date(); d.setHours(23, 59, 59, 999);
+    return d.toISOString();
+  }
+  if (lc === 'until-morning' || lc === 'morning') {
+    const d = new Date();
+    if (d.getHours() >= 9) d.setDate(d.getDate() + 1);
+    d.setHours(9, 0, 0, 0);
+    return d.toISOString();
+  }
+  if (lc === 'weekend' || lc === 'until-monday') {
+    const d = new Date();
+    const day = d.getDay();
+    const daysToMonday = day === 1 ? 7 : (8 - day) % 7 || 7;
+    d.setDate(d.getDate() + daysToMonday);
+    d.setHours(9, 0, 0, 0);
+    return d.toISOString();
+  }
+  const m = lc.match(/^(\d+)\s*(m|min|h|hr|d|day|days)$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const unit = m[2];
+    const ms = unit.startsWith('m') && !unit.startsWith('min') ? n * 60 * 1000
+             : unit.startsWith('min') ? n * 60 * 1000
+             : unit.startsWith('h') ? n * 60 * 60 * 1000
+             : n * 24 * 60 * 60 * 1000;
+    return new Date(now + ms).toISOString();
+  }
+  const iso = new Date(s);
+  if (!isNaN(iso.getTime())) return iso.toISOString();
+  return null;
+}
+function formatHumTime(iso) {
+  if (!iso) return c.dim('—');
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const mins = Math.round((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return `${d.toLocaleString()} ${c.dim('(just now)')}`;
+  if (mins < 60) return `${d.toLocaleString()} ${c.dim(`(${mins}m ago)`)}`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${d.toLocaleString()} ${c.dim(`(${hrs}h ago)`)}`;
+  return `${d.toLocaleString()} ${c.dim(`(${Math.round(hrs/24)}d ago)`)}`;
+}
+
+function cmdHum(args) {
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help') return cmdHumHelp();
+  const subs = {
+    status: cmdHumStatus,
+    pause: cmdHumPause,
+    resume: cmdHumResume,
+    feedback: cmdHumFeedback,
+    runs: cmdHumRuns,
+    review: cmdHumReview,
+    test: cmdHumTest,
+    tune: cmdHumTune,
+    question: cmdHumQuestion,
+    learn: cmdHumLearn,
+    learnings: cmdHumLearnings,
+    situation: cmdHumSituation,
+    insight: cmdHumInsight,
+    audit: cmdHumAudit,
+  };
+  const fn = subs[sub];
+  if (!fn) die(`unknown: hum ${sub}. Try: merlin hum help`);
+  fn(args.slice(1));
+}
+
+function cmdHumHelp() {
+  console.log(c.bold('merlin hum') + ' — proactive check-in subsystem\n');
+  console.log('  status                       show next run, today\'s pings, cool-down, pause state, threshold');
+  console.log('  pause <duration>             "2h" | "30m" | "today" | "until-morning" | "weekend" | "<ISO>"');
+  console.log('  resume                       unpause');
+  console.log('  feedback <ping-id> <reaction>  record reaction: helpful | skip | snooze | more | 👍 | 👎');
+  console.log('    (use ping-id "last" to reference the most recent ping)');
+  console.log('  runs [--tail N]              tail hum-runs.jsonl (default 10)');
+  console.log('  review [--since Nd]          what was surfaced / reacted to (default 7d)');
+  console.log('  test                         fire a one-shot tick via webhook');
+  console.log('  tune                         show current config + feedback bias');
+  console.log('  question                     show current pending question (or null)');
+  console.log('  learn <id> <answer>          record a manual answer for the pending question');
+  console.log('  learnings [--tail N]         tail hum-learnings.jsonl (default 10)');
+  console.log('  situation [--json]           composite snapshot: where/env/time/now/next/working-on');
+  console.log('  insight [--since Nd]         aggregate last N days of tick traces into metrics (default 7d)');
+  console.log('  audit [--window 24h|7d] [--json]  drift check: outcome.sent count vs hum-feedback entries\n');
+  console.log(c.dim('State files:'));
+  console.log(c.dim(`  ${HUM_STATE}`));
+  console.log(c.dim(`  ${HUM_SEEN}`));
+  console.log(c.dim(`  ${HUM_FEEDBK}`));
+  console.log(c.dim(`  ${HUM_RUNS}`));
+}
+
+function cmdHumStatus(args) {
+  const s = loadHumState();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(s, null, 2)); return; }
+  console.log(c.bold('Hum Status') + '\n');
+  if (s.pause && s.pause.until && new Date(s.pause.until) > new Date()) {
+    console.log(`  ${c.yellow('PAUSED')} until ${new Date(s.pause.until).toLocaleString()}`);
+    if (s.pause.reason) console.log(`  reason:  ${s.pause.reason}`);
+  } else {
+    console.log(`  state:   ${c.green('active')}`);
+  }
+  const minIntMin = s.min_ping_interval_minutes ?? 60;
+  if (s.last_ping_at) {
+    const lastPingMs = Date.now() - new Date(s.last_ping_at).getTime();
+    const minMs = minIntMin * 60 * 1000;
+    if (lastPingMs < minMs) {
+      const m = Math.round((minMs - lastPingMs) / 60000);
+      console.log(`  min-interval: ${c.yellow(`${m}m remaining`)} (${minIntMin}m)`);
+    } else {
+      console.log(`  min-interval: ${c.green('clear')} (${minIntMin}m)`);
+    }
+  }
+  const today = s.today || {};
+  const cap = s.max_pings_per_day ?? 4;
+  const capColor = (today.pings || 0) >= cap ? c.red : c.green;
+  const runs = today.runs || 0;
+  const pings = today.pings || 0;
+  const questions = today.questions || 0;
+  const logOnly = today.log_only || 0;
+  console.log(`  today:    ${runs} ticks, ${capColor(`${pings}/${cap} pings`)}, ${questions} questions, ${logOnly} log-only`);
+  console.log(`  last run: ${formatHumTime(s.last_run_at)}`);
+  console.log(`  last ping: ${formatHumTime(s.last_ping_at)}`);
+
+  // Pending question, if any
+  try {
+    const raw = fs.readFileSync(HUM_PENDING_Q, 'utf8').trim();
+    if (raw && raw !== 'null') {
+      const q = JSON.parse(raw);
+      const exp = new Date(q.expires_at);
+      const remMin = Math.round((exp.getTime() - Date.now()) / 60000);
+      const status = remMin > 0 ? c.yellow(`${remMin}m left`) : c.red('EXPIRED');
+      console.log(`  pending question: ${c.bold(q.subject)} [${status}]`);
+    }
+  } catch {}
+
+  // Last outbound Merlin message stamp
+  try {
+    const stamp = JSON.parse(fs.readFileSync(path.join(TOOLS, 'data/last-merlin-message-at.json'), 'utf8'));
+    if (stamp.ts) console.log(`  last outbound msg: ${formatHumTime(stamp.ts)}`);
+  } catch {}
+}
+
+function cmdHumPause(args) {
+  const durStr = args[0];
+  if (!durStr) die('hum pause: duration required (e.g. "2h", "today", "until-morning", "weekend")');
+  const until = parseHumDuration(durStr);
+  if (!until) die(`hum pause: could not parse duration "${durStr}"`);
+  const s = loadHumState();
+  s.pause = { until, reason: args.slice(1).join(' ') || null, set_at: new Date().toISOString() };
+  saveHumState(s);
+  console.log(`${c.yellow('Paused')} until ${new Date(until).toLocaleString()}`);
+}
+
+function cmdHumResume(args) {
+  const s = loadHumState();
+  if (!s.pause) { console.log(c.dim('hum was not paused')); return; }
+  s.pause = null;
+  saveHumState(s);
+  console.log(c.green('Resumed'));
+}
+
+// Advisory lock around hum-feedback.jsonl. Must match the lockfile path used
+// by bin/hum-ping so reaction updates and ping appends serialize — a
+// naïve read-modify-write here would otherwise silently clobber a concurrent
+// append from a freshly-sent hum ping.
+const HUM_FEEDBK_LOCK = path.join(TOOLS, 'data/.hum-feedback.lock');
+function humFeedbackLockAcquire(timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try { fs.mkdirSync(HUM_FEEDBK_LOCK); return true; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const age = Date.now() - fs.statSync(HUM_FEEDBK_LOCK).mtimeMs;
+        if (age > 30_000) { try { fs.rmdirSync(HUM_FEEDBK_LOCK); } catch {} continue; }
+      } catch {}
+      const until = Date.now() + 20 + Math.floor(Math.random() * 30);
+      while (Date.now() < until) { /* spin */ }
+    }
+  }
+  return false;
+}
+function humFeedbackLockRelease() { try { fs.rmdirSync(HUM_FEEDBK_LOCK); } catch {} }
+
+function cmdHumFeedback(args) {
+  let pingId = args[0];
+  const reaction = args[1];
+  if (!pingId || !reaction) die('hum feedback <ping-id|last> <reaction>');
+  const norm = HUM_REACTION_ALIASES[reaction.toLowerCase()] || reaction;
+
+  if (!humFeedbackLockAcquire()) {
+    console.error(c.yellow('warn') + ': could not acquire hum-feedback lock after 5s; proceeding anyway');
+  }
+
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBK, 'utf8'); }
+  catch (e) {
+    humFeedbackLockRelease();
+    if (e.code === 'ENOENT') die('no hum feedback log yet');
+    throw e;
+  }
+  const lines = raw.split('\n');
+
+  if (pingId === 'last') {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      try {
+        const r = JSON.parse(lines[i]);
+        if (r.ping_id) { pingId = r.ping_id; break; }
+      } catch {}
+    }
+    if (pingId === 'last') die('no ping-id found in feedback log');
+  }
+
+  let found = false;
+  const out = lines.map(line => {
+    if (!line.trim()) return line;
+    try {
+      const r = JSON.parse(line);
+      if (r.ping_id === pingId) {
+        r.reaction = norm;
+        r.reaction_at = new Date().toISOString();
+        found = true;
+        return JSON.stringify(r);
+      }
+      return line;
+    } catch { return line; }
+  });
+  if (!found) {
+    humFeedbackLockRelease();
+    die(`no ping found with id "${pingId}"`);
+  }
+
+  const tmp = HUM_FEEDBK + '.tmp.' + process.pid;
+  try {
+    fs.writeFileSync(tmp, out.join('\n'));
+    fs.renameSync(tmp, HUM_FEEDBK);
+  } finally {
+    humFeedbackLockRelease();
+  }
+  console.log(`${c.green('Recorded')} reaction "${norm}" for ${pingId}`);
+
+  // Reinforcement loop: if the ping originated from an idea, append the
+  // reaction to hum-ideas.jsonl so the next ideation run can read it and
+  // bias generation. See system/hum-ideas-reservoir.md.
+  try {
+    const ideasFile = path.join(TOOLS, 'data/hum-ideas.jsonl');
+    const ideaRaw = fs.readFileSync(ideasFile, 'utf8');
+    const ideaLines = ideaRaw.split('\n').filter(Boolean);
+    let matchedIdeaId = null;
+    for (const line of ideaLines) {
+      try {
+        const r = JSON.parse(line);
+        if (r.ping_id === pingId && r.id) { matchedIdeaId = r.id; break; }
+      } catch {}
+    }
+    if (matchedIdeaId) {
+      const reactionRecord = {
+        id: matchedIdeaId,
+        reaction: norm,
+        reacted_at: new Date().toISOString(),
+        ping_id: pingId,
+      };
+      fs.appendFileSync(ideasFile, JSON.stringify(reactionRecord) + '\n');
+      console.log(c.dim(`  → linked to idea ${matchedIdeaId}`));
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(c.dim(`  (idea-link warn: ${e.message})`));
+  }
+}
+
+function cmdHumRuns(args) {
+  const tailStr = getFlag(args, '--tail', '10');
+  const tail = Math.max(1, parseInt(tailStr, 10) || 10);
+  let raw;
+  try { raw = fs.readFileSync(HUM_RUNS, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') { console.log(c.dim('(no runs yet)')); return; } throw e; }
+  const lines = raw.split('\n').filter(Boolean);
+  const recent = lines.slice(-tail);
+  if (!recent.length) { console.log(c.dim('(no runs yet)')); return; }
+  const rows = recent.map(line => {
+    try {
+      const r = JSON.parse(line);
+      const modeColor = r.mode === 'ping' ? c.green : (r.mode === 'error' ? c.red : c.dim);
+      return {
+        ts: String(r.ts || '').slice(0, 19),
+        mode: modeColor(r.mode || '?'),
+        lane: r.lane_rotated || '—',
+        top: r.top_score != null ? r.top_score.toFixed(2) : '—',
+        decision: r.decision || '—',
+        reason: r.deferral_reason || c.dim('—'),
+      };
+    } catch { return { ts: c.dim('(unparsable)'), mode: '', lane: '', top: '', decision: '', reason: '' }; }
+  });
+  console.log(table(rows, ['ts', 'mode', 'lane', 'top', 'decision', 'reason']));
+}
+
+function cmdHumReview(args) {
+  const sinceStr = getFlag(args, '--since', '7d');
+  const m = String(sinceStr).match(/^(\d+)([hd])$/);
+  const since = new Date();
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (m[2] === 'h') since.setHours(since.getHours() - n);
+    else since.setDate(since.getDate() - n);
+  } else { since.setDate(since.getDate() - 7); }
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBK, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') { console.log(c.dim('(no feedback log yet)')); return; } throw e; }
+  const lines = raw.split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+                       .filter(e => e.sent_at && new Date(e.sent_at) >= since);
+  console.log(c.bold(`Hum review — since ${since.toLocaleString()}`) + '\n');
+  console.log(`  total pings: ${entries.length}`);
+  const byLane = {}, byReact = { helpful: 0, skip: 0, snooze: 0, more: 0, silence: 0, none: 0 };
+  for (const e of entries) {
+    byLane[e.lane] = (byLane[e.lane] || 0) + 1;
+    const r = e.reaction || (e.reaction_at ? 'silence' : 'none');
+    byReact[r] = (byReact[r] || 0) + 1;
+  }
+  console.log('\n  ' + c.bold('By reaction:'));
+  for (const [k, v] of Object.entries(byReact)) console.log(`    ${k}: ${v}`);
+  console.log('\n  ' + c.bold('By lane:'));
+  for (const [k, v] of Object.entries(byLane)) console.log(`    ${k}: ${v}`);
+}
+
+function cmdHumTest(args) {
+  const lane = getFlag(args, '--lane', null);
+  const payload = lane ? JSON.stringify({ job: 'hum', force_lane: lane }) : JSON.stringify({ job: 'hum' });
+  console.log(c.dim(`Dispatching hum to http://localhost:9092 (bypasses jitter)...`));
+  const res = shSafe(`curl -sf --max-time 5 -X POST http://localhost:9092 -H "Content-Type: application/json" -d '${payload}'`);
+  if (res === null) die('dispatch failed — is the ops supervisor running? Check: merlin status');
+  console.log(c.green('Dispatched.') + ' Tail progress: ' + c.dim('merlin hum runs --tail 5'));
+}
+
+function cmdHumTune(args) {
+  const s = loadHumState();
+  console.log(c.bold('Hum tuning') + '\n');
+  console.log(`  min_ping_interval_minutes: ${s.min_ping_interval_minutes ?? 60}`);
+  console.log(`  max_pings_per_day: ${s.max_pings_per_day ?? 4}`);
+  console.log(`  schema_version: ${s.schema_version ?? 1}`);
+  console.log(c.dim('\nTo edit: modify ' + HUM_STATE + ' directly and save.'));
+  console.log(c.dim('Weekly hum-review proposes tuning based on reactions + answer rates.'));
+}
+
+// --- cost ---
+function cmdCost(args) {
+  const data = shSafe('curl -sf --max-time 3 http://127.0.0.1:9093/cost');
+  if (!data) { die('supervisor not reachable on :9093. Is the ops-supervisor running?'); return; }
+  const j = JSON.parse(data);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(j, null, 2)); return; }
+  console.log(c.bold('Ops Agent Cost') + '\n');
+  console.log(`  today:   $${j.todayUsd?.toFixed(4) || '0.0000'}`);
+  console.log(`  week:    $${j.weekUsd?.toFixed(4) || '0.0000'}`);
+  console.log(`  total:   $${j.totalUsd?.toFixed(4) || '0.0000'}`);
+  if (j.perModel && Object.keys(j.perModel).length) {
+    console.log(`\n  ${c.bold('Per model:')}`);
+    for (const [m, cost] of Object.entries(j.perModel)) {
+      console.log(`    ${m}: $${cost.toFixed(4)}`);
+    }
+  }
+  console.log(`  entries: ${j.entries || 0}`);
+}
+
+const HUM_PENDING_Q = path.join(HOME, 'dev/merlin/data/hum-pending-question.json');
+const HUM_LEARNINGS = path.join(HOME, 'dev/merlin/data/hum-learnings.jsonl');
+const HUM_ANSWER_BIN = path.join(HOME, 'dev/merlin/bin/hum-answer');
+
+function cmdHumQuestion(args) {
+  try {
+    const raw = require('fs').readFileSync(HUM_PENDING_Q, 'utf8').trim();
+    if (!raw || raw === 'null') { console.log(c.dim('(no pending question)')); return; }
+    const q = JSON.parse(raw);
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(q, null, 2)); return; }
+    console.log(c.bold('Pending Question') + '\n');
+    console.log(`  id:           ${q.id}`);
+    console.log(`  asked_at:     ${q.asked_at}`);
+    console.log(`  expires_at:   ${q.expires_at}`);
+    console.log(`  subject:      ${q.subject}`);
+    console.log(`  memory_hook:  ${q.memory_hook}`);
+    console.log(`\n  ${q.question}`);
+  } catch (e) {
+    if (e.code === 'ENOENT') { console.log(c.dim('(no pending question)')); return; }
+    throw e;
+  }
+}
+
+function cmdHumLearn(args) {
+  const [id, ...rest] = args;
+  const answer = rest.join(' ').trim();
+  if (!id || !answer) die('hum learn <id> <answer>');
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(HUM_ANSWER_BIN, [id, answer], { encoding: 'utf8' });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status ?? 0);
+}
+
+function cmdHumLearnings(args) {
+  let n = 10;
+  for (let i = 0; i < args.length; i++) if (args[i] === '--tail' && args[i + 1]) n = parseInt(args[++i], 10);
+  try {
+    const lines = require('fs').readFileSync(HUM_LEARNINGS, 'utf8').trim().split('\n').filter(Boolean);
+    const tail = lines.slice(-n);
+    if (hasFlag(args, '--json')) { console.log(tail.join('\n')); return; }
+    console.log(c.bold(`Last ${tail.length} hum learnings`) + '\n');
+    for (const line of tail) {
+      const r = JSON.parse(line);
+      const d = new Date(r.answered_at).toLocaleString();
+      console.log(`${c.dim(d)}  ${c.bold(r.subject)}  [${r.memory_hook}]`);
+      console.log(`  Q: ${r.question.slice(0, 140)}`);
+      console.log(`  A: ${r.answer.slice(0, 200)}\n`);
+    }
+  } catch (e) {
+    if (e.code === 'ENOENT') { console.log(c.dim('(no learnings yet)')); return; }
+    throw e;
+  }
+}
+
+// Composite situation snapshot for hum. Gathers where/environment/time/
+// activity/next/working-on signals. Cached 2 min in TMPDIR so multiple
+// callers within a tick share one computation.
+const SITUATION_CACHE = path.join(process.env.TMPDIR || '/tmp', 'merlin-situation.json');
+
+function readJsonSafe(p) {
+  try { return JSON.parse(require('fs').readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+function buildSituation() {
+  const fs = require('fs');
+  const tz = readJsonSafe(path.join(TOOLS, 'data/user-timezone.json'))?.timezone || 'America/New_York';
+  const cursor = readJsonSafe(path.join(TOOLS, 'data/phone-channel-cursor.json'));
+  const lastInboundMs = cursor?.lastSeenAt ? Date.now() - new Date(cursor.lastSeenAt).getTime() : null;
+  const inboundMinAgo = lastInboundMs !== null ? Math.round(lastInboundMs / 60000) : null;
+  const lastOut = readJsonSafe(path.join(TOOLS, 'data/last-merlin-message-at.json'));
+  const outboundMinAgo = lastOut?.ts ? Math.round((Date.now() - new Date(lastOut.ts).getTime()) / 60000) : null;
+
+  const activity = inferActivityState();
+
+  // Phone context (audio + motion) — returns null if stale / absent
+  let phoneCtx = null;
+  try {
+    phoneCtx = JSON.parse(shSafe(
+      `node -e "require('${path.join(TOOLS, 'lib/phone-context.js')}').getLatest().then(r=>console.log(JSON.stringify(r)))"`
+    ) || 'null');
+  } catch {}
+
+  // Sleep/wake inference — actual wake-time today + last-active yesterday
+  // from phone_unlocks + phone_context + merlin_messages. Closes context
+  // gap cg-20260413-02. See lib/sleep-wake.js for source priority.
+  let sleepWake = null;
+  try {
+    sleepWake = JSON.parse(shSafe(
+      `node -e "require('${path.join(TOOLS, 'lib/sleep-wake.js')}').inferToday().then(r=>console.log(JSON.stringify(r)))"`
+    ) || 'null');
+  } catch {}
+
+  // Current location via findme (single call; cached by findme itself)
+  let location = null;
+  try {
+    const raw = shSafe(`"${path.join(TOOLS, 'bin/findme')}" locate --json`);
+    location = JSON.parse(raw || 'null');
+  } catch {}
+
+  // Today's git commits (topic extraction)
+  let todayCommits = [];
+  try {
+    const out = shSafe(`cd ${HOME}/dev/merlin && git log --oneline --since="today 00:00" --no-color 2>/dev/null`);
+    todayCommits = (out || '').trim().split('\n').filter(Boolean).slice(0, 20);
+  } catch {}
+
+  // This-week commit topics — compact word-frequency of the last 7d commits'
+  // subject lines (minus prefixes like "feat:"/"fix:" and small words). Top 5.
+  let weekTopics = [];
+  try {
+    const raw = shSafe(`cd ${HOME}/dev/merlin && git log --since="7 days ago" --pretty=%s --no-color 2>/dev/null`) || '';
+    const stop = new Set(['the','and','for','with','from','into','that','this','add','adds','added','fix','fixes','fixed','update','updates','updated','feat','chore','docs','test','tests','when','what','have','has','not','now','new','use','uses','used','one','two','all','any','via','per']);
+    const freq = {};
+    for (const line of raw.split('\n')) {
+      const cleaned = line.replace(/^[a-z]+(\([^)]+\))?:/i, '').toLowerCase();
+      for (const w of cleaned.split(/[^a-z0-9-]+/)) {
+        if (w.length < 4 || stop.has(w)) continue;
+        freq[w] = (freq[w] || 0) + 1;
+      }
+    }
+    weekTopics = Object.entries(freq).sort((a,b) => b[1]-a[1]).slice(0, 5).map(([w]) => w);
+  } catch {}
+
+  // Weather, cached via apple-weather — skip if binary missing
+  let weather = null;
+  try {
+    const w = shSafe(`"${path.join(TOOLS, 'bin/apple-weather')}" --findme --json 2>/dev/null`);
+    if (w) {
+      const parsed = JSON.parse(w);
+      const cur = parsed?.currentWeather || parsed?.current || null;
+      if (cur) weather = { temp_f: cur.temperature, condition: cur.conditionCode, uv: cur.uvIndex };
+    }
+  } catch {}
+
+  // HID idle time — minutes since last keyboard/mouse/trackpad input on this
+  // Mac. Signals "at desk actively" vs "stepped away / on phone / in a
+  // meeting." `ioreg` returns nanoseconds.
+  let atDeskMin = null;
+  try {
+    const raw = shSafe(`ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print $NF; exit}'`);
+    const ns = parseInt(raw, 10);
+    if (Number.isFinite(ns)) atDeskMin = Math.round(ns / 1e9 / 60);
+  } catch {}
+
+  // Next — what's coming up. Calendar events in [+0, +120min] plus today's
+  // tasks summary. Feeds Sonnet's relevance overlay ("meeting in 30 min"
+  // trumps most other candidates).
+  let upcomingEvents = [];
+  try {
+    const raw = shSafe(`/opt/homebrew/bin/gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 1 --max 20 --json 2>/dev/null`) || '';
+    const data = JSON.parse(raw || '{}');
+    const events = data?.events || data?.items || [];
+    const now = Date.now();
+    const horizon = now + 2 * 3600 * 1000;
+    upcomingEvents = events
+      .map((e) => {
+        const start = new Date(e.start?.dateTime || e.start?.date || 0).getTime();
+        const end = new Date(e.end?.dateTime || e.end?.date || 0).getTime();
+        return { start, end, summary: e.summary || '(no title)', location: e.location || null };
+      })
+      .filter((e) => e.start && e.start >= now - 5 * 60000 && e.start <= horizon)
+      .slice(0, 3)
+      .map((e) => ({
+        in_min: Math.round((e.start - now) / 60000),
+        duration_min: Math.max(0, Math.round((e.end - e.start) / 60000)),
+        summary: e.summary,
+        location: e.location,
+      }));
+  } catch {}
+
+  // Due-today + overdue tasks — lightweight counts + top-3 titles
+  let dueToday = [], overdueCount = 0;
+  try {
+    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
+    const today = new Date().toISOString().slice(0, 10);
+    for (const line of plain.split('\n').filter(Boolean)) {
+      if (line.includes('completed')) continue;
+      const m = line.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!m) continue;
+      if (m[1] < today) overdueCount++;
+      else if (m[1] === today) {
+        // gog --plain is TSV; title is field 2
+        const parts = line.split('\t');
+        dueToday.push((parts[1] || line).slice(0, 80));
+      }
+    }
+    dueToday = dueToday.slice(0, 3);
+  } catch {}
+
+  return {
+    where: {
+      lat: location?.latitude ?? null,
+      lon: location?.longitude ?? null,
+      place: location?.place_name || location?.placeName || null,
+      companions: location?.companions || [],
+      activity: location?.activity || null,
+    },
+    environment: {
+      weather,
+      audio_class: phoneCtx?.fresh ? phoneCtx.audio_class : null,
+      db_bucket: phoneCtx?.fresh ? phoneCtx.ambient_db_bucket : null,
+      motion_class: phoneCtx?.motion_class || null,
+      phone_context_age_min: phoneCtx?.age_min ?? null,
+    },
+    time: {
+      local_hour: activity.local_hour,
+      tz: activity.local_tz,
+      activity_state: activity.state,
+      inbound_min_ago: inboundMinAgo,
+      outbound_min_ago: outboundMinAgo,
+      wake_time_today: sleepWake?.wake_time_today || null,
+      sleep_time_yesterday: sleepWake?.sleep_time_yesterday || null,
+      asleep_now: sleepWake?.asleep_now || false,
+    },
+    now_activity: {
+      at_desk_min: atDeskMin,
+    },
+    next: {
+      upcoming_events: upcomingEvents,
+      tasks_due_today: dueToday,
+      overdue_count: overdueCount,
+    },
+    working_on: {
+      today_commits: todayCommits,
+      week_commit_topics: weekTopics,
+    },
+  };
+}
+
+function cmdHumSituation(args) {
+  const fs = require('fs');
+  let snap = null;
+  try {
+    const stat = fs.statSync(SITUATION_CACHE);
+    if (Date.now() - stat.mtimeMs < 120 * 1000) {
+      snap = JSON.parse(fs.readFileSync(SITUATION_CACHE, 'utf8'));
+    }
+  } catch {}
+  if (!snap || hasFlag(args, '--fresh')) {
+    snap = buildSituation();
+    try { fs.writeFileSync(SITUATION_CACHE, JSON.stringify(snap)); } catch {}
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(snap, null, 2)); return; }
+  console.log(c.bold('Situation') + '\n');
+  console.log(`  where:    ${snap.where.place || '—'}  (${snap.where.lat?.toFixed(3)}, ${snap.where.lon?.toFixed(3)})`);
+  if (snap.where.companions?.length) console.log(`  with:     ${snap.where.companions.join(', ')}`);
+  console.log(`  activity: ${snap.where.activity || '—'}`);
+  console.log(`  state:    ${snap.time.activity_state}  (${snap.time.local_hour}:00 ${snap.time.tz})`);
+  console.log(`  inbound:  ${snap.time.inbound_min_ago ?? '—'} min ago   outbound: ${snap.time.outbound_min_ago ?? '—'} min ago`);
+  if (snap.time.wake_time_today) {
+    console.log(`  woke:     ${snap.time.wake_time_today.hm}  (${snap.time.wake_time_today.source})`);
+  }
+  if (snap.time.sleep_time_yesterday) {
+    console.log(`  to bed:   ${snap.time.sleep_time_yesterday.hm} y'day  (${snap.time.sleep_time_yesterday.source})`);
+  }
+  if (snap.environment.weather) console.log(`  weather:  ${snap.environment.weather.temp_f}F ${snap.environment.weather.condition}`);
+  if (snap.environment.audio_class) console.log(`  audio:    ${snap.environment.audio_class}  (${snap.environment.db_bucket || '—'})`);
+  if (snap.environment.motion_class) console.log(`  motion:   ${snap.environment.motion_class}`);
+  if (snap.now_activity?.at_desk_min !== null && snap.now_activity?.at_desk_min !== undefined) {
+    const d = snap.now_activity.at_desk_min;
+    console.log(`  at desk:  ${d < 2 ? c.green('active now') : d + ' min idle'}`);
+  }
+  if (snap.next?.upcoming_events?.length) {
+    console.log('\n  ' + c.bold('Next:'));
+    for (const e of snap.next.upcoming_events) {
+      const when = e.in_min < 0 ? 'started' : `in ${e.in_min}m`;
+      console.log(`    ${when}  ${e.summary}${e.location ? ' @ ' + e.location : ''}`);
+    }
+  }
+  if (snap.next?.tasks_due_today?.length || snap.next?.overdue_count) {
+    console.log(`  tasks:    ${snap.next.overdue_count} overdue, ${snap.next.tasks_due_today?.length || 0} due today`);
+  }
+  if (snap.working_on.today_commits?.length) {
+    console.log(`  today commits: ${snap.working_on.today_commits.length}`);
+  }
+  if (snap.working_on.week_commit_topics?.length) {
+    console.log(`  week topics:   ${snap.working_on.week_commit_topics.join(', ')}`);
+  }
+}
+
+// Insight — aggregate the enriched tick trace into metrics mirroring the
+// intent file in data/hum-intent.md. Read-only; hum-review uses the
+// same computations against its own window.
+// Drift audit — compare outcome.sent=true in hum-runs.jsonl vs hum-feedback
+// entries in the same window. They should be 1:1. Non-zero delta means the
+// send+log plumbing is dropping rows (the 2026-04-11..15 regression this
+// whole subsystem was hardened to prevent).
+function cmdHumAudit(args) {
+  let windowHours = 24;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--window' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) windowHours = parseInt(m[1], 10) * (m[2] === 'd' ? 24 : 1);
+    }
+  }
+  const asJson = hasFlag(args, '--json');
+  const cutoff = Date.now() - windowHours * 3600 * 1000;
+
+  function parseJsonl(p) {
+    try {
+      return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+    } catch (e) {
+      if (e.code === 'ENOENT') return [];
+      throw e;
+    }
+  }
+
+  const runs = parseJsonl(HUM_RUNS);
+  const feedback = parseJsonl(HUM_FEEDBK);
+
+  // A run "sent" if outcome.sent === true (new schema) OR decision === 'PING'
+  // with a ping_id (legacy schema, pre-2026-04-15 rewrite). Accept `ts` or
+  // `ran_at` as the timestamp key, and normalize `decision` case — historical
+  // rows have varied in both dimensions.
+  const sentPings = runs.filter((r) => {
+    const ts = Date.parse(r.ts || r.ran_at || '');
+    if (!Number.isFinite(ts) || ts < cutoff) return false;
+    const newSchema = r.outcome?.sent === true && r.outcome.ping_id;
+    const legacy = String(r.decision || '').toUpperCase() === 'PING' && r.ping_id;
+    return newSchema || legacy;
+  }).map((r) => r.outcome?.ping_id || r.ping_id);
+
+  const feedbackPings = feedback.filter((r) => {
+    const ts = Date.parse(r.sent_at || '');
+    return Number.isFinite(ts) && ts >= cutoff;
+  }).map((r) => r.ping_id);
+
+  const sentSet = new Set(sentPings);
+  const feedbackSet = new Set(feedbackPings);
+  const missingFeedback = [...sentSet].filter((id) => !feedbackSet.has(id));
+  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id));
+  const drift = missingFeedback.length + orphanFeedback.length;
+
+  const report = {
+    window_hours: windowHours,
+    cutoff_iso: new Date(cutoff).toISOString(),
+    pings_sent_in_runs: sentPings.length,
+    pings_logged_in_feedback: feedbackPings.length,
+    missing_feedback_for_sent: missingFeedback,
+    orphan_feedback_no_run: orphanFeedback,
+    drift_count: drift,
+    healthy: drift === 0,
+  };
+
+  if (asJson) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const mark = drift === 0 ? c.green('OK') : c.red('DRIFT');
+    console.log(`${c.bold('hum audit')} (last ${windowHours}h) — ${mark}`);
+    console.log(`  sent in runs:      ${report.pings_sent_in_runs}`);
+    console.log(`  logged in feedback: ${report.pings_logged_in_feedback}`);
+    if (missingFeedback.length) {
+      console.log(c.red(`  missing feedback (${missingFeedback.length}):`));
+      for (const id of missingFeedback) console.log(`    ${id}`);
+    }
+    if (orphanFeedback.length) {
+      console.log(c.yellow(`  orphan feedback (${orphanFeedback.length}):`));
+      for (const id of orphanFeedback) console.log(`    ${id}`);
+    }
+  }
+
+  process.exit(drift === 0 ? 0 : 1);
+}
+
+function cmdHumInsight(args) {
+  const fs = require('fs');
+  let sinceDays = 7;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) sinceDays = parseInt(m[1], 10) * (m[2] === 'h' ? 1 / 24 : 1);
+    }
+  }
+  const cutoff = Date.now() - sinceDays * 24 * 3600 * 1000;
+
+  let runs = [], feedback = [], learnings = [];
+  try {
+    runs = fs.readFileSync(HUM_RUNS, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.ts).getTime() >= cutoff);
+  } catch {}
+  try {
+    feedback = fs.readFileSync(HUM_FEEDBK, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.sent_at || r.ts || 0).getTime() >= cutoff);
+  } catch {}
+  try {
+    learnings = fs.readFileSync(HUM_LEARNINGS, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.answered_at || 0).getTime() >= cutoff);
+  } catch {}
+
+  const total = runs.length;
+  if (total === 0) {
+    console.log(c.dim(`No tick traces in the last ${sinceDays}d.`));
+    return;
+  }
+  const bucket = { silent: 0, info: 0, question: 0, error: 0 };
+  const perTopicCandidates = {}, perTopicWins = {}, perTopicErrors = {};
+  const scoreDist = [];
+  let sent = 0, downgrades = 0, bashGated = 0; // bashGated approximated by "no candidates AND no sonnet call"
+  let meetingSuppressed = 0;
+
+  for (const r of runs) {
+    const d = r.sonnet?.decision || 'error';
+    bucket[d] = (bucket[d] || 0) + 1;
+    if (r.outcome?.sent) sent++;
+    if (r.outcome?.downgrade_reason) downgrades++;
+    for (const c of (r.harvest?.candidates || [])) {
+      perTopicCandidates[c.topic] = (perTopicCandidates[c.topic] || 0) + 1;
+    }
+    for (const e of (r.harvest?.errors || [])) {
+      perTopicErrors[e.topic] = (perTopicErrors[e.topic] || 0) + 1;
+    }
+    if (r.sonnet?.based_on_topic) {
+      perTopicWins[r.sonnet.based_on_topic] = (perTopicWins[r.sonnet.based_on_topic] || 0) + 1;
+    }
+    if (typeof r.sonnet?.score === 'number') scoreDist.push(r.sonnet.score);
+  }
+
+  const silentRate = bucket.silent / total;
+  const reactedCount = feedback.filter((f) => f.reaction).length;
+  const positive = feedback.filter((f) => ['helpful', 'more', '👍'].includes(f.reaction)).length;
+  const negative = feedback.filter((f) => ['skip', 'snooze', '👎', '💤'].includes(f.reaction)).length;
+  const responseRate = feedback.length ? reactedCount / feedback.length : 0;
+  const positiveRate = (positive + negative) ? positive / (positive + negative) : 0;
+  const answerRate = bucket.question ? learnings.length / bucket.question : 0;
+
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({
+      window_days: sinceDays,
+      total, silent_rate: silentRate, bucket,
+      info_sent: sent, downgrades,
+      info_response_rate: responseRate, info_positive_rate: positiveRate,
+      questions_asked: bucket.question, questions_answered: learnings.length, answer_rate: answerRate,
+      per_topic_candidates: perTopicCandidates, per_topic_wins: perTopicWins, per_topic_errors: perTopicErrors,
+    }, null, 2));
+    return;
+  }
+
+  console.log(c.bold(`Hum insight — last ${sinceDays}d`) + '\n');
+  console.log(`  ticks:           ${total}`);
+  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${silentRate >= 0.85 ? c.green('✓ intent') : c.yellow('below 0.85')}`);
+  console.log(`  info:            ${bucket.info} (sent ${sent}, downgraded ${downgrades})`);
+  console.log(`  question:        ${bucket.question}  (answered ${learnings.length}, rate ${(answerRate * 100).toFixed(0)}%)  ${answerRate >= 0.4 ? c.green('✓ intent') : c.yellow('below 0.40')}`);
+  if (bucket.error) console.log(`  ${c.red('error:          ' + bucket.error)}`);
+
+  console.log('\n  ' + c.bold('Info reactions'));
+  console.log(`    response rate:  ${(responseRate * 100).toFixed(0)}%  ${responseRate >= 0.30 ? c.green('✓') : c.yellow('below 0.30')}`);
+  console.log(`    positive rate:  ${(positiveRate * 100).toFixed(0)}%  (${positive}👍 / ${negative}👎)  ${positiveRate >= 0.60 ? c.green('✓') : c.yellow('below 0.60')}`);
+
+  console.log('\n  ' + c.bold('Per-topic hit rate (wins ÷ candidates)'));
+  const topics = Object.keys(perTopicCandidates).sort();
+  for (const t of topics) {
+    const cand = perTopicCandidates[t] || 0;
+    const wins = perTopicWins[t] || 0;
+    const errs = perTopicErrors[t] || 0;
+    const attempts = cand + errs;
+    const hit = cand ? (wins / cand * 100).toFixed(0) + '%' : '—';
+    const errRate = attempts ? (errs / attempts * 100).toFixed(0) + '%' : '0%';
+    const errColor = errs / (attempts || 1) > 0.1 ? c.yellow : c.dim;
+    console.log(`    ${t.padEnd(18)} cand=${String(cand).padStart(3)}  wins=${String(wins).padStart(3)} (${hit})  ${errColor('err=' + errs + ' (' + errRate + ')')}`);
+  }
+
+  if (scoreDist.length) {
+    scoreDist.sort((a, b) => a - b);
+    const med = scoreDist[Math.floor(scoreDist.length / 2)];
+    const p90 = scoreDist[Math.floor(scoreDist.length * 0.9)];
+    console.log('\n  ' + c.bold('Sonnet score distribution') + `  median=${med.toFixed(2)}  p90=${p90.toFixed(2)}  (threshold 0.55)`);
+  }
+}
+
+// Infer the user's current activity state from existing signals. Reads
+// phone-channel-cursor.json (last inbound) + user-timezone.json (local TZ),
+// classifies as active / winding_down / sleeping / waking. Used by
+// trigger-hum.sh as a soft gate and exposed here for ad-hoc inspection.
+function inferActivityState() {
+  const fs = require('fs');
+  const dataDir = `${process.env.MERLIN_HOME || `${process.env.HOME}/Dev/merlin`}/data`;
+  const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+  const cursor = readJson(`${dataDir}/phone-channel-cursor.json`);
+  const tzdata = readJson(`${dataDir}/user-timezone.json`);
+  const tz = (tzdata && tzdata.timezone) || 'America/New_York';
+  const lastSeenAt = cursor && cursor.lastSeenAt ? new Date(cursor.lastSeenAt) : null;
+  const ageMin = lastSeenAt ? Math.round((Date.now() - lastSeenAt.getTime()) / 60000) : null;
+  const localHour = parseInt(
+    new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', hour12: false }).format(new Date()),
+    10
+  );
+  let state = 'active';
+  let reason = `${localHour}:00 local, inbound ${ageMin ?? '?'}m ago`;
+  if (localHour >= 1 && localHour < 7) {
+    state = 'sleeping';
+    reason = `sleep window ${localHour}:00 local`;
+  } else if ((localHour >= 22 || localHour < 1) && (ageMin === null || ageMin >= 30)) {
+    state = 'winding_down';
+    reason = `late (${localHour}:00) + no phone activity ${ageMin ?? '?'}m`;
+  } else if (localHour >= 7 && localHour < 9 && ageMin !== null && ageMin < 30) {
+    state = 'waking';
+    reason = `morning + fresh phone activity ${ageMin}m ago`;
+  }
+  return { state, last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz, reason };
+}
+
+function cmdContext(args) {
+  const ctxBuilder = require(path.join(TOOLS, 'lib/merlin-context.js'));
+  const skipCache = hasFlag(args, '--fresh');
+  const ctx = ctxBuilder.build({ skipCache });
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(ctx, null, 2)); return; }
+  console.log(c.bold('Merlin Context') + '\n');
+  console.log(`  built_at: ${ctx.built_at}`);
+  console.log(`\n  ${c.bold('Profile')}      ${Object.keys(ctx.profile).join(', ')}`);
+  console.log(`  ${c.bold('Tastes')}       ${Object.keys(ctx.tastes).join(', ')}`);
+  console.log(`  ${c.bold('Projects')}     ${Object.keys(ctx.projects).join(', ')}`);
+  console.log(`\n  ${c.bold('Knowledge sources')} (${Object.keys(ctx.knowledge).length})`);
+  for (const [k, v] of Object.entries(ctx.knowledge)) {
+    console.log(`    ${k.padEnd(15)} ${c.dim(v.via)}`);
+  }
+  console.log(`\n  ${c.bold('Recent')}`);
+  console.log(`    today commits:    ${ctx.recent.today_commits.length}`);
+  console.log(`    today triage:     P1=${ctx.recent.today_triage.p1 || 0} P2=${ctx.recent.today_triage.p2 || 0} P3=${ctx.recent.today_triage.p3 || 0}`);
+  console.log(`    hum runs 7d:      ${ctx.recent.counts.hum_runs_7d}`);
+  console.log(`    hum feedback 14d: ${ctx.recent.counts.hum_feedback_14d}`);
+  console.log(`    hum learnings 30d:${ctx.recent.counts.hum_learnings_30d}`);
+  console.log(`    watchlist notify: ${ctx.recent.counts.watchlist_notify} shows`);
+}
+
+function cmdActivity(args) {
+  const out = inferActivityState();
+  if (hasFlag(args, '--state-only')) { console.log(out.state); return; }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(out)); return; }
+  console.log(c.bold('Activity State') + '\n');
+  console.log(`  state:     ${out.state}`);
+  console.log(`  inbound:   ${out.last_inbound_min_ago ?? '—'} min ago`);
+  console.log(`  local:     ${out.local_hour}:00 ${out.local_tz}`);
+  console.log(`  reason:    ${out.reason}`);
+}
+
+// ========================================================================
+// BOOTSTRAP / RUN-LOOP SUBCOMMANDS
+// ========================================================================
+
+function cmdInit(args) {
+  // Interactive config wizard. Writes ROOT/.env (unless --force, asks before overwrite).
+  // Generates a webhook-token. Creates required data/ subdirs.
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def = '') => new Promise(r =>
+    rl.question(`  ${q}${def ? c.dim(` [${def}]`) : ''}: `, ans => r(ans.trim() || def))
+  );
+  const envPath = path.join(ROOT, '.env');
+  const force = hasFlag(args, '--force');
+
+  (async () => {
+    console.log(c.bold('Merlin init') + ' — interactive config\n');
+
+    if (fs.existsSync(envPath) && !force) {
+      const ans = await ask('.env already exists. Overwrite? (yes/no)', 'no');
+      if (!/^y(es)?$/i.test(ans)) { console.log(c.dim('  aborted — .env left alone')); rl.close(); return; }
+    }
+
+    console.log(c.dim('  press Enter to accept defaults; leave fields blank for optional integrations\n'));
+
+    const env = {};
+    env.MERLIN_HOME = await ask('MERLIN_HOME (absolute path to this clone)', ROOT);
+
+    console.log(c.bold('\n  Anthropic auth'));
+    console.log(c.dim('  Mode 1: paste an API key  ·  Mode 2: leave blank and use `claude` login (Max subscription)'));
+    env.ANTHROPIC_API_KEY = await ask('ANTHROPIC_API_KEY', '');
+
+    console.log(c.bold('\n  Identity'));
+    env.MERLIN_OWNER_EMAIL = await ask('Your primary email', '');
+    env.MERLIN_OWNER = await ask('GitHub username / owner', '');
+
+    console.log(c.bold('\n  Webhook channel'));
+    const crypto = require('crypto');
+    env.WEBHOOK_TOKEN = crypto.randomBytes(32).toString('hex');
+    console.log(c.dim(`  generated WEBHOOK_TOKEN (random)`));
+
+    console.log(c.bold('\n  Optional integrations') + c.dim(' (leave blank to skip; you can add later by editing .env)'));
+    env.SUPABASE_URL = await ask('SUPABASE_URL', '');
+    if (env.SUPABASE_URL) {
+      env.SUPABASE_SERVICE_ROLE_KEY = await ask('SUPABASE_SERVICE_ROLE_KEY', '');
+      env.MERLIN_SUPABASE_PROJECT = await ask('MERLIN_SUPABASE_PROJECT (project-ref)', '');
+    }
+    env.OLLAMA_URL = await ask('OLLAMA_URL', 'http://127.0.0.1:11434');
+    env.LOCAL_LLM_MODEL = await ask('LOCAL_LLM_MODEL', 'gemma3:4b');
+    env.LOCAL_EMBED_MODEL = await ask('LOCAL_EMBED_MODEL', 'nomic-embed-text');
+
+    rl.close();
+
+    const lines = [
+      '# Merlin environment — generated by `merlin init`. Edit anytime.',
+      `# Generated ${new Date().toISOString()}`,
+      '',
+      ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
+      '',
+    ];
+    fs.writeFileSync(envPath, lines.join('\n'));
+
+    // Create runtime dirs
+    for (const d of ['data', 'data/hum-cache', 'logs', 'agent/logs', 'agent/logs/supervisor-ops', 'agent/logs/supervisor-chat', 'agent/supervisor/state/ops', 'agent/supervisor/state/chat', 'secrets', 'credentials']) {
+      fs.mkdirSync(path.join(ROOT, d), { recursive: true });
+    }
+    // Write the webhook token to the secrets dir (scripts read this directly)
+    fs.writeFileSync(path.join(ROOT, 'secrets', 'webhook-token'), env.WEBHOOK_TOKEN + '\n');
+
+    console.log(c.green('\n  ✓ .env written'));
+    console.log(c.green('  ✓ data/, logs/, supervisor state/, secrets/ created'));
+    console.log(c.green('  ✓ webhook-token written to secrets/webhook-token'));
+    console.log(c.dim('\nNext: ') + c.bold('./bin/merlin up'));
+  })().catch(err => { console.error(c.red('Error: ') + err.message); process.exit(1); });
+}
+
+function cmdUp(args) {
+  // Foreground mode: spawn process-manager as a child of this process,
+  // forward signals so Ctrl-C cleanly tears down the whole tree.
+  const pm = path.join(ROOT, 'agent/bin/process-manager.mjs');
+  if (!fs.existsSync(pm)) die(`process-manager not found at ${pm}`);
+  console.log(c.bold('Merlin up') + c.dim(' — Ctrl-C to stop'));
+  console.log(c.dim(`  ROOT: ${ROOT}`));
+  console.log();
+  const child = spawn(process.execPath, [pm], { stdio: 'inherit', cwd: ROOT });
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => { try { child.kill(sig); } catch {} });
+  }
+  child.on('exit', (code, sig) => process.exit(code ?? (sig ? 128 : 0)));
+}
+
+function cmdDispatch(args) {
+  // POST a job to the ops-supervisor webhook.
+  //   merlin dispatch <job-name> [--task "task description"] [--port 9092]
+  if (args.length === 0 || hasFlag(args, '-h', '--help')) {
+    console.log('Usage: merlin dispatch <job-name> [--task "...task text..."] [--port <N>]');
+    console.log('       merlin dispatch                   # list dispatch-able jobs');
+    if (args.length === 0) {
+      const tasks = loadTasks().filter(t => t.webhook_task);
+      if (tasks.length) {
+        console.log('\nDispatch-able jobs:');
+        for (const t of tasks) console.log(`  ${t.name.padEnd(24)} ${c.dim(t.description?.slice(0, 60) || '')}`);
+      }
+    }
+    return;
+  }
+  const jobName = args[0];
+  const task = getFlag(args, '--task') || jobName.toUpperCase().replace(/-/g, ' ');
+  const port = getFlag(args, '--port', '9092');
+  // Resolve token from .env or secrets/webhook-token
+  let token = process.env.WEBHOOK_TOKEN;
+  if (!token) {
+    try { token = fs.readFileSync(path.join(ROOT, 'secrets/webhook-token'), 'utf8').trim(); } catch {}
+  }
+  if (!token) {
+    try {
+      const env = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
+      const m = env.match(/^WEBHOOK_TOKEN=(.+)$/m);
+      if (m) token = m[1].trim();
+    } catch {}
+  }
+  if (!token) die('No WEBHOOK_TOKEN — run `merlin init` first.');
+  const payload = JSON.stringify({ task, source: 'merlin-cli', job: jobName });
+  const cmd = `curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${port} -H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' -d '${payload.replace(/'/g, "'\\''")}'`;
+  try {
+    const code = execSync(cmd, { encoding: 'utf8' }).trim();
+    if (code.startsWith('2')) console.log(c.green('✓') + ` dispatched ${c.bold(jobName)} (HTTP ${code})`);
+    else die(`dispatch failed: HTTP ${code}. Is the supervisor running? Try \`merlin up\`.`);
+  } catch (e) { die(`dispatch failed: ${e.message}`); }
+}
+
+function cmdTail(args) {
+  // Tail one of the well-known log streams.
+  //   merlin tail              # ops supervisor events (default)
+  //   merlin tail ops|chat     # supervisor stream
+  //   merlin tail <job-name>   # logs/<job>.log
+  //   merlin tail --all        # multiplex ops + chat
+  const which = args[0] || 'ops';
+  const all = hasFlag(args, '--all');
+  const candidates = [];
+  if (all || which === 'ops') candidates.push({ label: 'ops', path: path.join(AGENT_LOGS, 'supervisor-ops/events.ndjson') });
+  if (all || which === 'chat') candidates.push({ label: 'chat', path: path.join(AGENT_LOGS, 'supervisor-chat/events.ndjson') });
+  if (!all && which !== 'ops' && which !== 'chat') {
+    // Treat as a job name → logs/<name>.log
+    candidates.length = 0;
+    candidates.push({ label: which, path: path.join(TOP_LOGS, `${which}.log`) });
+  }
+  const ok = candidates.filter(c => fs.existsSync(c.path));
+  if (!ok.length) {
+    console.log(c.dim('No log files yet — start the system with `merlin up` and try again.'));
+    for (const c of candidates) console.log(c.dim(`  expected: ${c.path}`));
+    return;
+  }
+  // Just shell out to `tail -F` for the best UX
+  const tailArgs = ['-F'].concat(ok.map(c => c.path));
+  const child = spawn('tail', tailArgs, { stdio: 'inherit' });
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { try { child.kill(sig); } catch {} });
+  child.on('exit', (code) => process.exit(code ?? 0));
+}
+
+// ========================================================================
+// MAIN DISPATCH
+// ========================================================================
+const [, , cmd, ...args] = process.argv;
+if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { cmdHelp(); process.exit(0); }
+
+const dispatch = {
+  // Bootstrap / run-loop
+  init: cmdInit,
+  up: cmdUp,
+  dispatch: cmdDispatch,
+  tail: cmdTail,
+  // Observability + task registry
+  tasks: cmdTasks,
+  status: cmdStatus,
+  services: cmdServices,
+  logs: cmdLogs,
+  cron: cmdCron,
+  git: cmdGit,
+  ci: cmdCi,
+  triage: cmdTriage,
+  hum: cmdHum,
+  restart: cmdRestart,
+  arch: cmdArch,
+  where: cmdWhere,
+  doctor: cmdDoctor,
+  cost: cmdCost,
+  activity: cmdActivity,
+  context: cmdContext,
+};
+
+const fn = dispatch[cmd];
+if (!fn) { console.error(c.red(`unknown subcommand: ${cmd}`) + '\n'); cmdHelp(); process.exit(1); }
+fn(args);

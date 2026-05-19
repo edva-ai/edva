@@ -1,0 +1,27 @@
+{
+  "_comment": "MCP servers for chat agent under supervisor. phone-channel provides reply/get_location tools; message delivery handled by supervisor HTTP dispatch instead of MCP notifications.",
+  "mcpServers": {
+    "phone-channel": {
+      "command": "node",
+      "args": ["${MERLIN_HOME_USER}/dev/merlin/agent/phone-channel/index.mjs"],
+      "alwaysLoad": true
+    },
+    "tools": {
+      "command": "node",
+      "args": ["${MERLIN_HOME_USER}/dev/merlin/agent/tools-mcp/index.mjs"],
+      "alwaysLoad": true
+    },
+    "supabase-merlin": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@supabase/mcp-server-supabase@latest",
+        "--project-ref=${MERLIN_SUPABASE_PROJECT}"
+      ],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
+      },
+      "alwaysLoad": true
+    }
+  }
+}

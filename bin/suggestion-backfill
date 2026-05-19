@@ -1,0 +1,262 @@
+#!/usr/bin/env node
+// suggestion-backfill — rebuild data/suggestion-history.jsonl from
+// the existing hum-feedback.jsonl, confirmed-stops.json, and prose-memory
+// rejection notes. Idempotent: deletes the ledger first, then writes fresh.
+//
+// Run after step 1 of the suggestion-history rollout. After this, hum-ping
+// will append new events at runtime; this binary is for migration only and
+// can be re-run if the JSONL gets corrupted (it's a pure derivation).
+//
+// Usage:
+//   suggestion-backfill           # rebuild
+//   suggestion-backfill --dry-run # print event counts, write nothing
+//   suggestion-backfill --keep    # don't delete existing ledger; append only
+//                                 # new events (idempotency: existing rows
+//                                 # are detected by ts+kind+subject_key)
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import {
+  canonicalKey, canonicalDisplay, canonicalAttrs, normalizeName,
+} from "../lib/suggestion-key.mjs";
+import {
+  LEDGER_FILE, mergeShortKeysToLong,
+} from "../lib/suggestion-history.mjs";
+
+const HOME = os.homedir();
+const FEEDBACK = path.join(HOME, "dev/merlin/data/hum-feedback.jsonl");
+const STOPS = path.join(HOME, "dev/merlin/data/confirmed-stops.json");
+const MEMORY_DIR = path.join(HOME, ".claude/projects/-Users-mraccah-Dev-merlin/memory");
+
+const args = new Set(process.argv.slice(2));
+const DRY = args.has("--dry-run");
+const KEEP = args.has("--keep");
+
+// ---------------------------------------------------------------------------
+// 1. Walk hum-feedback.jsonl. Each line = one ping with N findings + reaction.
+//    Emit one `surfaced` event per finding (advisory lanes only) and one
+//    `reaction` event for the headline finding only when reaction != null.
+// ---------------------------------------------------------------------------
+const REACTION_MAP = {
+  thumbs_down: { disposition: "negative", reason: "explicit_no" },
+  thumbs_up:   { disposition: "positive", reason: null },
+  heart:       { disposition: "positive", reason: null },
+  skip:        { disposition: "negative", reason: "explicit_no" },
+  down:        { disposition: "negative", reason: "explicit_no" },
+  "👎":        { disposition: "negative", reason: "explicit_no" },
+  "👍":        { disposition: "positive", reason: null },
+  snooze:      { disposition: "snoozed", reason: "timing" },
+  "💤":        { disposition: "snoozed", reason: "timing" },
+  more:        { disposition: "positive", reason: null },
+  helpful:     { disposition: "positive", reason: null },
+};
+
+function inferKeyFromUrl(url) {
+  if (!url) return null;
+  // pull the last path segment as a hint, e.g. .../kidilum-nyc/ → "kidilum"
+  try {
+    const u = new URL(url);
+    const seg = u.pathname.split("/").filter(Boolean).pop();
+    if (!seg) return null;
+    const slug = seg.replace(/[-_]?nyc$/i, "").replace(/-+/g, "-");
+    if (!/^[a-z0-9-]+$/i.test(slug)) return null;
+    return slug.toLowerCase();
+  } catch { return null; }
+}
+
+const events = [];
+let surfaceCount = 0, reactionCount = 0, missingKey = 0;
+
+if (!fs.existsSync(FEEDBACK)) {
+  console.error(`hum-feedback.jsonl not found at ${FEEDBACK}; nothing to backfill.`);
+  process.exit(0);
+}
+
+const feedbackRaw = fs.readFileSync(FEEDBACK, "utf8");
+for (const line of feedbackRaw.split("\n")) {
+  if (!line.trim()) continue;
+  let entry;
+  try { entry = JSON.parse(line); } catch { continue; }
+
+  const lane = entry.lane || (entry.findings?.[0]?.topic) || "unknown";
+  const findings = entry.findings || [];
+
+  // headline = first advisory-lane finding (matches the rule that we only
+  // attribute reactions to the headline). Other findings still get surfaced
+  // events so recall sees they were proposed, but only headline carries the
+  // reaction. This matches the policy decision in the design.
+  let headlineKey = null;
+
+  for (let i = 0; i < findings.length; i++) {
+    const f = findings[i];
+    let key = canonicalKey(f.topic || lane, f);
+    if (!key) {
+      // legacy row without supporting_data: try URL fingerprint from dedup_key
+      const dk = f.dedup_key || "";
+      const m = dk.match(/https?:\/\/[^\s]+/);
+      const urlKey = m ? inferKeyFromUrl(m[0]) : null;
+      if (urlKey && (f.topic === "dining" || lane === "dining")) {
+        key = `dining:${normalizeName(urlKey)}`;
+      }
+    }
+    if (!key) { missingKey++; continue; }
+
+    events.push({
+      kind: "surfaced",
+      ts: entry.sent_at,
+      subject_key: key,
+      lane: f.topic || lane,
+      display: canonicalDisplay(f.topic || lane, f),
+      attrs: canonicalAttrs(f.topic || lane, f),
+      ping_id: entry.ping_id || null,
+      message_id: entry.message_id || null,
+      _backfill_source: "hum-feedback.jsonl",
+    });
+    surfaceCount++;
+
+    if (i === 0) headlineKey = key;
+  }
+
+  if (entry.reaction && headlineKey) {
+    const map = REACTION_MAP[entry.reaction] || { disposition: "neutral", reason: null };
+    events.push({
+      kind: "reaction",
+      ts: entry.reaction_at || entry.sent_at,
+      subject_key: headlineKey,
+      disposition: map.disposition,
+      reason: map.reason,
+      reason_detail: null,
+      source: "tapback_or_token",
+      evidence: entry.reaction,
+      message_id: entry.message_id || null,
+      disposition_until: null,
+      _backfill_source: "hum-feedback.jsonl:reaction",
+    });
+    reactionCount++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Walk confirmed-stops.json. Each confirmed stop becomes a `visit` event
+//    keyed by `dining:<slug(name)>` (best-effort — neighborhood not always
+//    known). The merge pass at the end will fold these into the long-form key
+//    when one exists in the surfaced history.
+// ---------------------------------------------------------------------------
+let visitCount = 0;
+if (fs.existsSync(STOPS)) {
+  const stops = JSON.parse(fs.readFileSync(STOPS, "utf8"));
+  for (const stop of stops) {
+    if (!stop.name) continue;
+    // Only treat food-ish stops as dining lane. Other stop types (shops,
+    // entertainment) get a generic "places" lane so they don't pollute dining.
+    const isFood = /restaurant|cafe|bar|coffee|bakery|deli|pizzeria|noodle|grill|bbq|food/i
+      .test(stop.primary_type || "");
+    const lane = isFood ? "dining" : "places";
+    const key = `${lane}:${normalizeName(stop.name)}`;
+    if (!key) continue;
+    events.push({
+      kind: "visit",
+      ts: stop.ts,
+      subject_key: key,
+      source: "confirmed-stops.json",
+      evidence: `confirmed stop: ${stop.name} (${stop.address || stop.primary_type || "?"})`,
+      _backfill_source: "confirmed-stops.json",
+    });
+    visitCount++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Hard-coded prose-memory rejections. The May 1 Kidilum rejection lives
+//    only in user_food_taste.md / feedback_restaurant_recs_process.md as
+//    free-text. Without this seed, the ledger would miss it (no tapback,
+//    no skip, no structured row). Other rejections we know about can be
+//    added here over time; better long-term, the classifier writes new ones
+//    automatically as they happen.
+// ---------------------------------------------------------------------------
+const PROSE_REJECTIONS = [
+  {
+    subject_key: "dining:kidilum:flatiron",
+    ts: "2026-05-01T22:00:00.000Z",
+    disposition: "negative",
+    reason: "price",
+    reason_detail: "~$100/pp; flagged as ridiculously overpriced",
+    source: "prose_memory",
+    evidence: "feedback_restaurant_recs_process.md / user_food_taste.md: 'Kidilum (Kerala/Malabar, $100/pp) was rejected as overpriced despite loving Indian food.'",
+    message_id: null,
+    disposition_until: null,
+    _backfill_source: "memory:prose",
+  },
+];
+for (const r of PROSE_REJECTIONS) {
+  events.push({
+    kind: "reaction",
+    ts: r.ts,
+    subject_key: r.subject_key,
+    disposition: r.disposition,
+    reason: r.reason,
+    reason_detail: r.reason_detail,
+    source: r.source,
+    evidence: r.evidence,
+    message_id: r.message_id,
+    disposition_until: r.disposition_until,
+    _backfill_source: r._backfill_source,
+  });
+  reactionCount++;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Merge short keys into long ones. e.g. `dining:kidilum` → `dining:kidilum:flatiron`.
+// 5. Sort by ts ascending (so derive() is deterministic, last-reaction-wins).
+// ---------------------------------------------------------------------------
+const merged = mergeShortKeysToLong(events);
+merged.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
+console.error(`suggestion-backfill summary:`);
+console.error(`  surfaced events: ${surfaceCount}`);
+console.error(`  reaction events: ${reactionCount}`);
+console.error(`  visit events: ${visitCount}`);
+console.error(`  total events:    ${merged.length}`);
+console.error(`  findings without canonical key (skipped): ${missingKey}`);
+const aliased = merged.filter((e) => e._merged_from).length;
+console.error(`  events rewritten by short→long merge: ${aliased}`);
+const distinctKeys = new Set(merged.map((e) => e.subject_key));
+console.error(`  distinct subject_keys: ${distinctKeys.size}`);
+
+if (DRY) {
+  console.error("--dry-run: not writing");
+  // Show a sample: the Kidilum events should now all share one key
+  const kidEvents = merged.filter((e) => e.subject_key.startsWith("dining:kidilum"));
+  console.error(`\nKidilum trace (${kidEvents.length} events under key=${[...new Set(kidEvents.map(e=>e.subject_key))].join(", ")}):`);
+  for (const e of kidEvents) {
+    const detail = e.kind === "reaction"
+      ? `disposition=${e.disposition} reason=${e.reason}`
+      : e.kind === "visit"
+      ? `visit source=${e.source}`
+      : `surfaced lane=${e.lane}`;
+    console.error(`  [${e.ts}] ${e.kind.padEnd(9)} ${detail}`);
+  }
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Write out. By default rewrite the file from scratch; with --keep,
+//    append-only and dedupe by (kind, ts, subject_key, message_id).
+// ---------------------------------------------------------------------------
+if (!KEEP) {
+  fs.writeFileSync(LEDGER_FILE, merged.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  console.error(`wrote ${merged.length} events to ${LEDGER_FILE}`);
+} else {
+  const existing = fs.existsSync(LEDGER_FILE)
+    ? fs.readFileSync(LEDGER_FILE, "utf8").split("\n").filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter(Boolean)
+    : [];
+  const seen = new Set(existing.map((e) => `${e.kind}|${e.ts}|${e.subject_key}|${e.message_id||""}`));
+  const fresh = merged.filter((e) => !seen.has(`${e.kind}|${e.ts}|${e.subject_key}|${e.message_id||""}`));
+  if (fresh.length) {
+    fs.appendFileSync(LEDGER_FILE, fresh.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  }
+  console.error(`appended ${fresh.length} new events to ${LEDGER_FILE} (existing=${existing.length})`);
+}

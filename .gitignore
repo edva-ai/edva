@@ -1,0 +1,146 @@
+# Credentials & secrets
+.env
+.env
+credentials/
+secrets/
+
+# Private rebuild recipe — never publish. Lives in this private repo's working tree
+# only, intentionally untracked so it can't leak via reset/checkout/force-push.
+merlin-migration/rebuild-guide.md
+# Runtime state — everything under data/ is mutated by running processes
+# (DBs, ndjson logs, cursors, state files). Should never be tracked.
+data/
+# Plus per-process logs at the top-level logs/
+logs/
+# Legacy specifics kept for documentation:
+data/resy-auth.json
+data/gmail-push-token.json
+tools/firebase/.firebaserc
+client/fastlane/asc-api-key.json
+.mcp.json
+
+# Data files (local state)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/flights.json
+data/.firebase-token-cache
+data/.triage-restart-cooldown
+data/.watchdog-last-alert
+
+# Memory backup tarballs (pre-reindex defense in depth — git is primary backup)
+data/memory-snapshots/
+
+# Wiki DB hot snapshots (hourly VACUUM INTO — local-only defense in depth)
+data/memory-db-snapshots/
+
+# Wiki access log (runtime state — feeds the nightly pin auditor)
+data/wiki-access.jsonl
+
+# Runtime state — append-only or frequently-mutated files written by running
+# processes on the mac mini. Tracking these in git means any `git reset
+# --hard`, `git checkout .`, or force-push-and-reset sequence wipes live
+# data back to whenever the file was last committed. 2026-04-16 incident:
+# a reset-after-force-push wiped today's 5 hum tick traces and bounced
+# hum-state.json back to 2026-04-14, causing hum-daily to report an empty
+# day. These files must live on the mac mini's filesystem only.
+#
+# Hum runtime:
+data/hum-feedback.jsonl
+data/hum-interests-state.json
+data/hum-learnings.jsonl
+data/hum-runs.jsonl
+data/memory-retrieval.jsonl
+data/outbound-precheck-log.jsonl
+data/hum-seen.json
+data/hum-state.json
+data/hum-ideas.jsonl
+data/hum-pending-question.json
+data/hum-cache/
+data/.cache/
+# Supervisor session state (turn count, cost, session id — mutated every turn):
+agent/supervisor/state/chat/session.json
+agent/supervisor/state/ops/session.json
+# Email pipeline (append-only or cursor-style):
+data/email-inbound-dropped.jsonl
+data/email-inbound-handled.jsonl
+data/merlin-sent-mail.jsonl
+data/last-history-id.json
+# Phone channel cursors + counters:
+data/last-merlin-message-at.json
+data/phone-channel-cursor.json
+data/phone-channel-haiku-counter.json
+# Location enrichment queue (mutated as visits close):
+data/location-pending-enrich.json
+# Location edge-detection dedup (written every tick by merlin CLI):
+data/location-edge-seen.json
+# Hum ideation scorecard (mutated per run):
+data/hum-ideas-scorecard.json
+# Hum watchlist approval pointer (4h TTL, written per discover run):
+data/hum-pending-approval.json
+# Concert watcher dedup state (written every run):
+data/concert-watcher-seen.json
+# Watchdog cooldown + state markers:
+data/.gh-auth-last-alert
+data/.gog-auth-last-alert
+data/.gmail-action-last-at
+data/.hookdeck-restart-cooldown
+data/.hookdeck-disconnect-active
+data/.ollama-last-alert
+data/.ollama-restart-cooldown
+data/.phone-audio-wake-at
+data/.gmail-watch-last-alert
+data/.watchdog-push-gap-log
+data/.watchdog-issues-key
+data/gmail-watch-last.json
+# Runtime state added 2026-04-24 — see CLAUDE.md philosophy above:
+# Pulse + P1 resolution audit logs (same append-only shape as hum-runs.jsonl):
+data/pulse-runs.jsonl
+data/p1-resolutions.jsonl
+# Hum canary 48h TTL pointer:
+data/hum-canary-pending.json
+# Reclassification digest TTL state:
+data/reclassification-pending.json
+# FindMy account blob — contains plaintext credential, NEVER commit:
+data/findmy-account.json
+
+# Python bytecode:
+bin/__pycache__/
+# Editor/crash artifacts that should never land in history:
+*.bak
+*.bak.*
+osxphotos_crash.log
+
+# Logs
+logs/
+agent/logs/
+
+# Node
+node_modules/
+
+# Xcode
+client/SourcePackages/
+tools/SourcePackages/
+
+# Ruby / Bundler
+client/vendor/
+client/.bundle/
+
+# Fastlane artifacts
+client/fastlane/report.xml
+
+# External projects (have their own git repos)
+tools/gtasks-mcp/
+tools/home-control/
+
+# OS
+.DS_Store
+data/photo-thumbs/
+
+# Claude Code local state (per-workspace lock files + user-local settings)
+.claude/
+
+# Never commit Firebase admin SDK / service-account keys
+*service-account*.json
+*-adminsdk-*.json
+*service_account*.json

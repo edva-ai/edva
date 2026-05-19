@@ -1,0 +1,65 @@
+{
+  "_comment": "LaunchAgents and long-running processes that make up the Merlin always-on server.",
+  "services": [
+    {
+      "name": "claude-session",
+      "type": "launchagent",
+      "label": "ai.claude.session",
+      "plist": "~/Library/LaunchAgents/ai.claude.session.plist",
+      "description": "Launches process-manager which supervises chat-supervisor, ops-supervisor, and hookdeck. KeepAlive=true.",
+      "script": "agent/bin/process-manager.mjs",
+      "logs": {
+        "stdout": "agent/logs/claude-launchagent.log",
+        "stderr": "agent/logs/claude-launchagent.err.log"
+      },
+      "expected_running": true
+    },
+    {
+      "name": "claude-heartbeat",
+      "type": "launchagent",
+      "label": "com.example.merlin-heartbeat",
+      "plist": "~/Library/LaunchAgents/com.example.merlin-heartbeat.plist",
+      "description": "Posts system health to Firebase RTDB every 120s.",
+      "script": "agent/scripts/heartbeat-sender.sh",
+      "logs": {
+        "stdout": "logs/heartbeat.log",
+        "stderr": "logs/heartbeat.err.log"
+      },
+      "interval_seconds": 120,
+      "expected_running": true
+    },
+    {
+      "name": "resilience-test",
+      "type": "launchagent",
+      "label": "ai.claude.resilience-test",
+      "plist": "~/Library/LaunchAgents/ai.claude.resilience-test.plist",
+      "description": "Scheduled kill-tests of the agent to verify recovery. StartCalendarInterval.",
+      "script": "agent/bin/resilience-test.sh",
+      "logs": {
+        "stdout": "agent/logs/resilience-test.log",
+        "stderr": "agent/logs/resilience-test.log"
+      },
+      "expected_running": false
+    },
+    {
+      "name": "actions-runner",
+      "type": "launchagent",
+      "label": "actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin",
+      "plist": "~/Library/LaunchAgents/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin.plist",
+      "description": "GitHub Actions self-hosted runner for ${MERLIN_OWNER}/merlin (iOS/macOS TestFlight builds).",
+      "logs": {
+        "stdout": "~/Library/Logs/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin/stdout.log",
+        "stderr": "~/Library/Logs/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin/stderr.log"
+      },
+      "expected_running": true
+    },
+    {
+      "name": "process-manager-health",
+      "type": "http",
+      "port": 9095,
+      "path": "/health",
+      "description": "Process-manager HTTP health endpoint. Returns child process status.",
+      "expected_running": true
+    }
+  ]
+}

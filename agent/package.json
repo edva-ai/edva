@@ -1,0 +1,19 @@
+{
+  "name": "agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/managed-process.test.mjs test/pty-wrap.test.mjs test/resilience.test.mjs",
+    "test:leaks": "node --expose-gc --test test/resource-leak.test.mjs",
+    "test:chaos": "node test/chaos-simulator.mjs",
+    "test:all": "npm test && npm run test:leaks"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "googleapis": "^171.4.0"
+  }
+}

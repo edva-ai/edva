@@ -1,0 +1,302 @@
+#!/usr/bin/env node
+// hum-ping — atomically send a hum message AND record its feedback entry.
+//
+// Replaces the two-step dance in jobs/hum.md (send via merlin-send-curl,
+// then separately append to hum-feedback.jsonl). That dance was LLM-driven,
+// which meant step 2 got skipped on a nontrivial fraction of runs — so
+// hum-daily/hum-review reported zero reactions on pings that had been sent.
+//
+// This binary makes the send+log atomic: one exec, one code path, no way to
+// land a ping in the phone without its feedback row. It also holds a
+// mkdir-based advisory lock around the JSONL write so concurrent
+// `merlin hum feedback` calls can't clobber the new row via read-modify-
+// write on the same file.
+//
+// Usage:
+//   hum-ping --ping-id <id> --lane <lane> --score <num> [--findings <json>]
+//            [--suppress-hook] [--no-push] [--push-body <text>]
+//            [--message <text> | --message-from-stdin]
+//
+// Exit codes:
+//   0  sent + logged successfully
+//   2  usage error
+//   3  send failed (no row written)
+//   4  send succeeded but message_id capture failed (row written, marked incomplete)
+//   5  feedback append failed after send (row lost, send cannot be undone)
+//   7  refused: headline finding has a blocking disposition in suggestion-history
+//      (e.g. the user already rejected this restaurant). No send, no row.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { canonicalKey, canonicalDisplay, canonicalAttrs } from "../lib/suggestion-key.mjs";
+import { shouldFilter } from "../lib/suggestion-recall.mjs";
+import { appendSurfaced } from "../lib/suggestion-history.mjs";
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+function die(msg, code = 2) { console.error(msg); process.exit(code); }
+
+const pingId = flag("--ping-id");
+const lane = flag("--lane") || "unknown";
+const scoreRaw = flag("--score");
+const findingsRaw = flag("--findings");
+const suppressHook = flag("--suppress-hook", false);
+const noPush = flag("--no-push", false);
+const pushBody = flag("--push-body");
+let message = flag("--message");
+const fromStdin = flag("--message-from-stdin", false);
+
+if (!pingId) die("hum-ping: --ping-id is required");
+if (scoreRaw === undefined) die("hum-ping: --score is required");
+const score = Number(scoreRaw);
+if (!Number.isFinite(score)) die(`hum-ping: --score must be numeric (got ${scoreRaw})`);
+
+if (fromStdin) {
+  if (message) die("hum-ping: --message and --message-from-stdin are mutually exclusive");
+  message = fs.readFileSync(0, "utf8");
+}
+if (!message || !message.trim()) die("hum-ping: message body required (--message or --message-from-stdin)");
+
+let findings = null;
+if (findingsRaw) {
+  try { findings = JSON.parse(findingsRaw); }
+  catch (e) { die(`hum-ping: --findings must be valid JSON (${e.message})`); }
+  if (!Array.isArray(findings)) die("hum-ping: --findings must be a JSON array");
+}
+
+if (args.length) die(`hum-ping: unrecognized args: ${args.join(" ")}`);
+
+// ---------------------------------------------------------------------------
+// 0a. Compute canonical subject_key for each finding (advisory lanes only).
+//     Annotate the findings array in place so downstream readers can use the
+//     stable key instead of the source-URL-fingerprint dedup_key. Non-advisory
+//     lanes get null and fall through to the existing dedup_key behavior.
+// ---------------------------------------------------------------------------
+if (findings) {
+  for (const f of findings) {
+    const key = canonicalKey(f.topic || lane, f);
+    if (key) {
+      f.subject_key = key;
+      // Cache display + attrs once at write-time so the recall layer doesn't
+      // need to re-derive them on every read.
+      f.subject_display = canonicalDisplay(f.topic || lane, f);
+      f.subject_attrs = canonicalAttrs(f.topic || lane, f);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0b. Pre-send filter: if the headline finding (index 0) has a blocking
+//     disposition in suggestion-history, refuse to send. This is the safety
+//     net — the harvester's own filter and the rank LLM should both have
+//     caught it earlier, but if a rejected subject reaches hum-ping we drop
+//     it here. Exit code 7 lets the caller record a silent run trace with
+//     a clear root_cause.
+//
+//     Only the headline is checked — multi-finding pings can carry "others"
+//     that may already be in history without that being a problem (they're
+//     context, not the headline subject).
+// ---------------------------------------------------------------------------
+if (findings && findings.length > 0) {
+  const headline = findings[0];
+  const headlineKey = headline.subject_key;
+  if (headlineKey) {
+    const { block, reason, state } = shouldFilter(headlineKey);
+    if (block) {
+      console.error(`hum-ping: REFUSED — headline ${headlineKey} is blocked by suggestion-history (reason=${reason}, last_disposition=${state.disposition} ${state.reason || ""}, evidence=${(state.evidence_excerpt || "").slice(0, 80)})`);
+      console.error(`hum-ping: this is the safety-net filter; the harvester or rank step should have dropped it earlier. Tick will record as silent.`);
+      process.exit(7);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Send the ping via merlin-send-curl --capture-id.
+// ---------------------------------------------------------------------------
+const HOME = os.homedir();
+const SEND_BIN = path.join(HOME, "dev/merlin/bin/merlin-send-curl");
+const FEEDBACK_PATH = path.join(HOME, "dev/merlin/data/hum-feedback.jsonl");
+const LOCK_PATH = path.join(HOME, "dev/merlin/data/.hum-feedback.lock");
+
+const captureFile = path.join(os.tmpdir(), `hum-ping-capture.${process.pid}.${Date.now()}`);
+const sendArgs = ["--capture-id", captureFile];
+if (suppressHook) sendArgs.push("--suppress-hook");
+if (noPush) sendArgs.push("--no-push");
+if (pushBody) sendArgs.push("--push-body", pushBody);
+sendArgs.push(message);
+
+const sendResult = spawnSync(SEND_BIN, sendArgs, { encoding: "utf8" });
+if (sendResult.status !== 0) {
+  try { fs.unlinkSync(captureFile); } catch {}
+  console.error(`hum-ping: send failed (exit ${sendResult.status})`);
+  if (sendResult.stdout) console.error(sendResult.stdout);
+  if (sendResult.stderr) console.error(sendResult.stderr);
+  process.exit(3);
+}
+
+let messageId = null;
+let suppressedByPrecheck = false;
+let suppressReason = "";
+try {
+  const captureRaw = fs.readFileSync(captureFile, "utf8").trim();
+  // merlin-send-curl writes a JSON sentinel here when the outbound precheck
+  // suppressed the send (no DB row, no APNs push). In that case the harvester
+  // should NOT record a `surfaced` feedback row, suggestion-history row, or
+  // dedup key — nothing actually landed on the phone. See system/
+  // architecture.md § Outbound Precheck.
+  if (captureRaw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(captureRaw);
+      if (parsed && parsed.suppressed === true) {
+        suppressedByPrecheck = true;
+        suppressReason = (parsed.reason || "").toString();
+      }
+    } catch {}
+  } else {
+    messageId = captureRaw;
+  }
+} catch (e) {
+  // Send succeeded but we lost the id — file wasn't created. That's the
+  // capture-id plumbing, not hum-ping's fault. Log a row with null msg_id
+  // so at least the feedback-count isn't undercounted; mark it explicitly so
+  // we know this entry can't receive tapback reactions via phone-channel.
+  console.error(`hum-ping: send OK but capture-id missing (${e.message}); logging without message_id`);
+}
+try { fs.unlinkSync(captureFile); } catch {}
+
+if (suppressedByPrecheck) {
+  // Outbound precheck suppressed this ping — log to stderr and exit 0
+  // without writing the feedback row. The harvester's per-day dedup will
+  // re-evaluate on the next tick; if context has changed by then, the ping
+  // can re-fire and clear the gate.
+  console.error(`hum-ping: suppressed by outbound-precheck (${suppressReason}); no feedback row written`);
+  process.exit(0);
+}
+
+const entry = {
+  ping_id: pingId,
+  sent_at: new Date().toISOString(),
+  lane,
+  findings: findings ?? [],
+  score_at_ping: score,
+  reaction: null,
+  reaction_at: null,
+};
+if (messageId) entry.message_id = messageId;
+else entry.capture_id_missing = true;
+
+// ---------------------------------------------------------------------------
+// 2. Append the feedback row under an advisory lock. The lock defends the
+//    file against a concurrent `merlin hum feedback` read-modify-write, and
+//    against a second hum-ping running at the same moment. POSIX mkdir is
+//    atomic, so we use that as the lock primitive instead of shelling out to
+//    flock (which isn't installed on macOS).
+// ---------------------------------------------------------------------------
+function acquireLock(timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try { fs.mkdirSync(LOCK_PATH); return true; }
+    catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      // If the lock is very old, assume the holder crashed and steal it.
+      try {
+        const age = Date.now() - fs.statSync(LOCK_PATH).mtimeMs;
+        if (age > 30_000) {
+          fs.rmdirSync(LOCK_PATH);
+          continue;
+        }
+      } catch {}
+      // Busy-wait briefly — this path is exercised once per ping, cost is
+      // bounded, and sleep(ms) without a worker is clumsy in plain Node.
+      const until = Date.now() + 20 + Math.floor(Math.random() * 30);
+      while (Date.now() < until) { /* spin */ }
+    }
+  }
+  return false;
+}
+function releaseLock() {
+  try { fs.rmdirSync(LOCK_PATH); } catch {}
+}
+
+if (!acquireLock()) {
+  console.error("hum-ping: WARNING — could not acquire feedback lock after 5s, appending anyway");
+  // We still try: append is atomic for sub-PIPE_BUF writes on POSIX, so a
+  // lost lock is bad but not catastrophic for a single short JSONL line.
+}
+
+try {
+  fs.appendFileSync(FEEDBACK_PATH, JSON.stringify(entry) + "\n");
+} catch (e) {
+  releaseLock();
+  console.error(`hum-ping: feedback append failed after send: ${e.message}`);
+  process.exit(5);
+}
+releaseLock();
+
+// Read-back verification: the append call returned success, but a buggy
+// background process or a future code path could still clobber the file.
+// Cheap to verify: grep the last ~20 lines for our ping_id. Failure here
+// is loud (exit 6) — the send already happened, and a missing feedback row
+// is exactly the drift class this whole binary exists to prevent.
+try {
+  const tail = fs.readFileSync(FEEDBACK_PATH, "utf8").split("\n").slice(-20);
+  const found = tail.some((line) => {
+    if (!line.trim()) return false;
+    try { return JSON.parse(line).ping_id === pingId; } catch { return false; }
+  });
+  if (!found) {
+    console.error(`hum-ping: ERROR — appended feedback row for ${pingId} not visible on read-back; feedback file may be getting overwritten elsewhere`);
+    process.exit(6);
+  }
+} catch (e) {
+  console.error(`hum-ping: read-back verify failed: ${e.message}`);
+  // Don't exit non-zero for this — the write succeeded, only the verify
+  // couldn't read the file. Surface the warning and continue.
+}
+
+// ---------------------------------------------------------------------------
+// 3. Append `surfaced` events to suggestion-history.jsonl, one per finding
+//    that has a canonical subject_key. Best-effort: a failure here doesn't
+//    invalidate the send — log a warning and move on. Recall reads tolerate
+//    missing rows (a finding without a surfaced row just means "first time
+//    we've seen this subject" from the recall side, which is fine).
+// ---------------------------------------------------------------------------
+if (findings) {
+  let surfacedCount = 0;
+  for (const f of findings) {
+    if (!f.subject_key) continue;
+    try {
+      appendSurfaced({
+        subject_key: f.subject_key,
+        lane: f.topic || lane,
+        display: f.subject_display || "",
+        attrs: f.subject_attrs || {},
+        ping_id: pingId,
+        message_id: messageId,
+      });
+      surfacedCount++;
+    } catch (e) {
+      console.error(`hum-ping: WARNING — suggestion-history append failed for ${f.subject_key}: ${e.message}`);
+    }
+  }
+  if (surfacedCount > 0) {
+    console.error(`hum-ping: appended ${surfacedCount} surfaced events to suggestion-history`);
+  }
+}
+
+if (messageId) {
+  console.log(`hum-ping: sent + logged (ping_id=${pingId}, message_id=${messageId})`);
+  process.exit(0);
+} else {
+  console.error(`hum-ping: sent + logged without message_id (ping_id=${pingId})`);
+  process.exit(4);
+}

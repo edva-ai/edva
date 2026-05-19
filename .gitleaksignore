@@ -1,0 +1,4 @@
+# Historical: hardcoded Supabase user password before the Google-OAuth migration.
+# Password is slated for rotation once the new build verifies; leaving this fingerprint
+# here so future scans don't re-flag the historical revision of SupabaseManager.swift.
+# The new HEAD does not contain the password (commit 583becb).

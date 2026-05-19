@@ -1,0 +1,690 @@
+#!/usr/bin/env node
+// wiki — DB-as-truth wiki layer over long-term context memory.
+//
+// Step 1: read-only + ingest. Pages live in data/memory-index.db
+// alongside the existing memory_chunks index. Source of truth during the
+// migration window is still the .md files; backfill keeps the DB in sync.
+//
+// Usage:
+//   wiki backfill [--dry-run]
+//   wiki verify [--json]
+//   wiki list [--type t] [--status s] [--pinned]
+//   wiki read <id>           (id = "user_food_taste" or "user_food_taste.md")
+//   wiki render <id>         (print raw_md to stdout)
+//   wiki render-all <dir>    (write every page to <dir>; backup target)
+//   wiki stats
+
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const ws = require("../lib/wiki-store.js");
+
+const args = process.argv.slice(2);
+const [cmd, ...rest] = args;
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function positional() {
+  const argv = args.slice(1);
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function die(msg, code = 1) {
+  console.error(`wiki: ${msg}`);
+  process.exit(code);
+}
+
+function usage() {
+  console.log(`wiki — DB-as-truth wiki for long-term context memory
+
+Commands:
+  backfill [--dry-run]            Ingest every .md file under MEMORY_DIR into pages
+  verify [--json]                 Round-trip check: every row renders byte-equal to disk
+  list [--type T] [--status S] [--pinned]
+  read <id>                       Show parsed page (frontmatter + body + links)
+  render <id>                     Print raw_md to stdout (the canonical bytes)
+  render-all <dir>                Write every page row to <dir>/ (backup target)
+  stats                           Counts by type/status, link counts, dangling
+  link-audit [--id ID] [--apply]  Suggest/apply missing concept wikilinks
+  search "<q>" [--k N] [--mode fts|page] [--type T] [--json]
+  links <id> [--json]             Outgoing links from <id>
+  backlinks <id> [--json]         Incoming links to <id>
+
+Write commands (revisions tracked, file render gated by MEMORY_DB_AUTHORITATIVE):
+  edit <id>                       Open $EDITOR on raw_md, save on close
+  save <id> --body @file          Replace raw_md from a file path
+  pin <id> [--lock] | unpin <id>  Toggle pinned-subset membership; --lock also pin-locks
+  lock-pin <id> | unlock-pin <id> Toggle pin_locked flag (auditor skips locked pages)
+  pin-defaults [--dry-run]        Pin the curated default subset (~10 pages)
+  supersede <old_id> <new_id>     Mark old superseded; add edge <new> → <old>
+  delete <id>                     Soft-delete (with revision saved)
+  history <id> [--json]           List revisions
+  show-rev <id> <rev>             Print a specific revision's raw_md
+  pinned [--ids]                  Emit pinned subset (for SessionStart hook)
+  serve [--port N] [--host H]     Localhost HTTP browser (default :9096)
+
+Storage:
+  DB         : ${ws.DB_PATH}
+  Source     : ${ws.MEMORY_DIR}
+  Write mode : ${ws.dbAuthoritative() ? "DB-authoritative (no auto file render)" : "files-still-canonical (auto-render on save)"}
+`);
+}
+
+function cmdBackfill() {
+  const dryRun = Boolean(flag("dry-run", false));
+  const start = Date.now();
+  const r = ws.backfill({ dryRun });
+  const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+  console.log(
+    `backfill: ${r.pages_inserted} new, ${r.pages_updated} changed, ${r.pages_unchanged} unchanged, ${r.pages_removed} removed across ${r.files_scanned} files in ${elapsed}s${dryRun ? " (dry-run)" : ""}`,
+  );
+  if (r.errors.length) {
+    console.error(`errors: ${r.errors.length}`);
+    for (const e of r.errors) console.error(`  ${e.file}: ${e.error}`);
+    process.exit(1);
+  }
+}
+
+function cmdVerify() {
+  const asJson = Boolean(flag("json", false));
+  const r = ws.verify();
+  if (asJson) {
+    console.log(JSON.stringify(r, null, 2));
+    process.exit(r.mismatched.length ? 1 : 0);
+  }
+  console.log(`verify: ${r.matched}/${r.total} match`);
+  if (r.mismatched.length) {
+    console.log(`mismatches: ${r.mismatched.length}`);
+    for (const m of r.mismatched) {
+      if (m.kind === "byte_diff") {
+        console.log(
+          `  ${m.basename}  byte_diff  disk=${m.disk_len} db=${m.db_len} first_diff@${m.first_diff_offset}`,
+        );
+      } else {
+        console.log(`  ${m.basename}  ${m.kind}`);
+      }
+    }
+    process.exit(1);
+  }
+}
+
+function cmdList() {
+  const type = typeof flag("type") === "string" ? flag("type") : undefined;
+  const status = typeof flag("status") === "string" ? flag("status") : undefined;
+  const pinned = Boolean(flag("pinned", false)) ? true : undefined;
+  const rows = ws.listPages({ type, status, pinned });
+  if (!rows.length) {
+    console.log("(no pages — run `wiki backfill`)");
+    return;
+  }
+  const pad = (s, n) => String(s ?? "").padEnd(n);
+  for (const r of rows) {
+    const flags = [r.pinned ? "📌" : "  ", r.status === "active" ? "  " : "❌"].join("");
+    console.log(`${flags}  ${pad(r.type, 10)}  ${pad(r.id, 38)}  ${r.title || ""}`);
+  }
+  console.log(`\n${rows.length} page${rows.length === 1 ? "" : "s"}`);
+}
+
+function cmdRead() {
+  const id = positional()[0];
+  if (!id) die("read: need a page id, e.g. `wiki read user_food_taste`");
+  const row = ws.getPage(id);
+  if (!row) die(`read: no page with id ${id}`);
+  ws.logAccess({ tool: "wiki_read", page_ids: [row.id] });
+  console.log(`=== ${row.id} (${row.basename}) ===`);
+  console.log(`type        : ${row.type || ""}`);
+  console.log(`status      : ${row.status}${row.pinned ? "  📌 pinned" : ""}`);
+  if (row.title) console.log(`title       : ${row.title}`);
+  if (row.description) console.log(`description : ${row.description}`);
+  const scope = JSON.parse(row.scope_json || "[]");
+  if (scope.length) console.log(`scope       : ${scope.join(", ")}`);
+  if (row.last_verified_at) console.log(`verified_at : ${row.last_verified_at}`);
+  if (row.confidence) console.log(`confidence  : ${row.confidence}`);
+  if (row.expires_at) console.log(`expires_at  : ${row.expires_at}`);
+  console.log();
+  console.log(row.body_md);
+
+  const d = ws.db();
+  const out = d
+    .prepare(
+      "SELECT dst_id, link_type, display FROM page_links WHERE src_id = ? ORDER BY link_type, dst_id",
+    )
+    .all(row.id);
+  const incoming = d
+    .prepare(
+      "SELECT src_id, link_type FROM page_links WHERE dst_id = ? ORDER BY link_type, src_id",
+    )
+    .all(row.id);
+  if (out.length || incoming.length) {
+    console.log("\n=== links ===");
+    if (out.length) {
+      const byType = {};
+      for (const r of out) (byType[r.link_type] = byType[r.link_type] || []).push(r);
+      for (const [t, rows] of Object.entries(byType)) {
+        const lines = rows
+          .map((r) => (r.display ? `${r.dst_id} (${r.display})` : r.dst_id))
+          .join(", ");
+        console.log(`  → ${t.padEnd(12)} ${lines}`);
+      }
+    }
+    if (incoming.length) {
+      const byType = {};
+      for (const r of incoming) (byType[r.link_type] = byType[r.link_type] || []).push(r);
+      for (const [t, rows] of Object.entries(byType)) {
+        console.log(`  ← ${t.padEnd(12)} ${rows.map((r) => r.src_id).join(", ")}`);
+      }
+    }
+  }
+}
+
+function cmdRender() {
+  const id = positional()[0];
+  if (!id) die("render: need a page id");
+  const row = ws.getPage(id);
+  if (!row) die(`render: no page with id ${id}`);
+  if (Boolean(flag("to-disk", false))) {
+    const abs = path.join(ws.MEMORY_DIR, row.basename);
+    fs.writeFileSync(abs, ws.renderPage(row));
+    console.log(`wrote ${abs}`);
+    return;
+  }
+  process.stdout.write(ws.renderPage(row));
+}
+
+function cmdRenderAll() {
+  const dir = positional()[0];
+  if (!dir) die("render-all: need a target directory");
+  const r = ws.renderAllToDir(dir);
+  console.log(`render-all: wrote ${r.written} pages to ${dir}`);
+}
+
+function cmdStats() {
+  const s = ws.stats();
+  console.log(`pages       : ${s.total}`);
+  console.log(`pinned      : ${s.pinned}`);
+  console.log(`links       : ${s.links} (${s.dangling} dangling)`);
+  if (s.byType.length) {
+    console.log("\nby type:");
+    for (const t of s.byType) {
+      console.log(`  ${String(t.type || "(none)").padEnd(12)} ${t.n}`);
+    }
+  }
+  if (s.byStatus.length) {
+    console.log("\nby status:");
+    for (const t of s.byStatus) {
+      console.log(`  ${String(t.status || "(none)").padEnd(12)} ${t.n}`);
+    }
+  }
+  console.log(`\ndb     : ${ws.DB_PATH}`);
+  console.log(`source : ${ws.MEMORY_DIR}`);
+}
+
+function cmdLinkAudit() {
+  const linker = require("../lib/wiki-linker.js");
+  const id = typeof flag("id") === "string" ? flag("id") : null;
+  const asJson = Boolean(flag("json", false));
+  const apply = Boolean(flag("apply", false));
+  if (apply) {
+    const changed = linker.applySuggestions({ id, editedBy: "wiki:link-audit" });
+    if (asJson) {
+      console.log(JSON.stringify({ changed }, null, 2));
+      return;
+    }
+    if (!changed.length) {
+      console.log("wiki link-audit: clean");
+      return;
+    }
+    for (const c of changed) {
+      const links = c.added.map((a) => `${a.alias} -> ${a.target}`).join(", ");
+      console.log(`${c.id}: +${c.added.length}${c.rev ? ` (rev ${c.rev})` : ""}  ${links}`);
+    }
+    console.log(`\nupdated ${changed.length} page${changed.length === 1 ? "" : "s"}`);
+    return;
+  }
+  const suggestions = linker.suggestLinks({ id });
+  const summary = linker.summarize(suggestions);
+  if (asJson) {
+    console.log(JSON.stringify({ summary, suggestions }, null, 2));
+    process.exitCode = summary.total ? 1 : 0;
+    return;
+  }
+  if (!suggestions.length) {
+    console.log("wiki link-audit: clean");
+    return;
+  }
+  let cur = null;
+  for (const s of suggestions) {
+    if (s.page_id !== cur) {
+      cur = s.page_id;
+      console.log(`\n${s.page_id}`);
+    }
+    console.log(`  ${s.alias} -> [[${s.target}|${s.alias}]]`);
+  }
+  console.log(`\n${summary.total} suggestion(s) across ${summary.pages} page(s)`);
+  console.log("run `wiki link-audit --apply` to add safe first-occurrence links");
+  process.exitCode = 1;
+}
+
+function cmdSearch() {
+  const pos = positional();
+  const query = pos.join(" ").trim();
+  if (!query) die('search: need a query, e.g. `wiki search "food taste"`');
+  const limit = Number(flag("k", 10));
+  const mode = String(flag("mode", "fts"));
+  const typeRaw = flag("type", null);
+  const type = typeof typeRaw === "string" ? typeRaw : null;
+  const asJson = Boolean(flag("json", false));
+  const results = ws.searchPages(query, { mode, limit, type });
+  ws.logAccess({
+    tool: "wiki_search",
+    query,
+    page_ids: results.map((r) => r.id),
+  });
+  if (asJson) {
+    console.log(JSON.stringify({ query, mode, type: type || null, results }, null, 2));
+    return;
+  }
+  if (!results.length) {
+    console.log("(no matches)");
+    return;
+  }
+  for (const r of results) {
+    const score = r.score != null ? `[bm25=${r.score.toFixed(2)}]` : "";
+    const flagsStr = (r.pinned ? "📌 " : "") + (r.status === "active" ? "" : `(${r.status}) `);
+    console.log(`${score} ${flagsStr}${r.id} — ${r.title || ""}`);
+    if (r.heading) console.log(`  § ${r.heading}`);
+    if (r.snippet) console.log(`  ${r.snippet}`);
+  }
+  console.log(`\n${results.length} result${results.length === 1 ? "" : "s"} (mode=${mode})`);
+}
+
+function cmdLinks() {
+  const id = positional()[0];
+  if (!id) die("links: need a page id");
+  const asJson = Boolean(flag("json", false));
+  const out = ws.getForwardLinks(id);
+  if (asJson) {
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+  if (!out.length) {
+    console.log("(no outgoing links)");
+    return;
+  }
+  for (const r of out) {
+    const tag = r.resolved ? "" : " (dangling)";
+    const display = r.display ? ` "${r.display}"` : "";
+    console.log(`  → [${r.link_type}] ${r.dst_id}${tag}${display}`);
+  }
+}
+
+function cmdBacklinks() {
+  const id = positional()[0];
+  if (!id) die("backlinks: need a page id");
+  const asJson = Boolean(flag("json", false));
+  const out = ws.getBacklinks(id);
+  ws.logAccess({ tool: "wiki_backlinks", page_ids: [id] });
+  if (asJson) {
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+  if (!out.length) {
+    console.log("(no backlinks)");
+    return;
+  }
+  for (const r of out) console.log(`  ← [${r.link_type}] ${r.src_id}`);
+}
+
+// ─── Memory-write conflict precheck ──────────────────────────────────────────
+// Before any wiki save/edit, run memory-write-precheck.mjs to detect factual
+// contradictions with existing memory. Fail-open: any error lets the write
+// proceed. Skip for episodic pages (day/week/month) and when --no-precheck
+// flag is passed or when the caller is a bulk-ingest op (editedBy=cli:backfill).
+// Added 2026-05-16 per the user's request: "programmatic framework to ensure
+// memory is always consulted before saving new information."
+const PRECHECK_BIN = path.resolve(path.dirname(process.argv[1]), "memory-write-precheck.mjs");
+
+function runWritePrecheck(id, body) {
+  if (flag("no-precheck", false)) return;
+  // Skip episodic pages — they're log entries, not factual claims
+  const typeMatch = body.match(/^type:\s*['"]?(\w+)['"]?/m);
+  const pageType = typeMatch ? typeMatch[1] : "";
+  if (["day", "week", "month"].includes(pageType)) return;
+  // Skip if not a significant write (< 100 chars of body content)
+  const bodyOnly = body.replace(/^---[\s\S]*?---\s*/m, "").trim();
+  if (bodyOnly.length < 100) return;
+
+  const input = JSON.stringify({
+    page_id: id,
+    content: body.slice(0, 1500),
+    intent: `wiki:save:${id}`,
+  });
+  const r = spawnSync(PRECHECK_BIN, [], {
+    input, encoding: "utf8", timeout: 90000,
+  });
+  if (!r.stdout) return; // fail-open
+  let result;
+  try { result = JSON.parse(r.stdout); } catch { return; }
+  if (result.decision === "conflict") {
+    process.stderr.write("\n⚠️  wiki: memory write blocked — conflict detected\n\n");
+    for (const c of (result.conflicts || [])) {
+      process.stderr.write(`  Conflicting page: ${c.page_id}\n`);
+      process.stderr.write(`  Existing:  "${c.snippet}"\n`);
+      process.stderr.write(`  Problem:   ${c.explanation}\n\n`);
+    }
+    if (result.resolution) {
+      process.stderr.write(`  Resolution: ${result.resolution}\n\n`);
+    }
+    process.stderr.write("  Resolve the conflict first, then re-run wiki save.\n");
+    process.stderr.write("  Pass --no-precheck to bypass (auditor will flag).\n\n");
+    process.exit(2);
+  }
+}
+
+function cmdEdit() {
+  const id = positional()[0];
+  if (!id) die("edit: need a page id");
+  const editor = process.env.EDITOR || "vi";
+  const tmp = path.join(os.tmpdir(), `wiki-${process.pid}-${Date.now()}.md`);
+  let initial;
+  const existing = ws.getPage(id);
+  if (existing) {
+    initial = existing.raw_md;
+  } else {
+    // Scaffold a new page.
+    initial = `---\nname: "${id}"\ndescription: ""\ntype: reference\n---\n`;
+  }
+  fs.writeFileSync(tmp, initial);
+  const r = spawnSync(editor, [tmp], { stdio: "inherit" });
+  if (r.status !== 0) die(`edit: editor exited ${r.status}`);
+  const next = fs.readFileSync(tmp, "utf8");
+  fs.unlinkSync(tmp);
+  if (next === initial) {
+    console.log("edit: no changes");
+    return;
+  }
+  runWritePrecheck(id, next);
+  const out = ws.savePage(id, next, { editedBy: "cli:edit" });
+  console.log(
+    `edit: ${out.isNew ? "created" : out.changed ? "updated" : "no-op"} ${out.basename}${out.rev ? ` (rev ${out.rev})` : ""}`,
+  );
+}
+
+function cmdSave() {
+  const id = positional()[0];
+  if (!id) die("save: need a page id");
+  const bodyArg = flag("body");
+  if (typeof bodyArg !== "string")
+    die("save: --body @<file> required (use `-` for stdin)");
+  let body;
+  if (bodyArg === "-") {
+    body = fs.readFileSync(0, "utf8");
+  } else {
+    const fp = bodyArg.startsWith("@") ? bodyArg.slice(1) : bodyArg;
+    body = fs.readFileSync(fp, "utf8");
+  }
+  const editedBy = String(flag("by", "cli:save"));
+  runWritePrecheck(id, body);
+  const out = ws.savePage(id, body, { editedBy });
+  console.log(
+    `save: ${out.isNew ? "created" : out.changed ? "updated" : "no-op"} ${out.basename}${out.rev ? ` (rev ${out.rev})` : ""}`,
+  );
+}
+
+function cmdPin(setTo) {
+  const id = positional()[0];
+  if (!id) die(`${setTo ? "pin" : "unpin"}: need a page id`);
+  const out = ws.setPinned(id, setTo, { editedBy: setTo ? "cli:pin" : "cli:unpin" });
+  // Optional --lock on pin: also pin-lock the page so the nightly auditor
+  // skips it when deciding auto-unpin moves. Useful for identity / always-
+  // needed anchors whose value can't be measured by tool-call frequency.
+  if (setTo && Boolean(flag("lock", false))) {
+    ws.setPinLocked(id, true);
+    console.log(`pin: ${out.basename} 🔒 (rev ${out.rev || "—"}, locked)`);
+    return;
+  }
+  console.log(
+    `${setTo ? "pin" : "unpin"}: ${out.basename}${out.rev ? ` (rev ${out.rev})` : ""}`,
+  );
+}
+
+function cmdLockPin(lock) {
+  const id = positional()[0];
+  if (!id) die(`${lock ? "lock-pin" : "unlock-pin"}: need a page id`);
+  ws.setPinLocked(id, lock);
+  console.log(`${lock ? "lock-pin" : "unlock-pin"}: ${id} ${lock ? "🔒 locked" : "unlocked"}`);
+}
+
+function cmdSupersede() {
+  const [oldId, newId] = positional();
+  if (!oldId || !newId)
+    die("supersede: usage `wiki supersede <old_id> <new_id>`");
+  const r = ws.supersedePage(oldId, newId, { editedBy: "cli:supersede" });
+  console.log(`supersede: ${r.new} now supersedes ${r.old}`);
+}
+
+function cmdDelete() {
+  const id = positional()[0];
+  if (!id) die("delete: need a page id");
+  const r = ws.deletePage(id, { editedBy: "cli:delete" });
+  console.log(`delete: removed ${r.id}`);
+}
+
+function cmdHistory() {
+  const id = positional()[0];
+  if (!id) die("history: need a page id");
+  const asJson = Boolean(flag("json", false));
+  const rows = ws.getRevisions(id);
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+  if (!rows.length) {
+    console.log("(no revisions)");
+    return;
+  }
+  for (const r of rows) {
+    console.log(`rev ${String(r.rev).padStart(4)}  ${r.edited_at}  ${r.bytes}B  ${r.edited_by || ""}`);
+  }
+}
+
+function cmdShowRev() {
+  const [id, revStr] = positional();
+  if (!id || !revStr) die("show-rev: usage `wiki show-rev <id> <rev>`");
+  const rev = Number(revStr);
+  const r = ws.getRevision(id, rev);
+  if (!r) die(`show-rev: no rev ${rev} for ${id}`);
+  process.stdout.write(r.raw_md);
+}
+
+function cmdPinDefaults() {
+  // Curated initial subset — the always-on slice. Keep small (~10): more
+  // means less room for retrieval. The agent fetches everything else on
+  // demand via wiki_search / wiki_read.
+  const DEFAULT_PINS = [
+    "user_moshik",
+    "user_pari",
+    "user_daily_schedule",
+    "user_residences",
+    "user_food_taste",
+    "user_tv_pacing",
+    "feedback_no_shorthand",
+    "feedback_pulse_proactive",
+    "feedback_check_calendar_before_suggesting",
+    "project_scamper",
+  ];
+  const dryRun = Boolean(flag("dry-run", false));
+  const results = [];
+  for (const id of DEFAULT_PINS) {
+    const row = ws.getPage(id);
+    if (!row) {
+      results.push({ id, status: "missing" });
+      continue;
+    }
+    if (row.pinned) {
+      results.push({ id, status: "already-pinned" });
+      continue;
+    }
+    if (dryRun) {
+      results.push({ id, status: "would-pin" });
+    } else {
+      ws.setPinned(id, true, { editedBy: "cli:pin-defaults" });
+      results.push({ id, status: "pinned" });
+    }
+  }
+  const counts = {};
+  for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1;
+  for (const r of results) {
+    console.log(`  ${r.status.padEnd(16)} ${r.id}`);
+  }
+  console.log(
+    `\npin-defaults: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(", ")}${dryRun ? " (dry-run)" : ""}`,
+  );
+}
+
+async function cmdServe() {
+  // Mark BEFORE awaiting so the outer try/finally skips closeDb. The DB
+  // handle is owned by the server for its full lifetime.
+  cmdServe.keepOpen = true;
+  const port = Number(flag("port", 9096));
+  const host = String(flag("host", "127.0.0.1"));
+  const { serve } = require("../lib/wiki-serve.js");
+  const server = await serve({ port, host });
+  console.log(`wiki serve: http://${host}:${port}/`);
+  console.log("Ctrl-C to stop.");
+  const shutdown = () => {
+    console.log("\nshutting down…");
+    server.close(() => {
+      ws.closeDb();
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+function cmdPinned() {
+  const idsOnly = Boolean(flag("ids", false));
+  const rows = ws.listPages({ pinned: true, status: "active" });
+  if (idsOnly) {
+    for (const r of rows) console.log(r.id);
+    return;
+  }
+  if (!rows.length) {
+    console.log("(no pinned pages)");
+    return;
+  }
+  for (const r of rows) {
+    const row = ws.getPage(r.id);
+    console.log(`=== ${row.id} (${row.type || ""}) ===`);
+    if (row.title) console.log(row.title);
+    if (row.description) console.log(row.description);
+    console.log();
+  }
+}
+
+try {
+  switch (cmd) {
+    case undefined:
+    case "help":
+    case "--help":
+    case "-h":
+      usage();
+      break;
+    case "backfill":
+      cmdBackfill();
+      break;
+    case "verify":
+      cmdVerify();
+      break;
+    case "list":
+      cmdList();
+      break;
+    case "read":
+      cmdRead();
+      break;
+    case "render":
+      cmdRender();
+      break;
+    case "render-all":
+      cmdRenderAll();
+      break;
+    case "stats":
+      cmdStats();
+      break;
+    case "link-audit":
+      cmdLinkAudit();
+      break;
+    case "search":
+      cmdSearch();
+      break;
+    case "links":
+      cmdLinks();
+      break;
+    case "backlinks":
+      cmdBacklinks();
+      break;
+    case "edit":
+      cmdEdit();
+      break;
+    case "save":
+      cmdSave();
+      break;
+    case "pin":
+      cmdPin(true);
+      break;
+    case "unpin":
+      cmdPin(false);
+      break;
+    case "lock-pin":
+      cmdLockPin(true);
+      break;
+    case "unlock-pin":
+      cmdLockPin(false);
+      break;
+    case "supersede":
+      cmdSupersede();
+      break;
+    case "delete":
+      cmdDelete();
+      break;
+    case "history":
+      cmdHistory();
+      break;
+    case "show-rev":
+      cmdShowRev();
+      break;
+    case "pinned":
+      cmdPinned();
+      break;
+    case "pin-defaults":
+      cmdPinDefaults();
+      break;
+    case "serve":
+      cmdServe();
+      break;
+    default:
+      die(`unknown command: ${cmd}. Try \`wiki --help\`.`);
+  }
+} finally {
+  if (!cmdServe.keepOpen) ws.closeDb();
+}

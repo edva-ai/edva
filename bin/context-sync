@@ -1,0 +1,704 @@
+#!/usr/bin/env node
+// context-sync — Index data sources into the unified context memory.
+// Usage:
+//   context-sync notes    — index Apple Notes
+//   context-sync imsg     — index recent iMessage conversations
+//   context-sync email    — index email classification memories
+//   context-sync files    — index key project files
+//   context-sync all      — run all sources
+
+import { createRequire } from "node:module";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
+
+const require = createRequire(import.meta.url);
+const cm = require("../lib/context-memory");
+const wiki = require("../lib/wiki-store");
+
+const exec = promisify(execFile);
+const TOOLS = path.resolve(new URL("..", import.meta.url).pathname);
+const BIN = path.join(TOOLS, "bin");
+const DATA = path.join(TOOLS, "data");
+
+const cmd = process.argv[2];
+
+async function run(command, args = []) {
+  try {
+    const { stdout } = await exec(command, args, { timeout: 60000 });
+    return stdout.trim();
+  } catch (err) {
+    console.error(`  Error running ${command} ${args[0] || ""}: ${err.message}`);
+    return "";
+  }
+}
+
+// ── Notes ──
+
+async function syncNotes() {
+  process.stderr.write("Syncing notes... ");
+
+  const raw = await run(path.join(BIN, "notes"), ["list"]);
+  if (!raw) {
+    console.error("no notes found or error.");
+    return;
+  }
+
+  const lines = raw.split("\n").filter(Boolean);
+  const allIds = [];
+  let upserted = 0;
+
+  for (const line of lines) {
+    // Format: "Folder | Title" or just "Title" (when listing a specific folder)
+    const pipeIdx = line.indexOf(" | ");
+    const folder = pipeIdx >= 0 ? line.slice(0, pipeIdx).trim() : "";
+    const title = pipeIdx >= 0 ? line.slice(pipeIdx + 3).trim() : line.trim();
+    if (!title) continue;
+
+    allIds.push(title);
+
+    // Read note body
+    const body = await run(path.join(BIN, "notes"), ["read", title]);
+    const summary = body ? `${title}\n${body.slice(0, 200)}` : title;
+
+    cm.upsert({
+      source: "notes",
+      sourceId: title,
+      summary,
+      tags: folder,
+      metadata: { folder },
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("notes", allIds);
+  console.error(`${upserted} upserted, ${stale} stale removed.`);
+}
+
+// ── iMessage ──
+
+async function syncImsg() {
+  process.stderr.write("Syncing imsg... ");
+
+  const raw = await run(path.join(BIN, "imsg"), ["chats", "--limit", "30"]);
+  if (!raw) {
+    console.error("no chats found or error.");
+    return;
+  }
+
+  const lines = raw.split("\n").filter(Boolean);
+  const allIds = [];
+  let upserted = 0;
+
+  for (const line of lines) {
+    // Format: "Contact Name  (N msgs, last: 2026-04-07 12:34:56)"
+    const match = line.match(/^(.+?)\s{2,}\((\d+) msgs?, last: (.+?)\)$/);
+    if (!match) continue;
+
+    const contact = match[1].trim();
+    const msgCount = parseInt(match[2], 10);
+    const lastDate = match[3].trim();
+
+    // Skip chats with no recent activity (> 7 days old)
+    const lastMs = new Date(lastDate.replace(" ", "T")).getTime();
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    if (lastMs < sevenDaysAgo) continue;
+
+    allIds.push(contact);
+
+    // Read recent messages
+    const messages = await run(path.join(BIN, "imsg"), ["read", contact, "--limit", "5", "--days", "7"]);
+    const preview = messages
+      ? messages
+          .split("\n")
+          .slice(-3)
+          .map((l) => l.trim())
+          .join(" | ")
+          .slice(0, 200)
+      : "";
+
+    const summary = `${contact} — ${preview || "(no recent messages)"}`;
+
+    cm.upsert({
+      source: "imsg",
+      sourceId: contact,
+      summary,
+      tags: contact,
+      metadata: { lastMessage: lastDate, messageCount: msgCount },
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("imsg", allIds);
+  console.error(`${upserted} upserted, ${stale} stale removed.`);
+}
+
+// ── Email Memories ──
+
+function syncEmail() {
+  process.stderr.write("Syncing email... ");
+
+  const em = require("../lib/email-memory");
+  const memories = em.list({ limit: 500 });
+  const allIds = [];
+  let upserted = 0;
+
+  for (const m of memories) {
+    const sourceId = `mem-${m.id}`;
+    allIds.push(sourceId);
+
+    cm.upsert({
+      source: "email",
+      sourceId,
+      summary: m.text,
+      tags: m.tags || "",
+      metadata: { emailMemoryId: m.id, createdAt: m.created_at },
+      expiresAt: m.expires_at || null,
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("email", allIds);
+  console.error(`${upserted} upserted, ${stale} stale removed.`);
+}
+
+// ── Key Project Files ──
+
+function syncFiles() {
+  process.stderr.write("Syncing files... ");
+
+  // Project-specific reference files the user wants indexed alongside
+  // the auto-discovered sources. Add entries for recurring 1:1 notes,
+  // long-running project docs, playbooks worth keeping in the FTS index.
+  //
+  //   { path: "data/<file>.md", tags: "comma,separated,tags" }
+  const KEY_FILES = [
+    { path: "data/email-triage-playbook.md", tags: "email,triage,playbook" },
+  ];
+
+  const allIds = [];
+  let upserted = 0;
+
+  for (const f of KEY_FILES) {
+    const fullPath = path.join(DATA, "..", f.path);
+    if (!existsSync(fullPath)) continue;
+
+    allIds.push(f.path);
+
+    const content = readFileSync(fullPath, "utf8");
+    const filename = path.basename(f.path);
+    const summary = `${filename}\n${content.slice(0, 300)}`;
+
+    cm.upsert({
+      source: "files",
+      sourceId: f.path,
+      summary,
+      tags: f.tags,
+      metadata: { fullPath: fullPath },
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("files", allIds);
+  console.error(`${upserted} upserted, ${stale} stale removed.`);
+}
+
+// ── Wiki Recall Cards ──
+
+function wikiBodyPreview(page) {
+  return String(page?.body_md || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/\[[^\]]+\]\([^)]+\)/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function parseScopeJson(scopeJson) {
+  try {
+    const parsed = scopeJson ? JSON.parse(scopeJson) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function syncWiki() {
+  process.stderr.write("Syncing wiki... ");
+
+  const pages = wiki.listPages({ status: "active" });
+  const allIds = [];
+  let upserted = 0;
+  let skipped = 0;
+  const existingStmt = cm.db().prepare(
+    "SELECT summary, tags, metadata_json, expires_at FROM entries WHERE source = ? AND source_id = ?",
+  );
+
+  for (const row of pages) {
+    const page = wiki.getPage(row.id);
+    if (!page) continue;
+    allIds.push(page.id);
+
+    const scope = parseScopeJson(page.scope_json);
+    const summaryParts = [page.title, page.description, wikiBodyPreview(page)].filter(Boolean);
+    const tags = [page.type, page.status, page.pinned ? "pinned" : "", ...scope]
+      .filter(Boolean)
+      .join(",");
+    const metadata = {
+      pageId: page.id,
+      basename: page.basename,
+      title: page.title,
+      type: page.type,
+      status: page.status,
+      pinned: !!page.pinned,
+      updatedAt: page.updated_at,
+      description: page.description,
+    };
+    const existing = existingStmt.get("wiki", page.id);
+    const metaJson = JSON.stringify(metadata);
+    if (
+      existing &&
+      existing.summary === summaryParts.join(" — ") &&
+      existing.tags === tags &&
+      existing.metadata_json === metaJson &&
+      (existing.expires_at || null) === null
+    ) {
+      skipped++;
+      continue;
+    }
+
+    cm.upsert({
+      source: "wiki",
+      sourceId: page.id,
+      summary: summaryParts.join(" — "),
+      tags,
+      metadata,
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("wiki", allIds);
+  console.error(`${upserted} upserted, ${skipped} unchanged, ${stale} stale removed.`);
+}
+
+// ── Documents (docx, pdf, xlsx, xls from multiple directories) ──
+
+// Directories the context index walks looking for indexable documents.
+// Tune these to wherever you keep working docs / project repos / reference
+// material. Recursive scan respects MAX_DEPTH below.
+const DOCS_DIRS = [
+  path.join(process.env.HOME, "Documents"),
+  // Add project dirs here, e.g.:
+  //   path.join(process.env.HOME, "Dev", "project-x"),
+  //   "/Volumes/Shared/Reference",
+];
+const DOC_EXTENSIONS = new Set([".pdf", ".docx", ".xlsx", ".xls"]);
+
+function findDocs(dir, maxDepth = 3, depth = 0) {
+  const results = [];
+  if (depth >= maxDepth) return results;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory() && !entry.name.startsWith(".")) {
+      results.push(...findDocs(full, maxDepth, depth + 1));
+    } else if (entry.isFile() && DOC_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
+async function extractText(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    switch (ext) {
+      case ".docx": {
+        const { stdout } = await exec("textutil", ["-convert", "txt", "-stdout", filePath], { timeout: 15000 });
+        return stdout.trim();
+      }
+      case ".pdf": {
+        const { stdout } = await exec("pdftotext", ["-l", "3", "-q", filePath, "-"], { timeout: 15000 });
+        return stdout.trim();
+      }
+      case ".xlsx":
+      case ".xls": {
+        const XLSX = require("xlsx");
+        const wb = XLSX.readFile(filePath, { sheetRows: 20 });
+        const texts = [];
+        for (const name of wb.SheetNames.slice(0, 3)) {
+          const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
+          if (csv.trim()) texts.push(`[${name}] ${csv}`);
+        }
+        return texts.join("\n").trim();
+      }
+      default:
+        return "";
+    }
+  } catch {
+    return "";
+  }
+}
+
+async function syncDocs() {
+  process.stderr.write("Syncing docs... ");
+
+  // Collect files from all configured directories
+  const filesByBase = new Map(); // relPath -> { filePath, baseDir }
+  for (const dir of DOCS_DIRS) {
+    if (!existsSync(dir)) continue;
+    for (const filePath of findDocs(dir)) {
+      const relPath = path.relative(dir, filePath);
+      const baseName = path.basename(dir);
+      const key = `${baseName}/${relPath}`;
+      filesByBase.set(key, { filePath, baseDir: dir, baseName });
+    }
+  }
+
+  if (filesByBase.size === 0) {
+    console.error("no documents found.");
+    return;
+  }
+
+  const allIds = [];
+  let upserted = 0;
+  let errors = 0;
+  const entries = [...filesByBase.entries()];
+
+  // Process in batches of 10 for concurrency
+  for (let i = 0; i < entries.length; i += 10) {
+    const batch = entries.slice(i, i + 10);
+    const results = await Promise.all(
+      batch.map(async ([key, { filePath, baseDir, baseName }]) => {
+        const relPath = path.relative(baseDir, filePath);
+        const filename = path.basename(filePath);
+        const ext = path.extname(filePath).toLowerCase().slice(1);
+        const folder = path.dirname(relPath);
+
+        allIds.push(key);
+
+        const text = await extractText(filePath);
+        if (!text) {
+          errors++;
+          return;
+        }
+
+        const summary = `${filename}\n${text.slice(0, 200)}`;
+        const tags = [ext, baseName, folder !== "." ? folder : ""].filter(Boolean).join(",");
+
+        cm.upsert({
+          source: "docs",
+          sourceId: key,
+          summary,
+          tags,
+          metadata: { fullPath: filePath, ext, folder: folder !== "." ? folder : "", baseDir: baseName },
+        });
+        upserted++;
+      })
+    );
+  }
+
+  const stale = cm.removeStale("docs", allIds);
+  console.error(`${upserted} upserted, ${errors} failed, ${stale} stale removed.`);
+}
+
+// ── Watchlist (Supabase) ──
+
+async function syncWatchlist() {
+  process.stderr.write("Syncing watchlist... ");
+
+  let createClient;
+  try {
+    createClient = (await import("@supabase/supabase-js")).createClient;
+  } catch {
+    console.error("skipped (@supabase/supabase-js not available).");
+    return;
+  }
+
+  const supabase = createClient(
+    "https://${MERLIN_SUPABASE_PROJECT}.supabase.co",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zem93cmtqaGZzdHB0bnNzcnprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMDU2NjAsImV4cCI6MjA5MTg4MTY2MH0.seXkEaAFoc5Zw-MTj1dNKMR5hSnGvf1ijjv3o5WAs20"
+  );
+
+  const { data, error } = await supabase.from("watchlist").select("*");
+  if (error) {
+    console.error(`error: ${error.message}`);
+    return;
+  }
+
+  const allIds = [];
+  let upserted = 0;
+
+  for (const e of data) {
+    const sourceId = e.title;
+    allIds.push(sourceId);
+
+    const status = e.watched ? "watched" : "to watch";
+    const rating = e.rating ? ` (${e.rating})` : "";
+    const platform = e.platform ? ` on ${e.platform}` : "";
+    const year = e.year_start ? ` [${e.year_start}${e.year_end ? "-" + e.year_end : ""}]` : "";
+    const desc = e.description ? `\n${e.description}` : "";
+    const summary = `${e.title}${rating}${year}${platform} — ${e.type}, ${e.category.replace("_", " ")}, ${status}${desc}`;
+
+    const tags = [e.type, e.category, e.platform, e.genre, status, e.notify_new_season ? "tracking-seasons" : ""]
+      .filter(Boolean)
+      .join(",");
+
+    cm.upsert({
+      source: "watchlist",
+      sourceId,
+      summary,
+      tags,
+      metadata: { id: e.id, category: e.category, watched: e.watched, notify: e.notify_new_season },
+    });
+    upserted++;
+  }
+
+  const stale = cm.removeStale("watchlist", allIds);
+  console.error(`${upserted} upserted, ${stale} stale removed.`);
+}
+
+// ── Google Drive ──
+
+const DRIVE_API = "https://www.googleapis.com/drive/v3";
+const DRIVE_EXPORT_TYPES = {
+  "application/vnd.google-apps.document": "text/plain",
+  "application/vnd.google-apps.spreadsheet": "text/csv",
+  "application/vnd.google-apps.presentation": "text/plain",
+};
+// Skip these Google-internal types (not user content)
+const DRIVE_SKIP_TYPES = new Set([
+  "application/vnd.google-apps.form",
+  "application/vnd.google-apps.map",
+  "application/vnd.google-apps.site",
+  "application/vnd.google-apps.shortcut",
+  "application/vnd.google-apps.folder",
+]);
+
+async function driveRequest(endpoint, token) {
+  const res = await fetch(`${DRIVE_API}${endpoint}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Drive API ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res;
+}
+
+async function listAllDriveFiles(token) {
+  const files = [];
+  let pageToken = null;
+  const fields = "nextPageToken,files(id,name,mimeType,modifiedTime,parents,webViewLink,owners,shared)";
+  const q = "trashed=false";
+
+  do {
+    const params = new URLSearchParams({ q, fields, pageSize: "1000", orderBy: "modifiedTime desc" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const res = await driveRequest(`/files?${params}`, token);
+    const data = await res.json();
+    files.push(...(data.files || []));
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  return files;
+}
+
+async function exportDriveFile(file, token) {
+  const exportMime = DRIVE_EXPORT_TYPES[file.mimeType];
+  if (exportMime) {
+    // Google Workspace file — export as text
+    const res = await driveRequest(`/files/${file.id}/export?mimeType=${encodeURIComponent(exportMime)}`, token);
+    const text = await res.text();
+    return text.slice(0, 500);
+  }
+  // Binary file (PDF, image, etc.) — skip content extraction, index metadata only
+  return "";
+}
+
+async function buildFolderMap(token) {
+  // Fetch all folders to build id→name map for path resolution
+  const folders = new Map();
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({
+      q: "mimeType='application/vnd.google-apps.folder' and trashed=false",
+      fields: "nextPageToken,files(id,name,parents)",
+      pageSize: "1000",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const res = await driveRequest(`/files?${params}`, token);
+    const data = await res.json();
+    for (const f of data.files || []) folders.set(f.id, { name: f.name, parent: f.parents?.[0] });
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return folders;
+}
+
+function resolvePath(file, folderMap) {
+  const parts = [];
+  let parentId = file.parents?.[0];
+  while (parentId && folderMap.has(parentId)) {
+    const folder = folderMap.get(parentId);
+    parts.unshift(folder.name);
+    parentId = folder.parent;
+  }
+  return parts.length ? parts.join("/") : "";
+}
+
+async function syncGoogleDrive() {
+  process.stderr.write("Syncing gdrive... ");
+
+  let getAccessToken;
+  try {
+    getAccessToken = require("../lib/google-auth.js").getAccessToken;
+  } catch (err) {
+    console.error(`skipped (google-auth not available: ${err.message})`);
+    return;
+  }
+
+  let token;
+  try {
+    token = await getAccessToken();
+  } catch (err) {
+    console.error(`skipped (auth failed: ${err.message})`);
+    return;
+  }
+
+  let files, folderMap;
+  try {
+    [files, folderMap] = await Promise.all([listAllDriveFiles(token), buildFolderMap(token)]);
+  } catch (err) {
+    console.error(`error listing files: ${err.message}`);
+    return;
+  }
+
+  const allIds = [];
+  let upserted = 0;
+  let skipped = 0;
+
+  // Export text in parallel batches, then upsert sequentially (SQLite is single-writer)
+  const exportable = files.filter((f) => !DRIVE_SKIP_TYPES.has(f.mimeType));
+
+  for (let i = 0; i < exportable.length; i += 10) {
+    const batch = exportable.slice(i, i + 10);
+    // Parallel: fetch text from Drive API
+    const results = await Promise.all(
+      batch.map(async (file) => {
+        let text = "";
+        try {
+          text = await exportDriveFile(file, token);
+        } catch {
+          skipped++;
+        }
+        return { file, text };
+      })
+    );
+    // Sequential: write to SQLite
+    for (const { file, text } of results) {
+      allIds.push(file.id);
+      const folderPath = resolvePath(file, folderMap);
+      const typeLabel = file.mimeType.includes("document")
+        ? "doc"
+        : file.mimeType.includes("spreadsheet")
+          ? "sheet"
+          : file.mimeType.includes("presentation")
+            ? "slides"
+            : path.extname(file.name).replace(".", "") || "file";
+
+      const summary = text ? `${file.name}\n${text.slice(0, 300)}` : file.name;
+      const tags = [typeLabel, folderPath, file.shared ? "shared" : ""].filter(Boolean).join(",");
+
+      cm.upsert({
+        source: "gdrive",
+        sourceId: file.id,
+        summary,
+        tags,
+        metadata: {
+          name: file.name,
+          mimeType: file.mimeType,
+          folder: folderPath,
+          modifiedTime: file.modifiedTime,
+          webViewLink: file.webViewLink || null,
+          shared: file.shared || false,
+        },
+      });
+      upserted++;
+    }
+  }
+
+  const stale = cm.removeStale("gdrive", allIds);
+  console.error(`${upserted} upserted, ${skipped} export failures, ${stale} stale removed.`);
+}
+
+// ── Main ──
+
+async function syncAll() {
+  await syncNotes();
+  await syncImsg();
+  syncEmail();
+  syncFiles();
+  syncWiki();
+  await syncDocs();
+  await syncWatchlist();
+  await syncGoogleDrive();
+
+  const rows = cm.stats();
+  const total = rows.reduce((sum, r) => sum + r.count, 0);
+  console.error(`Done. Total: ${total} entries.`);
+}
+
+function usage() {
+  console.log(`context-sync — index data sources into context memory
+
+Commands:
+  notes      Index Apple Notes (title + first 200 chars)
+  imsg       Index recent iMessage conversations (last 7 days)
+  email      Index email classification memories
+  files      Index key project files
+  wiki       Index active wiki pages as compact recall cards
+  docs       Index ~/Documents (docx, pdf, xlsx, xls)
+  watchlist  Index watchlist from Supabase
+  gdrive     Index Google Drive (Docs, Sheets, Slides, files)
+  all        Run all sources
+`);
+}
+
+switch (cmd) {
+  case "notes":
+    await syncNotes();
+    break;
+  case "imsg":
+    await syncImsg();
+    break;
+  case "email":
+    syncEmail();
+    break;
+  case "files":
+    syncFiles();
+    break;
+  case "wiki":
+    syncWiki();
+    break;
+  case "docs":
+    await syncDocs();
+    break;
+  case "watchlist":
+    await syncWatchlist();
+    break;
+  case "gdrive":
+    await syncGoogleDrive();
+    break;
+  case "all":
+    await syncAll();
+    break;
+  default:
+    usage();
+}

@@ -1,0 +1,20 @@
+{
+  "_comment": "Test config — non-production ports, sonnet model, no fallback. DO NOT USE FOR PROD.",
+  "agents": {
+    "test": {
+      "model": "sonnet",
+      "cwd": "agent/supervisor",
+      "runtime": "supervisor",
+      "devChannels": [],
+      "permissionMode": "bypassPermissions",
+      "allowedTools": ["Bash", "Read", "Write", "Glob", "Grep"],
+      "remoteControlPrefix": "supervisor-test",
+      "supervisor": {
+        "controlPort": 19091,
+        "gmailPubsubPort": 19090,
+        "webhookPort": 19092,
+        "healthPort": 19093
+      }
+    }
+  }
+}

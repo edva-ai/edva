@@ -1,0 +1,214 @@
+name: Merlin Companion - iOS TestFlight
+
+on:
+  workflow_dispatch:
+
+# Allow multiple Merlin builds to queue (don't cancel the earlier one).
+# Cross-repo parallelism is naturally supported: each repo's runner agent
+# picks jobs independently, and this workflow now uses per-job ephemeral
+# state (keychain in $RUNNER_TEMP, profiles auto-fetched by Xcode via ASC
+# API) so it does not collide with concurrent builds from other repos.
+concurrency:
+  group: merlin-companion-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macos, ios]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/companion
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Verify Xcode
+        run: xcodebuild -version
+
+      - name: Setup ephemeral signing keychain
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+
+          # Prepend this keychain to the user search list. Serialized via
+          # mkdir-based mutex (macOS has no flock) so concurrent jobs from
+          # other repos don't race the search-list mutation. We only ADD
+          # and we only remove our own path in cleanup — never wildcard.
+          LOCK=/tmp/merlin-ci-keychain.lock
+          for i in $(seq 1 60); do
+            if mkdir "$LOCK" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          CURRENT=$(security list-keychains -d user | tr -d '"' | xargs)
+          FILTERED=$(echo "$CURRENT" | tr ' ' '\n' | grep -v "^$KEYCHAIN$" | tr '\n' ' ')
+          security list-keychains -d user -s "$KEYCHAIN" $FILTERED
+          rmdir "$LOCK" 2>/dev/null || true
+
+          CERT="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$IOS_CERTIFICATE_P12" | base64 --decode > "$CERT"
+
+          # Tolerate per-item import errors; require identity to land.
+          set +e
+          security import "$CERT" -P "$IOS_CERTIFICATE_PASSWORD" -A -k "$KEYCHAIN" \
+            > "$RUNNER_TEMP/import.log" 2>&1
+          set -e
+          cat "$RUNNER_TEMP/import.log"
+          if ! grep -q "identity imported" "$RUNNER_TEMP/import.log"; then
+            echo "ERROR: no identity imported"; exit 1
+          fi
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          rm "$CERT" "$RUNNER_TEMP/import.log"
+
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PW=$KEYCHAIN_PW" >> "$GITHUB_ENV"
+
+      - name: Stage ASC API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          ASC_DIR="$RUNNER_TEMP/asc"
+          mkdir -p "$ASC_DIR"
+          printf '%s' "$ASC_PRIVATE_KEY" > "$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          echo "ASC_DIR=$ASC_DIR" >> "$GITHUB_ENV"
+
+          # altool ignores --authenticationKeyPath and only searches its
+          # hardcoded list (~/private_keys, ~/.private_keys,
+          # ~/.appstoreconnect/private_keys). Mirror the key there so the
+          # Upload step can find it; cleanup step removes it after.
+          ALTOOL_KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$ALTOOL_KEY_DIR"
+          cp "$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8" "$ALTOOL_KEY_DIR/"
+          chmod 600 "$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          echo "ALTOOL_KEY_PATH=$ALTOOL_KEY_DIR/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Update build number
+        run: |
+          BUILD_NUMBER=${{ github.run_number }}
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Merlin.xcodeproj/project.pbxproj
+
+      - name: Clean per-job DerivedData
+        run: rm -rf "$RUNNER_TEMP/DerivedData"
+
+      - name: Resolve packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Merlin.xcodeproj \
+            -scheme Merlin \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData"
+
+      - name: Pin distribution profile specifiers in pbxproj
+        run: |
+          python3 <<'PYEOF'
+          path = 'Merlin.xcodeproj/project.pbxproj'
+          with open(path) as f:
+              c = f.read()
+          # Force Manual + Apple Distribution signing. -allowProvisioningUpdates
+          # on xcodebuild + ASC key will fetch/regenerate the named profiles
+          # from Apple on every build.
+          c = c.replace('CODE_SIGN_STYLE = Automatic;',
+              'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";')
+          c = c.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
+          c = c.replace(
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;',
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "Merlin NotificationService AppStore";')
+          c = c.replace(
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;',
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin; PROVISIONING_PROFILE_SPECIFIER = "Merlin AppStore";')
+          with open(path, 'w') as f:
+              f.write(c)
+          PYEOF
+
+      - name: Archive iOS (manual signing, JIT profile fetch)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcodebuild archive \
+            -project Merlin.xcodeproj \
+            -scheme Merlin \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Merlin-iOS.xcarchive" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
+
+      - name: Export iOS IPA
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Merlin-iOS.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export-ios" \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_DIR/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      - name: Upload iOS to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          IPA_PATH=$(find "$RUNNER_TEMP/export-ios" -name "*.ipa" | head -1)
+          set -o pipefail
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            --show-progress 2>&1 | tee "$RUNNER_TEMP/altool.log"
+          if grep -q "UPLOAD FAILED\|Validation failed\|ERROR:" "$RUNNER_TEMP/altool.log"; then
+            echo "::error::altool reported failure despite exit 0"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remove this job's keychain from the user search list (flock-
+          # serialized against concurrent jobs) and delete the keychain.
+          if [ -n "$KEYCHAIN" ] && [ -e "$KEYCHAIN" ]; then
+            LOCK=/tmp/merlin-ci-keychain.lock
+            for i in $(seq 1 60); do
+              if mkdir "$LOCK" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            REMAINING=$(security list-keychains -d user | tr -d '"' | xargs | tr ' ' '\n' | grep -v "^$KEYCHAIN$" | tr '\n' ' ')
+            security list-keychains -d user -s $REMAINING
+            rmdir "$LOCK" 2>/dev/null || true
+            security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          fi
+          # ASC key p8 lives in $RUNNER_TEMP/asc and is auto-cleaned by runner.
+          # The mirrored copy in ~/.appstoreconnect/private_keys persists across
+          # jobs on a self-hosted runner — remove it explicitly.
+          if [ -n "$ALTOOL_KEY_PATH" ] && [ -e "$ALTOOL_KEY_PATH" ]; then
+            rm -f "$ALTOOL_KEY_PATH"
+          fi
+          # We do NOT touch ~/Library/MobileDevice/Provisioning Profiles —
+          # Xcode manages its own JIT provisioning cache.
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merlin-companion-ios-ipa
+          path: ${{ runner.temp }}/export-ios/*.ipa
+          retention-days: 3

@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+// suggestion-classify — read a the user phone reply and, if it's a reaction to
+// a recent advisory hum ping, write a `reaction` event to suggestion-history.
+//
+// Designed to run fork-and-forget from phone-channel right after handling an
+// inbound user message. Latency budget: must NOT block the user-facing reply
+// flow. ~5s rules-first; only falls back to Gemma when rules are ambiguous.
+//
+// Auth model: rules + local Gemma only. NEVER calls Anthropic SDK / Haiku /
+// Sonnet — that would be API-key-billed (forbidden outside agent supervisors).
+//
+// Usage:
+//   suggestion-classify --message-id <uuid> --text "<user message>"
+//   echo "<text>" | suggestion-classify --message-id <uuid> --stdin
+//
+// Exit codes:
+//   0  classified + wrote a reaction event
+//   1  classified as non-reaction (or no recent advisory ping); no write
+//   2  usage error
+//   3  internal error
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { appendReaction } from "../lib/suggestion-history.mjs";
+import { localLlmChat } from "../lib/local-llm.mjs";
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+function die(msg, code = 2) { console.error(msg); process.exit(code); }
+function debug(...m) { if (process.env.SUGGESTION_CLASSIFY_DEBUG) console.error("[classify]", ...m); }
+
+const messageId = flag("--message-id");
+const fromStdin = flag("--stdin", false);
+let text = flag("--text");
+const dryRun = flag("--dry-run", false);
+
+if (fromStdin) {
+  if (text) die("--text and --stdin are mutually exclusive");
+  text = fs.readFileSync(0, "utf8");
+}
+if (!text || !text.trim()) die("usage: suggestion-classify --message-id <uuid> --text <text> | --stdin");
+
+text = text.trim();
+
+// ---------------------------------------------------------------------------
+// 1. Find the most recent advisory hum ping that the user could be reacting
+//    to. Window: 6 hours (matches the ambiguous-tapback window in CLAUDE.md).
+//    Returns null if no recent advisory ping exists — most user messages are
+//    fresh commands, not reactions.
+// ---------------------------------------------------------------------------
+const HUM_FEEDBACK_PATH = path.join(os.homedir(), "dev/merlin/data/hum-feedback.jsonl");
+const ADVISORY_LANES = new Set(["dining", "music", "art", "talks", "ideas", "watchlist", "concerts", "village", "broadway", "location_context"]);
+const REACTION_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+function findRecentAdvisoryPing(now = Date.now()) {
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBACK_PATH, "utf8"); }
+  catch { return null; }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (!entry.lane || !ADVISORY_LANES.has(entry.lane)) continue;
+    const sentAt = new Date(entry.sent_at).getTime();
+    if (now - sentAt > REACTION_WINDOW_MS) return null; // newer than this is also too old
+    const headline = (entry.findings || [])[0];
+    if (!headline) continue;
+    // Require subject_key — older rows without one can't be classified by key.
+    // hum-ping now writes subject_key; pre-rollout entries simply don't qualify.
+    if (!headline.subject_key) continue;
+    return {
+      ping_id: entry.ping_id,
+      message_id: entry.message_id,
+      sent_at: entry.sent_at,
+      lane: entry.lane,
+      subject_key: headline.subject_key,
+      display: headline.subject_display || headline.signal?.slice(0, 80) || "",
+      attrs: headline.subject_attrs || {},
+      reaction_already: entry.reaction || null,
+    };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Cheap rule-based classifier. Patterns ordered so most-specific wins.
+//    Each rule returns {disposition, reason, reason_detail?, confidence}.
+//    Confidence < 1 means "rule fired but worth Gemma double-check"; set
+//    higher when the phrase is unambiguous.
+// ---------------------------------------------------------------------------
+const RULES = [
+  // Already-seen / repetition complaints — strongest negative signal.
+  { re: /\b(why|why are you).*(again|surfacing.*again|showing.*again)\b/i,
+    disposition: "negative", reason: "already_seen", confidence: 0.95 },
+  { re: /\balready (showed|shown|seen|recommended|surfaced|on the list|saw this)\b/i,
+    disposition: "negative", reason: "already_seen", confidence: 0.9 },
+  { re: /\b(stop|quit) (recommending|suggesting|surfacing|sending)\b/i,
+    disposition: "negative", reason: "explicit_no", confidence: 0.95 },
+
+  // Visited / been-there.
+  { re: /\b(been there|we went|ate there|tried it|already (eat|dine|been)|on (my|the) list|i go (here|there))\b/i,
+    disposition: "visited", reason: null, confidence: 0.85 },
+
+  // Price-rejection.
+  { re: /\b(too (expensive|pricey|much)|overpriced|ridiculous(ly)? (expensive|priced)|over[- ]priced|not worth (the|that) (price|money|cost)|out of (my|the) (budget|range))\b/i,
+    disposition: "negative", reason: "price", confidence: 0.95 },
+  { re: /\b\$(?:1[0-9]{2}|[2-9][0-9]{2,})\s*(?:\/|per|pp|a person|each)/i,
+    disposition: "negative", reason: "price", confidence: 0.7 },
+
+  // Cuisine / topic mismatch — only when explicit.
+  { re: /\b(don't|do not) (like|want|care for|eat) /i,
+    disposition: "negative", reason: "cuisine_mismatch", confidence: 0.7 },
+
+  // Timing / deferred.
+  // Tune `after (...)` alternatives to the user's recurring deferral phrases
+  // (e.g. "after the trip", "after vacation", a partner's name, a city name).
+  { re: /\b(not (now|right now|today|tonight)|after (the trip|vacation)|maybe later|later this (week|month)|next (week|month))\b/i,
+    disposition: "deferred", reason: "timing", confidence: 0.75 },
+
+  // Plain rejection.
+  { re: /^(no|nope|nah|pass|skip|not interested|no thanks)\b/i,
+    disposition: "negative", reason: "explicit_no", confidence: 0.85 },
+  { re: /\b(not (interested|for me|my thing)|hard pass)\b/i,
+    disposition: "negative", reason: "explicit_no", confidence: 0.9 },
+
+  // Positive signals.
+  { re: /\b(love (it|this)|sounds (great|perfect|amazing)|booking|let's go|going|reserved|reservation made|on it|yes(,| -)? booking|i'm in)\b/i,
+    disposition: "positive", reason: null, confidence: 0.85 },
+  { re: /^(yes|yep|yeah|👍|❤️|love|nice|perfect|great|book it)$/i,
+    disposition: "positive", reason: null, confidence: 0.85 },
+];
+
+function applyRules(t) {
+  for (const r of RULES) {
+    if (r.re.test(t)) return { ...r, source: "rule" };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Gemma fallback for ambiguous messages. Strict JSON output. Returns null
+//    when Ollama is down or the model returns garbage — defaulting to
+//    "no reaction" is safer than fabricating one.
+// ---------------------------------------------------------------------------
+async function gemmaClassify(t, ping) {
+  const system = `You classify a single message the user sent to his AI assistant.
+Most messages are NEW commands. Some are reactions to a recent suggestion the AI sent him about ${ping.lane} (subject: ${ping.display}).
+Decide: is this message a reaction to that suggestion?
+Respond with JSON only: {"is_reaction": true|false, "disposition": "positive"|"negative"|"visited"|"snoozed"|"deferred"|"neutral", "reason": "price"|"already_seen"|"cuisine_mismatch"|"timing"|"not_interested_topic"|"explicit_no"|"duplicate"|null, "confidence": 0.0-1.0}
+If is_reaction=false, set disposition="neutral", reason=null, confidence=0.
+Default to is_reaction=false unless the message clearly references the suggestion or carries a reaction word ("love", "no", "expensive", "already saw", "later").`;
+  const user = `Recent suggestion: ${ping.display}
+the user's message: ${t}
+JSON:`;
+  let out;
+  try {
+    out = await localLlmChat({
+      system, user,
+      maxTokens: 120, temperature: 0.2, timeoutMs: 4000, think: false,
+    });
+  } catch (e) {
+    debug("gemma error:", e.message);
+    return null;
+  }
+  if (!out?.content) return null;
+  // Extract first JSON object (gemma sometimes adds preamble despite system).
+  const m = out.content.match(/\{[\s\S]*?\}/);
+  if (!m) { debug("no JSON in gemma:", out.content?.slice(0,200)); return null; }
+  let parsed;
+  try { parsed = JSON.parse(m[0]); } catch { debug("bad JSON:", m[0]); return null; }
+  if (!parsed.is_reaction) return { source: "gemma", is_reaction: false };
+  return {
+    source: "gemma",
+    is_reaction: true,
+    disposition: parsed.disposition,
+    reason: parsed.reason || null,
+    confidence: Number(parsed.confidence) || 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 4. Main path.
+// ---------------------------------------------------------------------------
+const ping = findRecentAdvisoryPing();
+if (!ping) {
+  debug("no recent advisory ping; treating as fresh command");
+  process.exit(1);
+}
+debug("recent advisory ping:", ping.subject_key, "lane=", ping.lane);
+
+let result = applyRules(text);
+if (!result) {
+  // Short messages with reaction-shaped tokens that didn't match a rule
+  // (e.g. "ok cool, maybe later") deserve a Gemma read. Long messages are
+  // almost always commands; skip Gemma to save latency.
+  if (text.length > 200) {
+    debug("long message, skipping gemma");
+    process.exit(1);
+  }
+  const g = await gemmaClassify(text, ping);
+  if (!g) { debug("no rule match, gemma unavailable / unclear → skip"); process.exit(1); }
+  if (!g.is_reaction || g.confidence < 0.6) {
+    debug("gemma says not a reaction (conf=", g.confidence, ")");
+    process.exit(1);
+  }
+  result = {
+    disposition: g.disposition,
+    reason: g.reason,
+    confidence: g.confidence,
+    source: "gemma",
+  };
+}
+
+if (!result.disposition) {
+  debug("no disposition resolved");
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Tapbacks already write the reaction via the existing `merlin hum
+//    feedback` path — don't double-record. If the ping already has a
+//    structured reaction recorded, only write a free-text reaction when it
+//    adds new information (e.g. price reason on top of a generic 👎). The
+//    deriveState fold in suggestion-history will keep the more-specific
+//    reason regardless of order.
+// ---------------------------------------------------------------------------
+const event = {
+  subject_key: ping.subject_key,
+  disposition: result.disposition,
+  reason: result.reason,
+  reason_detail: text.length <= 240 ? text : text.slice(0, 240) + "…",
+  source: `phone_${result.source}`,
+  evidence: text.slice(0, 240),
+  message_id: messageId || null,
+};
+
+if (dryRun) {
+  console.log(JSON.stringify({ ...event, _dry_run: true, _confidence: result.confidence, _ping: ping }, null, 2));
+  process.exit(0);
+}
+
+try {
+  appendReaction(event);
+} catch (e) {
+  console.error(`suggestion-classify: appendReaction failed: ${e.message}`);
+  process.exit(3);
+}
+
+console.error(`suggestion-classify: wrote ${result.disposition} reaction (reason=${result.reason || "-"}, src=${result.source}, conf=${result.confidence}) for ${ping.subject_key}`);
+process.exit(0);

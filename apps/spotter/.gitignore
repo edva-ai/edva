@@ -1,0 +1,41 @@
+# Xcode / SPM
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+build/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+.build/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Secrets / keys — never commit
+*.p12
+*.p8
+*.mobileprovision
+*.cer
+.env
+.env.local
+
+# Claude / scratch
+.claude/settings.local.json
+/tmp-exports/
+
+# Python
+__pycache__/
+*.pyc
+
+# xcodegen generated project — we check in project.yml, not the project file
+Spotter.xcodeproj/
+
+# Local tool caches
+.swiftpm/
+
+# Extraction / authoring scratch (we ship only the final PNGs under Assets.xcassets)
+_extract/
+illustrations/
+# Leftover from before the project was renamed Spotter
+Exercise/

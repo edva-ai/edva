@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+// hum-answer — record the user's answer to a pending hum question.
+//
+// Called by the chat-agent when a phone message is recognized as an answer
+// to the currently-pending hum question. Appends to hum-learnings.jsonl,
+// routes the answer to the appropriate memory file per memory_hook, and
+// clears hum-pending-question.json.
+//
+// Usage:
+//   hum-answer <id> "<answer text>"     # normal path
+//   hum-answer --show                   # print pending question
+//   hum-answer --clear                  # force-clear (expired, rejected, etc.)
+//
+// Memory routing (memory_hook → target file under ~/.claude/projects/.../memory/):
+//   show_preference       → user_art_taste.md (append observation)
+//   restaurant_preference → reference_trusted_restaurants.md (append row)
+//   event_recap           → reference_event_recaps.md (append row, create if missing)
+//   scamper_insight       → project_scamper_insights.md (append, create if missing)
+//   general_preference    → user_preferences_learned.md (append, create if missing)
+//   person                → reference_people_met.md (append, create if missing)
+//
+// All routing is non-destructive append. The hum-learnings.jsonl is the
+// canonical log — memory pages are derived views for future context harvest.
+//
+// As of 2026-05-02 (wiki step 5), routing goes through `lib/wiki-store.js`
+// `savePage()` so every append gets a revision in `page_revisions` and the
+// pages_fts index refreshes in the same transaction (the next `wiki_search`
+// sees the new line immediately). The .md file is still written by savePage
+// in the default mode, so existing consumers (`memory reindex`, the file-based
+// `memory-snapshot` cron) keep working.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+const requireFromHere = createRequire(import.meta.url);
+const ws = requireFromHere("../lib/wiki-store.js");
+
+const DATA = path.join(process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin"), "data");
+const PENDING = path.join(DATA, "hum-pending-question.json");
+const LEARNINGS = path.join(DATA, "hum-learnings.jsonl");
+
+// Routing is keyed by memory_hook → page id (basename minus .md). Defaults
+// for type are inferred from the prefix (user_/reference_/project_) when the
+// page is created fresh.
+const ROUTING = {
+  show_preference:       { id: "user_art_taste",                kind: "observation" },
+  restaurant_preference: { id: "reference_trusted_restaurants", kind: "row" },
+  event_recap:           { id: "reference_event_recaps",        kind: "row" },
+  scamper_insight:       { id: "project_scamper_insights",      kind: "observation" },
+  general_preference:    { id: "user_preferences_learned",      kind: "observation" },
+  person:                { id: "reference_people_met",          kind: "row" },
+};
+
+function readPending() {
+  try {
+    const raw = fs.readFileSync(PENDING, "utf8").trim();
+    if (!raw || raw === "null") return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function clearPending() {
+  fs.writeFileSync(PENDING, "null\n");
+}
+
+function inferType(id) {
+  if (id.startsWith("reference_")) return "reference";
+  if (id.startsWith("project_")) return "project";
+  if (id.startsWith("feedback_")) return "feedback";
+  return "user";
+}
+
+function appendToMemory(hook, subject, question, answer) {
+  const route = ROUTING[hook];
+  if (!route) return { ok: false, reason: `unknown memory_hook '${hook}'` };
+
+  const ts = new Date().toISOString().slice(0, 10);
+  const line = route.kind === "row"
+    ? `- ${ts} · ${subject}: ${answer}\n`
+    : `\n- ${ts} · ${subject}: ${answer}\n`;
+
+  let row = ws.getPage(route.id);
+  let nextRaw;
+  if (!row) {
+    // Create page with minimal frontmatter, then append the new line.
+    const title = route.id.replace(/_/g, " ");
+    const type = inferType(route.id);
+    const header =
+      `---\n` +
+      `name: ${title}\n` +
+      `description: Grown over time from hum-answer routing. See bin/hum-answer.\n` +
+      `type: ${type}\n` +
+      `---\n\n`;
+    nextRaw = header + line;
+  } else {
+    // Append to existing raw_md. Trailing newline already on `line`.
+    nextRaw = row.raw_md.endsWith("\n") ? row.raw_md + line : row.raw_md + "\n" + line;
+  }
+  const result = ws.savePage(route.id, nextRaw, { editedBy: "hum-answer" });
+  return {
+    ok: true,
+    page_id: route.id,
+    basename: result.basename,
+    rev: result.rev,
+    is_new: result.isNew,
+  };
+}
+
+const args = process.argv.slice(2);
+
+if (args[0] === "--show") {
+  const p = readPending();
+  if (!p) { console.log("null"); process.exit(0); }
+  console.log(JSON.stringify(p, null, 2));
+  process.exit(0);
+}
+
+if (args[0] === "--clear") {
+  clearPending();
+  console.log("cleared");
+  process.exit(0);
+}
+
+const [id, ...answerParts] = args;
+const answer = answerParts.join(" ").trim();
+if (!id || !answer) {
+  console.error("Usage: hum-answer <id> <answer>  |  --show  |  --clear");
+  process.exit(1);
+}
+
+const pending = readPending();
+if (!pending) {
+  console.error("No pending question.");
+  process.exit(2);
+}
+if (pending.id !== id) {
+  console.error(`Pending id=${pending.id}, got id=${id}`);
+  process.exit(3);
+}
+if (pending.expires_at && new Date(pending.expires_at).getTime() < Date.now()) {
+  console.error(`Pending question expired at ${pending.expires_at}`);
+  clearPending();
+  process.exit(4);
+}
+
+const record = {
+  id: pending.id,
+  asked_at: pending.asked_at,
+  answered_at: new Date().toISOString(),
+  subject: pending.subject,
+  memory_hook: pending.memory_hook,
+  question: pending.question,
+  answer,
+};
+fs.appendFileSync(LEARNINGS, JSON.stringify(record) + "\n");
+
+const routed = appendToMemory(
+  pending.memory_hook, pending.subject, pending.question, answer
+);
+
+clearPending();
+ws.closeDb();
+
+console.log(JSON.stringify({
+  ok: true,
+  learnings_appended: true,
+  memory_routed: routed,
+}));

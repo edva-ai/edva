@@ -1,0 +1,127 @@
+{
+  "$schema": "./tasks.schema.json",
+  "_comment": "Registry of all scheduled tasks in the Merlin system. Single source of truth for chat-agent delegation + cron reference. Edit this file, then run 'merlin doctor' to verify cron + playbook alignment. The set below ships as reference patterns — replace, extend, or delete to fit your own automation.",
+  "tasks": [
+    {
+      "name": "morning-digest",
+      "schedule": "55 7 * * *",
+      "schedule_human": "Daily at 8:00 AM",
+      "trigger_script": "agent/scripts/trigger-morning-digest.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "MORNING DIGEST",
+      "ops_playbook_section": "Morning Digest",
+      "delivers_to": "merlin",
+      "phrases": [
+        "morning brief",
+        "morning briefing",
+        "today's brief",
+        "daily brief",
+        "daily digest",
+        "morning digest"
+      ],
+      "description": "Reference job. Compile calendar, tasks, news headlines, and weather; deliver via long-form-rule (HTML email + phone pointer + APNs push). The canonical template for any cron-driven content job.",
+      "job": "morning-digest"
+    },
+    {
+      "name": "hum",
+      "schedule": "*/20 * * * *",
+      "schedule_human": "Every 20 minutes — the always-on hum of ambient awareness",
+      "trigger_script": "agent/scripts/trigger-hum.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "HUM",
+      "ops_playbook_section": "Hum",
+      "delivers_to": "merlin",
+      "phrases": [
+        "hum",
+        "hum status",
+        "pulse",
+        "proactive check-in",
+        "hum check",
+        "hum run"
+      ],
+      "description": "Every 20 minutes, fan out to the configured harvesters (weather, news, calendar, tasks, watchdog, serendipity by default — extend with your own), rank candidates with a Sonnet subagent, optionally surface one as a chat ping. Most ticks exit silently via the bash gates in the trigger script. See agent/ops-agent/jobs/hum.md for the playbook.",
+      "job": "hum"
+    },
+    {
+      "name": "hum-review",
+      "schedule": "30 9 * * 0",
+      "schedule_human": "Sundays at 9:30 AM",
+      "trigger_script": "agent/scripts/trigger-hum-review.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "HUM REVIEW",
+      "ops_playbook_section": "Hum Review",
+      "delivers_to": "email+merlin",
+      "phrases": [
+        "hum review",
+        "hum weekly review",
+        "hum performance",
+        "hum tuning",
+        "review hum",
+        "pulse review"
+      ],
+      "description": "Weekly self-assessment of hum: analyzes 7 days of ticks, pings, questions, answers, reactions, and memory growth. Emails the user a memo with engagement stats and proposed tuning. Never applies tuning automatically — proposals only. Read-only on all hum state files.",
+      "job": "hum-review"
+    },
+    {
+      "name": "wiki-audit",
+      "schedule": "30 3 * * *",
+      "schedule_human": "Daily at 3:30 AM",
+      "trigger_script": "agent/scripts/trigger-wiki-audit.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "email",
+      "phrases": [
+        "wiki audit",
+        "pin audit",
+        "rebalance pins"
+      ],
+      "description": "Nightly re-evaluation of the wiki pinned-page subset. Reads data/wiki-access.jsonl (last 7 days, MCP caller only), pins any unpinned page hit ≥ 5 times, unpins any pinned page with 0 hits AND pinned for ≥ 7 days AND not pin_locked. Emails the user a digest only when something changes (silent on no-op nights). Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "memory-snapshot",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-memory-snapshot.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Auto-commit + push the auto-memory dir to its private backup repo (${MERLIN_BACKUP_REPO}). Idempotent on no-changes. Primary backup layer for the memory corpus — pre-reindex tarballs in data/memory-snapshots/ are belt-and-suspenders.",
+      "job": null
+    },
+    {
+      "name": "chrome-cdp-watch",
+      "schedule": "*/15 * * * *",
+      "schedule_human": "Every 15 minutes",
+      "trigger_script": "agent/scripts/chrome-cdp-watch.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "merlin",
+      "phrases": [],
+      "description": "Probe Chrome DevTools Protocol on port 9222 and notify the user once per UP→DOWN transition so they can investigate a lost TCC grant / closed Chrome / chrome-devtools-mcp re-sign. Silent on recovery. Quiet hours 00:00–09:00 local defer the ping to the 09:00-tick. State in data/chrome-cdp-state.json. Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "context-sync",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-context-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "context-db",
+      "phrases": [
+        "context sync",
+        "sync context",
+        "reindex",
+        "rebuild context",
+        "context index"
+      ],
+      "description": "Re-index your wired-in sources (notes, messages, email memories, project files) into the context search database."
+    }
+  ]
+}

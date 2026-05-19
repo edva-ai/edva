@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+// Append a consumption marker to hum-ideas.jsonl. Used by hum.md step 4
+// when a winning candidate came from the `ideas` topic.
+//
+// Usage: hum-mark-idea-consumed <idea-id> <ping-id>
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const [ideaId, pingId] = process.argv.slice(2);
+if (!ideaId || !pingId) {
+  console.error("usage: hum-mark-idea-consumed <idea-id> <ping-id>");
+  process.exit(2);
+}
+
+const file = path.join(os.homedir(), "dev/merlin/data/hum-ideas.jsonl");
+const record = {
+  id: ideaId,
+  consumed: true,
+  consumed_at: new Date().toISOString(),
+  ping_id: pingId,
+};
+
+try {
+  fs.appendFileSync(file, JSON.stringify(record) + "\n");
+  console.log(`marked ${ideaId} consumed (ping=${pingId})`);
+} catch (e) {
+  console.error(`write failed: ${e.message}`);
+  process.exit(1);
+}

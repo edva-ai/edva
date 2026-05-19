@@ -1,0 +1,638 @@
+#!/usr/bin/env node
+// memory — hybrid (FTS5 + semantic) retrieval over auto-memory files.
+//
+// Auto-memory lives at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/*.md
+// and is loaded into every Claude Code conversation via MEMORY.md. This CLI
+// adds the retrieval/ranking/logging layer — use it when the agent needs
+// paraphrase-tolerant search over the profile, feedback rules, projects, etc.
+//
+// Usage:
+//   memory reindex [--force] [--dry-run]
+//   memory search "<query>" [--k N] [--mode hybrid|semantic|fts] [--caller tag] [--json]
+//   memory list [--file <basename>]
+//   memory show <basename>
+//   memory stats
+//   memory log [--tail N]
+//   memory eval [--cases <path>] [--json]
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const ms = require("../lib/memory-store.js");
+const mlint = require("../lib/memory-lint.js");
+
+const HOME = os.homedir();
+const DEFAULT_EVAL_CASES = path.join(
+  HOME,
+  "dev/merlin/data/memory-eval-cases.json",
+);
+
+const args = process.argv.slice(2);
+const [cmd, ...rest] = args;
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function die(msg, code = 1) {
+  console.error(`memory: ${msg}`);
+  process.exit(code);
+}
+
+function positional() {
+  const out = [];
+  const argv = args.slice(1); // drop cmd
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const next = argv[i + 1];
+      if (next && !next.startsWith("--")) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function fmtSnippet(body, maxLen = 160) {
+  const flat = (body || "").replace(/\s+/g, " ").trim();
+  return flat.length > maxLen ? flat.slice(0, maxLen) + "…" : flat;
+}
+
+function usage() {
+  console.log(`memory — hybrid retrieval over auto-memory files
+
+Commands:
+  reindex [--force] [--dry-run]          Rebuild the index (force re-embed even unchanged chunks)
+  search "<query>" [--k N] [--mode hybrid|semantic|fts] [--caller tag]
+         [--no-expand] [--no-scope-rerank] [--json]
+  list [--file <basename>]               List entries (optionally for one file)
+  show <basename>                        Dump chunks + entities + outgoing/incoming links
+  stats                                  Index health + counts
+  log [--tail N]                         Recent retrievals (default 20)
+  eval [--cases <path>] [--json]         Run the eval harness
+  lint [--json] [--fix-safe]             Structural lint: dangling links, unknown entities, etc.
+  entity list|show <id>|add              Browse the entity registry
+  new <type> <name>                      Scaffold a new memory file
+  supersede <old.md> <new.md>            Record that <new> supersedes <old>
+  graph [--entity <id>] [--format dot]   Entity/file graph for visualization
+
+Storage:
+  DB      : ${ms.DB_PATH}
+  Memory  : ${ms.MEMORY_DIR}
+  Log     : ${ms.LOG_PATH}
+`);
+}
+
+// Tarball the live memory dir before reindex touches anything. Belt-and-
+// suspenders to the per-commit git backup: if the reindex (or anything that
+// runs before it) corrupts a memory file, the tarball captured the
+// known-good state taken seconds earlier. Rotates to the last 14 tarballs.
+//
+// Skipped when --no-snapshot or when MEMORY_SKIP_SNAPSHOT=1 (the snapshot
+// cron itself sets this so we don't double-snapshot). Failure here never
+// blocks the reindex — backups are best-effort, not load-bearing.
+function preReindexTarball() {
+  if (Boolean(flag("no-snapshot", false))) return;
+  if (process.env.MEMORY_SKIP_SNAPSHOT === "1") return;
+  const snapshotDir = process.env.MEMORY_SNAPSHOT_DIR ||
+    path.join(HOME, "Dev/merlin/data/memory-snapshots");
+  try {
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    const ts = new Date()
+      .toISOString()
+      .replace(/[-:T]/g, "")
+      .replace(/\.\d{3}Z$/, "Z");
+    const out = path.join(snapshotDir, `memory-${ts}.tar.gz`);
+    const memoryDir = ms.MEMORY_DIR;
+    const parent = path.dirname(memoryDir);
+    const base = path.basename(memoryDir);
+    // Exclude the .git/ subdir — we already track history there; including
+    // it would balloon every tarball and isn't needed for restore.
+    const { spawnSync } = require("node:child_process");
+    const r = spawnSync(
+      "tar",
+      ["-czf", out, "--exclude=.git", "-C", parent, base],
+      { stdio: "pipe" },
+    );
+    if (r.status !== 0) {
+      console.error(`memory: pre-reindex tarball failed: ${r.stderr?.toString() || "unknown"}`);
+      return;
+    }
+    // Rotate: keep last 14 .tar.gz by mtime descending.
+    const tarballs = fs
+      .readdirSync(snapshotDir)
+      .filter((f) => f.startsWith("memory-") && f.endsWith(".tar.gz"))
+      .map((f) => ({
+        f,
+        m: fs.statSync(path.join(snapshotDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.m - a.m);
+    for (const old of tarballs.slice(14)) {
+      try {
+        fs.unlinkSync(path.join(snapshotDir, old.f));
+      } catch {}
+    }
+    return out;
+  } catch (err) {
+    console.error(`memory: pre-reindex tarball failed: ${err.message}`);
+  }
+}
+
+async function cmdReindex() {
+  const dryRun = Boolean(flag("dry-run", false));
+  const force = Boolean(flag("force", false));
+  const tarball = dryRun ? null : preReindexTarball();
+  const start = Date.now();
+  const stats = await ms.reindex({ dryRun, force });
+  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+  console.log(
+    `reindex: ${stats.chunks_written} written, ${stats.chunks_skipped_unchanged} unchanged, ${stats.chunks_removed} removed across ${stats.files_scanned} files in ${elapsed}s${dryRun ? " (dry-run)" : ""}`,
+  );
+  if (tarball) console.log(`pre-reindex tarball: ${tarball}`);
+  if (stats.errors.length) {
+    console.error(`errors: ${stats.errors.length}`);
+    for (const e of stats.errors.slice(0, 10)) {
+      console.error(`  ${e.file}${e.chunk_ix !== undefined ? `#${e.chunk_ix}` : ""}: ${e.error}`);
+    }
+  }
+}
+
+async function cmdSearch() {
+  const pos = positional();
+  const query = pos.join(" ").trim();
+  if (!query) die('search: need a query. usage: memory search "<query>"');
+  const limit = Number(flag("k", 10));
+  const mode = String(flag("mode", "hybrid"));
+  const caller = String(flag("caller", "cli"));
+  const asJson = Boolean(flag("json", false));
+  const expand = !Boolean(flag("no-expand", false));
+  const scopeRerank = !Boolean(flag("no-scope-rerank", false));
+  if (!["hybrid", "semantic", "fts"].includes(mode)) {
+    die(`search: --mode must be hybrid|semantic|fts (got ${mode})`);
+  }
+  // Step 5e (2026-05-02): the memory-reindex cron is disabled. memory_chunks
+  // is frozen at its last reindex; new wiki saves are searchable via
+  // `wiki search` (pages_fts, kept current per-save). Stderr-only so JSON
+  // consumers stay clean.
+  if (!asJson) {
+    process.stderr.write(
+      "memory search: deprecated — use `wiki search` for current content " +
+        "(memory_chunks frozen since 2026-05-02 step 5e)\n",
+    );
+  }
+  const results = await ms.search(query, {
+    mode,
+    limit,
+    caller,
+    expand,
+    scopeRerank,
+  });
+  if (asJson) {
+    console.log(JSON.stringify({ query, mode, results }, null, 2));
+    return;
+  }
+  if (!results.length) {
+    console.log("(no matches)");
+    return;
+  }
+  for (const r of results) {
+    const score =
+      mode === "hybrid"
+        ? `rrf=${(r.rrf || 0).toFixed(4)}`
+        : mode === "semantic"
+          ? `sem=${(r.sem_score || 0).toFixed(3)}`
+          : `fts=${(r.fts_score || 0).toFixed(3)}`;
+    const where = r.heading ? `${r.file} § ${r.heading}` : r.file;
+    const tag = r.expanded_from ? ` ← expanded from ${r.expanded_from}` : "";
+    console.log(`[${score}] ${where}${tag}`);
+    if (r.warnings && r.warnings.length) {
+      console.log(`  ⚠ ${r.warnings.join("; ")}`);
+    }
+    if (r.scope_reason === "scope_conflict") {
+      console.log(`  ⚠ scope conflict: chunk entities outside query scope`);
+    }
+    console.log(`  ${fmtSnippet(r.body)}`);
+    if (r.neighbors && r.neighbors.length && !r.expanded_from) {
+      const outs = r.neighbors
+        .filter((n) => n.direction === "out")
+        .map((n) => n.basename);
+      const ins = r.neighbors
+        .filter((n) => n.direction === "in")
+        .map((n) => n.basename);
+      const parts = [];
+      if (outs.length) parts.push(`links to: ${outs.join(", ")}`);
+      if (ins.length) parts.push(`linked from: ${ins.join(", ")}`);
+      if (parts.length) console.log(`  ↳ ${parts.join(" · ")}`);
+    }
+  }
+  console.log(`\n${results.length} result${results.length === 1 ? "" : "s"} (mode=${mode}${expand ? ", expand=on" : ""})`);
+}
+
+function cmdList() {
+  const file = flag("file");
+  const rows = ms.listEntries({ file: typeof file === "string" ? file : undefined });
+  if (!rows.length) {
+    console.log("(no entries — run `memory reindex`)");
+    return;
+  }
+  for (const r of rows) {
+    const flag = r.has_embedding ? "✓" : " ";
+    const where = r.heading ? `${r.file} § ${r.heading}` : r.file;
+    console.log(`[${flag}] ${where}${r.type ? `  (${r.type})` : ""}`);
+  }
+}
+
+function cmdShow() {
+  const file = positional()[0];
+  if (!file) die("show: need a memory filename, e.g. `memory show user_food_taste.md`");
+  const rows = ms.listEntries({ file });
+  if (!rows.length) die(`show: no indexed chunks for ${file}`);
+
+  const meta = ms.getFileMeta(file);
+  if (meta) {
+    console.log(`=== ${file} ===`);
+    if (meta.name) console.log(`name        : ${meta.name}`);
+    if (meta.type) console.log(`type        : ${meta.type}`);
+    console.log(`status      : ${meta.status}`);
+    const scope = JSON.parse(meta.scope_json || "[]");
+    if (scope.length) console.log(`scope       : ${scope.join(", ")}`);
+    const entities = JSON.parse(meta.entities_json || "[]");
+    if (entities.length) console.log(`entities    : ${entities.join(", ")}`);
+    if (meta.last_verified_at) console.log(`verified_at : ${meta.last_verified_at}`);
+    if (meta.confidence && meta.confidence !== "corroborating")
+      console.log(`confidence  : ${meta.confidence}`);
+    console.log();
+  }
+
+  for (const r of rows) {
+    console.log(`--- ${r.file} § ${r.heading || "(no heading)"} ---`);
+    if (r.type) console.log(`type: ${r.type}`);
+    if (r.tags) console.log(`tags: ${r.tags}`);
+    const ents = ms.getChunkEntities(r.id);
+    if (ents.length) console.log(`entities: ${ents.join(", ")}`);
+    console.log(r.body);
+    console.log();
+  }
+
+  // Links section — outgoing + incoming.
+  const forward = ms.getForwardLinks(file);
+  const back = ms.getBacklinks(file);
+  const superseders = ms.getSupersedersOf(file);
+  if (forward.length || back.length || superseders.length) {
+    console.log("=== links ===");
+    if (forward.length) {
+      const byType = {};
+      for (const r of forward) (byType[r.link_type] = byType[r.link_type] || []).push(r);
+      for (const [t, rows] of Object.entries(byType)) {
+        const lines = rows
+          .map((r) => (r.section ? `${r.dst} (§ ${r.section})` : r.dst))
+          .join(", ");
+        console.log(`  → ${t.padEnd(14)} ${lines}`);
+      }
+    }
+    if (back.length) {
+      const byType = {};
+      for (const r of back) (byType[r.link_type] = byType[r.link_type] || []).push(r);
+      for (const [t, rows] of Object.entries(byType)) {
+        const lines = rows.map((r) => r.src).join(", ");
+        console.log(`  ← ${t.padEnd(14)} ${lines}`);
+      }
+    }
+    if (superseders.length) {
+      console.log(`  ⚠ superseded-by: ${superseders.join(", ")}`);
+    }
+  }
+}
+
+function cmdStats() {
+  const s = ms.stats();
+  console.log(`chunks    : ${s.chunks}`);
+  console.log(`files     : ${s.files}`);
+  console.log(`embedded  : ${s.embedded} (${s.chunks ? Math.round((s.embedded / s.chunks) * 100) : 0}%)`);
+  console.log(`db        : ${ms.DB_PATH}`);
+  console.log(`source    : ${ms.MEMORY_DIR}`);
+  if (s.byType.length) {
+    console.log("\nby type:");
+    for (const t of s.byType) console.log(`  ${t.type.padEnd(14)} ${t.n}`);
+  }
+}
+
+function cmdLog() {
+  const n = Number(flag("tail", 20));
+  if (!fs.existsSync(ms.LOG_PATH)) {
+    console.log("(no retrieval log yet)");
+    return;
+  }
+  const lines = fs.readFileSync(ms.LOG_PATH, "utf8").split("\n").filter(Boolean);
+  for (const line of lines.slice(-n)) {
+    try {
+      const row = JSON.parse(line);
+      const top = (row.top || [])
+        .slice(0, 3)
+        .map((t) => `${t.file}${t.heading ? "§" : ""}`)
+        .join(", ");
+      console.log(
+        `${row.ts}  [${row.caller}] mode=${row.mode} lat=${row.latency_ms}ms q="${row.query}" → ${top}`,
+      );
+    } catch {
+      console.log(line);
+    }
+  }
+}
+
+async function cmdEval() {
+  const casesPath = String(flag("cases", DEFAULT_EVAL_CASES));
+  const asJson = Boolean(flag("json", false));
+  if (!fs.existsSync(casesPath)) die(`eval: cases file not found: ${casesPath}`);
+  const raw = JSON.parse(fs.readFileSync(casesPath, "utf8"));
+  const cases = raw.cases || raw;
+  if (!Array.isArray(cases) || !cases.length) die("eval: no cases in file");
+
+  const modes = ["fts", "semantic", "hybrid"];
+  const summary = {};
+  const details = [];
+  const latencies = { fts: [], semantic: [], hybrid: [] };
+
+  for (const mode of modes) {
+    let p1 = 0,
+      p3 = 0,
+      mrrSum = 0;
+    const perCompetency = {};
+    for (const c of cases) {
+      const start = Date.now();
+      const results = await ms.search(c.query, {
+        mode,
+        limit: 10,
+        caller: `eval:${mode}`,
+        log: false,
+        expand: false,
+      });
+      latencies[mode].push(Date.now() - start);
+      const files = results.map((r) => r.file);
+      const expected = Array.isArray(c.expected_files) ? c.expected_files : [c.expected_file];
+      const firstHitIx = files.findIndex((f) => expected.includes(f));
+      const hit1 = firstHitIx === 0 ? 1 : 0;
+      const hit3 = firstHitIx >= 0 && firstHitIx < 3 ? 1 : 0;
+      const rr = firstHitIx >= 0 ? 1 / (firstHitIx + 1) : 0;
+      p1 += hit1;
+      p3 += hit3;
+      mrrSum += rr;
+      const comp = c.competency || "retrieval";
+      perCompetency[comp] = perCompetency[comp] || { n: 0, p3: 0, bleeds: 0 };
+      perCompetency[comp].n++;
+      perCompetency[comp].p3 += hit3;
+      // scope/supersession leak detection: any file on the `expected_not_in_top3`
+      // list that shows up in top-3 is a bleed. Reports per-case + per-competency.
+      const bleeds = [];
+      if (Array.isArray(c.expected_not_in_top3) && c.expected_not_in_top3.length) {
+        const top3Files = files.slice(0, 3);
+        for (const bad of c.expected_not_in_top3) {
+          // Allow "file.md§Section" syntax — we ignore the section part here
+          // because the eval works at file granularity.
+          const badFile = bad.split("§")[0].trim();
+          if (top3Files.includes(badFile)) bleeds.push(badFile);
+        }
+        if (bleeds.length) perCompetency[comp].bleeds++;
+      }
+      details.push({
+        mode,
+        query: c.query,
+        expected,
+        top5: files.slice(0, 5),
+        first_hit_rank: firstHitIx >= 0 ? firstHitIx + 1 : null,
+        rr,
+        competency: comp,
+        bleeds,
+      });
+    }
+    const n = cases.length;
+    const lat = latencies[mode].slice().sort((a, b) => a - b);
+    const p50 = lat[Math.floor(lat.length / 2)] || 0;
+    const p95 = lat[Math.floor(lat.length * 0.95)] || 0;
+    summary[mode] = {
+      n,
+      "P@1": +(p1 / n).toFixed(3),
+      "P@3": +(p3 / n).toFixed(3),
+      MRR: +(mrrSum / n).toFixed(3),
+      latency_p50_ms: p50,
+      latency_p95_ms: p95,
+      by_competency: Object.fromEntries(
+        Object.entries(perCompetency).map(([k, v]) => [
+          k,
+          {
+            n: v.n,
+            "P@3": +(v.p3 / v.n).toFixed(3),
+            scope_bleeds: v.bleeds,
+          },
+        ]),
+      ),
+    };
+  }
+
+  const out = { ran_at: new Date().toISOString(), cases: cases.length, summary };
+  if (asJson) {
+    console.log(JSON.stringify({ ...out, details }, null, 2));
+    return;
+  }
+  console.log(`memory eval — ${cases.length} cases\n`);
+  console.log("mode     P@1     P@3     MRR    p50   p95");
+  for (const mode of modes) {
+    const s = summary[mode];
+    console.log(
+      `${mode.padEnd(8)} ${s["P@1"].toFixed(3)}   ${s["P@3"].toFixed(3)}   ${s.MRR.toFixed(3)}   ${String(s.latency_p50_ms).padStart(3)}ms ${String(s.latency_p95_ms).padStart(4)}ms`,
+    );
+  }
+  console.log("\nby competency (hybrid):");
+  const hybridComps = summary.hybrid.by_competency;
+  for (const [k, v] of Object.entries(hybridComps)) {
+    const bleed = v.scope_bleeds ? ` · bleeds=${v.scope_bleeds}` : "";
+    console.log(`  ${k.padEnd(16)} P@3=${v["P@3"].toFixed(3)} (n=${v.n})${bleed}`);
+  }
+  const misses = details.filter(
+    (d) => d.mode === "hybrid" && d.first_hit_rank === null,
+  );
+  if (misses.length) {
+    console.log(`\nhybrid misses (${misses.length}):`);
+    for (const m of misses) {
+      console.log(`  "${m.query}" → expected ${m.expected.join("|")} / got ${m.top5.slice(0, 3).join(", ")}`);
+    }
+  }
+  const bleeds = details.filter(
+    (d) => d.mode === "hybrid" && d.bleeds && d.bleeds.length,
+  );
+  if (bleeds.length) {
+    console.log(`\nhybrid scope bleeds (${bleeds.length}) — unwanted files in top-3:`);
+    for (const b of bleeds) {
+      console.log(`  "${b.query}" → ${b.bleeds.join(", ")}`);
+    }
+  }
+}
+
+function cmdLint() {
+  const asJson = Boolean(flag("json", false));
+  const onlySeverity = flag("severity"); // optional: error|warning|info
+  let issues = mlint.lint();
+  if (typeof onlySeverity === "string") {
+    issues = issues.filter((i) => i.severity === onlySeverity);
+  }
+  const summary = mlint.summarize(issues);
+  if (asJson) {
+    console.log(JSON.stringify({ summary, issues }, null, 2));
+    process.exitCode = summary.bySeverity.error > 0 ? 1 : 0;
+    return;
+  }
+  if (!issues.length) {
+    console.log("memory lint: clean");
+    return;
+  }
+  const pad = (s, n) => String(s || "").padEnd(n);
+  for (const i of issues) {
+    console.log(
+      `${pad(i.severity, 7)} ${pad(i.check, 22)} ${pad(i.file, 42)} ${i.message}`,
+    );
+  }
+  console.log(
+    `\n${summary.total} issue(s)  [errors=${summary.bySeverity.error || 0} warnings=${summary.bySeverity.warning || 0} info=${summary.bySeverity.info || 0}]`,
+  );
+  const byCheck = Object.entries(summary.byCheck)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}=${v}`)
+    .join("  ");
+  if (byCheck) console.log(`by check: ${byCheck}`);
+  process.exitCode = summary.bySeverity.error > 0 ? 1 : 0;
+}
+
+function cmdEntity() {
+  const sub = positional()[0] || "list";
+  if (sub === "list") {
+    const rows = ms
+      .db()
+      .prepare("SELECT id, type, status, scope_json FROM entities ORDER BY type, id")
+      .all();
+    if (!rows.length) {
+      console.log("(no entities — create _entities.yaml + run `memory reindex`)");
+      return;
+    }
+    const pad = (s, n) => String(s || "").padEnd(n);
+    for (const r of rows) {
+      const scope = JSON.parse(r.scope_json || "[]");
+      const s = scope.length ? `[${scope.join(",")}]` : "";
+      console.log(
+        `${pad(r.type, 10)} ${pad(r.id, 22)} ${pad(r.status, 10)} ${s}`,
+      );
+    }
+    console.log(`\n${rows.length} entities`);
+    return;
+  }
+  if (sub === "show") {
+    const id = positional()[1];
+    if (!id) die("entity show: need entity id");
+    const row = ms.db().prepare("SELECT * FROM entities WHERE id = ?").get(id);
+    if (!row) die(`entity show: no such id: ${id}`);
+    console.log(JSON.stringify({
+      ...row,
+      scope: JSON.parse(row.scope_json || "[]"),
+      aliases: JSON.parse(row.aliases_json || "[]"),
+      related: JSON.parse(row.related_json || "[]"),
+    }, null, 2));
+    return;
+  }
+  if (sub === "add") {
+    die("entity add: edit _entities.yaml directly and run `memory reindex`");
+  }
+  die(`entity: unknown subcommand ${sub}. Try list|show <id>|add`);
+}
+
+// `memory new` and `memory supersede` route through wiki-store as of step 5c
+// (2026-05-02). The on-disk .md still gets rendered by savePage's default
+// mode, but the write also produces a page_revisions row + refreshes
+// pages_fts in-transaction. `wiki edit` / `wiki new` / `wiki supersede` are
+// the more direct equivalents — these wrappers stay for backwards compat
+// with anything that scripted the legacy `memory` CLI.
+const wiki = require("../lib/wiki-store.js");
+
+async function cmdNew() {
+  const [type, ...nameParts] = positional();
+  if (!type) die("new: usage `memory new <type> <name>`, e.g. `memory new feedback pulse_cooldown`");
+  const validTypes = ["user", "feedback", "project", "reference"];
+  if (!validTypes.includes(type)) die(`new: type must be one of ${validTypes.join("|")}`);
+  const name = nameParts.join(" ").trim() || "new memory";
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const basename = `${type}_${slug}.md`;
+  const id = basename.replace(/\.md$/, "");
+  if (wiki.getPage(id)) die(`new: ${basename} already exists`);
+  const body = `---
+name: "${name}"
+description: "${name} — TODO: one-line hook for retrieval"
+type: ${type}
+scope: []
+status: active
+last_verified_at: ${new Date().toISOString().slice(0, 10)}
+---
+TODO: write the memory body. Use [[other_memory]] to link related memories.
+`;
+  const r = wiki.savePage(id, body, { editedBy: "memory:new" });
+  console.log(`created ${path.join(wiki.MEMORY_DIR, r.basename)}  (rev ${r.rev})`);
+}
+
+function cmdSupersede() {
+  const [oldName, newName] = positional();
+  if (!oldName || !newName)
+    die("supersede: usage `memory supersede <old.md> <new.md>`");
+  const oldId = oldName.replace(/\.md$/, "");
+  const newId = newName.replace(/\.md$/, "");
+  if (!wiki.getPage(newId)) die(`supersede: new page not found: ${newId}`);
+  if (!wiki.getPage(oldId)) die(`supersede: old page not found: ${oldId}`);
+  wiki.supersedePage(oldId, newId, { editedBy: "memory:supersede" });
+  console.log(`${newName} now supersedes ${oldName}`);
+  console.log(`${oldName} status → superseded`);
+  console.log(`(revisions tracked, pages_fts refreshed in-transaction; run \`memory reindex\` only if you need memory_chunks updated)`);
+}
+
+async function main() {
+  switch (cmd) {
+    case undefined:
+    case "help":
+    case "--help":
+    case "-h":
+      return usage();
+    case "reindex":
+      return cmdReindex();
+    case "search":
+      return cmdSearch();
+    case "list":
+      return cmdList();
+    case "show":
+      return cmdShow();
+    case "stats":
+      return cmdStats();
+    case "log":
+      return cmdLog();
+    case "eval":
+      return cmdEval();
+    case "lint":
+      return cmdLint();
+    case "entity":
+      return cmdEntity();
+    case "new":
+      return cmdNew();
+    case "supersede":
+      return cmdSupersede();
+    default:
+      die(`unknown command: ${cmd}. Try \`memory --help\`.`);
+  }
+}
+
+main()
+  .then(() => ms.closeDb())
+  .catch((err) => {
+    ms.closeDb();
+    die(err.stack || err.message);
+  });

@@ -1,0 +1,569 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1728CFE72F835409008F8BD7 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 99000001 /* Supabase */; };
+		1728CFE82F835409008F8BD7 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = 99000002 /* MarkdownUI */; };
+		AA000001 /* MerlinApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000001 /* MerlinApp.swift */; };
+		AA000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000002 /* ContentView.swift */; };
+		AA000003 /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000003 /* ChatViewModel.swift */; };
+		AA000004 /* Message.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000004 /* Message.swift */; };
+		AA000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB000005 /* Assets.xcassets */; };
+		AA000006 /* LockScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000007 /* LockScreen.swift */; };
+		AA000007 /* LocationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000008 /* LocationManager.swift */; };
+		AA000030 /* LocationTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000030 /* LocationTracker.swift */; };
+		AA000041 /* PhoneContextPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000041 /* PhoneContextPublisher.swift */; };
+		AA000042 /* WiFiContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000042 /* WiFiContext.swift */; };
+		AA000050 /* HealthKitManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000050 /* HealthKitManager.swift */; };
+		AA000008 /* CloudBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000009 /* CloudBackup.swift */; };
+		AA000018 /* MessageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000020 /* MessageStore.swift */; };
+		AA000010 /* MessageContentParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000010 /* MessageContentParser.swift */; };
+		AA000011 /* RichMessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000011 /* RichMessageView.swift */; };
+		AA000012 /* InlineImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000012 /* InlineImageView.swift */; };
+		AA000013 /* LinkPreviewCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000013 /* LinkPreviewCard.swift */; };
+		AA000014 /* SupabaseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000015 /* SupabaseManager.swift */; };
+		AA000015 /* MerlinIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000016 /* MerlinIntents.swift */; };
+		AA000060 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000060 /* SignInView.swift */; };
+		AA000070 /* MacKeychainStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000070 /* MacKeychainStorage.swift */; };
+		AA000080 /* MemoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000080 /* MemoryView.swift */; };
+		AA000016 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000017 /* NotificationService.swift */; };
+		AA000017 /* MerlinNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = CC000002 /* MerlinNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		33000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FF000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FF000003;
+			remoteInfo = MerlinNotificationService;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		DD000007 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				AA000017 /* MerlinNotificationService.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		BB000001 /* MerlinApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MerlinApp.swift; sourceTree = "<group>"; };
+		BB000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		BB000003 /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
+		BB000004 /* Message.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Message.swift; sourceTree = "<group>"; };
+		BB000005 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		BB000006 /* Merlin.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Merlin.entitlements; sourceTree = "<group>"; };
+		BB000007 /* LockScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LockScreen.swift; sourceTree = "<group>"; };
+		BB000008 /* LocationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationManager.swift; sourceTree = "<group>"; };
+		BB000030 /* LocationTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationTracker.swift; sourceTree = "<group>"; };
+		BB000041 /* PhoneContextPublisher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneContextPublisher.swift; sourceTree = "<group>"; };
+		BB000042 /* WiFiContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiContext.swift; sourceTree = "<group>"; };
+		BB000050 /* HealthKitManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthKitManager.swift; sourceTree = "<group>"; };
+		BB000009 /* CloudBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudBackup.swift; sourceTree = "<group>"; };
+		BB000020 /* MessageStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageStore.swift; sourceTree = "<group>"; };
+		BB000010 /* MessageContentParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageContentParser.swift; sourceTree = "<group>"; };
+		BB000011 /* RichMessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RichMessageView.swift; sourceTree = "<group>"; };
+		BB000012 /* InlineImageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineImageView.swift; sourceTree = "<group>"; };
+		BB000013 /* LinkPreviewCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LinkPreviewCard.swift; sourceTree = "<group>"; };
+		BB000014 /* Merlin-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Merlin-macOS.entitlements"; sourceTree = "<group>"; };
+		BB000015 /* SupabaseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupabaseManager.swift; sourceTree = "<group>"; };
+		BB000060 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
+		BB000070 /* MacKeychainStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacKeychainStorage.swift; sourceTree = "<group>"; };
+		BB000080 /* MemoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryView.swift; sourceTree = "<group>"; };
+		BB000016 /* MerlinIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MerlinIntents.swift; sourceTree = "<group>"; };
+		BB000017 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		BB000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB000019 /* MerlinNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MerlinNotificationService.entitlements; sourceTree = "<group>"; };
+		CC000001 /* Merlin.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Merlin.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC000002 /* MerlinNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MerlinNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DD000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1728CFE82F835409008F8BD7 /* MarkdownUI in Frameworks */,
+				1728CFE72F835409008F8BD7 /* Supabase in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		EE000001 = {
+			isa = PBXGroup;
+			children = (
+				EE000002 /* Merlin */,
+				EE000004 /* MerlinNotificationService */,
+				EE000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		EE000002 /* Merlin */ = {
+			isa = PBXGroup;
+			children = (
+				BB000001 /* MerlinApp.swift */,
+				BB000002 /* ContentView.swift */,
+				BB000003 /* ChatViewModel.swift */,
+				BB000004 /* Message.swift */,
+				BB000005 /* Assets.xcassets */,
+				BB000006 /* Merlin.entitlements */,
+				BB000014 /* Merlin-macOS.entitlements */,
+				BB000007 /* LockScreen.swift */,
+				BB000008 /* LocationManager.swift */,
+				BB000030 /* LocationTracker.swift */,
+				BB000041 /* PhoneContextPublisher.swift */,
+				BB000042 /* WiFiContext.swift */,
+				BB000050 /* HealthKitManager.swift */,
+				BB000009 /* CloudBackup.swift */,
+				BB000020 /* MessageStore.swift */,
+				BB000010 /* MessageContentParser.swift */,
+				BB000011 /* RichMessageView.swift */,
+				BB000012 /* InlineImageView.swift */,
+				BB000013 /* LinkPreviewCard.swift */,
+				BB000015 /* SupabaseManager.swift */,
+				BB000016 /* MerlinIntents.swift */,
+				BB000060 /* SignInView.swift */,
+				BB000070 /* MacKeychainStorage.swift */,
+				BB000080 /* MemoryView.swift */,
+			);
+			path = Merlin;
+			sourceTree = "<group>";
+		};
+		EE000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				CC000001 /* Merlin.app */,
+				CC000002 /* MerlinNotificationService.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		EE000004 /* MerlinNotificationService */ = {
+			isa = PBXGroup;
+			children = (
+				BB000017 /* NotificationService.swift */,
+				BB000018 /* Info.plist */,
+				BB000019 /* MerlinNotificationService.entitlements */,
+			);
+			path = MerlinNotificationService;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		FF000001 /* Merlin */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11000003 /* Build configuration list for PBXNativeTarget "Merlin" */;
+			buildPhases = (
+				DD000001 /* Sources */,
+				DD000002 /* Frameworks */,
+				DD000003 /* Resources */,
+				DD000007 /* Embed App Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				22000001 /* PBXTargetDependency */,
+			);
+			name = Merlin;
+			packageProductDependencies = (
+				99000001 /* Supabase */,
+				99000002 /* MarkdownUI */,
+			);
+			productName = Merlin;
+			productReference = CC000001 /* Merlin.app */;
+			productType = "com.apple.product-type.application";
+		};
+		FF000003 /* MerlinNotificationService */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 11000010 /* Build configuration list for PBXNativeTarget "MerlinNotificationService" */;
+			buildPhases = (
+				DD000004 /* Sources */,
+				DD000005 /* Frameworks */,
+				DD000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MerlinNotificationService;
+			productName = MerlinNotificationService;
+			productReference = CC000002 /* MerlinNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FF000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = 11000001 /* Build configuration list for PBXProject "Merlin" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = EE000001;
+			packageReferences = (
+				88000001 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+				88000002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
+			);
+			productRefGroup = EE000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				FF000001 /* Merlin */,
+				FF000003 /* MerlinNotificationService */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		DD000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000005 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		DD000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000001 /* MerlinApp.swift in Sources */,
+				AA000002 /* ContentView.swift in Sources */,
+				AA000003 /* ChatViewModel.swift in Sources */,
+				AA000004 /* Message.swift in Sources */,
+				AA000006 /* LockScreen.swift in Sources */,
+				AA000007 /* LocationManager.swift in Sources */,
+				AA000030 /* LocationTracker.swift in Sources */,
+				AA000041 /* PhoneContextPublisher.swift in Sources */,
+				AA000042 /* WiFiContext.swift in Sources */,
+				AA000050 /* HealthKitManager.swift in Sources */,
+				AA000008 /* CloudBackup.swift in Sources */,
+				AA000018 /* MessageStore.swift in Sources */,
+				AA000010 /* MessageContentParser.swift in Sources */,
+				AA000011 /* RichMessageView.swift in Sources */,
+				AA000012 /* InlineImageView.swift in Sources */,
+				AA000013 /* LinkPreviewCard.swift in Sources */,
+				AA000014 /* SupabaseManager.swift in Sources */,
+				AA000015 /* MerlinIntents.swift in Sources */,
+				AA000060 /* SignInView.swift in Sources */,
+				AA000070 /* MacKeychainStorage.swift in Sources */,
+				AA000080 /* MemoryView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DD000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000016 /* NotificationService.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		22000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FF000003 /* MerlinNotificationService */;
+			targetProxy = 33000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		11000004 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		11000005 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_OPTIMIZATION_LEVEL = s;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		11000006 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Merlin/Merlin.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Merlin/Merlin-macOS.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Merlin/Info.plist;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Merlin with Face ID";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Merlin tracks your location in the background to build a timeline of where you've been throughout the day.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
+				INFOPLIST_KEY_NSMotionUsageDescription = "Merlin uses motion data to detect whether you're walking, driving, or stationary.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Merlin reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Merlin does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Merlin reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		11000007 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Merlin/Merlin.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Merlin/Merlin-macOS.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Merlin/Info.plist;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSFaceIDUsageDescription = "Unlock Merlin with Face ID";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "Merlin tracks your location in the background to build a timeline of where you've been throughout the day.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Share your location when requested by the assistant";
+				INFOPLIST_KEY_NSMotionUsageDescription = "Merlin uses motion data to detect whether you're walking, driving, or stationary.";
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Merlin reads your health metrics — heart rate, sleep, workouts, activity — so your assistant can reason about your activity, recovery, and wellbeing.";
+				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Merlin does not write to Health. This string is present only because Apple requires it whenever HealthKit is linked.";
+				INFOPLIST_KEY_NSHealthClinicalHealthRecordsShareUsageDescription = "Merlin reads your clinical records — lab results, medications, allergies, conditions, immunizations, procedures, vitals — so your assistant can reason about your medical history alongside everything else it knows.";
+				INFOPLIST_KEY_UIBackgroundModes = "location remote-notification";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		11000008 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MerlinNotificationService/MerlinNotificationService.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MerlinNotificationService/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = MerlinNotificationService;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		11000009 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MerlinNotificationService/MerlinNotificationService.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = TEAMID_PLACEHOLDER;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MerlinNotificationService/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = MerlinNotificationService;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		11000001 /* Build configuration list for PBXProject "Merlin" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000004 /* Debug */,
+				11000005 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		11000003 /* Build configuration list for PBXNativeTarget "Merlin" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000006 /* Debug */,
+				11000007 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		11000010 /* Build configuration list for PBXNativeTarget "MerlinNotificationService" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				11000008 /* Debug */,
+				11000009 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		88000001 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/supabase-community/supabase-swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.0;
+			};
+		};
+		88000002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.4.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		99000001 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 88000001 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+		99000002 /* MarkdownUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 88000002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
+			productName = MarkdownUI;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = FF000002 /* Project object */;
+}

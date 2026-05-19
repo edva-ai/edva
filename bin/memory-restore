@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# memory-restore — restore auto-memory files from the backup repo.
+#
+# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its
+# own git repo (private ${MERLIN_BACKUP_REPO}) snapshotted every 30 min.
+# This script is how you walk that history back to a known-good state.
+#
+# Usage:
+#   memory-restore --list [--n N]                  Show recent snapshots
+#   memory-restore --diff <basename> [--at <ref>]  Show what would change
+#   memory-restore --file <basename> [--at <ref>]  Restore one file from <ref>
+#   memory-restore --snapshot <ref> [--dry-run]    Full restore from <ref>
+#   memory-restore --tarball <path>                Restore from a pre-reindex tarball
+#
+# <ref> defaults to HEAD~1 (the snapshot before the most recent commit).
+# Use --at HEAD@{2.hours.ago} or a commit hash for finer control.
+#
+# Safety:
+#   --file restores ONE file in place (overwrites it). The current state of
+#   that file is itself committed first as a safety snapshot, so nothing is
+#   lost — you can always restore further back.
+#   --snapshot does `git checkout <ref> -- .` after the same safety commit.
+#   --dry-run shows the diff without applying.
+
+set -euo pipefail
+
+MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}"
+TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$HOME/Dev/merlin/data/memory-snapshots}"
+
+if [[ ! -d "$MEMORY_DIR/.git" ]]; then
+  echo "memory-restore: $MEMORY_DIR is not a git repo" >&2
+  exit 2
+fi
+
+cd "$MEMORY_DIR"
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's|^# \{0,1\}||'
+}
+
+cmd=""
+arg=""
+ref="HEAD~1"
+n=20
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list)     cmd="list"; shift ;;
+    --diff)     cmd="diff"; arg="$2"; shift 2 ;;
+    --file)     cmd="file"; arg="$2"; shift 2 ;;
+    --snapshot) cmd="snapshot"; ref="$2"; shift 2 ;;
+    --tarball)  cmd="tarball"; arg="$2"; shift 2 ;;
+    --at)       ref="$2"; shift 2 ;;
+    --n)        n="$2"; shift 2 ;;
+    --dry-run)  dry_run=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *)
+      echo "memory-restore: unknown flag: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+# Take a safety snapshot of the current state before any destructive op.
+# That way the user can always `--snapshot HEAD~1` to undo whatever restore
+# they just ran.
+safety_snapshot() {
+  local label="$1"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    git commit -m "safety snapshot before $label" --quiet || true
+  fi
+}
+
+case "$cmd" in
+  list)
+    git log --oneline -n "$n"
+    ;;
+
+  diff)
+    if [[ -z "$arg" ]]; then
+      echo "memory-restore --diff: need a filename" >&2
+      exit 2
+    fi
+    git diff "$ref" -- "$arg"
+    ;;
+
+  file)
+    if [[ -z "$arg" ]]; then
+      echo "memory-restore --file: need a filename" >&2
+      exit 2
+    fi
+    if [[ "$dry_run" -eq 1 ]]; then
+      echo "=== would restore $arg from $ref ==="
+      git diff "$ref" -- "$arg"
+      exit 0
+    fi
+    safety_snapshot "restore $arg from $ref"
+    git checkout "$ref" -- "$arg"
+    git add "$arg"
+    git commit -m "restore $arg from $ref" --quiet
+    echo "memory-restore: $arg restored from $ref"
+    echo "  to undo: memory-restore --snapshot HEAD~1"
+    ;;
+
+  snapshot)
+    if [[ "$dry_run" -eq 1 ]]; then
+      echo "=== would restore everything to $ref ==="
+      git diff "$ref" --stat
+      exit 0
+    fi
+    echo "memory-restore: about to roll the entire memory dir back to $ref"
+    echo "  current HEAD: $(git log -1 --oneline)"
+    echo "  target      : $(git log -1 --oneline "$ref")"
+    read -r -p "  proceed? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      echo "memory-restore: aborted"
+      exit 0
+    fi
+    safety_snapshot "full restore to $ref"
+    git checkout "$ref" -- .
+    git add -A
+    git commit -m "full restore to $ref" --quiet || true
+    echo "memory-restore: rolled back to $ref"
+    echo "  to undo: memory-restore --snapshot HEAD~2"
+    ;;
+
+  tarball)
+    if [[ -z "$arg" ]]; then
+      echo "memory-restore --tarball: need a tarball path" >&2
+      exit 2
+    fi
+    # Allow either an absolute path or a basename inside TARBALL_DIR.
+    tarball="$arg"
+    if [[ ! -f "$tarball" && -f "$TARBALL_DIR/$arg" ]]; then
+      tarball="$TARBALL_DIR/$arg"
+    fi
+    if [[ ! -f "$tarball" ]]; then
+      echo "memory-restore: tarball not found: $arg" >&2
+      echo "  searched: $TARBALL_DIR/" >&2
+      exit 2
+    fi
+    if [[ "$dry_run" -eq 1 ]]; then
+      echo "=== contents of $tarball ==="
+      tar -tzf "$tarball" | head -50
+      exit 0
+    fi
+    echo "memory-restore: about to extract $tarball into $MEMORY_DIR"
+    read -r -p "  this overwrites current files. proceed? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      echo "memory-restore: aborted"
+      exit 0
+    fi
+    safety_snapshot "tarball restore from $(basename "$tarball")"
+    tar -xzf "$tarball" -C "$MEMORY_DIR" --strip-components=0
+    git add -A
+    git commit -m "restore from tarball $(basename "$tarball")" --quiet || true
+    echo "memory-restore: extracted $tarball"
+    ;;
+
+  "")
+    usage
+    exit 2
+    ;;
+esac

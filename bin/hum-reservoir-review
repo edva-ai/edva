@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+// Scan hum-ideas.jsonl for unconsumed ideas matching keyword(s) and mark them consumed.
+// Called when the user signals "already done/handled" or gives a skip/down reaction to a hum ping.
+//
+// Usage: hum-reservoir-review <keyword> [keyword2 ...] [--reason "text"] [--dry-run]
+//
+// Exit codes:
+//   0 — success (0 or more consumed)
+//   2 — no keywords provided
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const args = process.argv.slice(2);
+const dryRun = args.includes("--dry-run");
+const reasonIdx = args.indexOf("--reason");
+let customReason = null;
+if (reasonIdx !== -1) {
+  customReason = args[reasonIdx + 1];
+}
+
+const keywords = args.filter((a, i) => {
+  if (a.startsWith("--")) return false;
+  if (i > 0 && args[i - 1] === "--reason") return false;
+  return true;
+});
+
+if (keywords.length === 0) {
+  console.error("usage: hum-reservoir-review <keyword> [keyword2 ...] [--reason text] [--dry-run]");
+  process.exit(2);
+}
+
+const file = path.join(os.homedir(), "dev/merlin/data/hum-ideas.jsonl");
+
+if (!fs.existsSync(file)) {
+  console.log("0 matches (reservoir file not found)");
+  process.exit(0);
+}
+
+const lines = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
+
+// Collapse by id — later records override earlier ones
+const byId = new Map();
+for (const line of lines) {
+  try {
+    const obj = JSON.parse(line);
+    if (!obj.id) continue;
+    const existing = byId.get(obj.id) || {};
+    byId.set(obj.id, { ...existing, ...obj });
+  } catch {
+    // skip malformed lines
+  }
+}
+
+// Build search string for each idea — subject + rationale + category + why_now
+function searchText(idea) {
+  return [
+    idea.subject || "",
+    idea.rationale || "",
+    idea.category || "",
+    idea.why_now || "",
+    JSON.stringify(idea.supporting_data || {}),
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+const lowerKeywords = keywords.map((k) => k.toLowerCase());
+
+function matches(idea) {
+  const text = searchText(idea);
+  return lowerKeywords.some((kw) => text.includes(kw));
+}
+
+const unconsumed = [...byId.values()].filter((idea) => !idea.consumed);
+const matched = unconsumed.filter(matches);
+
+if (matched.length === 0) {
+  console.log(`0 matches for keywords: ${keywords.join(", ")}`);
+  process.exit(0);
+}
+
+if (dryRun) {
+  console.log(`[dry-run] would consume ${matched.length} idea(s):`);
+  for (const idea of matched) {
+    console.log(`  ${idea.id} — ${idea.subject}`);
+  }
+  process.exit(0);
+}
+
+const now = new Date().toISOString();
+const reason = customReason || `feedback signal: ${keywords.join(", ")}`;
+
+const toAppend = matched
+  .map((idea) =>
+    JSON.stringify({
+      id: idea.id,
+      consumed: true,
+      consumed_at: now,
+      consumed_reason: reason,
+      ping_id: null,
+    })
+  )
+  .join("\n");
+
+fs.appendFileSync(file, "\n" + toAppend + "\n");
+
+console.log(`consumed ${matched.length} idea(s) matching [${keywords.join(", ")}]:`);
+for (const idea of matched) {
+  console.log(`  ${idea.id} — ${idea.subject}`);
+}

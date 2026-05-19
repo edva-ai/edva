@@ -1,0 +1,225 @@
+#!/usr/bin/env node
+// wiki-audit — nightly re-evaluation of the pinned-page subset.
+//
+// Reads the wiki access log (`data/wiki-access.jsonl`) for the last N
+// days and decides:
+//   - Pin: any unpinned active page hit by MCP tools >= PIN_THRESHOLD times.
+//   - Unpin: any pinned page that has been pinned for >= TENURE_DAYS and
+//            received zero MCP hits in the window. pin_locked pages are
+//            skipped — they're identity / always-needed anchors that can't
+//            be measured by tool-call frequency (the SessionStart hook
+//            injects them, so agents never explicitly fetch them).
+//
+// Usage:
+//   wiki-audit                  # apply changes + email the user on changes
+//   wiki-audit --dry-run        # report only, no DB or email writes
+//   wiki-audit --no-email       # apply changes, skip email
+//   wiki-audit --window-days N  # change the lookback window (default 7)
+//   wiki-audit --pin-threshold N  # default 5
+//   wiki-audit --json           # machine-readable summary
+
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const ws = require("../lib/wiki-store.js");
+
+const args = process.argv.slice(2);
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+const DRY_RUN = Boolean(flag("dry-run", false));
+const NO_EMAIL = Boolean(flag("no-email", false));
+const AS_JSON = Boolean(flag("json", false));
+const WINDOW_DAYS = Number(flag("window-days", 7));
+const PIN_THRESHOLD = Number(flag("pin-threshold", 5));
+const TENURE_DAYS = Number(flag("tenure-days", 7));
+const EMAIL_TO = String(flag("email-to", "${MERLIN_OWNER_EMAIL}"));
+
+const sinceMs = Date.now() - WINDOW_DAYS * 24 * 3600 * 1000;
+
+function audit() {
+  const access = ws.readAccessLog({ sinceMs, onlyCallers: ["mcp"] });
+  const pages = ws.listPages({ status: "active" });
+  const pinNow = [];
+  const unpinNow = [];
+  const stayPinned = [];
+  const stayUnpinned = [];
+  const skippedLocked = [];
+  const tooFresh = [];
+
+  for (const p of pages) {
+    const hits = access.counts.get(p.id) || 0;
+    const isPinned = !!p.pinned;
+    if (isPinned) {
+      // Unpin?
+      if (p.pin_locked) {
+        skippedLocked.push({ ...p, hits });
+        continue;
+      }
+      if (hits === 0) {
+        // Tenure check.
+        const pinnedAt = p.pinned_at ? Date.parse(p.pinned_at) : null;
+        if (
+          pinnedAt &&
+          Number.isFinite(pinnedAt) &&
+          Date.now() - pinnedAt < TENURE_DAYS * 24 * 3600 * 1000
+        ) {
+          tooFresh.push({ ...p, hits });
+        } else {
+          unpinNow.push({ ...p, hits });
+        }
+      } else {
+        stayPinned.push({ ...p, hits });
+      }
+    } else {
+      // Pin?
+      if (hits >= PIN_THRESHOLD) {
+        pinNow.push({ ...p, hits });
+      } else {
+        stayUnpinned.push({ ...p, hits });
+      }
+    }
+  }
+
+  return {
+    window_days: WINDOW_DAYS,
+    pin_threshold: PIN_THRESHOLD,
+    tenure_days: TENURE_DAYS,
+    access_summary: {
+      entries: access.total_entries,
+      hits: access.total_hits,
+      by_tool: access.by_tool,
+    },
+    pin_now: pinNow,
+    unpin_now: unpinNow,
+    stay_pinned: stayPinned,
+    stay_unpinned: stayUnpinned,
+    skipped_locked: skippedLocked,
+    too_fresh: tooFresh,
+  };
+}
+
+function applyChanges(report) {
+  const editedBy = "wiki-audit";
+  for (const p of report.pin_now) {
+    ws.setPinned(p.id, true, { editedBy });
+  }
+  for (const p of report.unpin_now) {
+    ws.setPinned(p.id, false, { editedBy });
+  }
+}
+
+function fmtList(items, key = "id") {
+  if (!items.length) return "  (none)\n";
+  return items.map((p) => `  - ${p[key]} (hits=${p.hits}) — ${p.title || ""}`).join("\n") + "\n";
+}
+
+function buildText(report) {
+  const lines = [];
+  lines.push(`Wiki pin audit — ${new Date().toISOString().slice(0, 10)}`);
+  lines.push("");
+  lines.push(
+    `Window: last ${report.window_days}d. ${report.access_summary.entries} log entries, ${report.access_summary.hits} page hits (MCP only).`,
+  );
+  lines.push(
+    `By tool: ${Object.entries(report.access_summary.by_tool).map(([k, v]) => `${k}=${v}`).join(", ") || "(none)"}`,
+  );
+  lines.push("");
+  lines.push(`Pin (newly pinned, ${report.pin_now.length}):`);
+  lines.push(fmtList(report.pin_now));
+  lines.push(`Unpin (newly unpinned, ${report.unpin_now.length}):`);
+  lines.push(fmtList(report.unpin_now));
+  lines.push(`Pinned, still active (${report.stay_pinned.length}):`);
+  lines.push(fmtList(report.stay_pinned));
+  lines.push(`Pinned, locked — skipped from auto-unpin (${report.skipped_locked.length}):`);
+  lines.push(fmtList(report.skipped_locked));
+  lines.push(`Pinned, idle but too fresh to unpin (${report.too_fresh.length}):`);
+  lines.push(fmtList(report.too_fresh));
+  return lines.join("\n");
+}
+
+function buildHtml(report) {
+  const esc = (s) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    })[c]);
+  const li = (items) =>
+    items.length
+      ? `<ul>${items
+          .map(
+            (p) =>
+              `<li><code>${esc(p.id)}</code> <small>(hits=${p.hits})</small> — ${esc(p.title || "")}</li>`,
+          )
+          .join("")}</ul>`
+      : `<p style="color:#999;margin:4px 0 0">(none)</p>`;
+
+  return `<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:14px;color:#222;max-width:680px;line-height:1.5">
+<h2 style="margin:0 0 4px">Wiki pin audit — ${new Date().toISOString().slice(0, 10)}</h2>
+<p style="color:#666;margin:0 0 16px">Window: last ${report.window_days}d. ${report.access_summary.entries} log entries, ${report.access_summary.hits} page hits (MCP only).
+By tool: ${esc(Object.entries(report.access_summary.by_tool).map(([k, v]) => `${k}=${v}`).join(", ") || "(none)")}.</p>
+
+<h3 style="color:#0a8a1d">📌 Pinned (${report.pin_now.length})</h3>
+${li(report.pin_now)}
+
+<h3 style="color:#a83d2c">📍 Unpinned (${report.unpin_now.length})</h3>
+${li(report.unpin_now)}
+
+<details><summary>Pinned, still active (${report.stay_pinned.length})</summary>${li(report.stay_pinned)}</details>
+<details><summary>Pinned, locked (${report.skipped_locked.length})</summary>${li(report.skipped_locked)}</details>
+<details><summary>Pinned, too fresh to unpin (${report.too_fresh.length})</summary>${li(report.too_fresh)}</details>
+
+<p style="color:#999;font-size:12px;margin-top:24px">Auditor: <code>bin/wiki-audit</code> — pin if &ge; ${report.pin_threshold} hits in ${report.window_days}d, unpin if 0 hits and pinned &ge; ${report.tenure_days}d (skipped if pin_locked=1).</p>
+</body></html>`;
+}
+
+function sendEmail(report) {
+  const dataDir = path.join(process.env.MERLIN_HOME || path.join(os.homedir(), "Dev/merlin"), "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const tmp = path.join(dataDir, `.wiki-audit-${Date.now()}.html`);
+  fs.writeFileSync(tmp, buildHtml(report));
+  const ymd = new Date().toISOString().slice(0, 10);
+  const subj = `Wiki pin audit — ${report.pin_now.length}↑ ${report.unpin_now.length}↓ (${ymd})`;
+  const r = spawnSync(
+    path.join(os.homedir(), "dev/merlin/bin/email-send"),
+    ["--to", EMAIL_TO, "--subject", subj, "--body-file", tmp, "--html"],
+    { stdio: "inherit" },
+  );
+  try {
+    fs.unlinkSync(tmp);
+  } catch {}
+  if (r.status !== 0) {
+    console.error("wiki-audit: email-send failed (continuing)");
+  }
+}
+
+const report = audit();
+const txt = buildText(report);
+
+if (AS_JSON) {
+  console.log(JSON.stringify(report, null, 2));
+} else {
+  console.log(txt);
+}
+
+const hasChanges = report.pin_now.length || report.unpin_now.length;
+
+if (DRY_RUN) {
+  if (!AS_JSON) console.log("\n(dry-run: no changes applied, no email sent)");
+} else if (hasChanges) {
+  applyChanges(report);
+  if (!NO_EMAIL) sendEmail(report);
+}
+
+ws.closeDb();

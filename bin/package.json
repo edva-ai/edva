@@ -1,0 +1,9 @@
+{
+  "name": "tools-bin",
+  "private": true,
+  "dependencies": {
+    "@1password/sdk": "^0.4.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "node-html-parser": "^6.1.13"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "./agents.schema.json",
+  "_comment": "Central launch config for all agents. Consumed by launcher.sh, watchdog.sh, and supervisor. Change settings here, not in shell scripts.",
+  "agents": {
+    "chat": {
+      "model": "sonnet",
+      "fallbackModel": "haiku",
+      "cwd": "agent/chat-agent",
+      "runtime": "supervisor",
+      "devChannels": [],
+      "permissionMode": "bypassPermissions",
+      "allowedTools": [
+        "Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch", "Glob", "Grep", "Agent",
+        "mcp__tools__*",
+        "mcp__phone-channel__*",
+        "mcp__claude_ai_Gmail__*",
+        "mcp__claude_ai_Google_Calendar__*",
+        "mcp__claude_ai_Slack__*",
+        "mcp__supabase-merlin__*",
+        "mcp__gtasks__*"
+      ],
+      "remoteControlPrefix": "chat-agent",
+      "supervisor": {
+        "healthPort": 9094
+      }
+    },
+    "ops": {
+      "model": "opus",
+      "fallbackModel": "sonnet",
+      "effort": "xhigh",
+      "_effort_comment": "Defensive explicit setting — Opus 4.7 on Max defaults to xhigh per Anthropic 2026-04-16 announcement, but making it explicit at spawn time guarantees the level regardless of any future default shift. Session-scoped: changes require supervisor restart.",
+      "cwd": "agent/ops-agent",
+      "runtime": "supervisor",
+      "devChannels": [],
+      "permissionMode": "bypassPermissions",
+      "allowedTools": [
+        "Bash", "Read", "Edit", "Write", "WebFetch", "WebSearch", "Glob", "Grep", "Agent",
+        "mcp__tools__*",
+        "mcp__chrome-devtools__*",
+        "mcp__claude_ai_Gmail__*",
+        "mcp__claude_ai_Google_Calendar__*",
+        "mcp__claude_ai_Slack__*",
+        "mcp__supabase-merlin__*",
+        "mcp__gtasks__*"
+      ],
+      "remoteControlPrefix": "ops-agent",
+      "supervisor": {
+        "controlPort": 9091,
+        "gmailPubsubPort": 9090,
+        "webhookPort": 9092,
+        "healthPort": 9093
+      }
+    }
+  }
+}

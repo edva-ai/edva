@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# memory-snapshot — commit + push the auto-memory dir to its private backup repo.
+#
+# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its
+# own git repo (separate from the merlin code repo) tracking ${MERLIN_BACKUP_REPO}.
+# This script is the auto-commit driver: every N minutes (cron-driven), it stages
+# everything, commits if there are changes, and pushes to origin.
+#
+# Usage:
+#   memory-snapshot              # commit + push (default)
+#   memory-snapshot --no-push    # local snapshot only
+#   memory-snapshot --message    # custom commit message (default: timestamp)
+#   memory-snapshot --quiet      # no output unless something happens
+#
+# Exit codes:
+#   0 — success (committed + pushed, or no changes)
+#   1 — git error (commit/push failed)
+#   2 — repo not initialized
+
+set -euo pipefail
+
+MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}"
+
+PUSH=1
+QUIET=0
+MESSAGE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-push) PUSH=0; shift ;;
+    --quiet)   QUIET=1; shift ;;
+    --message) MESSAGE="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,15p' "$0" | sed 's|^# \{0,1\}||'
+      exit 0
+      ;;
+    *)
+      echo "memory-snapshot: unknown flag: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -d "$MEMORY_DIR/.git" ]]; then
+  echo "memory-snapshot: $MEMORY_DIR is not a git repo" >&2
+  echo "  init with: cd '$MEMORY_DIR' && git init && git remote add origin <url>" >&2
+  exit 2
+fi
+
+log() {
+  if [[ "$QUIET" -eq 0 ]]; then
+    echo "$@"
+  fi
+}
+
+# Refresh the .md mirror from the wiki DB (post-step-5d, the DB is
+# authoritative and saves no longer touch disk). This makes the file-based
+# backup capture every page's current content. `wiki render-all` is
+# idempotent — files are only rewritten when DB content has changed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WIKI="$SCRIPT_DIR/wiki"
+if [[ -x "$WIKI" ]]; then
+  "$WIKI" render-all "$MEMORY_DIR" >/dev/null 2>&1 || true
+fi
+
+# Check if there are any unstaged or untracked changes worth committing.
+# git status --porcelain is empty when working tree is clean.
+cd "$MEMORY_DIR"
+if [[ -z "$(git status --porcelain)" ]]; then
+  log "memory-snapshot: clean — no changes to commit"
+  exit 0
+fi
+
+git add -A
+
+# Compose commit message. Default: terse one-liner with a per-file count.
+if [[ -z "$MESSAGE" ]]; then
+  TS="$(date '+%Y-%m-%d %H:%M %Z')"
+  CHANGED="$(git diff --cached --name-only | wc -l | tr -d ' ')"
+  MESSAGE="snapshot ${TS} (${CHANGED} file$([ "$CHANGED" = "1" ] || echo s))"
+fi
+
+if ! git commit -m "$MESSAGE" --quiet; then
+  echo "memory-snapshot: git commit failed" >&2
+  exit 1
+fi
+
+log "memory-snapshot: committed — $(git log -1 --oneline)"
+
+if [[ "$PUSH" -eq 1 ]]; then
+  if ! git push --quiet 2>&1; then
+    echo "memory-snapshot: WARNING — local commit succeeded but push failed (will retry next snapshot)" >&2
+    exit 1
+  fi
+  log "memory-snapshot: pushed to $(git config --get remote.origin.url 2>/dev/null || echo origin)"
+fi

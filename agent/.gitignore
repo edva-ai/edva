@@ -1,0 +1,4 @@
+node_modules/
+logs/
+whatsapp-bridge/wa-auth/
+.DS_Store

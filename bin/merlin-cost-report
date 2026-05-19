@@ -1,0 +1,282 @@
+#!/usr/bin/env node
+// merlin-cost-report — per-job usage rollup from job-costs.ndjson.
+//
+// Added 2026-04-23 alongside the supervisor's per-turn job attribution.
+// Consumed by nightly-review's cost-optimization lens and by interactive
+// queries ("which jobs spent the most yesterday?").
+//
+// Usage:
+//   merlin-cost-report                          last 24h, table by job (desc cost)
+//   merlin-cost-report --since 7d               last 7d
+//   merlin-cost-report --since 2026-04-20       since a specific date (ET midnight)
+//   merlin-cost-report --json                   structured output for nightly-review
+//   merlin-cost-report --job hum                filter to one job, per-dispatch detail
+//   merlin-cost-report --trend 7d               per-day cost/job grid for the window
+//   merlin-cost-report --outliers               flag jobs whose last-24h cost is >1.5x their 7d avg
+//
+// Reads: agent/logs/supervisor-ops/job-costs.ndjson
+// (chat-agent has no job field — chat-supervisor writes cost.ndjson only.)
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const HOME = os.homedir();
+const JOB_COSTS = path.join(HOME, 'dev/merlin/agent/logs/supervisor-ops/job-costs.ndjson');
+
+// --- arg parsing ---
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const arg = (name, def = null) => {
+  const i = args.indexOf(name);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : def;
+};
+
+if (flag('--help') || flag('-h')) {
+  console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(0, 20).filter(l => l.startsWith('//')).map(l => l.slice(3)).join('\n'));
+  process.exit(0);
+}
+
+const SINCE_STR = arg('--since', '24h');
+const ASJSON = flag('--json');
+const TRENDFLAG = flag('--trend');
+const OUTLIERS = flag('--outliers');
+const JOB_FILTER = arg('--job', null);
+
+// Per the Max-only auth invariant (agent/CLAUDE.md § Auth Model), no
+// component should be making API-key-billed Anthropic calls. The
+// `total_cost_usd` field in job-costs.ndjson comes from the Claude SDK's
+// own usage estimate and is therefore phantom — never actual billed spend.
+// Treat the dollar figures as informational ratios only; suppress them by
+// default in user-facing output, surface explicitly with --show-phantom.
+// Triggered by 4/27, 4/28, 4/29, 4/30 nightly reviews repeatedly flagging
+// "$20K/day for webhook" outlier alerts on synthetic numbers.
+const API_KEY_BILLED = !!process.env.ANTHROPIC_API_KEY;
+const PHANTOM = !API_KEY_BILLED;
+const SHOW_PHANTOM = flag('--show-phantom');
+const PHANTOM_BANNER = "[!] dollar figures are SDK-estimated (Max-only auth — no actual API spend). Use ratios for relative attribution only.";
+
+// --- parse --since ---
+function parseSince(s) {
+  // "24h" | "7d" | "14d" | "2026-04-20" | "24h"
+  const m = /^(\d+)([hd])$/.exec(s);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const ms = m[2] === 'h' ? n * 3600_000 : n * 86400_000;
+    return new Date(Date.now() - ms);
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    // anchor to ET midnight so day boundaries are human-sensible
+    const etMidnight = new Date(`${s}T00:00:00-04:00`);
+    return etMidnight;
+  }
+  throw new Error(`unrecognized --since value: ${s} (use "24h", "7d", or "YYYY-MM-DD")`);
+}
+const SINCE = parseSince(SINCE_STR);
+
+// --- load + filter rows ---
+if (!fs.existsSync(JOB_COSTS)) {
+  console.error(`no job-costs.ndjson at ${JOB_COSTS} — supervisor hasn't written any turns yet (or restart pending)`);
+  process.exit(1);
+}
+
+const rows = [];
+for (const line of fs.readFileSync(JOB_COSTS, 'utf8').split('\n')) {
+  const t = line.trim();
+  if (!t) continue;
+  try {
+    const row = JSON.parse(t);
+    if (new Date(row.ts) < SINCE) continue;
+    if (JOB_FILTER && row.source !== JOB_FILTER) continue;
+    rows.push(row);
+  } catch { /* skip bad lines */ }
+}
+
+if (rows.length === 0) {
+  console.error(`no job-cost rows since ${SINCE.toISOString()}${JOB_FILTER ? ` for job=${JOB_FILTER}` : ''}`);
+  process.exit(0);
+}
+
+// --- aggregation helpers ---
+function emptyStats() {
+  return {
+    dispatches: 0,
+    total_cost_usd: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    web_search_requests: 0,
+    total_duration_ms: 0,
+    total_turns: 0,
+    first_ts: null,
+    last_ts: null,
+  };
+}
+function add(stats, row) {
+  stats.dispatches += 1;
+  stats.total_cost_usd += row.total_cost_usd || 0;
+  stats.input_tokens += row.input_tokens || 0;
+  stats.output_tokens += row.output_tokens || 0;
+  stats.cache_read_tokens += row.cache_read_tokens || 0;
+  stats.cache_creation_tokens += row.cache_creation_tokens || 0;
+  stats.web_search_requests += row.web_search_requests || 0;
+  stats.total_duration_ms += row.duration_ms || 0;
+  stats.total_turns += row.num_turns || 0;
+  if (!stats.first_ts || row.ts < stats.first_ts) stats.first_ts = row.ts;
+  if (!stats.last_ts || row.ts > stats.last_ts) stats.last_ts = row.ts;
+}
+function fmt(n) { return n.toLocaleString('en-US'); }
+function hum(n) { if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'; if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'; return String(n); }
+
+// --- by-job rollup (default view) ---
+const byJob = new Map();
+for (const row of rows) {
+  const src = row.source || '(unknown)';
+  if (!byJob.has(src)) byJob.set(src, emptyStats());
+  add(byJob.get(src), row);
+}
+const jobSummary = [...byJob.entries()]
+  .map(([source, stats]) => ({
+    source,
+    dispatches: stats.dispatches,
+    total_cost_usd: +stats.total_cost_usd.toFixed(4),
+    avg_cost_per_dispatch: +(stats.total_cost_usd / stats.dispatches).toFixed(4),
+    input_tokens: stats.input_tokens,
+    output_tokens: stats.output_tokens,
+    cache_read_tokens: stats.cache_read_tokens,
+    cache_creation_tokens: stats.cache_creation_tokens,
+    web_search_requests: stats.web_search_requests,
+    total_duration_ms: stats.total_duration_ms,
+    total_turns: stats.total_turns,
+    first_ts: stats.first_ts,
+    last_ts: stats.last_ts,
+  }))
+  .sort((a, b) => b.total_cost_usd - a.total_cost_usd);
+
+// --- outlier detection (24h vs 7d avg) ---
+function loadWindow(startMs, endMs) {
+  const all = new Map();
+  for (const line of fs.readFileSync(JOB_COSTS, 'utf8').split('\n')) {
+    const t = line.trim(); if (!t) continue;
+    try {
+      const row = JSON.parse(t);
+      const ts = new Date(row.ts).getTime();
+      if (ts < startMs || ts >= endMs) continue;
+      const src = row.source || '(unknown)';
+      if (!all.has(src)) all.set(src, emptyStats());
+      add(all.get(src), row);
+    } catch {}
+  }
+  return all;
+}
+
+if (OUTLIERS) {
+  // Outlier detection on phantom dollar figures produces phantom alerts —
+  // the past four nightly reviews chased $20K/day "anomalies" on inputs
+  // that were never billed. Suppress unless explicitly opted in, and route
+  // surveys to dispatch counts + token volumes instead.
+  if (PHANTOM && !SHOW_PHANTOM) {
+    if (ASJSON) {
+      console.log(JSON.stringify({
+        window: '24h vs 6d avg',
+        outliers: [],
+        suppressed: true,
+        reason: 'phantom-cost-disabled',
+        note: PHANTOM_BANNER,
+      }, null, 2));
+    } else {
+      console.log(PHANTOM_BANNER);
+      console.log("(--outliers suppressed; re-run with --show-phantom to see SDK-estimated ratios)");
+    }
+    process.exit(0);
+  }
+  const now = Date.now();
+  const last24 = loadWindow(now - 86400_000, now);
+  const prev6d = loadWindow(now - 7 * 86400_000, now - 86400_000);
+  const outliers = [];
+  for (const [source, today] of last24.entries()) {
+    const prev = prev6d.get(source);
+    if (!prev || prev.dispatches === 0) continue;
+    const prevDailyAvg = prev.total_cost_usd / 6; // 6 days before yesterday
+    if (prevDailyAvg < 0.01) continue; // noise floor
+    const ratio = today.total_cost_usd / prevDailyAvg;
+    if (ratio >= 1.5 || ratio <= 0.5) {
+      outliers.push({
+        source,
+        last_24h_cost_usd: +today.total_cost_usd.toFixed(4),
+        prev_6d_daily_avg_usd: +prevDailyAvg.toFixed(4),
+        ratio: +ratio.toFixed(2),
+        direction: ratio >= 1.5 ? 'up' : 'down',
+        dispatches_24h: today.dispatches,
+      });
+    }
+  }
+  outliers.sort((a, b) => Math.abs(b.ratio - 1) - Math.abs(a.ratio - 1));
+  if (ASJSON) { console.log(JSON.stringify({ window: '24h vs 6d avg', outliers, phantom: PHANTOM, note: PHANTOM ? PHANTOM_BANNER : null }, null, 2)); process.exit(0); }
+  if (outliers.length === 0) { console.log('no cost outliers in the last 24h (threshold: 1.5x or 0.5x of prior 6-day daily avg)'); process.exit(0); }
+  if (PHANTOM) console.log(PHANTOM_BANNER);
+  console.log(`COST OUTLIERS (last 24h vs prior 6-day avg)`);
+  console.log(`${'job'.padEnd(24)} ${'24h $'.padStart(10)} ${'6d avg $/d'.padStart(12)} ${'ratio'.padStart(7)} ${'dir'.padStart(5)} ${'runs'.padStart(5)}`);
+  for (const o of outliers) {
+    console.log(`${o.source.padEnd(24)} ${o.last_24h_cost_usd.toFixed(4).padStart(10)} ${o.prev_6d_daily_avg_usd.toFixed(4).padStart(12)} ${o.ratio.toFixed(2).padStart(7)} ${o.direction.padStart(5)} ${String(o.dispatches_24h).padStart(5)}`);
+  }
+  process.exit(0);
+}
+
+// --- trend grid (per-day × per-job) ---
+if (TRENDFLAG) {
+  const byDay = new Map(); // day → Map<source, stats>
+  for (const row of rows) {
+    const d = row.ts.slice(0, 10);
+    if (!byDay.has(d)) byDay.set(d, new Map());
+    const day = byDay.get(d);
+    const src = row.source || '(unknown)';
+    if (!day.has(src)) day.set(src, emptyStats());
+    add(day.get(src), row);
+  }
+  if (ASJSON) {
+    const out = {};
+    for (const [d, m] of byDay) out[d] = Object.fromEntries([...m].map(([s, v]) => [s, { dispatches: v.dispatches, cost_usd: +v.total_cost_usd.toFixed(4) }]));
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(0);
+  }
+  const allSources = [...new Set([...byDay.values()].flatMap(m => [...m.keys()]))].sort();
+  const days = [...byDay.keys()].sort();
+  console.log(`COST TREND (since ${SINCE.toISOString().slice(0, 10)}) — $ per job per day`);
+  console.log(`${'job'.padEnd(24)} ${days.map(d => d.slice(5).padStart(7)).join(' ')}`);
+  for (const src of allSources) {
+    const cells = days.map(d => {
+      const st = byDay.get(d).get(src);
+      return st ? st.total_cost_usd.toFixed(2).padStart(7) : '     -.';
+    });
+    console.log(`${src.padEnd(24)} ${cells.join(' ')}`);
+  }
+  process.exit(0);
+}
+
+// --- per-dispatch detail (with --job) ---
+if (JOB_FILTER) {
+  if (ASJSON) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+  console.log(`DISPATCHES for job=${JOB_FILTER} since ${SINCE.toISOString().slice(0, 16).replace('T', ' ')} UTC`);
+  console.log(`${'ts'.padEnd(20)} ${'id'.padEnd(6)} ${'cost $'.padStart(8)} ${'dur'.padStart(6)} ${'turns'.padStart(5)} ${'in'.padStart(7)} ${'out'.padStart(7)} ${'cache_r'.padStart(8)} ${'cache_c'.padStart(8)} ${'web'.padStart(4)}`);
+  for (const r of rows.sort((a, b) => a.ts.localeCompare(b.ts))) {
+    console.log(`${r.ts.slice(0, 19).replace('T', ' ').padEnd(20)} ${(r.short_id || '').padEnd(6)} ${(r.total_cost_usd || 0).toFixed(4).padStart(8)} ${((r.duration_ms || 0) / 1000).toFixed(1).padStart(6)} ${String(r.num_turns || 0).padStart(5)} ${hum(r.input_tokens || 0).padStart(7)} ${hum(r.output_tokens || 0).padStart(7)} ${hum(r.cache_read_tokens || 0).padStart(8)} ${hum(r.cache_creation_tokens || 0).padStart(8)} ${String(r.web_search_requests || 0).padStart(4)}`);
+  }
+  const total = rows.reduce((s, r) => s + (r.total_cost_usd || 0), 0);
+  console.log(`\n${rows.length} dispatches, total $${total.toFixed(4)}`);
+  process.exit(0);
+}
+
+// --- default: by-job summary ---
+if (ASJSON) { console.log(JSON.stringify({ since: SINCE.toISOString(), phantom: PHANTOM, note: PHANTOM ? PHANTOM_BANNER : null, jobs: jobSummary }, null, 2)); process.exit(0); }
+
+const totalCost = jobSummary.reduce((s, j) => s + j.total_cost_usd, 0);
+const totalDispatches = jobSummary.reduce((s, j) => s + j.dispatches, 0);
+if (PHANTOM) console.log(PHANTOM_BANNER);
+console.log(`USAGE BY JOB (since ${SINCE.toISOString().slice(0, 16).replace('T', ' ')} UTC) — ${totalDispatches} dispatches${PHANTOM ? '' : `, total $${totalCost.toFixed(2)}`}`);
+const dollarHeader = PHANTOM ? '[$est]' : '$';
+console.log(`${'job'.padEnd(26)} ${'runs'.padStart(5)} ${(`${dollarHeader} total`).padStart(11)} ${(`${dollarHeader} avg`).padStart(10)} ${'in'.padStart(8)} ${'out'.padStart(8)} ${'cache_r'.padStart(9)} ${'web'.padStart(4)}`);
+for (const j of jobSummary) {
+  console.log(`${j.source.padEnd(26)} ${String(j.dispatches).padStart(5)} ${j.total_cost_usd.toFixed(2).padStart(11)} ${j.avg_cost_per_dispatch.toFixed(4).padStart(10)} ${hum(j.input_tokens).padStart(8)} ${hum(j.output_tokens).padStart(8)} ${hum(j.cache_read_tokens).padStart(9)} ${String(j.web_search_requests).padStart(4)}`);
+}

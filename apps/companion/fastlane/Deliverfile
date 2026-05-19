@@ -1,0 +1,10 @@
+app_identifier "com.example.Merlin"
+
+api_key_path "./fastlane/asc-api-key.json"
+
+# Only update app icon — skip everything else
+skip_screenshots true
+skip_binary_upload true
+overwrite_screenshots false
+force true
+run_precheck_before_submit false

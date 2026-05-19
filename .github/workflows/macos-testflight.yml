@@ -1,0 +1,205 @@
+name: Merlin Companion - macOS TestFlight
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: merlin-companion-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macos, ios]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/companion
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Verify Xcode
+        run: xcodebuild -version
+
+      - name: Install signing certificates & provisioning profiles
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          MAC_CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_PROVISIONING_PROFILE: ${{ secrets.MAC_PROVISIONING_PROFILE }}
+          MAC_NOTIFSERVICE_PROFILE: ${{ secrets.MAC_NOTIFSERVICE_PROFILE }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import Apple Distribution certificate
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$IOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+
+          # Import Mac Installer Distribution certificate
+          echo "$MAC_CERTIFICATE_P12" | base64 --decode > $RUNNER_TEMP/mac-cert.p12
+          security import $RUNNER_TEMP/mac-cert.p12 -k "$KEYCHAIN_PATH" -P "$MAC_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
+          rm $RUNNER_TEMP/mac-cert.p12
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+
+          # Install app profile
+          PROFILE_PATH="$RUNNER_TEMP/mac-profile.provisionprofile"
+          echo "$MAC_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
+          PROFILE_PLIST=$(security cms -D -i "$PROFILE_PATH")
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PROFILE_PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PROFILE_PLIST")
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".provisionprofile
+          rm "$PROFILE_PATH"
+
+          # Install notification service extension profile
+          EXT_PATH="$RUNNER_TEMP/ext-profile.provisionprofile"
+          echo "$MAC_NOTIFSERVICE_PROFILE" | base64 --decode > "$EXT_PATH"
+          EXT_PLIST=$(security cms -D -i "$EXT_PATH")
+          EXT_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$EXT_PLIST")
+          EXT_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$EXT_PLIST")
+          cp "$EXT_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$EXT_UUID".provisionprofile
+          rm "$EXT_PATH"
+
+          echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "mac_profile_uuid=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "mac_profile_name=$PROFILE_NAME" >> "$GITHUB_ENV"
+          echo "ext_profile_name=$EXT_NAME" >> "$GITHUB_ENV"
+          echo "Installed Mac profile: name=$PROFILE_NAME uuid=$PROFILE_UUID"
+          echo "Installed ext profile: name=$EXT_NAME uuid=$EXT_UUID"
+
+      - name: Update build number
+        run: |
+          BUILD_NUMBER=${{ github.run_number }}
+          echo "Build number: $BUILD_NUMBER"
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Merlin.xcodeproj/project.pbxproj
+
+      - name: Clean DerivedData
+        run: rm -rf ~/Library/Developer/Xcode/DerivedData/Merlin-*
+
+      - name: Resolve packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Merlin.xcodeproj \
+            -scheme Merlin
+
+      - name: Configure macOS signing
+        run: |
+          python3 - "$mac_profile_name" "$ext_profile_name" <<'PYEOF'
+          import sys
+          app_profile = sys.argv[1]
+          ext_profile = sys.argv[2]
+          with open('Merlin.xcodeproj/project.pbxproj', 'r') as f:
+              content = f.read()
+          content = content.replace('CODE_SIGN_STYLE = Automatic;',
+              'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Distribution";')
+          content = content.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
+          content = content.replace(
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
+          content = content.replace(
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
+          with open('Merlin.xcodeproj/project.pbxproj', 'w') as f:
+              f.write(content)
+          PYEOF
+
+      - name: Archive macOS (native)
+        run: |
+          xcodebuild archive \
+            -project Merlin.xcodeproj \
+            -scheme Merlin \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/Merlin-macOS.xcarchive \
+            -destination 'generic/platform=macOS' \
+            DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER
+
+      - name: Export macOS pkg
+        run: |
+          cat > $RUNNER_TEMP/ExportOptions-macOS.plist <<EOPLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>teamID</key>
+              <string>TEAMID_PLACEHOLDER</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>signingCertificate</key>
+              <string>Apple Distribution</string>
+              <key>installerSigningCertificate</key>
+              <string>3rd Party Mac Developer Installer</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>com.example.Merlin</key>
+                  <string>${mac_profile_name}</string>
+                  <key>com.example.Merlin.NotificationService</key>
+                  <string>${ext_profile_name}</string>
+              </dict>
+          </dict>
+          </plist>
+          EOPLIST
+          echo "Generated ExportOptions with profile: $mac_profile_name"
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/Merlin-macOS.xcarchive \
+            -exportPath $RUNNER_TEMP/export-macos \
+            -exportOptionsPlist $RUNNER_TEMP/ExportOptions-macOS.plist
+
+      - name: Upload macOS to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/private_keys
+          echo "$ASC_PRIVATE_KEY" > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+          PKG_PATH=$(find $RUNNER_TEMP/export-macos -name "*.pkg" -o -name "*.ipa" -o -name "*.app" | head -1)
+          if [[ "$PKG_PATH" == *.app ]]; then
+            productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Merlin.pkg \
+              --sign "3rd Party Mac Developer Installer: Moshe Raccah (TEAMID_PLACEHOLDER)"
+            PKG_PATH=$RUNNER_TEMP/export-macos/Merlin.pkg
+          fi
+
+          xcrun altool --upload-app \
+            --type macos \
+            --file "$PKG_PATH" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            --show-progress
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/private_keys/AuthKey_*.p8
+          if [ -n "$keychain_path" ]; then
+            security delete-keychain "$keychain_path" 2>/dev/null || true
+          fi
+          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile
+          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merlin-companion-macos-build
+          path: ${{ runner.temp }}/export-macos/*
+          retention-days: 3

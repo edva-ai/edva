@@ -1,0 +1,2 @@
+app_identifier("com.example.Merlin")
+apple_id(ENV["APPLE_ID"] || "set-via-env-or-edit-Appfile@example.com")

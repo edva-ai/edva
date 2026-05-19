@@ -1,0 +1,251 @@
+name: iOS TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label'
+        required: false
+        default: 'macmini'
+        type: string
+      distribute_external:
+        description: 'Distribute to external tester group after processing'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Upload to TestFlight
+    runs-on: [self-hosted, macos, "${{ inputs.runner || 'macmini' }}"]
+    timeout-minutes: 45
+
+    steps:
+      - name: Clean old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            for (const a of artifacts.data.artifacts) {
+              if (a.name.startsWith('spotter-ios-') && !a.expired) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner, repo: context.repo.repo, artifact_id: a.id,
+                });
+              }
+            }
+
+      - uses: actions/checkout@v4
+        with: { clean: true, fetch-depth: 0, ref: '${{ github.ref }}' }
+
+      - name: Verify tools
+        run: |
+          export PATH=/opt/homebrew/bin:$PATH
+          xcodebuild -version
+          xcodegen --version
+
+      - name: Import signing cert into a fresh keychain
+        env:
+          IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Apple intermediate certs (trust chain)
+          curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$RUNNER_TEMP/wwdrg3.cer"
+          security import "$RUNNER_TEMP/wwdrg3.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null || true
+          curl -sL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o "$RUNNER_TEMP/wwdrg6.cer"
+          security import "$RUNNER_TEMP/wwdrg6.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null || true
+          rm -f "$RUNNER_TEMP"/wwdrg*.cer
+
+          # Distribution identity
+          CERT_PATH="$RUNNER_TEMP/spotter.p12"
+          echo "$IOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -P "$IOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+
+          # Put it first in the user search list so xcodebuild picks it
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Locate App Store provisioning profile
+        id: profile
+        run: |
+          set -e
+          # Find the installed App Store profile for com.example.spotter
+          for p in ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision; do
+            [ -f "$p" ] || continue
+            PLIST=$(security cms -D -i "$p" 2>/dev/null) || continue
+            APP_ID=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" /dev/stdin <<< "$PLIST" 2>/dev/null || echo "")
+            HAS_DEVICES=$(/usr/libexec/PlistBuddy -c "Print ProvisionedDevices" /dev/stdin <<< "$PLIST" 2>&1 | grep -v "Does Not" | head -1)
+            if [[ "$APP_ID" == "TEAMID_PLACEHOLDER.com.example.spotter" && -z "$HAS_DEVICES" ]]; then
+              NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PLIST")
+              UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PLIST")
+              EXPIRY=$(/usr/libexec/PlistBuddy -c "Print ExpirationDate" /dev/stdin <<< "$PLIST")
+              echo "uuid=$UUID" >> "$GITHUB_OUTPUT"
+              echo "name=$NAME" >> "$GITHUB_OUTPUT"
+              echo "Using profile: $NAME ($UUID), expires $EXPIRY"
+              exit 0
+            fi
+          done
+          echo "::error::No App Store profile for com.example.spotter found on this runner"
+          exit 1
+
+      - name: Confirm Apple Distribution identity
+        run: |
+          security find-identity -v -p codesigning | grep "Apple Distribution: <Developer Name> (TEAMID_PLACEHOLDER)"
+
+      - name: Generate Xcode project
+        run: |
+          export PATH=/opt/homebrew/bin:$PATH
+          xcodegen
+
+      - name: Stamp build number + scope manual signing to Spotter target
+        env:
+          PROFILE_UUID: ${{ steps.profile.outputs.uuid }}
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" Spotter/Info.plist
+          # Scope manual signing to the Spotter target only — SPM subprojects
+          # don't handle provisioning profiles, so passing flags globally via
+          # xcodebuild breaks them. We patch the pbxproj buildSettings blocks
+          # that contain PRODUCT_BUNDLE_IDENTIFIER = com.example.spotter.
+          python3 - <<'PY'
+          import re, os
+          path = "Spotter.xcodeproj/project.pbxproj"
+          src = open(path).read()
+          uuid = os.environ["PROFILE_UUID"]
+          name = os.environ["PROFILE_NAME"]
+
+          def patch(m):
+              body = m.group(0)
+              if "com.example.spotter" not in body:
+                  return body
+              body = body.replace("CODE_SIGN_STYLE = Automatic;", "CODE_SIGN_STYLE = Manual;")
+              inject = (
+                  f"\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = \"{name}\";"
+                  f"\n\t\t\t\tPROVISIONING_PROFILE = \"{uuid}\";"
+                  f"\n\t\t\t\t\"CODE_SIGN_IDENTITY[sdk=iphoneos*]\" = \"Apple Distribution\";"
+              )
+              body = body.replace("CODE_SIGN_STYLE = Manual;", "CODE_SIGN_STYLE = Manual;" + inject)
+              return body
+
+          src2 = re.sub(r"buildSettings = \{[^}]*\};", patch, src, flags=re.S)
+          open(path, "w").write(src2)
+          print("patched" if src != src2 else "no changes")
+          PY
+
+      - name: Archive
+        run: |
+          rm -rf build
+          # No signing overrides on the CLI — settings baked into pbxproj above.
+          xcodebuild archive \
+            -project Spotter.xcodeproj \
+            -scheme Spotter \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Spotter.xcarchive | tail -80
+          test -d build/Spotter.xcarchive
+
+      - name: Export IPA
+        env:
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          cat > build/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>TEAMID_PLACEHOLDER</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.example.spotter</key><string>$PROFILE_NAME</string>
+            </dict>
+            <key>stripSwiftSymbols</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath build/Spotter.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist build/ExportOptions.plist | tail -40
+          ls -la build/export/
+
+      - name: Stage ASC API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          umask 077
+          printf '%s\n' "$ASC_PRIVATE_KEY" > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          IPA=$(find build/export -name "*.ipa" | head -1)
+          test -n "$IPA"
+          xcrun altool --upload-app --type ios --file "$IPA" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" \
+            --show-progress 2>&1 | tee /tmp/altool.log
+          grep -qi "UPLOAD SUCCEEDED" /tmp/altool.log
+
+      - name: Distribute to external testers
+        if: ${{ inputs.distribute_external == true }}
+        env:
+          ASC_APP_ID: ${{ secrets.ASC_APP_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          python3 -m pip install --user --quiet --break-system-packages pyjwt cryptography 2>/dev/null \
+            || python3 -m pip install --user --quiet pyjwt cryptography
+          python3 ci/distribute_external.py \
+            --build-number "${{ github.run_number }}" \
+            --group "Spotter External"
+
+      - name: Clean up API key + temp keychain
+        if: always()
+        run: |
+          rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
+          if [ -n "$keychain_path" ]; then
+            security delete-keychain "$keychain_path" 2>/dev/null || true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spotter-ios-${{ github.run_number }}
+          path: build/export/*.ipa
+          retention-days: 3

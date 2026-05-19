@@ -1,0 +1,261 @@
+#!/opt/homebrew/bin/node
+// merlin-logs — time-merged view across supervisor + watchdog + event logs.
+//
+// Motivation: during the 2026-04-18 5h hum outage, diagnosing required
+// cross-referencing ~6 log files by hand. This CLI reads them all, normalizes
+// each line to {ts, source, line}, and emits a single chronological stream.
+//
+// Usage:
+//   merlin-logs                            # last 5min of all logs
+//   merlin-logs --since 16:40              # since 16:40 local today
+//   merlin-logs --since "2026-04-18T20:00:00Z"
+//   merlin-logs --last 30m                 # last 30 minutes
+//   merlin-logs --last 2h                  # last 2 hours
+//   merlin-logs -n 200                     # latest 200 merged lines
+//   merlin-logs --source ops               # only ops-supervisor.log
+//   merlin-logs --source ops,events        # multiple sources
+//   merlin-logs --grep "auth"              # regex filter on the body
+//   merlin-logs --tail                     # follow new lines as they're written
+//
+// Sources:
+//   ops       ops-supervisor.log          (ISO-prefixed per line after 2026-04-18)
+//   chat      chat-supervisor.log         (ISO-prefixed per line)
+//   hookdeck  hookdeck.log                (unprefixed; best-effort time from file mtime)
+//   launch    claude-launchagent.err.log  (leading "YYYY-MM-DD HH:MM:SS" local)
+//   watchdog  watchdog.log                (leading "YYYY-MM-DD HH:MM:SS" local)
+//   events    supervisor-ops/events.ndjson (ts field, ISO)
+//   hum       hum-runs.jsonl              (ts field, ISO)
+
+import fs from "node:fs";
+import path from "node:path";
+
+const HOME = process.env.HOME;
+const LOGDIR = path.join(HOME, "dev/merlin/agent/logs");
+const DATA_DIR = path.join(process.env.MERLIN_HOME || path.join(HOME, "Dev/merlin"), "data");
+
+const SOURCES = {
+  ops:      { file: path.join(LOGDIR, "ops-supervisor.log"),          parse: parseIsoPrefixed },
+  chat:     { file: path.join(LOGDIR, "chat-supervisor.log"),         parse: parseIsoPrefixed },
+  hookdeck: { file: path.join(LOGDIR, "hookdeck.log"),                parse: parseUnprefixed  },
+  launch:   { file: path.join(LOGDIR, "claude-launchagent.err.log"),  parse: parseSpaceDatetime },
+  watchdog: { file: path.join(LOGDIR, "watchdog.log"),                parse: parseSpaceDatetime },
+  events:   { file: path.join(LOGDIR, "supervisor-ops/events.ndjson"),parse: parseNdjsonTs    },
+  hum:      { file: path.join(DATA_DIR, "hum-runs.jsonl"),            parse: parseNdjsonTs    },
+};
+
+function usage() {
+  process.stderr.write(`Usage: merlin-logs [OPTIONS]
+
+Options:
+  --since TIME         show lines since TIME (ISO-8601 or local "HH:MM")
+  --last DURATION      show lines in the last DURATION (e.g. 30m, 2h, 45s)
+  -n, --limit N        show only the latest N lines after merging
+  --source NAMES       comma-separated list. Default: all. Known: ${Object.keys(SOURCES).join(", ")}
+  --grep REGEX         filter lines whose body matches REGEX (case-insensitive)
+  --tail               after printing history, follow new writes
+  --no-color           disable terminal color
+
+Default: last 5 minutes, all sources, colored.
+`);
+}
+
+// ─── time parsing ────────────────────────────────────────────────────────
+
+function parseIsoPrefixed(line) {
+  // "2026-04-19T02:45:30.123Z [supervisor] …"
+  const m = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(.*)$/);
+  if (!m) return null;
+  return { ts: Date.parse(m[1]), body: m[2] };
+}
+
+function parseSpaceDatetime(line) {
+  // "2026-04-18 20:40:00 [hum:tick] Dispatched hum"
+  // Both process-manager.mjs (launchagent) and watchdog.sh write UTC:
+  //   process-manager uses new Date().toISOString().replace("T"," ") — UTC
+  //   watchdog.sh → `date '+...'` under cron typically has TZ unset → UTC
+  // Treat the naked "YYYY-MM-DD HH:MM:SS" as UTC.
+  const m = line.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$/);
+  if (!m) return null;
+  const ts = Date.parse(`${m[1]}T${m[2]}Z`);
+  if (isNaN(ts)) return null;
+  return { ts, body: m[3] };
+}
+
+function parseNdjsonTs(line) {
+  try {
+    const e = JSON.parse(line);
+    if (!e.ts) return null;
+    return { ts: Date.parse(e.ts), body: JSON.stringify(e) };
+  } catch { return null; }
+}
+
+function parseUnprefixed(line) {
+  // No timestamps — skip so hookdeck lines appear via `--source hookdeck`
+  // explicit request only. In the default "all" merge, they'd cluster at t=0.
+  return null;
+}
+
+function parseDuration(s) {
+  const m = String(s).match(/^(\d+)\s*([smh]?)$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  switch (m[2]) {
+    case "":  return n * 1000;
+    case "s": return n * 1000;
+    case "m": return n * 60_000;
+    case "h": return n * 3_600_000;
+  }
+  return null;
+}
+
+function parseSinceArg(s) {
+  // Accept ISO 8601 or "HH:MM" (local today)
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return Date.parse(s);
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) {
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), +m[1], +m[2], +(m[3] || 0));
+    return d.getTime();
+  }
+  const n = Date.parse(s);
+  return isNaN(n) ? null : n;
+}
+
+// ─── argv ────────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const opts = { sources: Object.keys(SOURCES), grep: null, tail: false, limit: null, since: null, color: true };
+  const now = Date.now();
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "--since":    opts.since = parseSinceArg(argv[++i]); break;
+      case "--last": {
+        const d = parseDuration(argv[++i]);
+        if (d == null) { process.stderr.write(`bad --last value\n`); process.exit(2); }
+        opts.since = now - d;
+        break;
+      }
+      case "-n":
+      case "--limit":    opts.limit = parseInt(argv[++i], 10); break;
+      case "--source":   opts.sources = argv[++i].split(",").map(s => s.trim()); break;
+      case "--grep":     opts.grep = new RegExp(argv[++i], "i"); break;
+      case "--tail":     opts.tail = true; break;
+      case "--no-color": opts.color = false; break;
+      case "-h":
+      case "--help":     usage(); process.exit(0);
+      default: process.stderr.write(`unknown arg: ${a}\n`); usage(); process.exit(2);
+    }
+  }
+  // Default window: last 5 minutes if neither --since nor --limit supplied.
+  if (opts.since == null && opts.limit == null) opts.since = now - 5 * 60_000;
+  // Validate sources.
+  for (const s of opts.sources) {
+    if (!(s in SOURCES)) { process.stderr.write(`unknown source: ${s}\n`); process.exit(2); }
+  }
+  if (!process.stdout.isTTY) opts.color = false;
+  return opts;
+}
+
+// ─── reading ─────────────────────────────────────────────────────────────
+
+function readAllLines(file) {
+  try { return fs.readFileSync(file, "utf8").split("\n"); }
+  catch { return []; }
+}
+
+function collectRecords(opts) {
+  const records = [];
+  for (const src of opts.sources) {
+    const { file, parse } = SOURCES[src];
+    if (!fs.existsSync(file)) continue;
+    const lines = readAllLines(file);
+    for (const raw of lines) {
+      if (!raw) continue;
+      const parsed = parse(raw);
+      if (!parsed) continue;
+      if (opts.since != null && parsed.ts < opts.since) continue;
+      if (opts.grep && !opts.grep.test(parsed.body) && !opts.grep.test(raw)) continue;
+      records.push({ ts: parsed.ts, source: src, body: parsed.body });
+    }
+  }
+  records.sort((a, b) => a.ts - b.ts);
+  if (opts.limit != null && records.length > opts.limit) {
+    return records.slice(records.length - opts.limit);
+  }
+  return records;
+}
+
+// ─── output ──────────────────────────────────────────────────────────────
+
+const SOURCE_COLOR = {
+  ops:      "\x1b[36m", // cyan
+  chat:     "\x1b[35m", // magenta
+  hookdeck: "\x1b[33m", // yellow
+  launch:   "\x1b[90m", // grey
+  watchdog: "\x1b[33m", // yellow
+  events:   "\x1b[34m", // blue
+  hum:      "\x1b[32m", // green
+};
+const RESET = "\x1b[0m";
+
+function emit(rec, color) {
+  const t = new Date(rec.ts).toISOString().replace("T", " ").replace("Z", "");
+  if (color) {
+    const c = SOURCE_COLOR[rec.source] || "";
+    process.stdout.write(`${c}${t} [${rec.source}]${RESET} ${rec.body}\n`);
+  } else {
+    process.stdout.write(`${t} [${rec.source}] ${rec.body}\n`);
+  }
+}
+
+// ─── tail follow ─────────────────────────────────────────────────────────
+
+function startTail(opts, lastPositions) {
+  const POLL_MS = 750;
+  setInterval(() => {
+    const newRecs = [];
+    for (const src of opts.sources) {
+      const { file, parse } = SOURCES[src];
+      let stat;
+      try { stat = fs.statSync(file); } catch { continue; }
+      const pos = lastPositions[src] || 0;
+      if (stat.size <= pos) {
+        // File truncated (rotation) — reset.
+        if (stat.size < pos) lastPositions[src] = 0;
+        continue;
+      }
+      const fd = fs.openSync(file, "r");
+      const buf = Buffer.alloc(stat.size - pos);
+      fs.readSync(fd, buf, 0, buf.length, pos);
+      fs.closeSync(fd);
+      lastPositions[src] = stat.size;
+      for (const raw of buf.toString("utf8").split("\n")) {
+        if (!raw) continue;
+        const parsed = parse(raw);
+        if (!parsed) continue;
+        if (opts.grep && !opts.grep.test(parsed.body) && !opts.grep.test(raw)) continue;
+        newRecs.push({ ts: parsed.ts, source: src, body: parsed.body });
+      }
+    }
+    newRecs.sort((a, b) => a.ts - b.ts);
+    for (const r of newRecs) emit(r, opts.color);
+  }, POLL_MS).unref?.();
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+const opts = parseArgs(process.argv);
+const records = collectRecords(opts);
+for (const r of records) emit(r, opts.color);
+
+if (opts.tail) {
+  const positions = {};
+  for (const src of opts.sources) {
+    const { file } = SOURCES[src];
+    try { positions[src] = fs.statSync(file).size; } catch { positions[src] = 0; }
+  }
+  startTail(opts, positions);
+  // Keep process alive.
+  setInterval(() => {}, 60_000);
+}

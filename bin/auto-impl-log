@@ -1,0 +1,156 @@
+#!/usr/bin/env node
+// auto-impl-log — indexed view of Self-Improvement Executor auto-applied
+// changes. Every change the executor applies is tagged in its commit subject
+// as `[auto-impl <item-id>]`; this CLI pulls them from git log, joins with
+// nightly-review-state.json for classifier + critic metadata, and prints a
+// compact audit view.
+//
+// Usage:
+//   auto-impl-log                       # last 7 days
+//   auto-impl-log --since 24h|7d|30d
+//   auto-impl-log --json                # full records as JSON
+//   auto-impl-log --id s-20260419-05    # one item
+//
+// Output columns (TTY): date · sha7 · id · risk · category · critic · title
+
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { execSync } = require("node:child_process");
+
+const STATE_PATH = path.join(
+  os.homedir(),
+  "dev/merlin/data/nightly-review-state.json",
+);
+
+function flag(name, def = undefined) {
+  const argv = process.argv.slice(2);
+  const i = argv.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = argv[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function parseSince(spec) {
+  if (!spec || spec === true) return "7 days ago";
+  const m = String(spec).match(/^(\d+)\s*([hdw])$/);
+  if (!m) return spec; // let git parse it as a free-form date
+  const n = m[1];
+  const unit = { h: "hours", d: "days", w: "weeks" }[m[2]];
+  return `${n} ${unit} ago`;
+}
+
+function die(msg, code = 1) {
+  console.error(`auto-impl-log: ${msg}`);
+  process.exit(code);
+}
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return { suggestions: [] };
+  }
+}
+
+function gitLogAutoImpl(since) {
+  // %H · subject · %ai (author date ISO)
+  const args = [
+    "log",
+    "--all",
+    "--grep",
+    "\\[auto-impl",
+    "-E",
+    "--pretty=format:%H\t%s\t%ai",
+    `--since=${since}`,
+  ];
+  let out;
+  try {
+    out = execSync(`git ${args.map((a) => JSON.stringify(a)).join(" ")}`, {
+      cwd: path.join(os.homedir(), "dev/merlin"),
+      encoding: "utf8",
+    });
+  } catch (err) {
+    die(`git log failed: ${err.message}`);
+  }
+  const rows = [];
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    const [sha, subject, date] = line.split("\t");
+    const m = subject.match(/^\[auto-impl\s+(s-\d{8}-\d+)\]\s*(.*)$/);
+    if (!m) continue;
+    rows.push({
+      sha,
+      sha7: sha.slice(0, 7),
+      id: m[1],
+      title: m[2].trim(),
+      committed_at: date,
+    });
+  }
+  return rows;
+}
+
+function joinState(rows, state) {
+  const byId = new Map();
+  for (const s of state.suggestions || []) byId.set(s.id, s);
+  return rows.map((r) => {
+    const s = byId.get(r.id) || {};
+    return {
+      ...r,
+      risk: s.risk || "?",
+      category: s.category || "?",
+      classifier_rationale: s.classifier_rationale || null,
+      critic_verdict: s.critic_verdict || "?",
+      doctor_before: s.doctor_before || null,
+      doctor_after: s.doctor_after || null,
+      reverted_reason: s.reverted_reason || null,
+    };
+  });
+}
+
+function render(rows) {
+  if (!rows.length) {
+    console.log("(no auto-applied commits in window)");
+    return;
+  }
+  const header = "date        sha7    id              risk     category       critic      title";
+  console.log(header);
+  console.log("─".repeat(Math.min(header.length, 120)));
+  for (const r of rows) {
+    const date = r.committed_at.slice(0, 10);
+    const risk = (r.risk || "?").padEnd(8);
+    const category = (r.category || "?").padEnd(14);
+    const critic = (r.critic_verdict || "?")
+      .split(":")[0]
+      .trim()
+      .padEnd(11);
+    console.log(
+      `${date}  ${r.sha7}  ${r.id}  ${risk} ${category} ${critic} ${r.title}`,
+    );
+  }
+  console.log();
+  console.log(`${rows.length} auto-applied commit${rows.length === 1 ? "" : "s"}.`);
+  console.log(`Revert any: git revert <sha>`);
+}
+
+function main() {
+  const since = parseSince(flag("since", "7d"));
+  const only = flag("id");
+  const asJson = Boolean(flag("json", false));
+
+  let rows = gitLogAutoImpl(since);
+  if (only) rows = rows.filter((r) => r.id === only);
+  const state = loadState();
+  rows = joinState(rows, state);
+
+  if (asJson) {
+    console.log(JSON.stringify({ since, count: rows.length, rows }, null, 2));
+    return;
+  }
+  render(rows);
+}
+
+main();

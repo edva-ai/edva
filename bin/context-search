@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+// context-search — Search across all indexed data sources (Notes, iMessage, email, files).
+// Usage:
+//   context-search <query>                    — search all sources
+//   context-search <query> --source notes     — filter by source
+//   context-search stats                      — show entry counts per source
+
+import { createRequire } from "node:module";
+const path = require("node:path");
+const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
+
+const require = createRequire(import.meta.url);
+const cm = require("../lib/context-memory");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i + 1 >= args.length) return undefined;
+  return args[i + 1];
+}
+
+const READ_HINTS = {
+  notes: (id) => `notes_read "${id}"`,
+  imsg: (id) => `imsg_read "${id}"`,
+  email: () => `email_mem_search`,
+  files: (id) => `Read ${MERLIN_HOME}/${id}`,
+  docs: (id) => `Read ~/${id}`,
+  gdrive: (id, meta) => meta?.webViewLink || `Google Drive file ${id}`,
+  wiki: (id) => `wiki_read "${id}"`,
+};
+
+function usage() {
+  console.log(`context-search — search across all indexed data sources
+
+Usage:
+  context-search <query>                    Search all sources
+  context-search <query> --source <s>       Filter to one source (notes, imsg, email, files, docs, gdrive, wiki)
+  context-search stats                      Show entry counts per source
+`);
+}
+
+switch (cmd) {
+  case "stats": {
+    const rows = cm.stats();
+    if (rows.length === 0) {
+      console.log("No entries. Run context-sync to populate.");
+      break;
+    }
+    let total = 0;
+    for (const r of rows) {
+      console.log(`${r.source}: ${r.count} entries`);
+      total += r.count;
+    }
+    console.log(`total: ${total} entries`);
+    break;
+  }
+
+  case undefined:
+  case "help":
+  case "--help":
+  case "-h":
+    usage();
+    break;
+
+  default: {
+    // Join all positional args (skip --flag value pairs) as the query
+    const positional = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith("--")) { i++; continue; }
+      positional.push(args[i]);
+    }
+    const query = positional.join(" ");
+    const source = flag("source");
+    const results = cm.search(query, { source, limit: 15 });
+
+    if (results.length === 0) {
+      console.log("No matches.");
+      break;
+    }
+
+    for (const r of results) {
+      const preview =
+        r.summary.length > 150 ? r.summary.replace(/\n/g, " ").slice(0, 150) + "..." : r.summary.replace(/\n/g, " ");
+      const meta = r.metadata_json ? JSON.parse(r.metadata_json) : {};
+      const label = r.source === "gdrive" ? (meta.name || r.source_id) : r.source_id;
+      const hint = (READ_HINTS[r.source] || (() => ""))(r.source_id, meta);
+      console.log(`[${r.source}] ${label} — ${preview}`);
+      if (hint) console.log(`  -> ${hint}`);
+    }
+
+    const sources = [...new Set(results.map((r) => r.source))];
+    console.log(`\n${results.length} result${results.length === 1 ? "" : "s"} across ${sources.join(", ")}`);
+    break;
+  }
+}

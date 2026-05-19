@@ -1,0 +1,53 @@
+name: Spotter
+options:
+  bundleIdPrefix: co.silo
+  deploymentTarget:
+    iOS: "26.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    GENERATE_INFOPLIST_FILE: NO
+    SWIFT_EMIT_LOC_STRINGS: YES
+    DEVELOPMENT_TEAM: TEAMID_PLACEHOLDER
+
+packages:
+  Supabase:
+    url: https://github.com/supabase/supabase-swift
+    from: "2.24.0"
+
+targets:
+  Spotter:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Spotter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.spotter
+        PRODUCT_NAME: Spotter
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: TEAMID_PLACEHOLDER
+        INFOPLIST_FILE: Spotter/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Spotter/Spotter.entitlements
+        DEVELOPMENT_ASSET_PATHS: '"Spotter/Preview Content"'
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+    dependencies:
+      - package: Supabase
+        product: Supabase

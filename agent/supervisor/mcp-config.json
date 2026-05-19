@@ -1,0 +1,5 @@
+{
+  "_comment": "MCP servers loaded for ops-agent when running under supervisor. phone-channel stays with chat-agent; gmail/webhook channels are obsoleted by supervisor HTTP endpoints.",
+  "mcpServers": {
+  }
+}

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.example.merlin.auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.example.merlin</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+	  The Memory tab loads the in-repo wiki HTTP browser at
+	  http://${MERLIN_HOST}:9096 (an unqualified hostname on Tailscale
+	  / home LAN). NSAllowsLocalNetworking permits plaintext HTTP to
+	  .local / loopback / unqualified hostnames without opening up
+	  arbitrary internet traffic.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

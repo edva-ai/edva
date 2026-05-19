@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# wiki-db-snapshot — atomic snapshot of memory-index.db for backup.
+#
+# Runs SQLite VACUUM INTO into a timestamped file, then keeps only the last
+# 24 snapshots (~1 day at hourly cron). Defense-in-depth complement to the
+# file-based memory-snapshot cron — if the DB itself corrupts (the FTS5
+# bridge briefly did so during a 2026-05-02 experiment), restoring from the
+# most recent snapshot is one cp away.
+#
+# VACUUM INTO is hot-safe: it reads the live DB through normal SQLite
+# isolation and writes a fresh, defragmented copy. No locking the live DB,
+# no journal-mode quirks. Equivalent to `cp` but guaranteed-consistent
+# under WAL.
+#
+# Usage:
+#   wiki-db-snapshot              # snapshot + rotate
+#   wiki-db-snapshot --quiet      # no stdout unless something failed
+#   wiki-db-snapshot --keep N     # rotate to last N (default 24)
+#   wiki-db-snapshot --dest <dir> # override destination dir
+#
+# Exit codes:
+#   0  success
+#   1  snapshot failed
+#   2  source DB missing
+
+const path = require("node:path");
+const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
+
+set -euo pipefail
+
+DB_PATH="${MEMORY_INDEX_DB:-${MERLIN_HOME}/data/memory-index.db}"
+DEST_DIR="${MERLIN_HOME}/data/memory-db-snapshots"
+KEEP=24
+QUIET=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --quiet) QUIET=1; shift ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    --dest) DEST_DIR="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# *//'
+      exit 0
+      ;;
+    *) echo "wiki-db-snapshot: unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+log() {
+  if [[ "$QUIET" -eq 0 ]]; then
+    echo "$@"
+  fi
+}
+
+if [[ ! -f "$DB_PATH" ]]; then
+  echo "wiki-db-snapshot: source DB not found: $DB_PATH" >&2
+  exit 2
+fi
+
+mkdir -p "$DEST_DIR"
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="$DEST_DIR/memory-index-$TS.db"
+# In the (rare) case two snapshots fire in the same second (manual + cron
+# overlap), append a pid so the second one doesn't fail with "output file
+# already exists".
+if [[ -e "$OUT" ]]; then
+  OUT="$DEST_DIR/memory-index-$TS-$$.db"
+fi
+
+# VACUUM INTO requires sqlite3 binary. macOS ships it; check for it.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "wiki-db-snapshot: sqlite3 binary not found in PATH" >&2
+  exit 1
+fi
+
+# VACUUM INTO is the hot-safe snapshot primitive. The output file is a
+# complete, defragmented copy — usable directly via `cp $OUT $DB_PATH` to
+# restore.
+ERR_LOG="${TMPDIR:-/tmp}/wiki-db-snapshot.err"
+if ! sqlite3 "$DB_PATH" "VACUUM INTO '$OUT';" 2>"$ERR_LOG"; then
+  echo "wiki-db-snapshot: VACUUM INTO failed:" >&2
+  cat "$ERR_LOG" >&2 || true
+  exit 1
+fi
+
+# Rotate: keep newest $KEEP by mtime; drop the rest. ls -t prints newest
+# first; tail -n +N skips the first N-1 lines, so +KEEP+1 leaves only the
+# stragglers older than the cutoff.
+ls -t "$DEST_DIR"/memory-index-*.db 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
+  rm -f -- "$f"
+done
+
+# Count what remains.
+remaining=$(ls "$DEST_DIR"/memory-index-*.db 2>/dev/null | wc -l | tr -d ' ')
+bytes=$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT" 2>/dev/null || echo "?")
+log "wiki-db-snapshot: $OUT ($bytes bytes; keeping $remaining/$KEEP)"

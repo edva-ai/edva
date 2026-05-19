@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// email-send — send mail via smtp2go HTTP API as the Merlin identity.
+//
+// Designed for agent-originated emails (portfolio memos, alerts, reports).
+// Defaults to "Merlin <${MERLIN_AGENT_FROM_EMAIL}>" with Reply-To ${MERLIN_AGENT_FROM_EMAIL} so
+// replies route back through the inbound Merlin channel.
+//
+// Usage:
+//   email-send --to <addr> --subject <s> --body <text> [--html] [--attach <file>]...
+//              [--from <addr>] [--from-name <name>] [--reply-to <addr>] [--body-file <path>]
+//              [--in-reply-to <message-id>] [--references <ids>]
+
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+const require = createRequire(import.meta.url);
+const { loadEnv } = require("../lib/load-env.js");
+const { guessMimeType } = require("../lib/mime-types.js");
+
+loadEnv();
+
+const API_KEY = process.env.SMTP2GO_API_KEY;
+if (!API_KEY) {
+  console.error("email-send: SMTP2GO_API_KEY not set in .env");
+  process.exit(1);
+}
+
+const DEFAULT_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || "${MERLIN_AGENT_FROM_EMAIL}";
+const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || "Merlin";
+const DEFAULT_REPLY_TO = process.env.EMAIL_REPLY_TO || "${MERLIN_AGENT_FROM_EMAIL}";
+const SENT_LOG = path.join(process.env.HOME, "dev/merlin/data/merlin-sent-mail.jsonl");
+
+function parseArgs(argv) {
+  const a = {
+    to: null, subject: null, body: null, html: false,
+    attachments: [],
+    fromName: DEFAULT_FROM_NAME, fromAddress: DEFAULT_FROM_ADDRESS,
+    replyTo: DEFAULT_REPLY_TO,
+    inReplyTo: null, references: null,
+  };
+  for (let i = 2; i < argv.length; i++) {
+    const k = argv[i];
+    if (k === "--to") a.to = argv[++i];
+    else if (k === "--subject") a.subject = argv[++i];
+    else if (k === "--body") a.body = argv[++i];
+    else if (k === "--body-file") a.body = fs.readFileSync(argv[++i], "utf8");
+    else if (k === "--html") a.html = true;
+    else if (k === "--attach") a.attachments.push({ path: argv[++i] });
+    else if (k === "--inline") {
+      const spec = argv[++i];
+      const idx = spec.lastIndexOf(":");
+      if (idx < 0) { console.error(`--inline requires <path>:<cid>`); process.exit(1); }
+      a.attachments.push({ path: spec.slice(0, idx), cid: spec.slice(idx + 1) });
+    }
+    else if (k === "--from-name") a.fromName = argv[++i];
+    else if (k === "--from") a.fromAddress = argv[++i];
+    else if (k === "--reply-to") a.replyTo = argv[++i];
+    else if (k === "--no-reply-to") a.replyTo = null;
+    else if (k === "--in-reply-to") a.inReplyTo = argv[++i];
+    else if (k === "--references") a.references = argv[++i];
+    else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
+    else { console.error(`email-send: unknown flag: ${k}`); process.exit(1); }
+  }
+  return a;
+}
+
+function printUsage() {
+  console.log(`email-send — send mail via smtp2go as Merlin
+Usage:
+  email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
+             [--html] [--attach <file>]...
+             [--from <addr>] [--from-name <name>]
+             [--reply-to <addr>] [--no-reply-to]
+             [--in-reply-to <message-id>] [--references <ids>]
+
+Defaults:
+  From:     ${DEFAULT_FROM_NAME} <${DEFAULT_FROM_ADDRESS}>
+  Reply-To: ${DEFAULT_REPLY_TO}`);
+}
+
+// Extract plain text from HTML for the multipart/alternative text_body.
+// Without this, SMTP2Go auto-generates a text alternative whose tag-stripper
+// preserves `<!DOCTYPE html>` and similar declarations as visible text.
+function htmlToText(html) {
+  return html
+    .replace(/<!DOCTYPE[^>]*>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|h[1-6]|li|tr|table)>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<a\b[^>]*\bhref="([^"]+)"[^>]*>([^<]*)<\/a>/gi, "$2 ($1)")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function send(a) {
+  // Em-dash gate for agent-originated mail to the user. Pinned rule
+  // feedback-no-em-dashes: never ship em (U+2014) or en (U+2013) dashes
+  // in text the user will read. Fires only when the agent identity is the
+  // default Merlin address AND the recipient is ${MERLIN_OWNER_EMAIL} so
+  // outbound to third parties (mkt-outreach-apply, etc.) is unaffected.
+  // Set EMAIL_SEND_ALLOW_DASHES=1 to override for one-off paste-throughs.
+  if (
+    a.fromAddress === "${MERLIN_AGENT_FROM_EMAIL}" &&
+    String(a.to).toLowerCase() === "${MERLIN_OWNER_EMAIL}" &&
+    !process.env.EMAIL_SEND_ALLOW_DASHES
+  ) {
+    const haystack = `${a.subject}\n${a.body}`;
+    if (/[—–]/.test(haystack)) {
+      const m = haystack.match(/.{0,40}[—–].{0,40}/);
+      console.error(`email-send: em/en dash found in subject or body (violates feedback-no-em-dashes). Example: ${JSON.stringify(m?.[0] || "")}. Replace with comma/semicolon/period/parens/hyphen, or set EMAIL_SEND_ALLOW_DASHES=1 to override.`);
+      process.exit(1);
+    }
+  }
+
+  const sender = a.fromName ? `${a.fromName} <${a.fromAddress}>` : a.fromAddress;
+  const payload = {
+    api_key: API_KEY,
+    sender,
+    to: [a.to],
+    subject: a.subject,
+  };
+  if (a.html) {
+    payload.html_body = a.body;
+    payload.text_body = htmlToText(a.body);
+  }
+  else payload.text_body = a.body;
+
+  const headers = [];
+  if (a.replyTo) headers.push({ header: "Reply-To", value: a.replyTo });
+  if (a.inReplyTo) headers.push({ header: "In-Reply-To", value: a.inReplyTo });
+  if (a.references) headers.push({ header: "References", value: a.references });
+  if (headers.length) payload.custom_headers = headers;
+
+  if (a.attachments.length > 0) {
+    payload.attachments = a.attachments.map((att) => {
+      const o = {
+        filename: path.basename(att.path),
+        fileblob: fs.readFileSync(att.path).toString("base64"),
+        mimetype: guessMimeType(att.path),
+      };
+      if (att.cid) o.cid = att.cid;
+      return o;
+    });
+  }
+
+  const res = await fetch("https://api.smtp2go.com/v3/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+
+  if (!res.ok || data.data?.error) {
+    console.error(`email-send error: ${JSON.stringify(data.data?.error || data)}`);
+    process.exit(1);
+  }
+  const d = data.data || {};
+  console.log(`Sent: email_id=${d.email_id || "?"} succeeded=${d.succeeded} failed=${d.failed}`);
+
+  // Sent-mail log lets the email-inbound playbook resolve replies via In-Reply-To.
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      email_id: d.email_id || null,
+      from: a.fromAddress,
+      to: a.to,
+      subject: a.subject,
+      reply_to: a.replyTo || null,
+      in_reply_to: a.inReplyTo || null,
+      references: a.references || null,
+      originating_task: process.env.MERLIN_TASK_ID || null,
+    };
+    await fs.promises.appendFile(SENT_LOG, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.error(`email-send: sent-log append failed: ${err.message}`);
+  }
+
+  // Auto-label agent-originated mail in the user's inbox so triage/search can
+  // distinguish it from inbound mail. Only labels when the From identity is
+  // the default Merlin address and the recipient is ${MERLIN_OWNER_EMAIL} — i.e.
+  // a self-addressed agent memo. Fires in the background; failures are silent.
+  if (
+    a.fromAddress === "${MERLIN_AGENT_FROM_EMAIL}" &&
+    String(a.to).toLowerCase() === "${MERLIN_OWNER_EMAIL}"
+  ) {
+    const { spawn } = await import("node:child_process");
+    spawn(
+      path.join(path.dirname(new URL(import.meta.url).pathname), "merlin-email-label.sh"),
+      [a.subject],
+      { detached: true, stdio: "ignore" }
+    ).unref();
+  }
+}
+
+const args = parseArgs(process.argv);
+if (!args.to || !args.subject || args.body === null) {
+  printUsage();
+  process.exit(1);
+}
+send(args).catch((e) => { console.error(`email-send fatal: ${e.message}`); process.exit(1); });

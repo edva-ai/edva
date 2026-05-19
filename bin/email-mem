@@ -1,0 +1,113 @@
+#!/usr/bin/env node
+// email-mem — CLI for managing email classification memories.
+// Usage:
+//   email-mem add "Already handled SMH K-1 tax document for 2025" --tags "smh,tax,k-1"
+//   email-mem add "Ignore all emails from noreply@example.com" --tags "example.com" --expires 2026-12-31
+//   email-mem search "SMH tax"
+//   email-mem list
+//   email-mem list --tag tax
+//   email-mem remove 3
+//   email-mem test --from "smh@broker.com" --subject "Your K-1 is ready"
+
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const em = require("../lib/email-memory");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+
+function flag(name) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1 || i + 1 >= args.length) return undefined;
+  return args[i + 1];
+}
+
+function usage() {
+  console.log(`email-mem — manage email classification memories
+
+Commands:
+  add <text> [--tags t1,t2] [--expires YYYY-MM-DD]   Add a memory
+  search <query>                                       Search memories
+  list [--tag <tag>]                                   List all memories
+  remove <id>                                          Remove a memory by ID
+  test --from <f> --subject <s> [--snippet <sn>]       Test what memories match an email
+  supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]   Mark row superseded
+`);
+}
+
+switch (cmd) {
+  case "add": {
+    const text = args[1];
+    if (!text) { console.error("Usage: email-mem add <text> [--tags ...] [--expires ...]"); process.exit(1); }
+    const id = em.add({ text, tags: flag("tags") || "", expiresAt: flag("expires") || null });
+    console.log(`Added memory #${id}: ${text}`);
+    break;
+  }
+  case "search": {
+    const query = args[1];
+    if (!query) { console.error("Usage: email-mem search <query>"); process.exit(1); }
+    const results = em.search(query);
+    if (results.length === 0) { console.log("No matches."); break; }
+    for (const r of results) {
+      console.log(`#${r.id} [${r.created_at}] ${r.text}${r.tags ? ` (${r.tags})` : ""}`);
+    }
+    break;
+  }
+  case "list": {
+    const tag = flag("tag");
+    const results = em.list({ tag });
+    if (results.length === 0) { console.log("No memories."); break; }
+    for (const r of results) {
+      const exp = r.expires_at ? ` expires:${r.expires_at}` : "";
+      console.log(`#${r.id} [${r.created_at}] ${r.text}${r.tags ? ` (${r.tags})` : ""}${exp}`);
+    }
+    break;
+  }
+  case "remove": {
+    const id = parseInt(args[1], 10);
+    if (isNaN(id)) { console.error("Usage: email-mem remove <id>"); process.exit(1); }
+    em.remove(id);
+    console.log(`Removed memory #${id}`);
+    break;
+  }
+  case "supersede": {
+    // Mark a row as superseded by another (e.g., a corrected classification).
+    // The row is kept (search history matters) but tags are updated to flag
+    // the supersession + add the canonical-correct tag if provided.
+    //   email-mem supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]
+    const id = parseInt(args[1], 10);
+    const byId = parseInt(flag("by") || "", 10);
+    if (isNaN(id) || isNaN(byId)) {
+      console.error("Usage: email-mem supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]");
+      process.exit(1);
+    }
+    const addTag = flag("add-tag");
+    const removeTag = flag("remove-tag");
+    const all = em.list({ limit: 100000 });
+    const row = all.find((r) => r.id === id);
+    if (!row) { console.error(`No memory with id=${id}`); process.exit(2); }
+    let tags = (row.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+    if (removeTag) tags = tags.filter((t) => t !== removeTag);
+    if (addTag && !tags.includes(addTag)) tags.push(addTag);
+    if (!tags.includes(`superseded-by-#${byId}`)) tags.push(`superseded-by-#${byId}`);
+    em.update(id, { tags: tags.join(",") });
+    console.log(`Superseded memory #${id} (now tagged: ${tags.join(",")})`);
+    break;
+  }
+  case "test": {
+    const from = flag("from") || "";
+    const subject = flag("subject") || "";
+    const snippet = flag("snippet") || "";
+    const results = em.searchForEmail({ from, subject, snippet });
+    if (results.length === 0) { console.log("No matching memories for this email."); break; }
+    console.log(`${results.length} matching memor${results.length === 1 ? "y" : "ies"}:`);
+    for (const r of results) {
+      console.log(`  #${r.id}: ${r.text}`);
+    }
+    console.log("\nPrompt block:");
+    console.log(em.formatForPrompt({ from, subject, snippet }));
+    break;
+  }
+  default:
+    usage();
+}
