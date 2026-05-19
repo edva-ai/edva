@@ -102,15 +102,16 @@ The phone-channel ack layer (the "checking calendar…" status text while the re
 
 ## Requirements
 
+Minimum to run *anything*:
+
 - **macOS** (Apple Silicon preferred) or Linux
 - **Node.js 22.5+** (built-in SQLite via `node:sqlite`)
-- **[Ollama](https://ollama.com)** running locally with `gemma3:4b` and `nomic-embed-text` pulled (for the ack layer + memory embeddings)
-- A Claude API key OR an active Claude Max subscription
-- *(optional)* GitHub CLI (`gh`) for some workflow commands
-- *(optional)* `gog` CLI for Google Calendar / Tasks / People integration
-- *(optional)* `op` CLI (1Password) if you want managed secrets
+- **[Ollama](https://ollama.com)** running locally with `gemma3:4b` and `nomic-embed-text` pulled
+- A **Claude API key** OR an active **Claude Max** subscription
 
-The bootstrap script will tell you which of these are missing.
+Per-feature dependencies (Gmail Pub/Sub, Supabase, SMTP outbound, iOS builds, GitHub Actions CI, etc.) are mapped in [`docs/dependencies.md`](docs/dependencies.md). Read it before committing to a deployment plan — there are real gotchas around things like the missing `gog` CLI (used by several reference jobs), self-hosted vs hosted GitHub runners, and what works on Linux vs requires macOS.
+
+The bootstrap script probes for what's installed and warns about gaps.
 
 ---
 

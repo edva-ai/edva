@@ -1,4 +1,4 @@
-# Exercise
+# Spotter
 
 Personal SwiftUI iOS app that follows your 6-page workout guide: Strength A/B (gym), Bodyweight A/B (no-gym), Minimum Effective, and Cardio. It picks today's workout from a weekly default × gym-available toggle, lets you swap per-day, logs every set with reps/weight/duration, and syncs to Supabase so Merlin can query your tracking data.
 
@@ -12,9 +12,9 @@ Personal SwiftUI iOS app that follows your 6-page workout guide: Strength A/B (g
 
 ## Project layout
 ```
-Exercise/
-  ExerciseApp.swift           — app entry, SwiftData container, Google URL handling
-  Info.plist, Exercise.entitlements
+Spotter/
+  SpotterApp.swift           — app entry, SwiftData container, Google URL handling
+  Info.plist, Spotter.entitlements
   Assets.xcassets/            — 39 exercise illustration imagesets + AppIcon + AccentColor
   Catalog/WorkoutCatalog.swift — catalog of all 7 workouts + 39 exercises from the PDF
   Models/Models.swift         — SwiftData: WeeklyPlanDay, DayOverride, WorkoutSession, SetLog, AppSettings
@@ -32,7 +32,7 @@ supabase/migrations/0001_initial.sql — schema + RLS + `exercise_highlights` vi
 
 ## One-time setup
 
-Before the app will sync or sign in, plug the following into `Exercise/Info.plist` (or a `.xcconfig` — see *Secrets*):
+Before the app will sync or sign in, plug the following into `Spotter/Info.plist` (or a `.xcconfig` — see *Secrets*):
 
 | Key | Source |
 |---|---|
@@ -44,37 +44,37 @@ Before the app will sync or sign in, plug the following into `Exercise/Info.plis
 The app still runs without these (for local dev/TestFlight smoke); the sign-in screen will show an error. Fill them in to enable sync.
 
 ### Supabase
-1. Create a new project (e.g. `exercise-spotter`).
+1. Create a new project (e.g. `spotter-supabase`).
 2. Run the migration: `supabase db push` (or paste `supabase/migrations/0001_initial.sql` into the SQL editor).
 3. Auth → Providers → Google → enable, paste your Google OAuth web client ID + secret.
 4. Copy Project URL and anon key into `Info.plist`.
 
 ### Google Cloud
 1. Create or reuse an OAuth consent screen (external, testing mode is fine).
-2. Create two OAuth clients: one **Web** (give Supabase the ID+secret), one **iOS** (bundle ID `com.raccah.Exercise`).
+2. Create two OAuth clients: one **Web** (give Supabase the ID+secret), one **iOS** (bundle ID `com.example.Spotter`).
 3. Put the iOS client's Client ID into `GIDClientID` and its Reversed Client ID into `CFBundleURLSchemes`.
 
 ### TestFlight signing
-The project uses **automatic** signing. Open `Exercise.xcodeproj`, select the *Exercise* target → Signing & Capabilities → pick your team. XcodeGen preserves any manual signing changes on re-generation if you keep them in `settings.base` of `project.yml`.
+The project uses **automatic** signing. Open `Spotter.xcodeproj`, select the *Spotter* target → Signing & Capabilities → pick your team. XcodeGen preserves any manual signing changes on re-generation if you keep them in `settings.base` of `project.yml`.
 
 ## Running
 ```bash
 brew install xcodegen                     # once
-xcodegen                                  # regenerates Exercise.xcodeproj
-open Exercise.xcodeproj                   # ⌘R to run on simulator / device
+xcodegen                                  # regenerates Spotter.xcodeproj
+open Spotter.xcodeproj                   # ⌘R to run on simulator / device
 ```
 
 ## TestFlight build
 ```bash
-xcodebuild -project Exercise.xcodeproj -scheme Exercise \
+xcodebuild -project Spotter.xcodeproj -scheme Spotter \
     -configuration Release -destination 'generic/platform=iOS' \
-    -archivePath build/Exercise.xcarchive archive
+    -archivePath build/Spotter.xcarchive archive
 
-xcodebuild -exportArchive -archivePath build/Exercise.xcarchive \
+xcodebuild -exportArchive -archivePath build/Spotter.xcarchive \
     -exportOptionsPlist ExportOptions.plist \
     -exportPath build/export
 
-xcrun altool --upload-app --type ios --file build/export/Exercise.ipa \
+xcrun altool --upload-app --type ios --file build/export/Spotter.ipa \
     --apiKey <asc-api-key> --apiIssuer <asc-issuer-id>
 ```
 (Create `ExportOptions.plist` with `method=app-store`, `teamID=<your team>`, `signingStyle=automatic`.)
