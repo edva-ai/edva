@@ -1,0 +1,5 @@
+{
+  "_comment": "Persisted user timezone — read by trigger-hum.sh + other cron-driven scripts that gate on local hour. Copy to data/user-timezone.json. The companion app overwrites this whenever a fresh phone-context lands; for hosts without the companion app, set it once here.",
+  "timezone": "America/New_York",
+  "updated_at": "2026-01-01T00:00:00Z"
+}

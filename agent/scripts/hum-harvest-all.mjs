@@ -12,9 +12,10 @@ import path from "node:path";
 import os from "node:os";
 
 const HOME = os.homedir();
-const REGISTRY = path.join(HOME, "dev/merlin/data/hum-interests.json");
-const STATE = path.join(HOME, "dev/merlin/data/hum-interests-state.json");
-const HARVESTER_DIR = path.join(HOME, "dev/merlin/agent/scripts/hum-harvesters");
+const MERLIN_HOME = process.env.MERLIN_HOME || path.join(HOME, "Dev/merlin");
+const REGISTRY = path.join(MERLIN_HOME, "data/hum-interests.json");
+const STATE = path.join(MERLIN_HOME, "data/hum-interests-state.json");
+const HARVESTER_DIR = path.join(MERLIN_HOME, "agent/scripts/hum-harvesters");
 
 function readJson(p, def = null) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return def; }

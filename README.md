@@ -71,11 +71,11 @@ Six more reference jobs ship under `system/tasks.json` (`hum`, `hum-review`, `wi
 
 | Surface | Notes |
 |---|---|
-| Personal jobs | Specific to your life — replace the reference set or extend it |
-| Hum harvesters | 7 generic ones ship (weather, news, calendar, tasks, watchdog, serendipity, `_common`) — add your own under `agent/scripts/hum-harvesters/` |
-| Smart-home / location / messaging integrations | The MCP bridge has 23 working tools; 65 personal-tool blocks were removed. Add your own backends under `bin/` and register tool blocks in `agent/tools-mcp/index.mjs` |
-| Code-signing identity | Apple Team ID, bundle IDs — see [`apps/companion/CODE-SIGNING.md`](apps/companion/CODE-SIGNING.md) |
-| Your memory corpus | The wiki/memory layer is the substrate; your `user_*`, `project_*`, `feedback_*` pages live in Claude Code's per-project memory dir |
+| **Hum loop** populated | Empty on day 1. The harness + 7 generic harvesters ship; you write `data/hum-interests.json` + `data/hum-intent.md` and add your own harvesters. See [`docs/hum.md`](docs/hum.md). |
+| **Memory corpus** populated | Empty on day 1. The wiki layer ships; you write `user_*`, `project_*`, `feedback_*`, `reference_*` pages. See [`docs/memory.md`](docs/memory.md). |
+| Personal jobs | Specific to your life — replace the reference set or extend it. See [`docs/writing-a-job.md`](docs/writing-a-job.md). |
+| Smart-home / location / messaging integrations | The MCP bridge has 23 working tools; 65 personal-tool blocks were removed. Add your own backends under `bin/` and register tool blocks in `agent/tools-mcp/index.mjs`. |
+| Code-signing identity | Apple Team ID, bundle IDs — see [`apps/companion/CODE-SIGNING.md`](apps/companion/CODE-SIGNING.md). |
 
 ---
 

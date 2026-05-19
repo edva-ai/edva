@@ -1,0 +1,57 @@
+{
+  "_comment": "Hum harvester registry. Copy to data/hum-interests.json (gitignored) and edit. Each topic is one harvester invocation; the harness reads this on every tick and runs every enabled topic whose cadence has elapsed.",
+  "_schema": {
+    "name": "Topic id. Matches the harvester filename: agent/scripts/hum-harvesters/<name>.mjs",
+    "enabled": "true to run this topic on ticks",
+    "script": "Override script path. Default is hum-harvesters/<name>.mjs.",
+    "cadence_min": "Minimum minutes between runs (0 = run every tick)",
+    "cache_ttl_min": "Per-topic harvester output cache TTL (the harvester reads its cache before doing network work)",
+    "active_window": "When this topic should run. Examples: 'daily', 'mon-fri 09:30-16:00 ET', 'sat-sun', or null. If null/'daily', always runs.",
+    "urgency_rule": "Optional inline override of the ranker's urgency weight. Defaults are fine to start."
+  },
+  "topics": [
+    {
+      "name": "weather",
+      "enabled": true,
+      "cadence_min": 20,
+      "cache_ttl_min": 60,
+      "active_window": "daily"
+    },
+    {
+      "name": "news",
+      "enabled": true,
+      "cadence_min": 60,
+      "cache_ttl_min": 30,
+      "active_window": "daily"
+    },
+    {
+      "name": "calendar",
+      "enabled": true,
+      "cadence_min": 20,
+      "cache_ttl_min": 5,
+      "active_window": "daily"
+    },
+    {
+      "name": "tasks",
+      "enabled": true,
+      "cadence_min": 20,
+      "cache_ttl_min": 5,
+      "active_window": "daily"
+    },
+    {
+      "name": "watchdog",
+      "enabled": true,
+      "cadence_min": 30,
+      "cache_ttl_min": 5,
+      "active_window": "daily"
+    },
+    {
+      "name": "serendipity",
+      "enabled": false,
+      "cadence_min": 120,
+      "cache_ttl_min": 60,
+      "active_window": "sat-sun 09:00-18:00",
+      "_note": "deferred — needs a richer places-scoring backend. Disabled by default."
+    }
+  ]
+}

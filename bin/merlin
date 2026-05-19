@@ -2338,10 +2338,32 @@ function cmdInit(args) {
     // Write the webhook token to the secrets dir (scripts read this directly)
     fs.writeFileSync(path.join(ROOT, 'secrets', 'webhook-token'), env.WEBHOOK_TOKEN + '\n');
 
+    // Seed runtime config from examples/, but never overwrite existing files —
+    // the user may have customized them between init runs.
+    const seedMap = [
+      ['examples/hum-interests.example.json', 'data/hum-interests.json'],
+      ['examples/hum-intent.example.md',      'data/hum-intent.md'],
+      ['examples/user-timezone.example.json', 'data/user-timezone.json'],
+    ];
+    const seeded = [];
+    for (const [src, dst] of seedMap) {
+      const dstAbs = path.join(ROOT, dst);
+      if (fs.existsSync(dstAbs)) continue;
+      const srcAbs = path.join(ROOT, src);
+      if (!fs.existsSync(srcAbs)) continue;
+      fs.copyFileSync(srcAbs, dstAbs);
+      seeded.push(dst);
+    }
+
     console.log(c.green('\n  ✓ .env written'));
     console.log(c.green('  ✓ data/, logs/, supervisor state/, secrets/ created'));
     console.log(c.green('  ✓ webhook-token written to secrets/webhook-token'));
+    if (seeded.length) {
+      console.log(c.green('  ✓ seeded ' + seeded.length + ' runtime config files from examples/:'));
+      for (const s of seeded) console.log(c.dim('      ' + s));
+    }
     console.log(c.dim('\nNext: ') + c.bold('./bin/merlin up'));
+    console.log(c.dim('See docs/hum.md + docs/memory.md to populate the ambient-awareness loop + memory layer.'));
   })().catch(err => { console.error(c.red('Error: ') + err.message); process.exit(1); });
 }
 
