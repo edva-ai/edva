@@ -51,7 +51,7 @@ jobs:
 
       - name: Verify tools
         run: |
-          export PATH=/opt/homebrew/bin:$PATH
+          export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH
           xcodebuild -version
           xcodegen --version
 
@@ -120,7 +120,7 @@ jobs:
 
       - name: Generate Xcode project
         run: |
-          export PATH=/opt/homebrew/bin:$PATH
+          export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH
           xcodegen
 
       - name: Stamp build number + scope manual signing to Spotter target

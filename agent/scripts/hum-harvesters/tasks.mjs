@@ -5,7 +5,7 @@ import { readStdinJson, emit, emitNull, stampRun } from "./_common.mjs";
 const { situation: sit, context } = await readStdinJson(); void sit; void context;
 
 try {
-  const plain = execSync("/opt/homebrew/bin/gog tasks list @default --plain", {
+  const plain = execSync("gog tasks list @default --plain", {
     encoding: "utf8", timeout: 10000,
   });
   // gog plain output is TSV; find overdue + due-today lines

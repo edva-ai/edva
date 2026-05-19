@@ -14,9 +14,9 @@ set -euo pipefail
 : "${MERLIN_HOME:=${HOME}/Dev/merlin}"
 
 
-TMUX=/opt/homebrew/bin/tmux
+TMUX=tmux
 CLAUDE="$HOME/.local/bin/claude"
-NODE=/opt/homebrew/bin/node
+NODE=node
 SESSION=claude
 WORKDIR="${MERLIN_HOME}/agent"
 CHAT_DIR="$WORKDIR/chat-agent"

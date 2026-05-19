@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = path.join(__dirname, "mock-service.mjs");
 const PTY_WRAP = path.join(__dirname, "..", "bin", "pty-wrap.py");
-const PYTHON = "/opt/homebrew/bin/python3";
+const PYTHON = "python3";
 const NODE = process.execPath;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

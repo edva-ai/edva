@@ -20,7 +20,7 @@ Save the following as `~/Library/LaunchAgents/ai.merlin.session.plist`:
 
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/node</string>
+        <string>node</string>
         <string>YOUR_MERLIN_HOME/agent/bin/process-manager.mjs</string>
     </array>
 

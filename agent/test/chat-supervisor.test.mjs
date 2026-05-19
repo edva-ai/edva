@@ -19,7 +19,7 @@ import { spawn, execSync } from "node:child_process";
 // The tests skip gracefully when this is detected.
 function canChildListen() {
   try {
-    execSync(`${"/opt/homebrew/bin/node"} -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"`, { timeout: 3000, stdio: "pipe" });
+    execSync(`${"node"} -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"`, { timeout: 3000, stdio: "pipe" });
     return true;
   } catch { return false; }
 }
@@ -27,7 +27,7 @@ function canChildListen() {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK_CLAUDE = path.join(__dirname, "mock-claude.mjs");
 const CHAT_SUPERVISOR = path.join(__dirname, "..", "supervisor", "chat-supervisor.mjs");
-const NODE = "/opt/homebrew/bin/node";
+const NODE = "node";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

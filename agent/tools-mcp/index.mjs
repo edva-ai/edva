@@ -27,7 +27,7 @@ async function run(cmd, args = [], opts = {}) {
       ...restOpts,
       env: {
         ...process.env,
-        PATH: `${BIN}:/opt/homebrew/bin:${process.env.PATH}`,
+        PATH: `${BIN}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
         ...(optsEnv || {}),
       },
     });
@@ -81,7 +81,7 @@ block here.
 ### Spam filter (REQUIRES \`bin/spam-filter\` — supply your own)
 - spam_block / spam_list
 
-### Google Contacts (REQUIRES \`gog\` CLI — github.com/google-org/gog or similar)
+### Google Contacts (REQUIRES \`gog\` CLI — see docs/dependencies.md § Google Calendar / Tasks / Contacts)
 - contacts_search / contacts_get / contacts_list
 `,
   }

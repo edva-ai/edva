@@ -5,7 +5,7 @@
 #
 # Required before sourcing: webhook-auth.sh (populates CURL_AUTH).
 #
-# Assumes callers export PATH to include /opt/homebrew/bin so node is
+# Assumes callers export PATH to include the standard system bin dirs so node is
 # reachable under cron.
 
 : "${MERLIN_HOME:=${HOME}/Dev/merlin}"

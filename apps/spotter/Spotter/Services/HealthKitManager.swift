@@ -779,8 +779,9 @@ final class HealthKitManager: @unchecked Sendable {
         // Match Merlin's behaviour — APNs token if present (Spotter doesn't
         // register for remote notifications, so this falls through to the
         // per-vendor identifier, which is stable across reinstalls within
-        // co.silo.*). Different value than Merlin's vendor id, so Spotter's
-        // aggregate rows sit alongside Merlin's rather than overwriting them.
+        // the same vendor/team-id namespace). Different value than Merlin's
+        // vendor id, so Spotter's aggregate rows sit alongside Merlin's
+        // rather than overwriting them.
         if let token = UserDefaults.standard.string(forKey: "merlin.apnsDeviceToken"),
            !token.isEmpty {
             return token

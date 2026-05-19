@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/node
+#!node
 // merlin-logs — time-merged view across supervisor + watchdog + event logs.
 //
 // Motivation: during the 2026-04-18 5h hum outage, diagnosing required

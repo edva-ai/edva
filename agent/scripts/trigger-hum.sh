@@ -15,7 +15,7 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 # 2026-04-14: rewrite — dropped --after-message piggyback and --silence-check
 # modes. The new hum is a pure 20-min tick; see jobs/hum.md.
 
-export PATH="/opt/homebrew/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 MODE="tick"
 case "$1" in
@@ -80,7 +80,7 @@ fi
 # Calendar busy gate: skip if the user is in a meeting right now.
 # Transparent/free events (e.g. shared-calendar-only entries) don't block.
 if [ "$MODE" != "manual" ]; then
-  GOG_BIN="/opt/homebrew/bin/gog"
+  GOG_BIN="gog"
   if [ -x "$GOG_BIN" ]; then
     NOW_ISO=$(TZ="$USER_TZ" date -Iseconds)
     FOUR_AGO=$(TZ="$USER_TZ" date -v-4H -Iseconds)

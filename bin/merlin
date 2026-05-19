@@ -505,7 +505,7 @@ function cmdServices(args) {
   const lc = shSafe('launchctl list') || '';
   const enriched = services.map(sv => {
     if (sv.type === 'tmux') {
-      const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
+      const tmuxOut = shSafe('tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
       return { ...sv, status: tmuxOut ? 'running' : 'not running' };
     }
     const line = lc.split('\n').find(l => l.endsWith('\t' + sv.label));
@@ -660,7 +660,7 @@ function cmdTriageStatus(args) {
     try { s.supervisor_health = JSON.parse(health); } catch {}
   }
   // ops-agent process in pane 1
-  const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
+  const tmuxOut = shSafe('tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
   if (tmuxOut) {
     const line = tmuxOut.split('\n').find(l => l.startsWith('1 '));
     if (line) {
@@ -867,7 +867,7 @@ function cmdTriageResolve(args) {
 }
 
 // --- restart ---
-const TMUX = '/opt/homebrew/bin/tmux';
+const TMUX = 'tmux';
 
 // Wrappers that send raw argv to tmux — no shell interpolation.
 function tmuxRun(args) {
@@ -905,7 +905,7 @@ function cmdRestart(args) {
   const target = args.find(a => !a.startsWith('--'));
   if (!target) die('restart: usage: merlin restart <ops|chat|hookdeck|session>');
   const CLAUDE = path.join(HOME, '.local/bin/claude');
-  const NODE = '/opt/homebrew/bin/node';
+  const NODE = 'node';
   const AGENT_DIR = path.join(TOOLS, 'agent');
   const SUPERVISOR_DIR = path.join(AGENT_DIR, 'supervisor');
   const CONFIG_DIR = path.join(AGENT_DIR, 'config');
@@ -1235,7 +1235,7 @@ function cmdDoctor(args) {
   // target was inspected instead of the actual binary. Probe by invoking a
   // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
   // (renamed binary, expired token bucket) without reading the symlink.
-  const gogProbe = shSafe('/opt/homebrew/bin/gog tasks lists --plain --account=${MERLIN_OWNER_EMAIL} --no-input 2>&1 | head -3');
+  const gogProbe = shSafe('gog tasks lists --plain --account=${MERLIN_OWNER_EMAIL} --no-input 2>&1 | head -3');
   const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
   add('gog tasks CLI reachable', !!gogOk, gogOk
     ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
@@ -1878,7 +1878,7 @@ function buildSituation() {
   // trumps most other candidates).
   let upcomingEvents = [];
   try {
-    const raw = shSafe(`/opt/homebrew/bin/gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 1 --max 20 --json 2>/dev/null`) || '';
+    const raw = shSafe(`gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 1 --max 20 --json 2>/dev/null`) || '';
     const data = JSON.parse(raw || '{}');
     const events = data?.events || data?.items || [];
     const now = Date.now();
@@ -1902,7 +1902,7 @@ function buildSituation() {
   // Due-today + overdue tasks — lightweight counts + top-3 titles
   let dueToday = [], overdueCount = 0;
   try {
-    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
+    const plain = shSafe(`gog tasks list @default --plain 2>/dev/null`) || '';
     const today = new Date().toISOString().slice(0, 10);
     for (const line of plain.split('\n').filter(Boolean)) {
       if (line.includes('completed')) continue;

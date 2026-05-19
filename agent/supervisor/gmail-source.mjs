@@ -44,20 +44,23 @@ const MAX_BODY_SIZE = 64 * 1024;
 const MAX_RECENT = 100;
 const BATCH_WINDOW_MS = 8000; // accumulate pushes for 8s before dispatching
 
-// Guest-host chat fast-path coalescing: see agent/ops-agent/CLAUDE.md
-// "Fast-path classification". Messages from express@airbnb.com and
-// sender@messages.homeaway.com whose subject contains one of these markers
-// skip full triage and only need label + mark-read. Coalesce 2+ such messages
-// in the same batch window into one dispatch (saves ~3 dispatches/day).
-// Hospitable emails are NOT fast-path — they can trigger tasks/notifications.
-const FAST_PATH_FROMS = ["express@airbnb.com", "sender@messages.homeaway.com"];
-const FAST_PATH_SUBJECT_MARKERS = [
-  "has replied to your message",
-  "Reservation for",
-  "Message from",
-];
+// Fast-path coalescing pattern: high-volume vendor traffic whose triage
+// outcome is always "label + mark-read" should skip full LLM evaluation
+// and coalesce in the batch window. The shipped lists are empty — populate
+// with your own from-domains + subject-markers as you observe noise
+// patterns in your inbox. Setting these from env keeps the lists out of
+// code so you can tune without a rebuild.
+//
+// Example values (uncomment + edit to fit your traffic):
+//   MERLIN_GMAIL_FASTPATH_FROMS="express@airbnb.com,sender@messages.homeaway.com"
+//   MERLIN_GMAIL_FASTPATH_SUBJECTS="has replied to your message,Reservation for,Message from"
+const FAST_PATH_FROMS = (process.env.MERLIN_GMAIL_FASTPATH_FROMS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const FAST_PATH_SUBJECT_MARKERS = (process.env.MERLIN_GMAIL_FASTPATH_SUBJECTS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 function isFastPathMeta(meta) {
   if (!meta || !meta.from || !meta.subject) return false;
+  if (!FAST_PATH_FROMS.length || !FAST_PATH_SUBJECT_MARKERS.length) return false;
   const fromLc = String(meta.from).toLowerCase();
   if (!FAST_PATH_FROMS.some((f) => fromLc.includes(f))) return false;
   return FAST_PATH_SUBJECT_MARKERS.some((m) => meta.subject.includes(m));
@@ -327,9 +330,9 @@ export class GmailSource {
             (m) => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`,
           );
           const content =
-            `Guest-host chat fast-path batch (${fastPath.length} messages).\n` +
-            `All are express@airbnb.com / messages.homeaway.com replies that qualify for the fast-path in CLAUDE.md.\n` +
-            `For EACH message below: label (airbnb-miami or pamper-homes based on property name in the subject), mark-read, record in email-mem. No body fetch, no task, no notification. Handle all of them in one batched tool pass.\n\n` +
+            `Fast-path batch (${fastPath.length} messages).\n` +
+            `All match the MERLIN_GMAIL_FASTPATH_FROMS + MERLIN_GMAIL_FASTPATH_SUBJECTS pattern and qualify for the no-LLM fast path per CLAUDE.md.\n` +
+            `For EACH message below: apply the appropriate label (per your inbox conventions), mark-read, record in email-mem. No body fetch, no task, no notification. Handle all of them in one batched tool pass.\n\n` +
             lines.join("\n");
           this._dispatchFn(content, `gmail:fastpath-batch(${fastPath.length})`);
         } else {

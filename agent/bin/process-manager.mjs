@@ -24,7 +24,7 @@ const MERLIN = MERLIN_HOME;
 const AGENT_DIR = path.join(MERLIN, "agent");
 const LOG_DIR = path.join(AGENT_DIR, "logs");
 const SUPERVISOR_DIR = path.join(AGENT_DIR, "supervisor");
-const NODE = "/opt/homebrew/bin/node";
+const NODE = "node";
 
 // Load .env into process.env so secrets (SUPABASE_ACCESS_TOKEN, etc.)
 // propagate to every child process — supervisors, Claude, and MCP servers
@@ -87,7 +87,7 @@ function createProcesses() {
   children.push(
     new ManagedProcess({
       name: "hookdeck",
-      command: "/opt/homebrew/lib/node_modules/hookdeck-cli/binaries/darwin-arm64/hookdeck",
+      command: "hookdeck",
       // --log-level debug adds connection diagnostics to hookdeck.log
       // (WebSocket close reasons, retry backoff, DNS/TLS errors) so when the
       // tunnel drops, we have enough context to diagnose root cause instead of

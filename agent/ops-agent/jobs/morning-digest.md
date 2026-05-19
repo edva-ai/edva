@@ -95,7 +95,7 @@ Wait for Gmail to index, then label `personal` and mark-read:
 
 ```bash
 SUBJECT="Morning Brief — $(TZ=America/New_York date '+%a, %b %-d')"
-until MSG_ID=$(/opt/homebrew/bin/node -e "
+until MSG_ID=$(node -e "
 const { getAccessToken } = require('${MERLIN_HOME}/lib/google-auth.js');
 (async () => {
   const tok = await getAccessToken();

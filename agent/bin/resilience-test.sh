@@ -11,7 +11,7 @@ set -euo pipefail
 : "${MERLIN_HOME:=${HOME}/Dev/merlin}"
 
 
-TMUX=/opt/homebrew/bin/tmux
+TMUX=tmux
 SESSION=claude
 LOGDIR="${MERLIN_HOME}/agent/logs"
 LOG="$LOGDIR/resilience-test.log"

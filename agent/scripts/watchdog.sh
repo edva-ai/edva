@@ -4,7 +4,7 @@
 # unread sweep was dead from Apr 10 2026 until this was added).
 : "${MERLIN_HOME:=${HOME}/Dev/merlin}"
 
-export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin
+export PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/sbin
 source "$(dirname "$0")/lib/webhook-auth.sh"
 # watchdog.sh — health monitor for the agent process-manager.
 # Runs every 5 min via cron: */5 * * * * /path/to/watchdog.sh
@@ -19,7 +19,7 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 # It no longer manages tmux sessions or panes.
 
 LOG="${MERLIN_HOME}/agent/logs/watchdog.log"
-NODE=/opt/homebrew/bin/node
+NODE=node
 SEND="${MERLIN_HOME}/bin/merlin-send-curl"
 GMAIL_ACTION="${MERLIN_HOME}/bin/gmail-action"
 WORKDIR="${MERLIN_HOME}/agent"
@@ -616,7 +616,7 @@ fi
 # just see canned text forever. architecture.md marks canned as the only
 # permitted fallback; it is not a desirable steady state.
 OLLAMA_RESTART_COOLDOWN="${MERLIN_HOME}/data/.ollama-restart-cooldown"
-BREW_BIN=/opt/homebrew/bin/brew
+BREW_BIN=brew
 if ! curl -sf --max-time 3 http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
   ATTEMPT=$(incident_seen "ollama-down")
   log "Ollama unreachable on :11434 (attempt $ATTEMPT) — phone-channel acks will fall through to CANNED"
@@ -673,7 +673,7 @@ fi
 # The `gh` CLI stores its OAuth token in the macOS keyring. Token is long-lived
 # (device-flow OAuth, no expiry) but can be invalidated by revocation or SSO
 # cycles. Alert at most once per 24h if it breaks.
-GH_BIN=/opt/homebrew/bin/gh
+GH_BIN=gh
 GH_TOKEN_FILE="${MERLIN_HOME}/secrets/gh-token"
 GH_ALERT_COOLDOWN="${MERLIN_HOME}/data/.gh-auth-last-alert"
 if [ -x "$GH_BIN" ]; then
@@ -757,7 +757,7 @@ fi
 # --- gog CLI auth health ---
 # Google Tasks/Calendar/etc. OAuth refresh tokens can be revoked by Google
 # (rotation, inactivity, password change). Alert at most once per 24h.
-GOG_BIN=/opt/homebrew/bin/gog
+GOG_BIN=gog
 GOG_ALERT_COOLDOWN="${MERLIN_HOME}/data/.gog-auth-last-alert"
 if [ -x "$GOG_BIN" ]; then
   GOG_ERR=$("$GOG_BIN" tasks list @default --limit 1 2>&1 >/dev/null)

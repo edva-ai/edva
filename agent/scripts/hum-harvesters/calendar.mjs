@@ -102,7 +102,7 @@ if (isMain) {
 
   try {
     const json = execSync(
-      "/opt/homebrew/bin/gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 2 --max 30 --json 2>/dev/null",
+      "gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 2 --max 30 --json 2>/dev/null",
       { encoding: "utf8", timeout: 10000 },
     );
     const data = JSON.parse(json);
