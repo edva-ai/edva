@@ -1,158 +1,122 @@
 # Merlin
 
-**A 24/7 personal-agent OS built on Claude Code.** Runs persistent agents under supervisors that restart on crash, wires them to ingress channels (webhook, Gmail, phone, custom), drives scheduled jobs from markdown playbooks, and backs the whole thing with a SQLite/FTS5 memory layer.
+**An assistant that pays attention — even when you're not asking.**
 
-```
-┌──────── init ────────┐  ┌──────────── process-manager ────────────┐
-│ launchd (macOS)      │─▶│ chat-supervisor  ─▶ claude -p (chat)     │
-│ systemd (Linux)      │  │ ops-supervisor   ─▶ claude -p (ops)      │
-└──────────────────────┘  │ + channel daemons (webhook / gmail / …)  │
-                          └────────────────┬───────────────────────────┘
-                                           │ HTTP POST /dispatch
-                          ┌────────────────┴──────────────┐
-                          │ ingress channels (opt-in)     │
-                          │  webhook · gmail-pubsub ·     │
-                          │  phone-realtime · custom      │
-                          └───────────────────────────────┘
-```
+Most assistants wait. You type, they reply, the moment passes. Merlin stays on. It learns what you like, watches what matters, and quietly handles the things you'd rather not think about.
 
-Read [`system/architecture.md`](system/architecture.md) for the deep version.
+> Runs on the Claude subscription you already have. No API keys. No per-token bills.
+
+→ Read the full story: **[silo.co/merlin](https://silo.co/merlin)**
+
+---
+
+## On the Claude you already have
+
+You may have seen agent frameworks like *openclaw*. They're powerful, but they plug into the Claude API — separate account, pay per token, a bill that scales with how much your agent does.
+
+Merlin works the other way around. It runs through Anthropic's official Claude environment on the subscription you already use in your browser. Sign in once with `claude`, and Merlin works through your account.
+
+- **No API key to manage.** No per-token billing.
+- **No new account.** Same Claude, just always on.
+- **Flat monthly cost** — built for an assistant that runs continuously.
+
+If you'd rather pay by usage, Merlin will use an API key too. But the subscription path is the one it was designed for.
+
+---
+
+## What Merlin does
+
+- **Keeps an eye on your inbox.** The urgent things find your phone the moment they arrive. Receipts, newsletters, and the routine noise get sorted and out of the way before you sit down.
+- **Manages your calendar.** "Put Alice on for Tuesday at 2." Done. Move it, decline a conflict, send the invite — Merlin handles the rest.
+- **Books your table.** Mention the place and the night. If a window opens up, Merlin grabs it.
+- **Brings you the morning.** A quiet brief with today's calendar, your tasks, the weather, and the headlines you'd care about — waiting for you before you're out of bed.
+- **Knows your taste.** Recommends restaurants by what you actually like and where you are, not what's popular this week.
+- **Watches the world for you.** A flight you've been pricing drops. Tickets to a show you'd want. A friend's birthday is in a week. The follow-up call you meant to schedule. You'll hear about it at the right moment, from the right direction.
+- **Helps with the rest.** "Write that no for me." "Summarize this." "Plan a long weekend in Lisbon under two thousand." Describe what you need; Merlin does the work.
+- **Stays close.** A companion iOS/macOS app keeps the conversation going. Reply with 👍 to confirm, or "skip" to teach Merlin what not to bring up again.
+
+## What makes Merlin different
+
+Five things most AI assistants miss.
+
+🧠 **It remembers you.** Your preferences, your decisions, the things you said last month. The longer you use it, the more it understands what *you* actually want.
+
+🐝 **It reaches out.** When Merlin notices something worth knowing, it tells you. Quietly. At the right moment. When there's nothing useful to say, it stays quiet.
+
+🛠️ **It gets things done.** Doesn't just suggest. Writes the email, books the dinner, sets the reminder, runs the research. With safety rails for the things that matter — no money moves without you saying yes.
+
+⏰ **It shows up on time.** Recurring work happens on schedule, in the background. You don't have to remember; it does.
+
+📈 **It gets better as you live with it.** Every week, Merlin reviews how it did, learns from how you responded, and tunes itself to fit your life more closely.
 
 ---
 
 ## Quickstart
 
+For the technically inclined:
+
 ```bash
-git clone https://github.com/<your-org>/merlin.git ~/Dev/merlin
+git clone https://github.com/mraccah2/merlin.git ~/Dev/merlin
 cd ~/Dev/merlin
 
-# 1. Install deps, set up data dirs, check for ollama
+# 1. Install deps, set up runtime dirs, check Ollama
 ./scripts/bootstrap.sh
 
-# 2. Interactive config wizard → writes .env + creates a webhook token
+# 2. Interactive setup — writes .env, generates a webhook token, seeds example configs
 ./bin/merlin init
 
 # 3. Start everything in the foreground (Ctrl-C to stop)
 ./bin/merlin up
 
-# In a second terminal — fire a test job
+# In another terminal — fire a test job
 ./bin/merlin dispatch morning-digest
 
-# Tail the agent logs as it runs
+# Watch it work
 ./bin/merlin tail ops
 ```
 
-That's the local-dev path. For 24/7 deployment, install the launchd/systemd unit (see `docs/installer.md`, TODO).
-
----
-
-## What is Merlin actually doing?
-
-The agents you'll run aren't general-purpose chatbots — they're job-runners. You write a **markdown playbook** describing what an agent should do (steps, tools to call, output format), tag it with a cron schedule or a webhook trigger, and the supervisor dispatches a `claude -p` child against that playbook on every firing.
-
-The reference job in this repo is `agent/ops-agent/jobs/morning-digest.md` — compiles calendar + tasks + inbox + weather + headlines into one HTML email, ships it to the user, follows up with a one-line phone-channel pointer and an APNs push. Cron-driven, runs daily at 7:55 AM by default.
-
-Six more reference jobs ship under `system/tasks.json` (`hum`, `hum-review`, `wiki-audit`, `memory-snapshot`, `chrome-cdp-watch`, `context-sync`) — extend from there.
-
----
+For 24/7 deployment, install the launchd or systemd service per [`docs/installer.md`](docs/installer.md).
 
 ## What ships out of the box
 
-| Component | Path | What |
-|---|---|---|
-| **Kernel** | `agent/` | process-manager, supervisors, channel framework, MCP shell bridge, kernel test suite |
-| **CLI** | `bin/` | 22 tools: `merlin` (status/tasks/triage/...), `wiki`, `memory`, `email-send`, `email-mem`, `context-search`, `hum-*`, `suggestion-*` |
-| **Libraries** | `lib/` | `wiki-store`, `memory-store`, `local-llm`, `apns-push`, `supabase-rest`, `merlin-context`, etc. |
-| **Apps** | `apps/` | Two SwiftUI apps — `companion/` (iOS+macOS chat) and `spotter/` (iOS fitness tracker) |
-| **Reference jobs** | `agent/ops-agent/jobs/` | `morning-digest`, `hum.md` + 5 hum playbooks |
-| **CI** | `.github/workflows/` | iOS + macOS TestFlight workflows for the companion app, secret-scan |
+| | |
+|---|---|
+| Kernel | process-manager, supervisors, channel framework, MCP shell bridge, kernel test suite |
+| CLIs | 22 tools — `merlin`, `wiki`, `memory`, `email-*`, `context-*`, `hum-*`, `suggestion-*` |
+| Libraries | `wiki-store`, `memory-store`, `local-llm`, `apns-push`, `supabase-rest`, `merlin-context` |
+| Apps | Two SwiftUI companion apps — chat (`apps/companion/`) and fitness tracker (`apps/spotter/`) |
+| Reference jobs | `morning-digest`, hum + 5 hum-* playbooks, wiki-audit, memory-snapshot, chrome-cdp-watch, context-sync |
+| CI | iOS + macOS TestFlight workflows, secret-scan |
 
 ## What you'll build yourself
 
-| Surface | Notes |
-|---|---|
-| **Hum loop** populated | Empty on day 1. The harness + 7 generic harvesters ship; you write `data/hum-interests.json` + `data/hum-intent.md` and add your own harvesters. See [`docs/hum.md`](docs/hum.md). |
-| **Memory corpus** populated | Empty on day 1. The wiki layer ships; you write `user_*`, `project_*`, `feedback_*`, `reference_*` pages. See [`docs/memory.md`](docs/memory.md). |
-| Personal jobs | Specific to your life — replace the reference set or extend it. See [`docs/writing-a-job.md`](docs/writing-a-job.md). |
-| Smart-home / location / messaging integrations | The MCP bridge has 23 working tools; 65 personal-tool blocks were removed. Add your own backends under `bin/` and register tool blocks in `agent/tools-mcp/index.mjs`. |
-| Code-signing identity | Apple Team ID, bundle IDs — see [`apps/companion/CODE-SIGNING.md`](apps/companion/CODE-SIGNING.md). |
+Merlin is deliberately a small, opinionated kernel — not a turnkey product. The integrations are sparse because *your* assistant should know about *your* life.
 
----
-
-## Architecture in one paragraph
-
-`launchd` (or `systemd`) launches `agent/bin/process-manager.mjs`. Process-manager spawns the supervisors as direct children — one per agent role from `agent/config/agents.json`. Each supervisor wraps a long-lived `claude -p` child with `--resume` semantics (session-id persists across restarts) and exposes an HTTP `/dispatch` port. Ingress channels (`agent/{webhook,gmail,phone,dispatch-bridge}-channel/`) start as additional children, listen to their respective protocols, and POST normalized events to the supervisor. The agent does work via MCP tools (the shell bridge in `agent/tools-mcp/index.mjs` exposes every binary in `bin/` as a callable tool, the wiki/memory layer is `lib/wiki-store.js` + `lib/memory-store.js`, and a local Ollama model handles low-stakes acks via `lib/local-llm.mjs`). All sessions log per-turn to `agent/logs/supervisor-{ops,chat}/events.ndjson`, with cost attributed per job for the `merlin cost-report` rollup.
-
-Restart semantics: `POST /restart` on a supervisor rotates only the inner `claude -p` child (supervisor stays up). Killing the supervisor PID respawns it via process-manager. Killing process-manager respawns it via init. Session IDs persist through all three layers so conversations don't lose state.
-
-The full doc is [`system/architecture.md`](system/architecture.md).
-
----
-
-## Auth model
-
-Two modes, picked in `agent/config/agents.json`:
-
-- **API key (default)** — set `ANTHROPIC_API_KEY` in `.env`. Easiest. Pay-per-token.
-- **Claude Max subscription** — authenticate `claude` once on the host; the supervisor strips `ANTHROPIC_API_KEY` from the child env so the Max session is the only auth path. Fixed monthly cost. Also a *hardening profile*: if Max is unavailable, agents go down rather than silently fall back to API-key calls.
-
-The phone-channel ack layer (the "checking calendar…" status text while the real Claude reply lands) always runs against a local Ollama model — no Anthropic calls. See `lib/local-llm.mjs`.
+- **Populate Hum's awareness loop.** Empty on day 1. See [`docs/hum.md`](docs/hum.md).
+- **Populate your memory corpus.** Empty on day 1. See [`docs/memory.md`](docs/memory.md).
+- **Wire up integrations** — Gmail ([guide](docs/integrations/gmail.md)), Supabase ([guide](docs/integrations/supabase.md)), SMTP ([guide](docs/integrations/smtp.md)), or your own.
+- **Write your own jobs.** Markdown playbooks. See [`docs/writing-a-job.md`](docs/writing-a-job.md).
+- **Set your Apple signing identity** — for the companion apps. See [`apps/companion/CODE-SIGNING.md`](apps/companion/CODE-SIGNING.md).
 
 ---
 
 ## Requirements
 
-Minimum to run *anything*:
+Minimum:
 
-- **macOS** (Apple Silicon preferred) or Linux
-- **Node.js 22.5+** (built-in SQLite via `node:sqlite`)
-- **[Ollama](https://ollama.com)** running locally with `gemma3:4b` and `nomic-embed-text` pulled
-- A **Claude API key** OR an active **Claude Max** subscription
+- **macOS** (Apple Silicon preferred) or **Linux**
+- **Node.js 22.5+** (built-in `node:sqlite`)
+- **[Ollama](https://ollama.com)** with `gemma3:4b` and `nomic-embed-text` pulled
+- A **Claude Max subscription** (recommended) OR a **Claude API key**
 
-Per-feature dependencies (Gmail Pub/Sub, Supabase, SMTP outbound, iOS builds, GitHub Actions CI, etc.) are mapped in [`docs/dependencies.md`](docs/dependencies.md). Read it before committing to a deployment plan — there are real gotchas around things like the missing `gog` CLI (used by several reference jobs), self-hosted vs hosted GitHub runners, and what works on Linux vs requires macOS.
+Full dependency matrix, per-feature requirements, and platform notes in [`docs/dependencies.md`](docs/dependencies.md). The bootstrap script probes for what's installed and warns about gaps.
 
-The bootstrap script probes for what's installed and warns about gaps.
+## Under the hood
 
----
-
-## Project layout
-
-```
-.github/workflows/   ios-testflight, macos-testflight, secret-scan
-agent/               kernel substrate
-  bin/                 process-manager + companions
-  chat-agent/          chat agent's cwd + CLAUDE.md
-  ops-agent/           ops agent's cwd + CLAUDE.md + jobs/
-  config/              agents.json + schema + loader
-  dispatch-bridge/     server-to-server dispatch channel
-  gmail-channel/       opt-in Gmail Pub/Sub ingress
-  phone-channel/       opt-in companion-app realtime ingress
-  webhook-channel/     opt-in HTTP webhook ingress
-  scripts/             watchdog, gmail watch setup/renew, log rotation,
-                       hum harness + 7 reference harvesters
-  supervisor/          chat-supervisor, ops-supervisor, claude-session,
-                       dispatcher, queue-persist, …
-  test/                kernel test suite
-  tools-mcp/           MCP shell bridge → bin/
-  lib/                 managed-process, priority-dispatcher
-apps/
-  companion/           iOS/macOS chat app (+ CODE-SIGNING.md)
-  spotter/             iOS fitness tracker
-bin/                   user-facing CLIs (merlin, wiki, memory, …)
-lib/                   shared libraries
-system/
-  architecture.md      cross-component map (read first)
-  wiki-architecture.md memory layer detail
-  tasks.json           scheduled-job registry
-  services.json        launchd/systemd unit registry
-scripts/               bootstrap + installer helpers
-docs/                  user-facing guides (in progress)
-```
-
----
+For the curious. Merlin is built on Claude Code with persistent `claude -p` supervisors, durable session resume, an MCP shell bridge that turns any CLI into an agent tool, a SQLite memory layer with full-text + embedding search, a local Ollama model handling latency-sensitive acknowledgments, and markdown playbooks describing every scheduled job. Read the architecture: [`system/architecture.md`](system/architecture.md).
 
 ## License + contributing
 
-Apache 2.0 — see `LICENSE`. Contributions welcome; security disclosures via `SECURITY.md` (TODO).
+Apache 2.0 — see [`LICENSE`](LICENSE). Contributions welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md). Security disclosures via [`SECURITY.md`](SECURITY.md).
 
-Merlin is the open-source extraction of a personal Mac-Mini-hosted agent that's been running 24/7. The patterns are battle-tested; the integrations are deliberately sparse because they're the part you have to make yours.
+→ Read more: **[silo.co/merlin](https://silo.co/merlin)**
