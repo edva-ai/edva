@@ -4,6 +4,26 @@
 credentials/
 secrets/
 
+# ─── Public/private overlay system ───────────────────────────────────────
+# See docs/architecture-public-private.md.
+#
+# `local/` is the root-level personal overlay drop. Anything you keep here
+# stays out of the public repo — most importantly `local/CLAUDE.md` (personal
+# agent rules) and `local/<dir>/` mirror trees. Loaders explicitly check this
+# path in addition to the public kernel paths.
+local/
+# `_ext/` is the per-extension-point drop. Each kernel loader (hum harvesters,
+# ops-agent jobs, MCP tools) globs files under its own `_ext/` subdir at run
+# time. The `_ext/` dirs themselves ship as empty placeholders (`.gitkeep`
+# inside) so contributors see the extension surface without us having to
+# document each one. Everything written into them is, by construction,
+# personal-overlay content and never gets committed.
+**/_ext/*
+!**/_ext/.gitkeep
+# Personal overlay scratch outside the well-known dirs — never tracked.
+*.local.md
+*.local.json
+
 # Private rebuild recipe — never publish. Lives in this private repo's working tree
 # only, intentionally untracked so it can't leak via reset/checkout/force-push.
 merlin-migration/rebuild-guide.md

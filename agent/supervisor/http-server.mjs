@@ -15,10 +15,26 @@ import crypto from "node:crypto";
 
 const MAX_BODY = 64 * 1024;
 const HOME = process.env.HOME;
-const JOBS_DIR = path.join(HOME, "dev/merlin/agent/ops-agent/jobs");
-const TOKEN_PATH = path.join(HOME, "dev/merlin/secrets/webhook-token");
-const EMAIL_INBOUND_SECRET_PATH = path.join(HOME, "dev/merlin/secrets/email-inbound-secret");
+const MERLIN_HOME = process.env.MERLIN_HOME || path.join(HOME, "dev/merlin");
+const JOBS_DIR = path.join(MERLIN_HOME, "agent/ops-agent/jobs");
+// Personal-overlay drop. Jobs here are dispatchable identically to bundled
+// jobs; kernel jobs win on name conflicts. See docs/architecture-public-private.md.
+const JOBS_EXT_DIR = path.join(JOBS_DIR, "_ext");
+const TOKEN_PATH = path.join(MERLIN_HOME, "secrets/webhook-token");
+const EMAIL_INBOUND_SECRET_PATH = path.join(MERLIN_HOME, "secrets/email-inbound-secret");
 const EMAIL_INBOUND_PLAYBOOK_PATH = path.join(JOBS_DIR, "email-inbound.md");
+
+// Resolve a webhook-dispatched job name to its playbook file. Kernel dir wins;
+// `_ext/` is the personal-overlay fallback. Returns the path that exists, or
+// the kernel path if neither exists (so the downstream ENOENT message is
+// helpful — "not found in jobs/" rather than "not found in jobs/_ext/").
+function resolveJobFile(jobName) {
+  const kernel = path.join(JOBS_DIR, `${jobName}.md`);
+  if (fs.existsSync(kernel)) return kernel;
+  const overlay = path.join(JOBS_EXT_DIR, `${jobName}.md`);
+  if (fs.existsSync(overlay)) return overlay;
+  return kernel;
+}
 
 const _secretCache = new Map();
 function readSecret(p, label) {
@@ -131,7 +147,7 @@ export function startServers({ ports, gmailSource, supervisor }) {
 
       let task;
       if (payload.job) {
-        const jobFile = path.join(JOBS_DIR, `${payload.job}.md`);
+        const jobFile = resolveJobFile(payload.job);
         try {
           task = fs.readFileSync(jobFile, "utf8");
           // No log line here — the subsequent `[supervisor] disp NNNNNN → <job>`

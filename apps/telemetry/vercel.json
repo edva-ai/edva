@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/px/(.*)", "destination": "/api/ping" },
+    { "source": "/px", "destination": "/api/ping" },
+    { "source": "/install", "destination": "/api/ping" }
+  ]
+}

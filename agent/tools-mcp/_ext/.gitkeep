@@ -1,0 +1,8 @@
+# Personal MCP tools overlay drop.
+#
+# Each file is an ES module exporting `{ tools: [...descriptors], handlers:
+# { tool_name: async (args) => result } }`. Loaded by `agent/tools-mcp/
+# index.mjs` at MCP-server startup and merged into the public tool set.
+#
+# Anything you place under `_ext/` is gitignored — see .gitignore at repo
+# root and docs/architecture-public-private.md.

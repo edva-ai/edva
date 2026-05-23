@@ -1,0 +1,9 @@
+# Personal ops-agent job overlay drop.
+#
+# Files placed here (e.g. `mkt-ph-launch-monitor.md`, `flights-scan.md`)
+# are dispatchable through the webhook channel exactly like the bundled
+# jobs in the parent dir. The job-file resolver checks the kernel jobs
+# dir first, then falls back to `_ext/`.
+#
+# Anything you place under `_ext/` is gitignored — see .gitignore at repo
+# root and docs/architecture-public-private.md.

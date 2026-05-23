@@ -1,0 +1,138 @@
+{
+  "README.md": [
+    "brand_spotter:| Apps | Two SwiftUI companion apps \u2014 chat (`apps/companion/`) and fitness tracker (`apps/spotter/`)\u2026",
+    "domain_silo:\u2192 Read more: **[silo.co/merlin](https://silo.co/merlin)**",
+    "domain_silo:\u2192 Read the full story: **[silo.co/merlin](https://silo.co/merlin)**",
+    "owner_handle:git clone https://github.com/mraccah2/merlin.git ~/Dev/merlin"
+  ],
+  "SECURITY.md": [
+    "owner_handle:Instead, open a [GitHub security advisory](https://github.com/mraccah2/merlin/security/advisories/ne\u2026"
+  ],
+  "agent/scripts/watchdog.sh": [
+    "hookdeck_host:dig hkdk.events +short 2>&1 || true",
+    "hookdeck_host:echo \"--- dig hkdk.events +short ---\"",
+    "hookdeck_host:echo \"--- ping hkdk.events (3 pkts, 2s timeout) ---\"",
+    "hookdeck_host:ping -c 3 -t 2 hkdk.events 2>&1 || true"
+  ],
+  "apps/spotter/.github/workflows/ios-testflight.yml": [
+    "brand_spotter:# Find the installed App Store profile for com.example.spotter",
+    "brand_spotter:# Scope manual signing to the Spotter target only \u2014 SPM subprojects",
+    "brand_spotter:# that contain PRODUCT_BUNDLE_IDENTIFIER = com.example.spotter.",
+    "brand_spotter:- name: Stamp build number + scope manual signing to Spotter target",
+    "brand_spotter:--group \"Spotter External\"",
+    "brand_spotter:-archivePath build/Spotter.xcarchive \\",
+    "brand_spotter:-archivePath build/Spotter.xcarchive | tail -80",
+    "brand_spotter:-project Spotter.xcodeproj \\",
+    "brand_spotter:-scheme Spotter \\",
+    "brand_spotter:/usr/libexec/PlistBuddy -c \"Set :CFBundleVersion ${{ github.run_number }}\" Spotter/Info.plist",
+    "brand_spotter:<key>com.example.spotter</key><string>$PROFILE_NAME</string>",
+    "brand_spotter:CERT_PATH=\"$RUNNER_TEMP/spotter.p12\"",
+    "brand_spotter:echo \"::error::No App Store profile for com.example.spotter found on this runner\"",
+    "brand_spotter:if \"com.example.spotter\" not in body:",
+    "brand_spotter:if (a.name.startsWith('spotter-ios-') && !a.expired) {",
+    "brand_spotter:if [[ \"$APP_ID\" == \"TEAMID_PLACEHOLDER.com.example.spotter\" && -z \"$HAS_DEVICES\" ]]; then",
+    "brand_spotter:name: spotter-ios-${{ github.run_number }}",
+    "brand_spotter:path = \"Spotter.xcodeproj/project.pbxproj\"",
+    "brand_spotter:test -d build/Spotter.xcarchive"
+  ],
+  "apps/spotter/.gitignore": [
+    "brand_spotter:# Leftover from before the project was renamed Spotter",
+    "brand_spotter:Spotter.xcodeproj/"
+  ],
+  "apps/spotter/README.md": [
+    "brand_spotter:# Spotter",
+    "brand_spotter:-archivePath build/Spotter.xcarchive archive",
+    "brand_spotter:1. Create a new project (e.g. `spotter-supabase`).",
+    "brand_spotter:2. Create two OAuth clients: one **Web** (give Supabase the ID+secret), one **iOS** (bundle ID `com.\u2026",
+    "brand_spotter:Before the app will sync or sign in, plug the following into `Spotter/Info.plist` (or a `.xcconfig` \u2026",
+    "brand_spotter:Info.plist, Spotter.entitlements",
+    "brand_spotter:Spotter/",
+    "brand_spotter:The project uses **automatic** signing. Open `Spotter.xcodeproj`, select the *Spotter* target \u2192 Sign\u2026",
+    "brand_spotter:open Spotter.xcodeproj                   # \u2318R to run on simulator / device",
+    "brand_spotter:xcodebuild -exportArchive -archivePath build/Spotter.xcarchive \\",
+    "brand_spotter:xcodebuild -project Spotter.xcodeproj -scheme Spotter \\",
+    "brand_spotter:xcodegen                                  # regenerates Spotter.xcodeproj",
+    "brand_spotter:xcrun altool --upload-app --type ios --file build/export/Spotter.ipa \\"
+  ],
+  "apps/spotter/Spotter/Info.plist": [
+    "brand_spotter:<string>Spotter reads your clinical records \u2014 lab results, medications, allergies, conditions, immun\u2026",
+    "brand_spotter:<string>Spotter reads your health metrics \u2014 heart rate, sleep, workouts, activity \u2014 so Merlin can re\u2026",
+    "brand_spotter:<string>Spotter</string>",
+    "brand_spotter:<string>Unlock Spotter with Face ID so only you can see your training history.</string>",
+    "brand_spotter:<string>com.example.spotter.merlin.auth</string>",
+    "brand_spotter:<string>com.example.spotter.merlin</string>"
+  ],
+  "apps/spotter/Spotter/Services/HealthKitManager.swift": [
+    "brand_spotter:// Match Merlin's behaviour \u2014 APNs token if present (Spotter doesn't",
+    "brand_spotter:// vendor id, so Spotter's aggregate rows sit alongside Merlin's",
+    "brand_spotter:/// **Merlin's** Supabase (not Spotter's own project). Verbatim port of",
+    "brand_spotter:/// MainActor on every upload (Spotter compiles with strict concurrency",
+    "brand_spotter:/// Spotter dramatically expands coverage compared to the Merlin app",
+    "brand_spotter:/// `SupabaseManager` there). Rationale: Spotter is foregrounded for far"
+  ],
+  "apps/spotter/Spotter/Services/NotificationScheduler.swift": [
+    "brand_spotter:static let reminderIdentifier = \"spotter.daily-noon-reminder\""
+  ],
+  "apps/spotter/Spotter/Services/SpotterSupabase.swift": [
+    "brand_spotter:// Spotter uses its own scheme so the OS routes the callback to us,",
+    "brand_spotter:/// `AuthService` / `SupabaseSync` which write to Spotter's own project.",
+    "brand_spotter:/// as a standalone module so Spotter's existing Supabase plumbing is",
+    "brand_spotter:static let callbackScheme = \"com.example.spotter.merlin\"",
+    "supabase_proj:static let url = URL(string: \"https://mszowrkjhfstptnssrzk.supabase.co\")!"
+  ],
+  "apps/spotter/Spotter/Views/SettingsView.swift": [
+    "brand_spotter:Text(\"Spotter\")",
+    "brand_spotter:Text(\"Uploads Apple Health metrics, workouts, and clinical records to Merlin's Supabase so your assi\u2026"
+  ],
+  "apps/spotter/ci/distribute_external.py": [
+    "brand_spotter:DEFAULT_GROUP = \"Spotter External\""
+  ],
+  "apps/spotter/ci/register_runner.sh": [
+    "brand_spotter:# It creates a NEW runner folder ~/actions-runner-spotter/ so it doesn't",
+    "brand_spotter:--name \"$(hostname -s)-spotter\" \\",
+    "brand_spotter:DIR=\"$HOME/actions-runner-spotter\""
+  ],
+  "apps/spotter/project.yml": [
+    "brand_spotter:- path: Spotter",
+    "brand_spotter:CODE_SIGN_ENTITLEMENTS: Spotter/Spotter.entitlements",
+    "brand_spotter:DEVELOPMENT_ASSET_PATHS: '\"Spotter/Preview Content\"'",
+    "brand_spotter:INFOPLIST_FILE: Spotter/Info.plist",
+    "brand_spotter:PRODUCT_BUNDLE_IDENTIFIER: com.example.spotter",
+    "brand_spotter:PRODUCT_NAME: Spotter",
+    "brand_spotter:Spotter:",
+    "brand_spotter:name: Spotter"
+  ],
+  "bin/memory": [
+    "owner_handle:// Auto-memory lives at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/*.md"
+  ],
+  "bin/memory-restore": [
+    "owner_handle:# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its",
+    "owner_handle:MEMORY_DIR=\"${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}\""
+  ],
+  "bin/memory-snapshot": [
+    "owner_handle:# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its",
+    "owner_handle:MEMORY_DIR=\"${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}\""
+  ],
+  "bin/suggestion-backfill": [
+    "owner_handle:const MEMORY_DIR = path.join(HOME, \".claude/projects/-Users-mraccah-Dev-merlin/memory\");"
+  ],
+  "docs/dependencies.md": [
+    "brand_spotter:- For Spotter: **xcodegen** (`brew install xcodegen`) \u2014 generates `Spotter.xcodeproj` from `project.\u2026",
+    "brand_spotter:| Python 3 | Spotter's `ci/distribute_external.py` uses Python. Not needed if you're not building th\u2026",
+    "hookdeck_host:- `hkdk.events` \u2014 if Hookdeck wired"
+  ],
+  "docs/integrations/gmail.md": [
+    "hookdeck_host:MERLIN_HOOKDECK_URL=https://hkdk.events/<your-connection-id>",
+    "hookdeck_host:That prints a URL like `https://hkdk.events/<your-connection-id>`. Add to `.env`:"
+  ],
+  "docs/quickstart.md": [
+    "owner_handle:git clone https://github.com/mraccah2/merlin.git ~/Dev/merlin"
+  ],
+  "lib/merlin-context.js": [
+    "owner_handle:const MEMORY_DIR = path.join(HOME, \".claude/projects/-Users-mraccah-Dev-merlin/memory\");"
+  ],
+  "system/architecture.md": [
+    "brand_spotter:spotter/             iOS fitness tracker",
+    "brand_spotter:| **Spotter** | Fitness tracker (workouts, sets, reps, HealthKit). Writes to its own Supabase projec\u2026"
+  ]
+}

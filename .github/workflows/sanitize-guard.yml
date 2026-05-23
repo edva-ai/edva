@@ -1,0 +1,35 @@
+name: Sanitize guard
+
+# Server-side run of .tools/sanitize-guard.py. The same script runs locally
+# as a pre-commit hook, but pre-commit can be bypassed (a fresh clone without
+# `pre-commit install`, a `git commit --no-verify`, a web-UI edit on
+# github.com). This workflow is the floor: any new personal-identifier hit
+# beyond the accepted baseline blocks the merge.
+#
+# See docs/architecture-public-private.md for the full kernel/overlay model.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sanitize-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so a future "scan history" mode (bin/merlin audit
+          # --history) works without a re-fetch.
+          fetch-depth: 0
+
+      - name: Run sanitize-guard (--all)
+        # --all walks every tracked file rather than only staged diff. PR
+        # context doesn't have a "staged" concept and we'd rather catch
+        # regressions from main's baseline drift too.
+        run: |
+          python3 --version
+          python3 .tools/sanitize-guard.py --all
