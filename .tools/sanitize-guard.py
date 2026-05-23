@@ -116,7 +116,16 @@ SKIP_PREFIXES = (
     "secrets/",
     "credentials/",
     "node_modules/",
-    ".tools/sanitize-guard.py",   # this file (it documents the patterns)
+    # The guard's own working dir contains the patterns themselves (in the
+    # script source, in --list-patterns output, and in the baseline JSON which
+    # stores each accepted hit verbatim). Scanning it would always flag itself.
+    ".tools/",
+    # The PR template + the architecture doc reference pattern names in
+    # examples and section headers — that's meta-content describing this
+    # boundary, not actual personal coupling. Skip them so the guard doesn't
+    # trip on its own documentation.
+    ".github/pull_request_template.md",
+    "docs/architecture-public-private.md",
 )
 SKIP_PATH_CONTAINS = (
     "/_ext/",                      # any extension drop
