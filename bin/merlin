@@ -127,7 +127,9 @@ function cmdHelp() {
   console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)\n');
   console.log(c.bold('SAFETY'));
   console.log('  audit [--commits N]           run sanitize-guard --all + scan last N commit messages (default 50)');
-  console.log(c.dim('                                — for monthly review of public/private boundary integrity\n'));
+  console.log(c.dim('                                — for monthly review of public/private boundary integrity'));
+  console.log('  review-pr <PR#> | --file F    Claude-powered narrative-leak review of a PR diff or file');
+  console.log(c.dim('                                — catches paraphrased personal content (Layer 6a)\n'));
   console.log(c.dim('Flags: --json  --no-color  --help'));
 }
 
@@ -2811,6 +2813,351 @@ function cmdAudit(args) {
   process.exit(hadFailure ? 1 : 0);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// review-pr — Layer 6a of the public/private boundary: LLM-based narrative
+// leak detection.
+//
+// The pattern-based sanitize-guard catches *explicit* identifiers (canonical
+// names, addresses, emails, codenames, credentials, paths). It cannot catch
+// content that, without using any flagged token, still uniquely identifies
+// a real person, event, or transaction. Examples:
+//
+//   - "the property I bought in 2024 for $X"
+//   - "my partner's medical condition"
+//   - a code comment dated to a specific personal milestone
+//   - AI-generated docs that paraphrase personal context
+//
+// That's what this subcommand asks Claude to look for.
+//
+// Usage:
+//   merlin review-pr <PR#>             diff via `gh pr diff <N>`
+//   merlin review-pr --file <path>     scan a local file (any text)
+//   merlin review-pr --stdin           read diff from stdin
+//   merlin review-pr <PR#> --json      machine-readable output
+//   merlin review-pr <PR#> --model M   override default model
+//
+// Defaults to claude-haiku-4-5 for cost (a typical PR review runs ~$0.005-$0.02).
+// Requires ANTHROPIC_API_KEY in the env or in .env (set by `merlin init` Mode 1).
+//
+// See docs/architecture-public-private.md § Layer 6a.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REVIEW_PR_SYSTEM_PROMPT = `You are reviewing a code diff for personal-content leaks that would land in a PUBLIC open-source repository called Merlin. Your job is one thing only: catch personal/identity-coupled content that pattern-based scanners cannot.
+
+## What's already screened (do NOT re-flag)
+
+A pattern-based pre-commit hook (\`.tools/sanitize-guard.py\`) catches these and blocks the commit. Do not flag instances of:
+- Canonical first names, GitHub handles, owner emails
+- Known property names, business names, project codenames
+- Known credentials, third-party service hostnames, known Supabase/GCP project IDs
+- Hardcoded paths like \`/Users/<owner>/\`
+
+If you see these in the diff, they are pre-approved (in the baseline) or will be blocked separately. Do not waste a finding on them.
+
+## What you ARE looking for
+
+Content that, without using any of the above explicit identifiers, still:
+
+1. **Narrative personal context** — descriptions of a specific real person, relationship, household, business operation, or life event that a reader could plausibly tie back to the operator.
+   Examples: "the property I bought in 2024", "my partner runs the ops side", "the apartment we moved into".
+
+2. **Specific financial or transactional detail** — concrete dollar amounts, contract terms, or transaction details that appear personal rather than illustrative.
+   Examples: "the $42,300 settlement", "monthly rent of $4,250", "the 18% commission on the X deal".
+   NOT this: arbitrary numbers in code (port 9090, timeout 5000), illustrative pricing in docs ("$10/month for Pro plan").
+
+3. **Specific dated events** — a date paired with a concrete event that reads as a real autobiographical reference, not a generic example.
+   Examples: "the launch on March 15, 2026", "after the merger in Q3", "since my surgery last spring".
+   NOT this: release dates, copyright years, schema migration timestamps, ISO date format examples.
+
+4. **Geographic specificity that triangulates** — a city + a specific landmark/street/neighborhood/property type that narrows to a real address.
+   Examples: "the 3rd-floor walkup on Chelsea's west side", "our Miami house near the marina".
+   NOT this: generic city names in API examples ("San Francisco, CA").
+
+5. **Relationship reveal** — references to spouse, partner, child, business partner by role even without name.
+   Examples: "my wife handles the books", "the kids' school schedule".
+
+6. **AI-generated text with personal echoes** — auto-written prose (docs, comments, commit messages) that includes uniquely identifying details, even if no single pattern fires.
+
+## What you are NOT looking for
+
+- Generic technical content (port numbers, byte sizes, timeouts, hex colors)
+- Generic examples in docs ("example.com", "Alice and Bob")
+- Sanitized hypotheticals ("Suppose you have 3 properties")
+- Standard open-source boilerplate (MIT license year, contributor guides)
+- Public dates (release of Node.js 22, etc.)
+- Public-facing URLs the project is intentionally publishing (e.g. project marketing links in the README)
+
+## How to calibrate severity
+
+- **high** — would clearly identify a real person/transaction/event to a stranger reading the public repo
+- **medium** — adds personally identifying context that, combined with other public info, could narrow identity
+- **low** — feels personal but is ambiguous; flag for human review
+
+Be honest about uncertainty. If you can't tell whether a passage is generic or personal, mark it **low** and explain the ambiguity. Better to surface a borderline case than silently miss one.
+
+## Output
+
+You MUST emit valid JSON matching the schema provided. \`findings\` may be an empty array. \`summary.verdict\`:
+- **ship** — no findings, or only \`low\` findings that are clearly false-positive territory
+- **review** — at least one \`medium\` or borderline \`high\` finding; human should look
+- **block** — at least one \`high\` finding that should be sanitized before merge`;
+
+const REVIEW_PR_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['findings', 'summary'],
+  properties: {
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['file', 'severity', 'category', 'snippet', 'why', 'suggestion'],
+        properties: {
+          file: { type: 'string', description: 'Path of the file in the diff (use "(unknown)" if not derivable)' },
+          line_hint: { type: 'integer', description: 'Approximate line number, or 0 if unknown' },
+          severity: { type: 'string', enum: ['low', 'medium', 'high'] },
+          category: {
+            type: 'string',
+            enum: [
+              'narrative_personal',
+              'specific_financial',
+              'specific_event',
+              'geographic_reveal',
+              'relationship_reveal',
+              'ai_generated_echo',
+              'other',
+            ],
+          },
+          snippet: { type: 'string', description: 'The exact passage (≤200 chars)' },
+          why: { type: 'string', description: 'One sentence explaining why this is a leak risk' },
+          suggestion: { type: 'string', description: 'How to fix it — generalize, redact, or move to overlay' },
+        },
+      },
+    },
+    summary: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['total_findings', 'highest_severity', 'verdict'],
+      properties: {
+        total_findings: { type: 'integer' },
+        highest_severity: { type: 'string', enum: ['none', 'low', 'medium', 'high'] },
+        verdict: { type: 'string', enum: ['ship', 'review', 'block'] },
+      },
+    },
+  },
+};
+
+const REVIEW_PR_DEFAULT_MODEL = 'claude-haiku-4-5';
+const REVIEW_PR_MAX_DIFF_BYTES = 80 * 1024;        // ~20k tokens — cost cap per call
+const REVIEW_PR_SKIP_PATH_PATTERNS = [
+  /(^|\/)package-lock\.json$/,
+  /(^|\/)yarn\.lock$/,
+  /(^|\/)pnpm-lock\.yaml$/,
+  /(^|\/)Gemfile\.lock$/,
+  /\.gitkeep$/,
+  /(^|\/)node_modules\//,
+  /\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|tar|gz|xcarchive|woff2?)$/i,
+];
+
+function loadAnthropicKey() {
+  if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
+  try {
+    const env = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
+    const m = env.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+    if (m) return m[1].trim();
+  } catch {}
+  return null;
+}
+
+// Trim a unified diff to fit within maxBytes by dropping skip-listed files
+// first, then truncating remaining hunks. Preserves the file-by-file header
+// shape so the model can still attribute findings to filenames.
+function filterAndTrimDiff(rawDiff, maxBytes) {
+  // Split on `diff --git ` headers, keeping the header on each chunk.
+  const parts = rawDiff.split(/^(?=diff --git )/m);
+  const kept = [];
+  let droppedSkipped = 0;
+  for (const part of parts) {
+    if (!part.trim()) continue;
+    const header = part.split('\n', 1)[0];
+    // header looks like:  diff --git a/path/to/x b/path/to/x
+    const m = header.match(/diff --git a\/(\S+) b\/(\S+)/);
+    const filePath = m ? m[2] : '';
+    if (filePath && REVIEW_PR_SKIP_PATH_PATTERNS.some((re) => re.test(filePath))) {
+      droppedSkipped++;
+      continue;
+    }
+    kept.push(part);
+  }
+  let body = kept.join('');
+  let truncated = false;
+  if (Buffer.byteLength(body, 'utf8') > maxBytes) {
+    // Truncate to maxBytes worth of bytes; cut at the last newline to keep
+    // a partial hunk valid-looking.
+    const buf = Buffer.from(body, 'utf8').slice(0, maxBytes);
+    const lastNl = buf.lastIndexOf(0x0a);
+    body = (lastNl > 0 ? buf.slice(0, lastNl) : buf).toString('utf8');
+    truncated = true;
+  }
+  return { body, droppedSkipped, truncated };
+}
+
+async function cmdReviewPr(args) {
+  if (args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+    console.log(c.bold('merlin review-pr') + ' — LLM-based narrative leak detection\n');
+    console.log('Usage:');
+    console.log('  merlin review-pr <PR#> [--model M] [--max-diff-bytes N] [--json]');
+    console.log('  merlin review-pr --file <path>  [--model M] [--json]');
+    console.log('  merlin review-pr --stdin        [--model M] [--json]');
+    console.log('\nDefaults: --model claude-haiku-4-5  --max-diff-bytes 81920');
+    console.log('Requires ANTHROPIC_API_KEY in env or .env.\n');
+    console.log('Catches what sanitize-guard cannot: paraphrased personal context,');
+    console.log('specific dated events, financial detail, relationship reveals.');
+    console.log('See docs/architecture-public-private.md § Layer 6a.');
+    return;
+  }
+
+  const model = getFlag(args, '--model', REVIEW_PR_DEFAULT_MODEL);
+  const maxBytes = parseInt(getFlag(args, '--max-diff-bytes', String(REVIEW_PR_MAX_DIFF_BYTES)), 10);
+  const filePath = getFlag(args, '--file');
+  const fromStdin = hasFlag(args, '--stdin');
+  const jsonOut = hasFlag(args, '--json');
+  const prArg = args.find((a) => /^\d+$/.test(a));
+
+  // Source the diff/text.
+  let rawDiff = '';
+  let source = '';
+  if (filePath) {
+    try { rawDiff = fs.readFileSync(filePath, 'utf8'); }
+    catch (err) { die(`can't read --file ${filePath}: ${err.code || err.message}`); }
+    source = `file: ${filePath}`;
+  } else if (fromStdin) {
+    rawDiff = fs.readFileSync(0, 'utf8');
+    source = 'stdin';
+  } else if (prArg) {
+    try {
+      rawDiff = execSync(`gh pr diff ${prArg}`, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+    } catch (err) {
+      die(`gh pr diff ${prArg} failed: ${err.message.split('\n')[0]}`);
+    }
+    source = `PR #${prArg}`;
+  } else {
+    die('usage: merlin review-pr <PR#> | --file <path> | --stdin  (--help for flags)');
+  }
+
+  if (!rawDiff.trim()) die(`no diff content from ${source}`);
+
+  const { body: trimmedDiff, droppedSkipped, truncated } = filterAndTrimDiff(rawDiff, maxBytes);
+  if (!trimmedDiff.trim()) die('diff was non-empty but every file was skip-listed (lockfiles, binaries, etc.)');
+
+  const apiKey = loadAnthropicKey();
+  if (!apiKey) die('No ANTHROPIC_API_KEY in env or .env.  Set it, or run: merlin init');
+
+  // Lazy-require the SDK so users who never run review-pr don't pay the import cost.
+  let Anthropic;
+  try {
+    Anthropic = require('@anthropic-ai/sdk').default;
+  } catch (err) {
+    die('@anthropic-ai/sdk not installed. Run: npm install --prefix ' + ROOT);
+  }
+  const client = new Anthropic({ apiKey });
+
+  if (!jsonOut) {
+    console.log(c.bold('merlin review-pr') + c.dim(` — ${source}, model=${model}`));
+    if (droppedSkipped) console.log(c.dim(`  skipped ${droppedSkipped} lockfile/binary file(s)`));
+    if (truncated) console.log(c.yellow(`  warning: diff truncated to ${maxBytes} bytes — large PR, consider splitting`));
+    console.log(c.dim('  calling Claude…\n'));
+  }
+
+  let response;
+  try {
+    response = await client.messages.create({
+      model,
+      max_tokens: 8000,
+      // System prompt is the cache-eligible portion. On Haiku 4.5 the
+      // minimum cacheable prefix is ~4096 tokens and our prompt is smaller —
+      // the marker is benign (no-op when below threshold) and pays off if a
+      // future revision grows the prompt past the floor.
+      system: [
+        { type: 'text', text: REVIEW_PR_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: `Review this diff:\n\n\`\`\`diff\n${trimmedDiff}\n\`\`\``,
+        },
+      ],
+      // Constrain the response to our finding schema. Validated server-side;
+      // first request on a new schema pays a one-time compile cost.
+      output_config: {
+        format: { type: 'json_schema', schema: REVIEW_PR_SCHEMA },
+      },
+    });
+  } catch (err) {
+    if (err && err.constructor && err.constructor.name === 'AuthenticationError') {
+      die('Anthropic auth failed — check ANTHROPIC_API_KEY value');
+    }
+    if (err && err.constructor && err.constructor.name === 'RateLimitError') {
+      die('rate-limited by Anthropic — retry in a moment');
+    }
+    if (err && err.status) {
+      die(`Anthropic API error ${err.status}: ${err.message}`);
+    }
+    die(`unexpected error calling Claude: ${err.message || err}`);
+  }
+
+  // Extract the JSON text block. With output_config.format, content is still
+  // a list of blocks — find the text block and JSON.parse it.
+  const textBlock = (response.content || []).find((b) => b.type === 'text');
+  if (!textBlock) die('Claude returned no text block — unexpected response shape');
+  let parsed;
+  try {
+    parsed = JSON.parse(textBlock.text);
+  } catch (err) {
+    die(`Claude returned non-JSON: ${textBlock.text.slice(0, 200)}…`);
+  }
+
+  // Cost report — Haiku 4.5 is $1/M in, $5/M out.
+  const usage = response.usage || {};
+  const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+  const cacheRead = usage.cache_read_input_tokens || 0;
+  const outTok = usage.output_tokens || 0;
+  // Use haiku rates for the estimate regardless of model — close enough for
+  // a back-of-envelope number, and conservative (haiku is cheapest).
+  const estCost = (inTok / 1e6) * 1.00 + (cacheRead / 1e6) * 0.10 + (outTok / 1e6) * 5.00;
+
+  if (jsonOut) {
+    console.log(JSON.stringify({ ...parsed, _meta: { model, source, usage, est_cost_usd: estCost } }, null, 2));
+    process.exit(parsed.summary.verdict === 'block' ? 1 : 0);
+  }
+
+  // Pretty output.
+  const sevColor = (s) => (s === 'high' ? c.red : s === 'medium' ? c.yellow : c.dim);
+  console.log(c.bold(`Verdict: `) + sevColor(parsed.summary.verdict)(parsed.summary.verdict.toUpperCase()));
+  console.log(c.dim(`  ${parsed.summary.total_findings} finding(s), highest severity: ${parsed.summary.highest_severity}`));
+  console.log(c.dim(`  ${inTok} in + ${cacheRead} cache-read + ${outTok} out tokens · est $${estCost.toFixed(4)}`));
+  if (parsed.findings.length === 0) {
+    console.log('\n' + c.green('✓ no narrative leaks detected'));
+  } else {
+    console.log('');
+    for (const f of parsed.findings) {
+      const tag = sevColor(f.severity)(`[${f.severity.toUpperCase()}]`);
+      const loc = f.line_hint ? `${f.file}:${f.line_hint}` : f.file;
+      console.log(`${tag} ${c.bold(loc)}  ${c.dim('(' + f.category + ')')}`);
+      console.log(`  ${c.dim('snippet:')} ${f.snippet}`);
+      console.log(`  ${c.dim('why:    ')} ${f.why}`);
+      console.log(`  ${c.dim('fix:    ')} ${f.suggestion}`);
+      console.log('');
+    }
+  }
+  // Reminder + caveats — every time, never feel solved.
+  console.log(c.dim('Caveats: LLM review is probabilistic — false-positive and false-negative both possible.'));
+  console.log(c.dim('This is Layer 6a (narrative) — pattern-based sanitize-guard (Layer 2/3) remains primary.'));
+
+  process.exit(parsed.summary.verdict === 'block' ? 1 : 0);
+}
+
 function cmdUp(args) {
   // Foreground mode: spawn process-manager as a child of this process,
   // forward signals so Ctrl-C cleanly tears down the whole tree.
@@ -2926,6 +3273,7 @@ const dispatch = {
   activity: cmdActivity,
   context: cmdContext,
   audit: cmdAudit,
+  'review-pr': cmdReviewPr,
 };
 
 const fn = dispatch[cmd];
