@@ -19,6 +19,11 @@ import { spawnSync } from "node:child_process";
 // Hardwiring it here removes the dependency on agent recall.
 const SPAM_FILTER_BIN = path.join(process.env.HOME, "dev/merlin/bin/spam-filter");
 const GMAIL_ACTION_BIN = path.join(process.env.HOME, "dev/merlin/bin/gmail-action");
+// Intake-skip rules — sender/subject patterns whose triage outcome is
+// mechanical (label + mark-read with no LLM evaluation needed). The file is
+// gitignored (data/ is); operators populate it themselves with patterns
+// observed in their own mail flow. Shipped empty.
+const INTAKE_SKIP_RULES_FILE = path.join(process.env.HOME, "dev/merlin/data/intake-skip-rules.json");
 function extractEmailAddr(fromHeader) {
   if (!fromHeader) return "";
   const m = String(fromHeader).match(/<([^>]+)>/);
@@ -38,6 +43,65 @@ function intakeSpamCheck(messageId, fromHeader) {
     }
   } catch {}
   return { blocked: false };
+}
+
+// Intake-skip fast-paths. Documented in agent/ops-agent/CLAUDE.md as Step 0c
+// but historically only enforced LLM-side, which depends on agent recall and
+// still burns one dispatch per email. Rules in data/intake-skip-rules.json
+// fire BEFORE dispatch: match a rule → apply the rule's `label`, mark read,
+// skip the LLM. Sender match is substring on the From-header email address
+// (lowercased). `sender_re` and `subject_re` are JS regex strings (no flags)
+// for the per-rule patterns that need them.
+//
+// File shape:
+//   { "rules": [ { "id": "...", "sender" | "sender_re": "...", "subject_re"?: "...", "label": "..." }, ... ] }
+//
+// Shipped empty (data/ is gitignored). Populate per host.
+let _intakeRulesCache = null;
+let _intakeRulesMtime = 0;
+function loadIntakeSkipRules() {
+  try {
+    const st = fs.statSync(INTAKE_SKIP_RULES_FILE);
+    if (st.mtimeMs === _intakeRulesMtime && _intakeRulesCache) return _intakeRulesCache;
+    const raw = JSON.parse(fs.readFileSync(INTAKE_SKIP_RULES_FILE, "utf8"));
+    _intakeRulesCache = Array.isArray(raw.rules) ? raw.rules : [];
+    _intakeRulesMtime = st.mtimeMs;
+    return _intakeRulesCache;
+  } catch {
+    return [];
+  }
+}
+function matchIntakeSkipRule(rule, sender, subject) {
+  if (rule.sender_re) {
+    try { if (!new RegExp(rule.sender_re).test(sender)) return false; } catch { return false; }
+  } else if (rule.sender) {
+    if (!sender.includes(String(rule.sender).toLowerCase())) return false;
+  } else {
+    return false; // misconfigured rule — must specify sender or sender_re
+  }
+  if (rule.subject_re) {
+    try { if (!new RegExp(rule.subject_re).test(subject || "")) return false; } catch { return false; }
+  }
+  return true;
+}
+function intakeFastPathCheck(messageId, fromHeader, subject) {
+  const sender = extractEmailAddr(fromHeader);
+  if (!sender) return { matched: false };
+  const rules = loadIntakeSkipRules();
+  for (const rule of rules) {
+    if (matchIntakeSkipRule(rule, sender, subject)) {
+      // Apply: label + mark-read. Best-effort; failure leaves the message
+      // available for the LLM-side fast-path (defense in depth).
+      let applied = false;
+      try {
+        const r1 = spawnSync(GMAIL_ACTION_BIN, ["label", messageId, rule.label], { timeout: 8000 });
+        const r2 = spawnSync(GMAIL_ACTION_BIN, ["mark-read", messageId], { timeout: 8000 });
+        applied = r1.status === 0 && r2.status === 0;
+      } catch {}
+      return { matched: true, applied, rule: rule.id, label: rule.label, sender };
+    }
+  }
+  return { matched: false };
 }
 
 const MAX_BODY_SIZE = 64 * 1024;
@@ -352,6 +416,23 @@ export class GmailSource {
                 this.triageLog(`skip phantom messageId ${m.messageId} (phantom_skip=true in reclassify-tracking)`);
                 continue;
               }
+              // Auto-phantom-skip: if this messageId has been dispatched ≥4 times
+              // in the last 30 min (tracked by the ops-agent), it's stuck in a
+              // loop. Self-heal by setting phantom_skip=true without requiring
+              // ops-agent involvement. Closes the loop on the supervisor side so
+              // re-enqueue stops at intake, not after 20+ wasted full agent runs.
+              const entry = tracking[m.messageId];
+              if (entry?.attempts?.length >= 4) {
+                const cutoff = Date.now() - 30 * 60 * 1000;
+                const recent = (entry.attempts || []).filter(a => new Date(a.ts).getTime() > cutoff);
+                if (recent.length >= 4) {
+                  tracking[m.messageId].phantom_skip = true;
+                  tracking[m.messageId].phantom_reason = `auto: ${recent.length} dispatches in 30 min`;
+                  fs.writeFileSync(trackingFile, JSON.stringify(tracking, null, 2));
+                  this.triageLog(`auto-phantom-skip ${m.messageId}: ${recent.length} dispatches in 30 min — loop broken`);
+                  continue;
+                }
+              }
             }
           } catch {}
           // Intake spam-filter Step 0b check. If sender is on the spam-blocklist,
@@ -359,6 +440,14 @@ export class GmailSource {
           const spam = intakeSpamCheck(m.messageId, m.from);
           if (spam.blocked) {
             this.triageLog(`spam-blocklist intake skip ${m.messageId} from ${spam.sender} (${spam.reason})`);
+            continue;
+          }
+          // Intake-skip fast-paths (Step 0c). Sender/subject patterns whose
+          // triage outcome is mechanical (label + mark-read); skip dispatch
+          // entirely on match. Rules in data/intake-skip-rules.json (per-host).
+          const fp = intakeFastPathCheck(m.messageId, m.from, m.subject);
+          if (fp.matched) {
+            this.triageLog(`intake-skip rule=${fp.rule} ${m.messageId} from ${fp.sender} → label=${fp.label} applied=${fp.applied}`);
             continue;
           }
           const content = `New email received. MessageId: ${m.messageId}\nPre-fetched: From: ${m.from} | Subject: ${m.subject}\nFetch and triage this ONE email now using the Gmail connector, following the Email Triage Rules in CLAUDE.md.`;
