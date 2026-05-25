@@ -34,6 +34,13 @@ HOOKDECK_DIAG_DIR="${MERLIN_HOME}/agent/logs/hookdeck-diagnostics"
 STALE_EVENT_MS=600000  # 10 min without supervisor events = stale
 PUSH_GAP_MS=3600000    # 60 min without Gmail push = likely Pub/Sub delivery failure
 
+# Queue-depth thresholds. Normal steady-state is 0-2 queued; WARN logs but
+# stays silent; ALERT pages the operator (rate-limited via incident_should_alert).
+# Tunable here; the durable-queue snapshot at data/dispatcher-queue.json shows
+# 0 queued / a few inFlight typically.
+QUEUE_BACKLOG_WARN=5
+QUEUE_BACKLOG_ALERT=10
+
 # Supervisor health port
 eval "$("$CONFIG_DIR/load-agent.sh" ops)"
 HEALTH_PORT="$AGENT_SUPERVISOR_HEALTH_PORT"
@@ -303,6 +310,25 @@ if [ -n "$HEALTH_PORT" ]; then
         ISSUES="$ISSUES ops-supervisor(stale)"
       fi
 
+      # Queue-depth early-alert. Normal steady-state is queueDepth=0 with 1-2
+      # inFlight. A sustained backlog above QUEUE_BACKLOG_WARN is the leading
+      # indicator that downstream turns aren't draining (long-tail subagent,
+      # web-search timeout, an agent stuck on a single turn). We log + page
+      # well before the stale-then-restart machinery above trips, so debugging
+      # happens while the buildup is small.
+      if [ "$QUEUE_DEPTH" -ge "$QUEUE_BACKLOG_ALERT" ]; then
+        ATTEMPT=$(incident_seen "ops-queue-backlog")
+        log "Ops queue backlog: queueDepth=$QUEUE_DEPTH >= $QUEUE_BACKLOG_ALERT (attempt $ATTEMPT)"
+        ISSUES="$ISSUES ops-supervisor(queue-backlog=$QUEUE_DEPTH)"
+        if incident_should_alert "ops-queue-backlog"; then
+          notify "⚠️ Ops queue backlog: ${QUEUE_DEPTH} tasks queued, supervisor isn't draining. Likely a long-tail subagent or stuck turn — check agent/logs/ops.log."
+        fi
+      elif [ "$QUEUE_DEPTH" -ge "$QUEUE_BACKLOG_WARN" ]; then
+        log "Ops queue elevated: queueDepth=$QUEUE_DEPTH (warn=$QUEUE_BACKLOG_WARN, alert=$QUEUE_BACKLOG_ALERT)"
+      else
+        incident_clear "ops-queue-backlog"
+      fi
+
       # Push gap is diagnostic + self-heal only, never an alert on its own.
       # Quiet overnight inboxes gap >60min normally; real failures also trip
       # a downstream detector (watch expiry, Hookdeck disconnect, unread
@@ -376,6 +402,22 @@ if [ -n "$CHAT_HEALTH_PORT" ]; then
       log "Chat supervisor stale: lastEventAge=${CHAT_LAST_AGE}ms queueDepth=$CHAT_QUEUE — restarting"
       curl -sf -X POST "http://127.0.0.1:$CHAT_HEALTH_PORT/restart" > /dev/null 2>&1
       ISSUES="$ISSUES chat-supervisor(stale)"
+    fi
+
+    # Chat queue-depth early-alert (parity with ops). Chat backlogs are rarer
+    # (one-message-at-a-time phone-channel cadence) so a buildup here is a
+    # stronger signal than on ops.
+    if [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_ALERT" ]; then
+      ATTEMPT=$(incident_seen "chat-queue-backlog")
+      log "Chat queue backlog: queueDepth=$CHAT_QUEUE >= $QUEUE_BACKLOG_ALERT (attempt $ATTEMPT)"
+      ISSUES="$ISSUES chat-supervisor(queue-backlog=$CHAT_QUEUE)"
+      if incident_should_alert "chat-queue-backlog"; then
+        notify "⚠️ Chat queue backlog: ${CHAT_QUEUE} tasks queued — phone-channel reply loop isn't draining."
+      fi
+    elif [ "$CHAT_QUEUE" -ge "$QUEUE_BACKLOG_WARN" ]; then
+      log "Chat queue elevated: queueDepth=$CHAT_QUEUE (warn=$QUEUE_BACKLOG_WARN, alert=$QUEUE_BACKLOG_ALERT)"
+    else
+      incident_clear "chat-queue-backlog"
     fi
 
     # Phone-channel heartbeat staleness
@@ -573,10 +615,14 @@ if [ -f "$HOOKDECK_LOG" ]; then
 fi
 
 # --- Gmail unread sweep (catches silently-missed triage) ---
-# Periodically query Gmail for unread inbox messages older than 5 min.
-# Anything that old should have been triaged by now. If not, the push arrived
-# but the agent silently dropped the classification. Dispatch a RECLASSIFY
-# task for each stuck message.
+# Periodically query Gmail for unread inbox messages older than 5 min that
+# do NOT already have the `p1` label (P1 triage intentionally leaves emails
+# unread — see ops-agent/CLAUDE.md Step 5). Anything that old without a p1
+# label should have been triaged by now. If not, the push arrived but the
+# agent silently dropped the classification. Dispatch a RECLASSIFY task for
+# each stuck message. The `-label:p1` exclusion lives in `gmail-action
+# list-unread-older`'s query — without it the watchdog dispatches RECLASSIFY
+# for every legit-unread P1 every tick forever.
 STUCK_EMAILS=$("${MERLIN_HOME}/bin/gmail-action" list-unread-older 5 2>/dev/null || echo "[]")
 STUCK_COUNT=$(echo "$STUCK_EMAILS" | jq 'length' 2>/dev/null || echo 0)
 STUCK_COUNT=${STUCK_COUNT:-0}
