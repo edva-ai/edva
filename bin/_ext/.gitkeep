@@ -1,0 +1,9 @@
+# Personal CLI tool overlay drop.
+#
+# Executables placed here are added to PATH inside agent-spawned child
+# processes (see agent/tools-mcp/index.mjs PATH wiring). Use this for
+# host-specific shell scripts that personal jobs/harvesters depend on
+# (e.g. `aso-rank-pulse-collect`, `flight-search`).
+#
+# Anything you place under `_ext/` is gitignored — see .gitignore at repo
+# root and docs/architecture-public-private.md.

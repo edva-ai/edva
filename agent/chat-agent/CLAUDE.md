@@ -189,3 +189,11 @@ Three reply handlers ship as references in this file (Reclassification Accept, R
 - Never run sudo commands — copy to clipboard for the user to run.
 - When in doubt, ask the user rather than act.
 - If a task will take >30 seconds, acknowledge receipt first, then send results when done.
+
+---
+
+## Local Rules (personal overlay)
+
+If `$MERLIN_HOME/local/CLAUDE.md` exists, also follow every rule in it. The
+parent `agent/CLAUDE.md` § "Local Rules" describes the contract — chat-agent
+inherits it without modification.

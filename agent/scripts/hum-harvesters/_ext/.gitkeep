@@ -1,0 +1,12 @@
+# Personal hum harvester overlay drop.
+#
+# Files placed here (e.g. `exercise.mjs`, `dining.mjs`, `stocks.mjs`) are
+# discovered by `agent/scripts/hum-harvest-all.mjs` at run time and
+# registered identically to the bundled harvesters in the parent dir.
+#
+# Naming: `<topic>.mjs` where <topic> matches the `name` field in your
+# `data/hum-interests.json`. The bundled harvesters take precedence; the
+# loader only looks here for topics not satisfied by the kernel set.
+#
+# Anything you place under `_ext/` is gitignored — see .gitignore at repo
+# root and docs/architecture-public-private.md.

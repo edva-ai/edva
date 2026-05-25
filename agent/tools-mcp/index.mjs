@@ -469,6 +469,51 @@ async function runEpisodeSemantic(query, limit) {
   }
 }
 
+// ─── Personal-overlay loader ────────────────────────────────────────────────
+// Discover MCP tools dropped under `agent/tools-mcp/_ext/*.mjs`. Each ext file
+// is dynamically imported and expected to export (default or named) a `tools`
+// array where each entry has the same `{ name, description, schema, run }`
+// shape as the kernel `TOOLS` entries above. Name conflicts log a warning and
+// the kernel tool wins.
+//
+// See docs/architecture-public-private.md for the full overlay contract.
+import { readdirSync, statSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const EXT_DIR = `${MERLIN_HOME}/agent/tools-mcp/_ext`;
+async function loadExtTools() {
+  let entries;
+  try { entries = readdirSync(EXT_DIR); }
+  catch { return; } // dir missing = no overlays = totally fine
+  for (const name of entries) {
+    if (!name.endsWith(".mjs") && !name.endsWith(".js")) continue;
+    const full = `${EXT_DIR}/${name}`;
+    try {
+      if (!statSync(full).isFile()) continue;
+      const mod = await import(pathToFileURL(full).href);
+      const tools = mod.tools || mod.default?.tools || (Array.isArray(mod.default) ? mod.default : null);
+      if (!Array.isArray(tools)) {
+        console.error(`[tools-mcp/_ext] ${name}: no exported 'tools' array — skipped`);
+        continue;
+      }
+      for (const t of tools) {
+        if (!t?.name || typeof t.run !== "function") {
+          console.error(`[tools-mcp/_ext] ${name}: tool missing name/run — skipped`);
+          continue;
+        }
+        if (TOOLS.find((k) => k.name === t.name)) {
+          console.error(`[tools-mcp/_ext] ${name}: '${t.name}' shadows kernel tool — overlay ignored`);
+          continue;
+        }
+        TOOLS.push(t);
+      }
+      console.error(`[tools-mcp/_ext] loaded ${tools.length} tool(s) from ${name}`);
+    } catch (err) {
+      console.error(`[tools-mcp/_ext] ${name}: import failed: ${err.message}`);
+    }
+  }
+}
+await loadExtTools();
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS.map((t) => ({
     name: t.name,

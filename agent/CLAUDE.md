@@ -322,3 +322,19 @@ The correct posture: analyze, frame cautiously, defer to the user's doctor for a
 - If the phone-channel is unavailable, fall back to `email-send` (a real email from Merlin) — never a Gmail draft, never Slack. See Outbound Email Policy.
 - Log all actions to the session transcript.
 - When in doubt, escalate rather than act.
+
+---
+
+## Local Rules (personal overlay)
+
+If `$MERLIN_HOME/local/CLAUDE.md` exists, also follow every rule in it. Local
+rules layer on top of the kernel rules in this file: they may add new rules
+(e.g. names of people, properties, projects to know about), and where the
+local file explicitly says "override," they take precedence. Where the local
+file is silent, the kernel rule wins.
+
+This is the **only** mechanism by which personal context, identity, or
+single-host policy enters an agent session. Generic kernel files in this
+repository must never reference a specific person, address, business, or
+credential — that material belongs in `local/CLAUDE.md` (which is gitignored)
+or in the personal overlay repo (see `docs/architecture-public-private.md`).

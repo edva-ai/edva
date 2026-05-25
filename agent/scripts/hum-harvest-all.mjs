@@ -16,6 +16,38 @@ const MERLIN_HOME = process.env.MERLIN_HOME || path.join(HOME, "Dev/merlin");
 const REGISTRY = path.join(MERLIN_HOME, "data/hum-interests.json");
 const STATE = path.join(MERLIN_HOME, "data/hum-interests-state.json");
 const HARVESTER_DIR = path.join(MERLIN_HOME, "agent/scripts/hum-harvesters");
+// Personal-overlay drop. Files here have the same shape as bundled harvesters
+// and are discovered when a topic in `data/hum-interests.json` has no
+// matching kernel harvester. See docs/architecture-public-private.md.
+const HARVESTER_EXT_DIR = path.join(HARVESTER_DIR, "_ext");
+
+// Resolve a topic's harvester script. Kernel dir wins; the overlay only
+// satisfies topics the kernel doesn't ship. A `script` override in the
+// registry is honored verbatim (relative to MERLIN_HOME) — that's the escape
+// hatch for personal harvesters that intentionally shadow a kernel one.
+function resolveHarvesterPath(topic) {
+  if (topic.script) {
+    // Absolute or repo-relative override path. If the override is a bare
+    // filename like "weather.mjs" (the legacy default), treat it the same
+    // way as no override and walk both dirs.
+    if (topic.script.includes("/")) {
+      return path.isAbsolute(topic.script)
+        ? topic.script
+        : path.join(MERLIN_HOME, topic.script);
+    }
+  }
+  const filename = (topic.script && !topic.script.includes("/"))
+    ? topic.script
+    : `${topic.name}.mjs`;
+  const kernel = path.join(HARVESTER_DIR, filename);
+  if (fs.existsSync(kernel)) return kernel;
+  const overlay = path.join(HARVESTER_EXT_DIR, filename);
+  if (fs.existsSync(overlay)) return overlay;
+  // Fall through with the kernel path so the spawn error is clear about
+  // where we looked — better than silently picking the overlay path that
+  // also doesn't exist.
+  return kernel;
+}
 
 function readJson(p, def = null) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return def; }
@@ -136,7 +168,7 @@ async function main() {
   // Run all in parallel. Web-search harvesters can take longer — give them 150s; rest 15s.
   const results = await Promise.all(runnable.map((t) => {
     const timeout = ["art", "music", "dining", "crossref"].includes(t.name) ? 150000 : 15000;
-    return runHarvester(t.name, path.join(HARVESTER_DIR, t.script), envelope, timeout);
+    return runHarvester(t.name, resolveHarvesterPath(t), envelope, timeout);
   }));
 
   const candidates = results.filter((r) => r.candidate).map((r) => r.candidate);

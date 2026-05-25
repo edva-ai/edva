@@ -86,6 +86,7 @@ function cmdHelp() {
   console.log('Usage: merlin <subcommand> [args...] [--flags]\n');
   console.log(c.bold('BOOTSTRAP / RUN'));
   console.log('  init [--force]                interactive config wizard → writes .env + token');
+  console.log('  overlay <subcmd>              attach/detach a personal overlay repo (see: overlay help)');
   console.log('  up                            start process-manager in the foreground (Ctrl-C to stop)');
   console.log('  dispatch <job> [--task ...]   POST a job to the ops-supervisor webhook');
   console.log('  tail [ops|chat|<job>]         tail the ops/chat supervisor stream (or a job log)\n');
@@ -124,6 +125,9 @@ function cmdHelp() {
   console.log(c.bold('DISCOVERY'));
   console.log('  arch                          print architecture.md');
   console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)\n');
+  console.log(c.bold('SAFETY'));
+  console.log('  audit [--commits N]           run sanitize-guard --all + scan last N commit messages (default 50)');
+  console.log(c.dim('                                — for monthly review of public/private boundary integrity\n'));
   console.log(c.dim('Flags: --json  --no-color  --help'));
 }
 
@@ -2320,6 +2324,16 @@ function cmdInit(args) {
     env.LOCAL_LLM_MODEL = await ask('LOCAL_LLM_MODEL', 'gemma3:4b');
     env.LOCAL_EMBED_MODEL = await ask('LOCAL_EMBED_MODEL', 'nomic-embed-text');
 
+    // Telemetry consent — fully transparent, default-on but with an obvious
+    // opt-out. We fire one POST per host (see sendInstallPing below) with no
+    // PII and no raw IP — see apps/telemetry/README.md for the exact payload.
+    console.log(c.bold('\n  Telemetry'));
+    console.log(c.dim('  One anonymous "first-run" ping helps us see how many people are')
+                + c.dim('\n  actually installing Merlin. No PII, no raw IP, no environment')
+                + c.dim('\n  contents. Source: apps/telemetry/api/ping.ts. Skip with N.'));
+    const telemetryAns = await ask('Send anonymous install ping? (Y/n)', 'Y');
+    env.MERLIN_TELEMETRY = /^n(o)?$/i.test(telemetryAns) ? 'off' : 'on';
+
     rl.close();
 
     const lines = [
@@ -2364,7 +2378,437 @@ function cmdInit(args) {
     }
     console.log(c.dim('\nNext: ') + c.bold('./bin/merlin up'));
     console.log(c.dim('See docs/hum.md + docs/memory.md to populate the ambient-awareness loop + memory layer.'));
+
+    // Fire-and-forget install ping. Never blocks, never errors out the
+    // install, and is a complete no-op if the user opted out above.
+    if (env.MERLIN_TELEMETRY === 'on') {
+      sendInstallPing('fresh-install').catch(() => {});
+    }
   })().catch(err => { console.error(c.red('Error: ') + err.message); process.exit(1); });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Install telemetry — see apps/telemetry/ for the receiving end and the
+// privacy posture. Honors `MERLIN_NO_TELEMETRY=1` (env) and the
+// `MERLIN_TELEMETRY=off` value the init wizard writes to .env. Idempotent —
+// per-host, fires at most once per `bin/merlin install` ctx via the touchfile
+// `data/.install-pinged-<ctx>`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The deployed Vercel URL goes here after `cd apps/telemetry && vercel --prod`.
+// Forks of merlin can either repoint this at their own deploy, set
+// MERLIN_TELEMETRY_URL=… at install time, or leave MERLIN_NO_TELEMETRY=1 set.
+const DEFAULT_TELEMETRY_URL = 'https://merlin-telemetry.vercel.app/install';
+
+async function sendInstallPing(ctx) {
+  // Hard kill switches — checked again here even though cmdInit also checks,
+  // so callers that fire pings outside cmdInit still get the same gates.
+  if (process.env.MERLIN_NO_TELEMETRY === '1') return;
+  try {
+    const envText = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
+    if (/^MERLIN_TELEMETRY=off$/m.test(envText)) return;
+  } catch { /* no .env yet — that's fine, only relevant inside cmdInit */ }
+
+  // One ping per (host, ctx). Re-running `merlin init --force` with the same
+  // ctx is treated as the same install for telemetry purposes.
+  const touch = path.join(ROOT, 'data', `.install-pinged-${ctx}`);
+  try { if (fs.existsSync(touch)) return; } catch {}
+
+  const cryptoMod = require('crypto');
+  const hostFp = cryptoMod
+    .createHash('sha256')
+    .update(`${os.hostname()}|${os.userInfo().username || ''}`)
+    .digest('hex')
+    .slice(0, 16);
+
+  let sha = '';
+  try {
+    sha = execSync('git rev-parse --short HEAD', { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+  } catch {}
+
+  let ver = '';
+  try {
+    ver = require(path.join(ROOT, 'package.json')).version || '';
+  } catch {}
+
+  const url = process.env.MERLIN_TELEMETRY_URL || DEFAULT_TELEMETRY_URL;
+  const payload = JSON.stringify({
+    host_fp: hostFp,
+    os: process.platform,
+    arch: process.arch,
+    ver,
+    sha,
+    ctx,
+  });
+
+  // 3-second hard timeout — telemetry must never make install feel slow.
+  await new Promise((resolve) => {
+    const lib = url.startsWith('https:') ? require('https') : require('http');
+    const u = new URL(url);
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        timeout: 3000,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          'user-agent': `merlin-cli/${ver || 'dev'} (${process.platform}; ${process.arch})`,
+        },
+      },
+      (res) => { res.resume(); res.on('end', resolve); res.on('error', resolve); }
+    );
+    req.on('timeout', () => { try { req.destroy(); } catch {} resolve(); });
+    req.on('error', resolve);
+    req.write(payload);
+    req.end();
+  });
+
+  // Touchfile written regardless of HTTP outcome — we don't want a flaky
+  // network to cause repeated pings on every re-init.
+  try { fs.mkdirSync(path.dirname(touch), { recursive: true }); fs.writeFileSync(touch, new Date().toISOString() + '\n'); } catch {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overlay subcommand — attach a personal-overlay repo onto this merlin clone.
+//
+// `merlin overlay add <path>` walks the personal repo's well-known subdirs and
+// symlinks individual files into the kernel's matching `_ext/` directories
+// plus `local/`. `status` reports active overlays. `sync` re-creates symlinks
+// after the overlay repo changes. `remove` unlinks (leaves the overlay repo
+// untouched).
+//
+// Refuses to symlink anything outside the declared extension surface — see
+// `OVERLAY_MAP` below. This is the safety boundary: a malformed overlay
+// cannot replace kernel code, only extend it.
+//
+// See docs/architecture-public-private.md for the full overlay model.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Source-subdir-in-overlay → destination-subdir-in-merlin. Order matters only
+// for `status` output. Every other path in the overlay repo is ignored.
+const OVERLAY_MAP = [
+  { src: 'CLAUDE.md',           dst: 'local/CLAUDE.md',                              type: 'file' },
+  { src: 'jobs',                dst: 'agent/ops-agent/jobs/_ext',                    type: 'dir'  },
+  { src: 'harvesters',          dst: 'agent/scripts/hum-harvesters/_ext',            type: 'dir'  },
+  { src: 'tools-mcp',           dst: 'agent/tools-mcp/_ext',                         type: 'dir'  },
+  { src: 'bin',                 dst: 'bin/_ext',                                     type: 'dir'  },
+  { src: 'memory-seed',         dst: 'local/memory-seed',                            type: 'dir'  },
+];
+
+const OVERLAY_REGISTRY = path.join(ROOT, 'data', '.overlay-registry.json');
+
+function readOverlayRegistry() {
+  try { return JSON.parse(fs.readFileSync(OVERLAY_REGISTRY, 'utf8')); }
+  catch { return { overlays: [] }; }
+}
+
+function writeOverlayRegistry(reg) {
+  fs.mkdirSync(path.dirname(OVERLAY_REGISTRY), { recursive: true });
+  fs.writeFileSync(OVERLAY_REGISTRY, JSON.stringify(reg, null, 2) + '\n');
+}
+
+// Build the planned symlink list for a given overlay-repo root. Each entry is
+// `{ from: <absolute source>, to: <absolute target in merlin> }`. Files that
+// would land outside the declared OVERLAY_MAP destinations are dropped.
+function planOverlayLinks(overlayRoot) {
+  const plan = [];
+  for (const m of OVERLAY_MAP) {
+    const srcAbs = path.join(overlayRoot, m.src);
+    if (!fs.existsSync(srcAbs)) continue;
+    if (m.type === 'file') {
+      plan.push({ from: srcAbs, to: path.join(ROOT, m.dst) });
+      continue;
+    }
+    // Directory mode — symlink each contained file individually so kernel
+    // `.gitkeep` placeholders in `_ext/` aren't shadowed and so a single
+    // overlay file going missing doesn't take down the whole dir.
+    for (const name of fs.readdirSync(srcAbs)) {
+      if (name.startsWith('.')) continue;            // skip .DS_Store, .git artifacts
+      const from = path.join(srcAbs, name);
+      const to = path.join(ROOT, m.dst, name);
+      // Defense in depth: target must remain inside the declared dst dir.
+      const dstDir = path.resolve(path.join(ROOT, m.dst));
+      if (!path.resolve(to).startsWith(dstDir + path.sep)) continue;
+      plan.push({ from, to });
+    }
+  }
+  return plan;
+}
+
+function applyPlan(plan, { dryRun = false } = {}) {
+  const made = [];
+  for (const link of plan) {
+    fs.mkdirSync(path.dirname(link.to), { recursive: true });
+    try {
+      const lstat = fs.lstatSync(link.to);
+      // If the existing entry is already the symlink we'd create, no-op.
+      if (lstat.isSymbolicLink() && fs.readlinkSync(link.to) === link.from) continue;
+      // Refuse to overwrite a real file — the user wrote something there and
+      // we should not silently destroy it.
+      if (!lstat.isSymbolicLink()) {
+        console.error(c.red('  refuse: ') + `${link.to} is a real file, not a symlink — leaving it alone`);
+        continue;
+      }
+      if (!dryRun) fs.unlinkSync(link.to);
+    } catch { /* ENOENT — fine, we'll create it below */ }
+    if (!dryRun) fs.symlinkSync(link.from, link.to);
+    made.push(link);
+  }
+  return made;
+}
+
+function cmdOverlay(args) {
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
+    console.log(c.bold('merlin overlay') + ' — personal-overlay management\n');
+    console.log('Usage:');
+    console.log('  merlin overlay add <path>      attach a personal overlay repo (symlinks _ext/ + local/)');
+    console.log('  merlin overlay status          list active overlays + their resolved symlinks');
+    console.log('  merlin overlay sync             re-create symlinks for every registered overlay');
+    console.log('  merlin overlay remove <path>   unlink a previously-added overlay');
+    console.log('\nSee docs/architecture-public-private.md for the full overlay contract.');
+    return;
+  }
+
+  if (sub === 'add') {
+    const target = args[1];
+    if (!target) die('usage: merlin overlay add <path-to-personal-overlay-repo>');
+    const overlayRoot = path.resolve(target.replace(/^~/, HOME));
+    if (!fs.existsSync(overlayRoot)) die(`overlay path not found: ${overlayRoot}`);
+    const reg = readOverlayRegistry();
+    if (reg.overlays.find((o) => o.path === overlayRoot)) {
+      console.log(c.dim(`  already registered: ${overlayRoot} — running sync instead`));
+    } else {
+      reg.overlays.push({ path: overlayRoot, added_at: new Date().toISOString() });
+      writeOverlayRegistry(reg);
+    }
+    const plan = planOverlayLinks(overlayRoot);
+    if (plan.length === 0) {
+      console.log(c.yellow(`  no files to link — does ${overlayRoot} have any of: ${OVERLAY_MAP.map(m => m.src).join(', ')}?`));
+      return;
+    }
+    const made = applyPlan(plan);
+    console.log(c.green(`  ✓ overlay registered: ${overlayRoot}`));
+    console.log(c.green(`  ✓ linked ${made.length} file(s):`));
+    for (const link of made) console.log(c.dim(`      ${path.relative(ROOT, link.to)}  →  ${path.relative(overlayRoot, link.from)}`));
+    return;
+  }
+
+  if (sub === 'sync') {
+    const reg = readOverlayRegistry();
+    if (reg.overlays.length === 0) { console.log(c.dim('  no overlays registered. Use: merlin overlay add <path>')); return; }
+    for (const o of reg.overlays) {
+      const plan = planOverlayLinks(o.path);
+      const made = applyPlan(plan);
+      console.log(c.green(`  ✓ ${o.path}: ${made.length} link(s) updated`));
+    }
+    return;
+  }
+
+  if (sub === 'status') {
+    const reg = readOverlayRegistry();
+    if (reg.overlays.length === 0) { console.log(c.dim('  no overlays registered')); return; }
+    for (const o of reg.overlays) {
+      console.log(c.bold(o.path) + c.dim(`  (added ${o.added_at})`));
+      const plan = planOverlayLinks(o.path);
+      for (const link of plan) {
+        const exists = fs.existsSync(link.to);
+        const correct = exists && fs.lstatSync(link.to).isSymbolicLink() && fs.readlinkSync(link.to) === link.from;
+        const tag = correct ? c.green('linked') : exists ? c.yellow('stale ') : c.red('missing');
+        console.log(`  ${tag}  ${path.relative(ROOT, link.to)}`);
+      }
+    }
+    return;
+  }
+
+  if (sub === 'remove') {
+    const target = args[1];
+    if (!target) die('usage: merlin overlay remove <path>');
+    const overlayRoot = path.resolve(target.replace(/^~/, HOME));
+    const reg = readOverlayRegistry();
+    const before = reg.overlays.length;
+    reg.overlays = reg.overlays.filter((o) => o.path !== overlayRoot);
+    if (reg.overlays.length === before) die(`overlay not registered: ${overlayRoot}`);
+    writeOverlayRegistry(reg);
+    // Unlink everything that points back at this overlay root, anywhere in
+    // the declared dst dirs. We don't recompute the plan — the overlay repo
+    // may already be gone — we just walk the dst dirs and unlink any
+    // symlink whose target starts with overlayRoot + '/'.
+    let removed = 0;
+    for (const m of OVERLAY_MAP) {
+      const dstAbs = path.join(ROOT, m.dst);
+      if (!fs.existsSync(dstAbs)) continue;
+      const entries = m.type === 'file' ? [path.basename(m.dst)] : (fs.readdirSync(path.dirname(dstAbs)).includes(path.basename(dstAbs)) ? fs.readdirSync(dstAbs) : []);
+      for (const name of entries) {
+        const full = m.type === 'file' ? dstAbs : path.join(dstAbs, name);
+        try {
+          const lstat = fs.lstatSync(full);
+          if (!lstat.isSymbolicLink()) continue;
+          if (fs.readlinkSync(full).startsWith(overlayRoot + path.sep) || fs.readlinkSync(full) === overlayRoot) {
+            fs.unlinkSync(full);
+            removed++;
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    console.log(c.green(`  ✓ overlay removed: ${overlayRoot} (${removed} link(s) unlinked)`));
+    return;
+  }
+
+  die(`unknown: overlay ${sub}. Try: merlin overlay help`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit subcommand — periodic-review wrapper around the safety surface.
+//
+// What it checks (and is honest about what it can't):
+//   1. Runs `.tools/sanitize-guard.py --all` to surface any drift between
+//      the current tree and the accepted baseline.
+//   2. Greps the last N commit messages (default 50) against the same
+//      personal-identifier patterns the guard uses on file content —
+//      commit messages aren't scanned by the pre-commit hook today.
+//   3. Reports baseline stats so the user can spot the "growing baseline"
+//      anti-pattern (i.e. accepting hits because they're annoying to fix
+//      rather than because they're intentional public content).
+//   4. Reports the number of tracked files in `local/` or `**/_ext/`
+//      (should always be zero — if not, something bypassed .gitignore).
+//
+// What it cannot check (be honest in the report):
+//   • Narrative/paraphrased personal content (no pattern triggers).
+//   • Past commits already on the public remote — those need history audit
+//     tooling outside this scope; flag it but don't claim coverage.
+//   • Content in forks or archive crawlers.
+//
+// Run cadence: monthly per docs/architecture-public-private.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cmdAudit(args) {
+  const commitsN = parseInt(getFlag(args, '--commits', '50'), 10) || 50;
+  const guard = path.join(ROOT, '.tools/sanitize-guard.py');
+  const baseline = path.join(ROOT, '.tools/sanitize-guard-baseline.json');
+
+  console.log(c.bold('merlin audit') + c.dim(` — public/private boundary review (${new Date().toISOString().slice(0,10)})\n`));
+
+  // ── 1. sanitize-guard --all
+  console.log(c.bold('1. sanitize-guard (all tracked files vs. baseline)'));
+  let guardExit = 0;
+  if (!fs.existsSync(guard)) {
+    console.log(c.red('   guard script missing at .tools/sanitize-guard.py'));
+    guardExit = 2;
+  } else {
+    const result = spawnSync('python3', [guard, '--all'], { stdio: 'inherit', cwd: ROOT });
+    guardExit = result.status ?? 1;
+    if (guardExit === 0) console.log(c.green('   ✓ clean against baseline'));
+  }
+
+  // ── 2. commit message scan
+  console.log('\n' + c.bold(`2. commit message scan (last ${commitsN} commits)`));
+  let commitHits = [];
+  try {
+    const log = execSync(`git log -n ${commitsN} --format="%h%x09%s%x09%b%x1e"`, { cwd: ROOT }).toString();
+    // Read the same pattern set the guard uses by extracting from the JSON
+    // baseline's keys — that always reflects the live PERSONAL_PATTERNS set
+    // (any pattern that has ever fired is in there as a hit-key prefix).
+    let patternNames = [];
+    try {
+      const b = JSON.parse(fs.readFileSync(baseline, 'utf8'));
+      const names = new Set();
+      for (const hits of Object.values(b)) {
+        for (const k of hits) names.add(k.split(':')[0]);
+      }
+      patternNames = [...names];
+    } catch { /* empty baseline = no pattern set yet */ }
+    // Use the guard's --list-patterns output instead — authoritative.
+    let patternMap = {};
+    try {
+      const out = execSync(`python3 ${guard} --list-patterns`, { cwd: ROOT }).toString();
+      for (const line of out.split('\n')) {
+        const m = line.match(/^\s+(\w+)\s+(.+)$/);
+        if (m) patternMap[m[1]] = new RegExp(m[2], 'i');
+      }
+    } catch {}
+    const commits = log.split('\x1e').filter(Boolean);
+    for (const entry of commits) {
+      const [hash, subject, ...bodyParts] = entry.split('\t');
+      const body = bodyParts.join('\t');
+      const text = `${subject}\n${body}`;
+      for (const [name, regex] of Object.entries(patternMap)) {
+        if (regex.test(text)) {
+          commitHits.push({ hash: hash.trim(), pattern: name, line: subject.trim().slice(0, 80) });
+        }
+      }
+    }
+  } catch (err) {
+    console.log(c.red(`   couldn't read git log: ${err.message}`));
+  }
+  if (commitHits.length === 0) {
+    console.log(c.green('   ✓ no personal-identifier hits in recent commit messages'));
+  } else {
+    console.log(c.red(`   ✗ ${commitHits.length} hit(s) in commit messages:`));
+    for (const h of commitHits) {
+      console.log(`     ${c.dim(h.hash)}  [${h.pattern}]  ${h.line}`);
+    }
+    console.log(c.dim('     (note: commit messages live in history forever; sanitization requires'));
+    console.log(c.dim('      rewriting history + force push + asking GitHub to clear caches.)'));
+  }
+
+  // ── 3. baseline drift stats
+  console.log('\n' + c.bold('3. baseline state'));
+  if (!fs.existsSync(baseline)) {
+    console.log(c.dim('   no baseline file — run: .tools/sanitize-guard.py --baseline'));
+  } else {
+    try {
+      const b = JSON.parse(fs.readFileSync(baseline, 'utf8'));
+      const fileCount = Object.keys(b).length;
+      const hitCount = Object.values(b).reduce((s, v) => s + v.length, 0);
+      console.log(`   files with accepted hits: ${fileCount}`);
+      console.log(`   total accepted hits:      ${hitCount}`);
+      console.log(c.dim('   → review periodically — accepting hits should be a deliberate choice, not a habit.'));
+      // Surface the top-3 files by hit count so review is easy.
+      const top = Object.entries(b).map(([f, h]) => [f, h.length]).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      if (top.length) {
+        console.log(c.dim('   top files:'));
+        for (const [f, n] of top) console.log(c.dim(`     ${n.toString().padStart(3)}  ${f}`));
+      }
+    } catch (err) {
+      console.log(c.red(`   couldn't read baseline: ${err.message}`));
+    }
+  }
+
+  // ── 4. tracked-files-in-overlay-dirs check
+  console.log('\n' + c.bold('4. tracked files in overlay locations (should be empty except .gitkeep)'));
+  try {
+    const tracked = execSync(
+      `git ls-files 'local/' 'local/**' '**/_ext/' '**/_ext/**' 2>/dev/null || true`,
+      { cwd: ROOT }
+    ).toString().split('\n').filter(Boolean).filter((f) => !f.endsWith('/.gitkeep'));
+    if (tracked.length === 0) {
+      console.log(c.green('   ✓ clean — no overlay content tracked'));
+    } else {
+      console.log(c.red(`   ✗ ${tracked.length} unexpected tracked file(s) in overlay dirs:`));
+      for (const t of tracked) console.log(`     ${t}`);
+      console.log(c.dim('     (these slipped past .gitignore via `git add -f` or similar; investigate)'));
+    }
+  } catch (err) {
+    console.log(c.dim(`   skip: ${err.message}`));
+  }
+
+  // ── 5. coverage caveats — print every time so it never feels solved
+  console.log('\n' + c.bold('5. what this audit cannot tell you'));
+  console.log(c.dim('   • paraphrased / narrative personal content (no pattern fires)'));
+  console.log(c.dim('   • content already in past commits — only HEAD is scanned by the guard'));
+  console.log(c.dim('   • content in forks, archive crawlers (Software Heritage, etc.), AI'));
+  console.log(c.dim('     training datasets, or GitHub search caches'));
+  console.log(c.dim('   → for narrative leaks, consider an LLM-based PR review pass'));
+  console.log(c.dim('     (`bin/merlin review-pr <N>` not yet built — see roadmap).'));
+
+  // Exit code reflects the strictest finding so audit is callable from CI.
+  const hadFailure = guardExit !== 0 || commitHits.length > 0;
+  process.exit(hadFailure ? 1 : 0);
 }
 
 function cmdUp(args) {
@@ -2460,6 +2904,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { cmdHelp(); pro
 const dispatch = {
   // Bootstrap / run-loop
   init: cmdInit,
+  overlay: cmdOverlay,
   up: cmdUp,
   dispatch: cmdDispatch,
   tail: cmdTail,
@@ -2480,6 +2925,7 @@ const dispatch = {
   cost: cmdCost,
   activity: cmdActivity,
   context: cmdContext,
+  audit: cmdAudit,
 };
 
 const fn = dispatch[cmd];
