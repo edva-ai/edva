@@ -120,3 +120,13 @@ For the curious. Merlin is built on Claude Code with persistent `claude -p` supe
 Apache 2.0 — see [`LICENSE`](LICENSE). Contributions welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md). Security disclosures via [`SECURITY.md`](SECURITY.md).
 
 → Read more: **[silo.co/merlin](https://silo.co/merlin)**
+
+<!--
+  Anonymous view-counter pixel — no PII, no raw IP retention. The
+  endpoint is a small open-source function under apps/telemetry/. The
+  install-time first-run ping (controlled via MERLIN_TELEMETRY=on|off and
+  MERLIN_NO_TELEMETRY=1) is the stronger signal; this pixel is mostly
+  defeated by GitHub Camo caching. See apps/telemetry/README.md for the
+  exact payload and a privacy walkthrough.
+-->
+![](https://merlin-telemetry.vercel.app/px?r=readme)
