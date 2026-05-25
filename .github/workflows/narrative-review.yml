@@ -1,0 +1,97 @@
+name: Narrative review (Claude)
+
+# Layer 6a — Claude-powered narrative leak detection on PR diffs. Catches
+# personal-content leakage that the pattern-based sanitize-guard (Layer 3)
+# cannot: paraphrased context, specific dated events, financial detail,
+# relationship reveals, AI-generated text with personally identifying echoes.
+#
+# Non-blocking by default: the job runs, posts findings as a PR comment, and
+# exits 0 even when Claude returns a "block" verdict. Treat it as advisory —
+# the canonical blocker is the human review enforced by branch protection +
+# sanitize-guard CI. To make it blocking, remove `|| true` from the run step.
+#
+# Cost: ~$0.005-$0.02 per PR with claude-haiku-4-5 (the default).
+#
+# Requires repo secret: ANTHROPIC_API_KEY. Skip the run cleanly if not set so
+# forks without a key don't see red CI.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write   # to post the findings comment
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install SDK
+        run: npm install --no-audit --no-fund @anthropic-ai/sdk
+
+      - name: Run merlin review-pr
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY repo secret not set — skipping narrative review."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --json puts the structured findings on stdout; tee saves a copy
+          # for the comment step. `|| true` keeps the workflow non-blocking
+          # even on a "block" verdict (Claude exits 1 in that case).
+          ./bin/merlin review-pr ${{ github.event.pull_request.number }} --json | tee /tmp/review.json || true
+
+      - name: Post findings as PR comment
+        if: ${{ steps.review.outputs.skipped != 'true' && always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -s /tmp/review.json ]; then
+            echo "No review output to post."
+            exit 0
+          fi
+          python3 - <<'PY' > /tmp/review.md
+          import json, sys
+          d = json.load(open('/tmp/review.json'))
+          s = d.get('summary', {})
+          verdict = s.get('verdict', '?').upper()
+          icon = {'SHIP': '✅', 'REVIEW': '⚠️', 'BLOCK': '🛑'}.get(verdict, '❓')
+          meta = d.get('_meta', {})
+          model = meta.get('model', '?')
+          cost  = meta.get('est_cost_usd', 0)
+          out = []
+          out.append(f"## {icon} Narrative leak review: **{verdict}**")
+          out.append("")
+          out.append(f"_{s.get('total_findings', 0)} finding(s), highest severity: {s.get('highest_severity', 'none')} · model: `{model}` · est cost: ${cost:.4f}_")
+          out.append("")
+          out.append("This is an LLM-based advisory check (Layer 6a). The pattern-based `sanitize-guard` CI check remains the authoritative blocker.")
+          out.append("")
+          for f in d.get('findings', []):
+              sev = f['severity'].upper()
+              loc = f"{f['file']}:{f['line_hint']}" if f.get('line_hint') else f['file']
+              out.append(f"### [{sev}] `{loc}` — _{f['category']}_")
+              out.append("")
+              out.append(f"> {f['snippet']}")
+              out.append("")
+              out.append(f"**Why:** {f['why']}")
+              out.append("")
+              out.append(f"**Suggestion:** {f['suggestion']}")
+              out.append("")
+          if not d.get('findings'):
+              out.append("_No findings — Claude saw no narrative leaks beyond what the pattern-based guard catches._")
+          print("\n".join(out))
+          PY
+          gh pr comment "$PR_NUMBER" --body-file /tmp/review.md

@@ -242,9 +242,9 @@ main. `.github/workflows/sanitize-guard.yml` runs `.tools/sanitize-guard.py
 ### Layer 6 — PR template + human review
 Every PR opens with `.github/pull_request_template.md` and a checklist
 forcing conscious attention on personal-content review and baseline diff
-intent. This is the only layer that catches **paraphrased** or
-**narrative** personal content (e.g. "the property I bought last year for
-$X" — no pattern fires).
+intent. Combined with Layer 6a (below), this is what catches
+**paraphrased** or **narrative** personal content (e.g. "the property I
+bought last year for $X" — no pattern fires).
 
 ### Layer 7 — Periodic audit
 `merlin audit` (run monthly) walks every tracked file with the guard,
@@ -274,19 +274,63 @@ GitHub support cache clear) exist but are expensive and incomplete. The
 only real fix is **never let it land in the first place** — i.e. layers
 0–6 doing their job.
 
+### Layer 6a — `merlin review-pr` (Claude-powered narrative review)
+
+The pattern-based guard catches *explicit* identifiers. It cannot catch
+content that, without using any of those tokens, still uniquely
+identifies a real person, event, transaction, or relationship —
+"the property I bought in 2024 for $X", "my partner's medical
+condition", AI-generated docs that paraphrase personal context. That's
+the gap `merlin review-pr` fills.
+
+```bash
+merlin review-pr <PR#>              # diffs PR via `gh pr diff`, prints findings
+merlin review-pr --file <path>      # scan any text file
+merlin review-pr --stdin            # accept a diff from stdin
+merlin review-pr <PR#> --json       # machine-readable, for CI use
+merlin review-pr <PR#> --model M    # override model (default claude-haiku-4-5)
+```
+
+The findings are categorized (`narrative_personal`, `specific_financial`,
+`specific_event`, `geographic_reveal`, `relationship_reveal`,
+`ai_generated_echo`, `other`) and severity-tagged
+(`low` / `medium` / `high`), with a verdict (`ship` / `review` / `block`).
+The exit code is non-zero on `block`, so the command is callable from CI.
+
+**Cost.** Defaults to `claude-haiku-4-5` ($1/$5 per 1M in/out tokens). A
+typical PR review runs ~$0.005-$0.02. Use `--model claude-opus-4-7`
+for higher-confidence review on a high-stakes change.
+
+**Auth.** Requires `ANTHROPIC_API_KEY` in env or `.env`. If you're on
+Claude Max (Mode 2 in `merlin init`), inject the key transiently with
+1Password or similar: `op run --env-file=.env.review-pr -- merlin
+review-pr <N>`.
+
+**Server-side companion.** `.github/workflows/narrative-review.yml` runs
+the same check on every PR, posts findings as a PR comment, and is
+**non-blocking by default**. Remove the `|| true` in the workflow to
+make it blocking. Requires `ANTHROPIC_API_KEY` repo secret.
+
+**Why a separate layer instead of merging into sanitize-guard.** The
+pattern-based guard is deterministic, fast, free, and zero-dependency —
+it must keep that posture so it stays in the pre-commit hook on every
+clone. The LLM review is probabilistic, costs money, and depends on a
+network call. Mixing them would either slow every commit or weaken the
+guarantees the deterministic layer provides. Keep them separate so the
+fast/cheap floor stays fast/cheap.
+
 ### What no layer here can catch
 
-- **Paraphrased / narrative personal content** that doesn't match any
-  pattern. Example: a code comment describing your home address in prose
-  without using street numbers. Only Layer 6 (human review) addresses
-  this — and even that misses things. A future Layer 6a (LLM-based PR
-  diff review with a "would this identify a real person?" prompt) is on
-  the roadmap; see `bin/merlin review-pr <N>` (not yet built).
-- **Past commits already on the public remote.** The guard scans HEAD,
-  not history. Use `merlin audit` to scan commit messages back N
-  commits, but full content-history audit is a separate one-off.
-- **Content in forks, mirrors, AI training datasets.** Out of scope of
-  any tooling here.
+- **Past commits already on the public remote.** Layers 2/3 scan HEAD,
+  Layer 6a scans diffs. Use `merlin audit` to scan commit messages back
+  N commits, but full content-history audit (`git filter-repo` + force
+  push + GitHub support cache clear) is a separate one-off operation.
+- **Content in forks, mirrors, AI training datasets, archive crawlers
+  (Software Heritage, GHArchive).** Out of scope of any tooling here.
+  The only mitigation is **prevention** — Layers 0-6a doing their job.
+- **False negatives in Layer 6a itself.** LLM review is probabilistic;
+  a passage Claude judges generic may not be. Treat the verdict as one
+  input to human review, not the final word.
 
 ## What goes in the kernel vs the overlay — heuristics
 
