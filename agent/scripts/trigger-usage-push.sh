@@ -17,7 +17,10 @@
 # Registered in system/tasks.json as "usage-push".
 
 set -uo pipefail
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
+# Derive MERLIN_HOME from this script's location (agent/scripts/) so casing or a
+# relocated checkout doesn't break it; honor an explicit MERLIN_HOME if set.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${MERLIN_HOME:=$(cd "$SCRIPT_DIR/../.." && pwd)}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 LOG="${MERLIN_HOME}/agent/logs/usage-push.log"

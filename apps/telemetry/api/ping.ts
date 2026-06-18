@@ -190,13 +190,28 @@ async function readStats(): Promise<Record<string, unknown> | null> {
 // Accepts the token either as ?token=… or an `Authorization: Bearer …` header.
 // When STATS_TOKEN is unset the gate is open (matches the pre-token behavior of
 // /stats); /usage additionally refuses entirely unless a token is configured.
+// Constant-time string equality — no early-out on the first differing byte, so
+// response timing doesn't leak how much of the token an attacker guessed right.
+function safeEqual(a: string, b: string): boolean {
+  const max = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < max; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
 function tokenOK(req: Request, url: URL): boolean {
   const required = process.env.STATS_TOKEN || "";
   if (!required) return true;
   const q = url.searchParams.get("token") || "";
   const auth = req.headers.get("authorization") || "";
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  return q === required || bearer === required;
+  // Both candidates checked unconditionally (no || short-circuit) so a present
+  // bearer can't change timing based on the query param, and vice versa.
+  const qOK = safeEqual(q, required);
+  const bearerOK = safeEqual(bearer, required);
+  return qOK || bearerOK;
 }
 
 function jsonResponse(obj: unknown, status = 200): Response {
@@ -280,18 +295,36 @@ function roundCost(t: UsageAcc): UsageAcc {
   return t;
 }
 
+// Cap on distinct jobs per push — a real host has tens of jobs; anything past
+// this is junk/abuse and would bloat the day-hash unboundedly.
+const MAX_JOBS_PER_PUSH = 500;
+
 // Persist one per-host daily usage snapshot. Idempotent: HSET overwrites the
-// host's field for that day. Best-effort — never throws.
-async function recordUsage(body: Record<string, unknown>): Promise<boolean> {
+// host's field for that day. Never throws — returns a status for the caller.
+// Validates client-controlled keys (host_fp, job count) since they become
+// Redis hash fields and HyperLogLog members; bad input is rejected (400) so a
+// token-holder can't inflate the unique-host count or grow the hash without
+// bound. KV outage → 503.
+async function recordUsage(
+  body: Record<string, unknown>,
+): Promise<{ status: number; error?: string }> {
   const redis = kv();
-  if (!redis) return false;
+  if (!redis) return { status: 503, error: "kv not configured" };
   const rawDay = String(body.day ?? "");
   const day = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : daySalt();
-  const host = clip(String(body.host_fp ?? "anon"), 64) || "anon";
+  // host_fp is the merlin/gandalf SHA-256 prefix — always lowercase hex. Reject
+  // anything else so the hosts HLL and day-hash fields can't be polluted.
+  const host = clip(String(body.host_fp ?? ""), 64);
+  if (!/^[0-9a-f]{8,64}$/.test(host)) {
+    return { status: 400, error: "invalid host_fp (expected 8-64 hex chars)" };
+  }
   const jobsIn =
     body.jobs && typeof body.jobs === "object"
       ? (body.jobs as Record<string, Record<string, unknown>>)
       : {};
+  if (Object.keys(jobsIn).length > MAX_JOBS_PER_PUSH) {
+    return { status: 400, error: `too many jobs (max ${MAX_JOBS_PER_PUSH})` };
+  }
   // Store the snapshot with the SAME field names the push sends (notably
   // total_cost_usd) so readUsage's accUsage — which maps total_cost_usd →
   // est_cost_usd — finds it. Normalizing through accUsage here would rename
@@ -326,9 +359,9 @@ async function recordUsage(body: Record<string, unknown>): Promise<boolean> {
     p.set(k("last_push"), snapshot.ts);
     p.set(k("phantom"), body.phantom ? "1" : "0");
     await p.exec();
-    return true;
+    return { status: 200 };
   } catch {
-    return false;
+    return { status: 503, error: "kv write failed" };
   }
 }
 
@@ -418,8 +451,8 @@ export default async function handler(req: Request): Promise<Response> {
       } catch {
         /* ignore — bad JSON yields an empty (no-op) push */
       }
-      const ok = await recordUsage(body);
-      return jsonResponse({ ok }, ok ? 200 : 503);
+      const r = await recordUsage(body);
+      return jsonResponse(r.error ? { ok: false, error: r.error } : { ok: true }, r.status);
     }
     if (req.method === "GET") {
       const d = Number(url.searchParams.get("days"));

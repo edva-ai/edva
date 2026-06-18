@@ -179,7 +179,9 @@ if (PUSH) {
     .update(`${os.hostname()}|${os.userInfo().username || ''}`)
     .digest('hex').slice(0, 16);
 
-  const MERLIN_ROOT = path.join(HOME, 'dev/merlin');
+  // Derive the repo root from this script's location (bin/), not a hardcoded
+  // ~/dev/merlin, so path casing/location differences don't bite.
+  const MERLIN_ROOT = path.join(__dirname, '..');
   let ver = '';
   try { ver = require(path.join(MERLIN_ROOT, 'package.json')).version || ''; } catch { /* optional */ }
   let sha = '';
@@ -216,17 +218,27 @@ if (PUSH) {
           'content-length': Buffer.byteLength(payload),
           authorization: `Bearer ${token}`,
         },
-      }, (res) => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 300); });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
+      }, (res) => { res.resume(); resolve(res.statusCode || 0); });
+      req.on('error', () => resolve(0));
+      req.on('timeout', () => { req.destroy(); resolve(0); });
       req.write(payload);
       req.end();
-    } catch { resolve(false); }
+    } catch { resolve(0); }
   });
 
+  // The rolling --since window cuts its OLDEST day at the boundary, so that
+  // day's rollup here is partial. It was already captured in full on the prior
+  // run; re-pushing it would SHRINK the stored day (the server HSET-overwrites,
+  // it doesn't merge). So drop the oldest day — unless it's the only one, in
+  // which case it's just "today" (partial-but-current, re-pushed in full
+  // tomorrow when it becomes the second-oldest).
+  const sortedDays = [...byDayPush.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const toPush = sortedDays.length > 1 ? sortedDays.slice(1) : sortedDays;
+
   (async () => {
-    let pushed = 0, failed = 0;
-    for (const [day, m] of [...byDayPush.entries()].sort()) {
+    let pushed = 0;
+    const failures = [];
+    for (const [day, m] of toPush) {
       const jobs = {};
       for (const [src, st] of m) {
         jobs[src] = {
@@ -242,13 +254,16 @@ if (PUSH) {
         };
       }
       const payload = JSON.stringify({ host_fp: hostFp, day, phantom: PHANTOM, ver, sha, jobs });
-      const ok = await postJson(usageUrl, payload);
-      if (ok) pushed++; else failed++;
+      const status = await postJson(usageUrl, payload);
+      if (status >= 200 && status < 300) pushed++;
+      else failures.push(`${day}:HTTP ${status || 'network-error'}`);
     }
+    const failed = failures.length;
+    const skipped = sortedDays.length - toPush.length;
     if (ASJSON) {
-      console.log(JSON.stringify({ pushed, failed, days: byDayPush.size, url: usageUrl }, null, 2));
+      console.log(JSON.stringify({ pushed, failed, days: toPush.length, skipped_partial_oldest: skipped, failures, url: usageUrl }, null, 2));
     } else {
-      console.log(`pushed ${pushed}/${byDayPush.size} day-snapshot(s) to ${usageUrl}${failed ? ` (${failed} failed)` : ''}`);
+      console.log(`pushed ${pushed}/${toPush.length} day-snapshot(s) to ${usageUrl}${skipped ? ` (skipped ${skipped} partial oldest)` : ''}${failed ? ` (${failed} failed: ${failures.join(', ')})` : ''}`);
     }
     process.exit(failed && !pushed ? 1 : 0);
   })();
