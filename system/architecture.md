@@ -255,7 +255,7 @@ Both modes are first-class. The kernel is auth-mode-neutral — pick whichever f
 | Surface | What it shows |
 |---|---|
 | `merlin status` | One-screen view: supervisor uptimes, child restart counts, last 5 jobs run, last hum tick, error counts |
-| `merlin cost-report` | Per-day, per-agent, per-job cost attribution. Reads the `cost.ndjson` + `job-costs.ndjson` event logs the supervisors write per turn. |
+| `merlin cost-report` | Per-day, per-agent, per-job cost attribution. Reads the `cost.ndjson` + `job-costs.ndjson` event logs the supervisors write per turn. `--push` rolls the per-day totals up to the hosted `/usage` endpoint (`apps/telemetry`) for durable, cross-host monitoring; wired as the nightly `usage-push` job in `system/tasks.json`. |
 | `agent/logs/supervisor-{ops,chat}/events.ndjson` | Full session stream (one JSON line per turn). Survives restarts. |
 | `merlin logs <job>` | Tail the log file for a specific job. |
 | `GET :9093/health` | JSON: `{childAlive, lastTurnAt, turnCount, cost, restarts, up}`. Webhook channels check this before dispatching to avoid queueing into a dead agent. |

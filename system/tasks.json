@@ -122,6 +122,24 @@
         "context index"
       ],
       "description": "Re-index your wired-in sources (notes, messages, email memories, project files) into the context search database."
+    },
+    {
+      "name": "usage-push",
+      "schedule": "15 4 * * *",
+      "schedule_human": "Daily at 4:15 AM",
+      "trigger_script": "agent/scripts/trigger-usage-push.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "telemetry",
+      "phrases": [
+        "usage push",
+        "push usage",
+        "cost push",
+        "push cost report"
+      ],
+      "description": "Push per-day Claude usage/cost rollups (from job-costs.ndjson via 'merlin-cost-report --push') to the hosted apps/telemetry /usage endpoint for central, durable monitoring across hosts. Runs after midnight over a 2-day window; idempotent per (host, day). Requires MERLIN_USAGE_TOKEN (or STATS_TOKEN) in .env. Direct script — no webhook, no Anthropic API. Non-fatal when there are no cost rows.",
+      "job": null
     }
   ]
 }
