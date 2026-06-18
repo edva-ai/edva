@@ -7,8 +7,9 @@ project:
 | ------------------------------------- | ------------------------------------------------- |
 | `GET  /px[/anything]?r=<tag>`         | The README tracking pixel (and any docs pixels).  |
 | `POST /install`                       | First-run install ping from `bin/merlin install`. |
+| `GET  /stats`                         | Aggregate, anonymous install counters (JSON).     |
 
-Both routes share one handler (`api/ping.ts`). The two `vercel.json` rewrites
+All three routes share one handler (`api/ping.ts`). The `vercel.json` rewrites
 just give us nicer URLs in the README and CLI than `/api/ping`.
 
 ## What gets logged
@@ -20,9 +21,39 @@ One JSON line per hit to Vercel Runtime Logs (queryable with `vercel logs`):
 {"kind":"install","ts":"…","ipHash":"…","ua":"…","host_fp":"…","os":"darwin","arch":"arm64","ver":"0.1.0","sha":"deadbeef","ctx":"fresh-install"}
 ```
 
-No database, no cookies, no raw IP retention. The IP is hashed with a
-per-calendar-day salt so we can count unique-per-day cloners without storing
-addresses across days. The hash narrows by ~50% every UTC midnight by design.
+No cookies, no raw IP retention. The IP is hashed with a per-calendar-day salt
+so we can count unique-per-day cloners without storing addresses across days.
+The hash narrows by ~50% every UTC midnight by design.
+
+## Durable install counters (KV)
+
+Vercel Runtime Logs expire (and the CLI can only *stream* them live — it can't
+fetch history), so the install ping also writes **anonymous aggregate counters**
+to a KV store (Upstash Redis / Vercel KV) that survive log expiry. Read them at
+`GET /stats`:
+
+```jsonc
+{
+  "installs_total": 42,        // running total of install pings
+  "unique_hosts": 17,          // HyperLogLog cardinality of host_fp
+  "last_install": "2026-06-18T…",
+  "by_os":      { "darwin": 30, "linux": 12 },
+  "by_arch":    { "arm64": 28, "x64": 14 },
+  "by_version": { "0.1.0": 42 },
+  "by_context": { "fresh-install": 35, "reinstall": 7 },
+  "recent":     [ { "ts": "…", "os": "darwin", "arch": "arm64", "ver": "0.1.0", "ctx": "fresh-install" } ]
+}
+```
+
+What KV stores is **only counters and a HyperLogLog** of host fingerprints — the
+`host_fp` values themselves are never written, so `unique_hosts` is a cardinality
+estimate with nothing to leak. The `recent` feed carries no IP and no `host_fp`,
+just the coarse os/arch/ver/ctx descriptors.
+
+KV is **best-effort**: every write is wrapped, and if the KV env vars are absent
+the function behaves exactly like the pre-KV, logs-only version — an install
+ping can never fail because of telemetry. `/stats` returns `503` when KV isn't
+configured, and can be gated behind a `STATS_TOKEN` env var (`/stats?token=…`).
 
 ## What is **not** logged
 
@@ -60,8 +91,21 @@ the installer.
 cd apps/telemetry
 vercel login            # one-time
 vercel link             # one-time, scope to a Vercel team
+
+# one-time: provision a KV store and attach it to this project. The Upstash
+# Redis marketplace integration injects KV_REST_API_URL / KV_REST_API_TOKEN.
+#   Dashboard → Storage → Create → Upstash Redis → Connect to merlin-telemetry
+# then pull the new env vars locally:
+vercel env pull
+
+# optional: gate /stats behind a token
+vercel env add STATS_TOKEN production
+
 vercel --prod           # ships, prints the *.vercel.app URL
 ```
+
+If you skip the KV step the function still deploys and works — it just falls
+back to logs-only and `/stats` returns `503` until a store is attached.
 
 After the first deploy:
 
