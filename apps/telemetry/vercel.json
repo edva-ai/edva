@@ -3,6 +3,7 @@
     { "source": "/px/(.*)", "destination": "/api/ping" },
     { "source": "/px", "destination": "/api/ping" },
     { "source": "/install", "destination": "/api/ping" },
-    { "source": "/stats", "destination": "/api/ping" }
+    { "source": "/stats", "destination": "/api/ping" },
+    { "source": "/usage", "destination": "/api/ping" }
   ]
 }

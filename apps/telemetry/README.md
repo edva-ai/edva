@@ -8,8 +8,9 @@ project:
 | `GET  /px[/anything]?r=<tag>`         | The README tracking pixel (and any docs pixels).  |
 | `POST /install`                       | First-run install ping from `bin/merlin install`. |
 | `GET  /stats`                         | Aggregate, anonymous install counters (JSON).     |
+| `GET\|POST /usage`                    | Private Claude usage/cost rollup (token-gated).   |
 
-All three routes share one handler (`api/ping.ts`). The `vercel.json` rewrites
+All four routes share one handler (`api/ping.ts`). The `vercel.json` rewrites
 just give us nicer URLs in the README and CLI than `/api/ping`.
 
 ## What gets logged
@@ -54,6 +55,52 @@ KV is **best-effort**: every write is wrapped, and if the KV env vars are absent
 the function behaves exactly like the pre-KV, logs-only version — an install
 ping can never fail because of telemetry. `/stats` returns `503` when KV isn't
 configured, and can be gated behind a `STATS_TOKEN` env var (`/stats?token=…`).
+
+## Claude usage/cost monitoring (`/usage`)
+
+Separate from anonymous adoption telemetry, `/usage` is **private operator
+telemetry** for central Claude API usage/cost monitoring across hosts. Merlin's
+supervisor already writes per-job token/cost rows locally
+(`agent/logs/supervisor-ops/job-costs.ndjson`, read by `bin/merlin-cost-report`);
+`merlin-cost-report --push` rolls those up **per day** and POSTs them here so they
+survive log rotation and are queryable from anywhere.
+
+```bash
+# on each host (token from .env / MERLIN_USAGE_TOKEN), e.g. from nightly-review:
+merlin-cost-report --since 2d --push
+```
+
+- **Always token-gated** (`STATS_TOKEN`, via `?token=` or `Authorization: Bearer`).
+  The endpoint returns `503` if no token is configured, so cost data can never be
+  ingested or read anonymously. Public clones leave `MERLIN_USAGE_TOKEN` unset.
+- **Idempotent** per `(host, day)`: re-pushing a day overwrites that host's
+  snapshot rather than double-counting, so a cron that pushes a 2-day window is safe.
+- **Cost figures are estimates.** Per merlin's Max-only auth invariant the
+  supervisor's `total_cost_usd` is an SDK estimate, not billed spend. `/usage`
+  carries a `cost_is_estimated` flag and names the field `est_cost_usd`. The
+  signals that matter for cost *reduction* are token volume and `cache_hit_rate`.
+
+Read the rollup (default last 30 days, `?days=N` to widen):
+
+```bash
+curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$(op read 'op://Dev/Merlin Telemetry Upstash KV/STATS_TOKEN')"
+```
+
+```jsonc
+{
+  "window_days": 14,
+  "unique_hosts": 2,
+  "last_push": "2026-06-18T…",
+  "cost_is_estimated": true,
+  "totals": { "dispatches": 410, "input_tokens": 1200000, "output_tokens": 90000,
+              "cache_read_tokens": 8400000, "cache_creation_tokens": 320000,
+              "web_search_requests": 12, "total_turns": 980,
+              "total_duration_ms": 5400000, "est_cost_usd": 0 },
+  "cache_hit_rate": 0.875,                 // cache_read / (cache_read + input)
+  "by_job": { "hum": { … }, "webhook": { … } },
+  "by_day": { "2026-06-17": { … }, "2026-06-18": { … } }
+}
+```
 
 ## What is **not** logged
 

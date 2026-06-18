@@ -13,6 +13,7 @@
 //   merlin-cost-report --job hum                filter to one job, per-dispatch detail
 //   merlin-cost-report --trend 7d               per-day cost/job grid for the window
 //   merlin-cost-report --outliers               flag jobs whose last-24h cost is >1.5x their 7d avg
+//   merlin-cost-report --since 2d --push        push per-day rollups to hosted /usage (central monitor)
 //
 // Reads: agent/logs/supervisor-ops/job-costs.ndjson
 // (chat-agent has no job field — chat-supervisor writes cost.ndjson only.)
@@ -41,6 +42,7 @@ const SINCE_STR = arg('--since', '24h');
 const ASJSON = flag('--json');
 const TRENDFLAG = flag('--trend');
 const OUTLIERS = flag('--outliers');
+const PUSH = flag('--push');
 const JOB_FILTER = arg('--job', null);
 
 // Per the Max-only auth invariant (agent/CLAUDE.md § Auth Model), no
@@ -153,6 +155,105 @@ const jobSummary = [...byJob.entries()]
     last_ts: stats.last_ts,
   }))
   .sort((a, b) => b.total_cost_usd - a.total_cost_usd);
+
+// --- push per-day rollups to the hosted /usage endpoint (central monitoring) ---
+// Batched daily snapshots (not a per-turn hook) so the supervisor's hot path
+// stays network-free. Idempotent server-side per (host, day): safe to re-run.
+// Intended to be called from nightly-review, e.g. `merlin-cost-report --since 2d --push`.
+if (PUSH) {
+  // Load .env if the caller didn't already export the token / endpoint.
+  try { require(path.join(__dirname, '..', 'lib', 'load-env.js')).loadEnv(); } catch { /* optional */ }
+
+  const token = process.env.MERLIN_USAGE_TOKEN || process.env.STATS_TOKEN || '';
+  if (!token) {
+    console.error('merlin-cost-report --push: set MERLIN_USAGE_TOKEN (or STATS_TOKEN) — refusing to push cost data unauthenticated');
+    process.exit(1);
+  }
+  // Derive the /usage URL from the install endpoint (forks repoint via MERLIN_TELEMETRY_URL).
+  const base = (process.env.MERLIN_TELEMETRY_URL || 'https://merlin-telemetry.vercel.app/install')
+    .replace(/\/(install|px|usage|stats)\/?$/, '');
+  const usageUrl = `${base}/usage`;
+
+  const crypto = require('crypto');
+  const hostFp = crypto.createHash('sha256')
+    .update(`${os.hostname()}|${os.userInfo().username || ''}`)
+    .digest('hex').slice(0, 16);
+
+  const MERLIN_ROOT = path.join(HOME, 'dev/merlin');
+  let ver = '';
+  try { ver = require(path.join(MERLIN_ROOT, 'package.json')).version || ''; } catch { /* optional */ }
+  let sha = '';
+  try {
+    sha = require('child_process')
+      .execSync('git rev-parse --short HEAD', { cwd: MERLIN_ROOT, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+  } catch { /* optional */ }
+
+  // Group the loaded window into per-day → per-job snapshots (the idempotent unit).
+  const byDayPush = new Map();
+  for (const row of rows) {
+    const d = (row.ts || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+    if (!byDayPush.has(d)) byDayPush.set(d, new Map());
+    const m = byDayPush.get(d);
+    const src = row.source || '(unknown)';
+    if (!m.has(src)) m.set(src, emptyStats());
+    add(m.get(src), row);
+  }
+
+  const postJson = (urlStr, payload) => new Promise((resolve) => {
+    try {
+      const u = new URL(urlStr);
+      const lib = u.protocol === 'https:' ? require('https') : require('http');
+      const req = lib.request({
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        timeout: 5000,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          authorization: `Bearer ${token}`,
+        },
+      }, (res) => { res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 300); });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.write(payload);
+      req.end();
+    } catch { resolve(false); }
+  });
+
+  (async () => {
+    let pushed = 0, failed = 0;
+    for (const [day, m] of [...byDayPush.entries()].sort()) {
+      const jobs = {};
+      for (const [src, st] of m) {
+        jobs[src] = {
+          dispatches: st.dispatches,
+          input_tokens: st.input_tokens,
+          output_tokens: st.output_tokens,
+          cache_read_tokens: st.cache_read_tokens,
+          cache_creation_tokens: st.cache_creation_tokens,
+          web_search_requests: st.web_search_requests,
+          total_turns: st.total_turns,
+          total_duration_ms: st.total_duration_ms,
+          total_cost_usd: +st.total_cost_usd.toFixed(4),
+        };
+      }
+      const payload = JSON.stringify({ host_fp: hostFp, day, phantom: PHANTOM, ver, sha, jobs });
+      const ok = await postJson(usageUrl, payload);
+      if (ok) pushed++; else failed++;
+    }
+    if (ASJSON) {
+      console.log(JSON.stringify({ pushed, failed, days: byDayPush.size, url: usageUrl }, null, 2));
+    } else {
+      console.log(`pushed ${pushed}/${byDayPush.size} day-snapshot(s) to ${usageUrl}${failed ? ` (${failed} failed)` : ''}`);
+    }
+    process.exit(failed && !pushed ? 1 : 0);
+  })();
+  return; // CommonJS module — top-level return stops the default table output
+}
 
 // --- outlier detection (24h vs 7d avg) ---
 function loadWindow(startMs, endMs) {
