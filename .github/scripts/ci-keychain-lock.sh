@@ -89,10 +89,27 @@ kc_lock_release() {
 }
 
 # Prepend $1 to the user search list, preserving every other entry.
+#
+# The login guarantee below is NOT redundant with the read. If
+# `security list-keychains -d user` fails or returns nothing — observed under
+# real contention, three concurrent signing jobs hammering `security` on one
+# host — then $current is empty, $filtered is empty, and this would write a
+# ONE-ENTRY list containing only the temp keychain, evicting login.keychain-db
+# and taking Gandalf's Max auth down. That is exactly the outage this helper
+# exists to prevent, reintroduced by the helper itself; caught 2026-07-28 by a
+# five-repo concurrent build (login gone 15:02:08–15:02:12).
+#
+# kc_remove always had this guarantee; kc_prepend did not. Both write the list,
+# so both need it — a write path without the guarantee is a write path that can
+# evict login.
 kc_prepend() {
   local add="$1" current filtered
   current=$(security list-keychains -d user | tr -d '"' | xargs)
   filtered=$(echo "$current" | tr ' ' '\n' | grep -vxF "$add" | grep -v '^$' | tr '\n' ' ')
+  case " $filtered " in
+    *" $KC_LOGIN_KEYCHAIN "*) ;;
+    *) filtered="$KC_LOGIN_KEYCHAIN $filtered" ;;
+  esac
   # Unquoted on purpose: the list must word-split into separate arguments.
   security list-keychains -d user -s "$add" $filtered
 }
