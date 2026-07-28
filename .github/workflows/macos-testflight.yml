@@ -62,17 +62,18 @@ jobs:
           kc_lock_release
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
 
           # Install app profile
           PROFILE_PATH="$RUNNER_TEMP/mac-profile.provisionprofile"
           echo "$MAC_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
-          PROFILE_PLIST=$(security cms -D -i "$PROFILE_PATH")
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PROFILE_PLIST")
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PROFILE_PLIST")
-          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".provisionprofile
+          # Installs under the UUID filename and prunes ONLY profiles with the
+          # same application-identifier. The blanket `rm -f ...Profiles/*` this
+          # replaces wiped the whole per-USER directory, deleting concurrent
+          # jobs' profiles — see .github/scripts/ci-signing-assets.sh
+          source "$GITHUB_WORKSPACE/.github/scripts/ci-signing-assets.sh"
+          read -r PROFILE_UUID PROFILE_NAME <<< "$(sa_install_profile "$PROFILE_PATH" provisionprofile)"
           rm "$PROFILE_PATH"
 
           # Install notification service extension profile
@@ -198,7 +199,13 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          rm -f ~/private_keys/AuthKey_*.p8
+          # Remove ONLY this job's ASC key and ONLY the profiles this job
+          # installed. `AuthKey_*.p8` deleted sibling jobs' credentials
+          # mid-build — observed 2026-07-28 killing a concurrent Butterfly
+          # build with "AuthKey_***.p8 ... no such file".
+          source "$GITHUB_WORKSPACE/.github/scripts/ci-signing-assets.sh"
+          sa_asc_key_remove "${{ secrets.ASC_KEY_ID }}"
+          sa_cleanup_installed
           if [ -n "$keychain_path" ]; then
             source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
             kc_lock_acquire
@@ -206,8 +213,6 @@ jobs:
             kc_lock_release
             security delete-keychain "$keychain_path" 2>/dev/null || true
           fi
-          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile
-          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision
 
       - name: Upload artifacts
         if: success()
