@@ -50,7 +50,16 @@ jobs:
           security import $RUNNER_TEMP/mac-cert.p12 -k "$KEYCHAIN_PATH" -P "$MAC_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
           rm $RUNNER_TEMP/mac-cert.p12
 
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          # Prepend under the host-wide mutex shared by every signing repo on this
+          # mini. This read-modify-write of the user search list was unsynchronized:
+          # two concurrent jobs lose each other's entry, and a list written from a
+          # stale read can drop login.keychain-db — which takes the Gandalf agent on
+          # this same host fully auth-down (Max OAuth token lives there, no API-key
+          # fallback by design). See the gandalf repo's architecture.md 2026-07-28.
+          source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
+          kc_lock_acquire
+          kc_prepend "$KEYCHAIN_PATH"
+          kc_lock_release
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile
@@ -191,6 +200,10 @@ jobs:
         run: |
           rm -f ~/private_keys/AuthKey_*.p8
           if [ -n "$keychain_path" ]; then
+            source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
+            kc_lock_acquire
+            kc_remove "$keychain_path"
+            kc_lock_release
             security delete-keychain "$keychain_path" 2>/dev/null || true
           fi
           rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.provisionprofile

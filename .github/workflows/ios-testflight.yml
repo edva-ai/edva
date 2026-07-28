@@ -41,18 +41,17 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
 
           # Prepend this keychain to the user search list. Serialized via
-          # mkdir-based mutex (macOS has no flock) so concurrent jobs from
-          # other repos don't race the search-list mutation. We only ADD
-          # and we only remove our own path in cleanup — never wildcard.
-          LOCK=/tmp/merlin-ci-keychain.lock
-          for i in $(seq 1 60); do
-            if mkdir "$LOCK" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          CURRENT=$(security list-keychains -d user | tr -d '"' | xargs)
-          FILTERED=$(echo "$CURRENT" | tr ' ' '\n' | grep -v "^$KEYCHAIN$" | tr '\n' ' ')
-          security list-keychains -d user -s "$KEYCHAIN" $FILTERED
-          rmdir "$LOCK" 2>/dev/null || true
+          # Prepend under the HOST-WIDE mutex shared by every signing repo on this
+          # mini. This used to use /tmp/merlin-ci-keychain.lock — a per-repo lock,
+          # which serialized this repo against itself but NOT against the other
+          # signing repos sharing this runner, all of which mutate the same global
+          # user search list on this host. A lock nobody else contends for is
+          # not a lock. The shared helper is also crash-safe (trap release + stale
+          # breaking); the old bare mkdir leaked the lock forever on SIGKILL.
+          source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
+          kc_lock_acquire
+          kc_prepend "$KEYCHAIN"
+          kc_lock_release
 
           CERT="$RUNNER_TEMP/cert.p12"
           printf '%s' "$IOS_CERTIFICATE_P12" | base64 --decode > "$CERT"
@@ -186,14 +185,16 @@ jobs:
           # Remove this job's keychain from the user search list (flock-
           # serialized against concurrent jobs) and delete the keychain.
           if [ -n "$KEYCHAIN" ] && [ -e "$KEYCHAIN" ]; then
-            LOCK=/tmp/merlin-ci-keychain.lock
-            for i in $(seq 1 60); do
-              if mkdir "$LOCK" 2>/dev/null; then break; fi
-              sleep 1
-            done
-            REMAINING=$(security list-keychains -d user | tr -d '"' | xargs | tr ' ' '\n' | grep -v "^$KEYCHAIN$" | tr '\n' ' ')
-            security list-keychains -d user -s $REMAINING
-            rmdir "$LOCK" 2>/dev/null || true
+            # $REMAINING could come back EMPTY (our keychain the only entry), and
+            # `list-keychains -s` with no arguments SETS an empty list rather than
+            # doing nothing — evicting login.keychain-db and taking the Gandalf agent
+            # on this host auth-down. kc_remove guarantees login survives. It also
+            # matches the path literally (grep -vxF); "^$KEYCHAIN$" treated the dots
+            # in the path as regex wildcards.
+            source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
+            kc_lock_acquire
+            kc_remove "$KEYCHAIN"
+            kc_lock_release
             security delete-keychain "$KEYCHAIN" 2>/dev/null || true
           fi
           # ASC key p8 lives in $RUNNER_TEMP/asc and is auto-cleaned by runner.
