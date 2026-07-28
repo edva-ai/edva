@@ -38,10 +38,27 @@ SA_PROFILES_DIR="${SA_PROFILES_DIR:-$HOME/Library/MobileDevice/Provisioning Prof
 SA_SECURITY="${SA_SECURITY:-/usr/bin/security}"
 SA_PLISTBUDDY="${SA_PLISTBUDDY:-/usr/libexec/PlistBuddy}"
 
-# sa__field <profile-path> <plist-key> — echo one field, empty on failure.
+# sa__field <profile-path> <plist-key> — echo one field, EMPTY on failure.
+#
+# The here-string is load-bearing: PlistBuddy needs a SEEKABLE file and cannot
+# read a pipe. `security ... | PlistBuddy /dev/stdin` returns the literal string
+# "Error Reading File: /dev/stdin" — and it prints that to STDOUT, so 2>/dev/null
+# does not hide it. The first version of this function piped, and the bogus value
+# flowed through as a UUID: foodierank installed "Error.mobileprovision" and the
+# archive failed with "No profile for team". `<<<` materialises a temp file,
+# which is what the hand-rolled code this replaced always did.
 sa__field() {
-  "$SA_SECURITY" cms -D -i "$1" 2>/dev/null \
-    | "$SA_PLISTBUDDY" -c "Print $2" /dev/stdin 2>/dev/null
+  local plist out
+  plist=$("$SA_SECURITY" cms -D -i "$1" 2>/dev/null) || return 0
+  [ -n "$plist" ] || return 0
+  out=$("$SA_PLISTBUDDY" -c "Print $2" /dev/stdin <<< "$plist" 2>/dev/null) || return 0
+  # PlistBuddy reports failures on stdout ("Error Reading File:", "Does Not
+  # Exist"), so a non-zero exit is not the only failure signal. Emit nothing
+  # rather than let an error string masquerade as a value.
+  case "$out" in
+    *"Error Reading File"*|*"Does Not Exist"*|*"Unexpected Character"*) return 0 ;;
+  esac
+  printf '%s' "$out"
 }
 
 # sa_install_profile <decoded-profile-path> [extension]
@@ -55,7 +72,12 @@ sa_install_profile() {
   app_id=$(sa__field "$src" "Entitlements:application-identifier")
   uuid=$(sa__field "$src" "UUID")
   name=$(sa__field "$src" "Name")
-  [ -n "$uuid" ] || { echo "sa_install_profile: no UUID in $src" >&2; return 1; }
+  # A malformed UUID means the decode failed. Refuse rather than install
+  # something like "Error.mobileprovision" and fail later in the archive.
+  case "$uuid" in
+    "" ) echo "sa_install_profile: no UUID in $src" >&2; return 1 ;;
+    *[!0-9A-Fa-f-]* ) echo "sa_install_profile: implausible UUID '$uuid' from $src" >&2; return 1 ;;
+  esac
 
   mkdir -p "$SA_PROFILES_DIR"
   # Prune ONLY profiles for the same application-identifier — the stale-match
