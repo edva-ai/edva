@@ -37,6 +37,10 @@ SA_PROFILES_DIR="${SA_PROFILES_DIR:-$HOME/Library/MobileDevice/Provisioning Prof
 # Overridable so the logic below is testable without Apple's CMS decoder.
 SA_SECURITY="${SA_SECURITY:-/usr/bin/security}"
 SA_PLISTBUDDY="${SA_PLISTBUDDY:-/usr/libexec/PlistBuddy}"
+# Per-job ledger of what this job installed. Keyed by run+job so concurrent jobs
+# on the same host never read each other's list. A file, not a variable: see
+# sa_install_profile.
+SA_STATE="${SA_STATE:-${RUNNER_TEMP:-/tmp}/.sa-installed-${GITHUB_RUN_ID:-local}-${GITHUB_JOB:-job}}"
 
 # sa__field <profile-path> <plist-key> — echo one field, EMPTY on failure.
 #
@@ -91,19 +95,29 @@ sa_install_profile() {
   fi
 
   cp "$src" "$SA_PROFILES_DIR/$uuid.$ext"
-  # Record for teardown. GITHUB_ENV persists across steps; the shell var covers
-  # same-step use and local runs.
-  SA_INSTALLED="${SA_INSTALLED:+$SA_INSTALLED:}$SA_PROFILES_DIR/$uuid.$ext"
-  [ -n "${GITHUB_ENV:-}" ] && echo "SA_INSTALLED=$SA_INSTALLED" >> "$GITHUB_ENV"
+  # Record for teardown in a FILE, not a shell variable.
+  #
+  # Callers invoke this inside command substitution to capture the uuid/name:
+  #     read -r UUID NAME <<< "$(sa_install_profile ...)"
+  # which runs the function in a SUBSHELL, so any variable it sets evaporates.
+  # The first version accumulated into $SA_INSTALLED and wrote it to GITHUB_ENV
+  # each call; with two profiles both calls started from an empty parent value,
+  # so GITHUB_ENV's last-wins left only the SECOND path and teardown leaked the
+  # first (observed: "Gandalf Mac Profile" survived a green build). Appending to
+  # a file survives subshells.
+  mkdir -p "$(dirname "$SA_STATE")" 2>/dev/null || true
+  echo "$SA_PROFILES_DIR/$uuid.$ext" >> "$SA_STATE"
   echo "$uuid $name"
 }
 
 # sa_cleanup_installed — remove ONLY the profiles this job installed.
 sa_cleanup_installed() {
-  local IFS=':' p
-  for p in ${SA_INSTALLED:-}; do
+  local p
+  [ -f "$SA_STATE" ] || return 0
+  while IFS= read -r p; do
     [ -n "$p" ] && rm -f "$p"
-  done
+  done < "$SA_STATE"
+  rm -f "$SA_STATE"
 }
 
 # sa_asc_key_stage <key-id> <pem-contents> [dir]
