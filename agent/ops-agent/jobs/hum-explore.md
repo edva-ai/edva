@@ -10,10 +10,10 @@ The weekly canary (Wed 12:00, retired the same day) asked the user, about three 
 
 Cron keeps the clock: `agent/scripts/trigger-hum-explore.sh` runs at **12:30 and 17:30 local** (`data/clock-jobs.json`, labels `trigger-hum-explore-midday` / `-evening`; `cron-tz-sync` keeps them on the user's local clock). It only kicks the on-demand launchd agent **`ai.claude.hum-explore`** (`agent/launch-agents/ai.claude.hum-explore.plist`), whose `run-hum-explore.sh` checks the Max login (`lib/max-auth-guard.sh`) and then calls **`bin/hum-explore-run`** (logic in `lib/hum-explore.mjs`, tests in `tests/hum-explore.test.mjs` and `hum-scheduled-senders-launchd.test.mjs`).
 
-**Why launchd (2026-10-15).** A pick goes out through `hum-ping` → `merlin-send-curl`, whose resolve-first gate (Opus) and outbound precheck (Sonnet) are `claude -p` calls on the Max login, and cron cannot reach that login. Both gates fail open, so the 17:30 pick that day logged `model unavailable: not_logged_in` and went out unchecked. Under launchd both gates run. With no verified Max login the run is **held** (`[hum-explore] held: …` in `watchdog.log`), never sent unchecked; nobody is paged (watchdog.sh owns Max-outage alerts). If the agent is not installed, `launchd_kick` logs it and posts the install line to the System tab, and nothing is sent. Install once on the host:
+**Why launchd (2026-10-15).** A pick goes out through `hum-ping` → `edva-send-curl`, whose resolve-first gate (Opus) and outbound precheck (Sonnet) are `claude -p` calls on the Max login, and cron cannot reach that login. Both gates fail open, so the 17:30 pick that day logged `model unavailable: not_logged_in` and went out unchecked. Under launchd both gates run. With no verified Max login the run is **held** (`[hum-explore] held: …` in `watchdog.log`), never sent unchecked; nobody is paged (watchdog.sh owns Max-outage alerts). If the agent is not installed, `launchd_kick` logs it and posts the install line to the System tab, and nothing is sent. Install once on the host:
 
 ```bash
-cp ~/Dev/merlin/agent/launch-agents/ai.claude.hum-explore.plist ~/Library/LaunchAgents/
+cp ~/Dev/edva/agent/launch-agents/ai.claude.hum-explore.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.claude.hum-explore.plist
 ```
 

@@ -7,7 +7,7 @@
 // instruction is to read this file before blaming a harvester, which is
 // impossible with the fields blank.
 //
-// SCOPE: these cover the rows emit() writes. merlin-send-curl has a second,
+// SCOPE: these cover the rows emit() writes. edva-send-curl has a second,
 // separate appender for its protected-intent suppress-override, which already
 // records its own intent and is not touched here.
 //

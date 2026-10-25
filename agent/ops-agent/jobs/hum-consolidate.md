@@ -31,7 +31,7 @@ trigger-hum-consolidate.sh (3:10 AM local; skips when nothing new since the wate
 ```bash
 node -e '
 const fs=require("fs"),os=require("os"),path=require("path");
-const D=path.join(os.homedir(),"Dev/merlin/data");
+const D=path.join(os.homedir(),"Dev/edva/data");
 let last=0; try{last=new Date(JSON.parse(fs.readFileSync(path.join(D,"hum-consolidate-state.json"),"utf8")).last_consolidated_at||0).getTime();}catch{}
 const raw=fs.readFileSync(path.join(D,"hum-responses.jsonl"),"utf8");
 const rows=raw.split("\n").filter(Boolean).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(r=>r&&new Date(r.ts||0).getTime()>last);
@@ -52,7 +52,7 @@ For each pending reply decide what it is:
 
   It used to be a loss, and it was the worst one in the pipeline: the class of reply the user is most annoyed to re-litigate ("already answered", "don't re-ask") was precisely the class this step dropped, surviving only in `hum-resolved-topics.jsonl` behind a 48h TTL that the hum tick never even read. (Fixed 2026-07-29.)
 
-  **One exception where you should still write:** if the transient reply also *corrects a fact Merlin has recorded wrong* (e.g. "that appointment is on Thursdays, not Tuesdays"), that correction is durable — fold it, or `wiki supersede` the wrong fact. The resolution is transient; the correction inside it is not.
+  **One exception where you should still write:** if the transient reply also *corrects a fact Edva has recorded wrong* (e.g. "that appointment is on Thursdays, not Tuesdays"), that correction is durable — fold it, or `wiki supersede` the wrong fact. The resolution is transient; the correction inside it is not.
 - **Noise / non-reply** — captured by a misfire (a fresh command that slipped through). Skip.
 
 When unsure, prefer folding a short, hedged fact over dropping it — the cost of a slightly-redundant wiki line is far lower than re-asking the user. But never invent specifics the reply didn't contain.
@@ -84,7 +84,7 @@ After processing all pending rows, write the newest processed row's `ts` as the 
 ```bash
 node -e '
 const fs=require("fs"),os=require("os"),path=require("path");
-const p=path.join(os.homedir(),"Dev/merlin/data/hum-consolidate-state.json");
+const p=path.join(os.homedir(),"Dev/edva/data/hum-consolidate-state.json");
 fs.writeFileSync(p, JSON.stringify({last_consolidated_at: process.argv[1]}, null, 2)+"\n");
 ' "<newest-ts-processed>"
 ```

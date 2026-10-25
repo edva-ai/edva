@@ -19,9 +19,9 @@ set -uo pipefail
 # full (tens of dollars on the fork ledger). Fail-open: a missing or unreadable state file runs the planner.
 # IMPROVEMENT_PLAN_FORCE=1 runs it regardless (a deliberate manual re-plan).
 #
-# Runs as an ephemeral `claude -p --model $MERLIN_MODEL_OPUS --effort xhigh`
+# Runs as an ephemeral `claude -p --model $EDVA_MODEL_OPUS --effort xhigh`
 # (lib/run-ephemeral-opus.sh reads the id from agent/config/models.env;
-# all improvement-related processes run on Opus, a user rule). This job authors real code changes to Merlin's own
+# all improvement-related processes run on Opus, a user rule). This job authors real code changes to Edva's own
 # source, which is exactly the workload that deserves the deepest tier.
 #
 # The opening line below must match the playbook's rule (rubric schema v4,
@@ -37,13 +37,13 @@ export PATH="/opt/homebrew/bin:$PATH"
 # The operator's name for the task text (lib/instance.cjs).
 source "$(dirname "$0")/lib/instance.sh"
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-ROOT="$MERLIN_INSTALL"
-JOB_MD="$MERLIN_INSTALL_TOOLS/agent/ops-agent/jobs/improvement-plan.md"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+ROOT="$EDVA_INSTALL"
+JOB_MD="$EDVA_INSTALL_TOOLS/agent/ops-agent/jobs/improvement-plan.md"
 
-TASK="Run the Self Improvement Plan job. Follow the playbook below end-to-end. ultrathink — you are authoring changes to Merlin's own source code that ${MERLIN_OWNER_NAME:-the user} will approve with a thumb on their phone, so the reasoning behind what you choose to build, and the honesty of each card's rationale, matter more than throughput. Three things to hold onto: every item leaves this run with a disposition; a verified change goes to self-improve-auto-apply first and lands on its own when it allows, and only complex or high-blast-radius changes (its exit 3) become Face-ID cards (${MERLIN_OWNER_NAME:-the user}, 2026-09-29); and anything they have skipped is never re-proposed. If the review that should precede you did not run, exit without planning rather than planning from a stale report."
+TASK="Run the Self Improvement Plan job. Follow the playbook below end-to-end. ultrathink — you are authoring changes to Edva's own source code that ${EDVA_OWNER_NAME:-the user} will approve with a thumb on their phone, so the reasoning behind what you choose to build, and the honesty of each card's rationale, matter more than throughput. Three things to hold onto: every item leaves this run with a disposition; a verified change goes to self-improve-auto-apply first and lands on its own when it allows, and only complex or high-blast-radius changes (its exit 3) become Face-ID cards (${EDVA_OWNER_NAME:-the user}, 2026-09-29); and anything they have skipped is never re-proposed. If the review that should precede you did not run, exit without planning rather than planning from a stale report."
 
-DATA="$MERLIN_INSTALL_TOOLS/data"
+DATA="$EDVA_INSTALL_TOOLS/data"
 if [ "${IMPROVEMENT_PLAN_FORCE:-0}" != "1" ]; then
   # Timestamps are machine-written ISO strings; compare them as instants.
   ALREADY=$(node -e '

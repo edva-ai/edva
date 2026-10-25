@@ -18,12 +18,12 @@
 // "The user's own request" is decided from structure, never from the text: a
 // gmail:<messageId> item whose row in the command-channel ledger
 // (email-inbound-handled.jsonl, written by gmail-source at the moment it
-// dispatched that message BECAUSE it was addressed to Merlin's address) has
+// dispatched that message BECAUSE it was addressed to Edva's address) has
 // From = OWNER_ADDRESS. Everything else (cron jobs, triage of other mail,
 // email-inbound escalations, whose allowlist also admits other senders) is only
 // dead-lettered; a cron job runs again on its own schedule.
 //
-// The chat lines never quote the email's subject: Merlin's own subjects can
+// The chat lines never quote the email's subject: Edva's own subjects can
 // carry sensitive figures (money, health), and these lines pass through the Sonnet
 // precheck, its log and the lock screen (Financial rule 5). They name the email
 // by how long ago it arrived. The retry header (read only by the agent) keeps
@@ -46,7 +46,7 @@ const SENT_SCAN_LINES = 500;
 
 const dataFile = (name) => installTools("data", name);
 export const deadLetterFile = () => dataFile("dead-letter.jsonl");
-export const sentMailFile = () => dataFile("merlin-sent-mail.jsonl");
+export const sentMailFile = () => dataFile("edva-sent-mail.jsonl");
 export const jobsDir = () => dataFile("jobs");
 
 function tailRows(file, n) {
@@ -76,7 +76,7 @@ export function ownRequestFor(item, { ledgerFile = inboundLedgerFile() } = {}) {
   return { kind: "email", gmailId, rfcMessageId: row.message_id || null, subject: String(row.subject || "").slice(0, 140), receivedAt: row.ts || null };
 }
 
-// Mail Merlin sent since `sinceMs` (email-send's own log), and whether a reply
+// Mail Edva sent since `sinceMs` (email-send's own log), and whether a reply
 // on the user's thread is among it. state is "replied", "not-replied" or "unknown":
 // unknown when the log can't be read, a line in it doesn't parse, the ledger
 // row had no Message-ID to match, or the scanned tail doesn't reach back to
@@ -145,22 +145,22 @@ export function buildRetryItem(item, { own = null, sent = [], replyState = "unkn
   const first = new Date(item.enqueuedAt || now).toISOString();
   const lines = [
     `[supervisor] RETRY. This task got stuck twice (the hang watchdog killed both attempts; it first arrived ${first}) and was dead-lettered. This is its one retry: if it gets stuck again it is dropped for good.`,
-    `The killed attempts may already have done some or all of the work. Before anything with a side effect, check what already happened since then: \`git -C ~/Dev/merlin log --since=${first} --oneline\`, \`~/Dev/merlin/bin/job-list\`, and the lists below (as of when it was set aside). Never send a second reply, email or message for something already sent; do only what is still missing. If what is left is long, launch it with \`~/Dev/merlin/bin/job-run\` instead of waiting on it in this turn.`,
+    `The killed attempts may already have done some or all of the work. Before anything with a side effect, check what already happened since then: \`git -C ~/Dev/edva log --since=${first} --oneline\`, \`~/Dev/edva/bin/job-list\`, and the lists below (as of when it was set aside). Never send a second reply, email or message for something already sent; do only what is still missing. If what is left is long, launch it with \`~/Dev/edva/bin/job-run\` instead of waiting on it in this turn.`,
   ];
   if (!jobs.length) lines.push(`No background job (job-run) was started since ${first}.`);
   else {
     lines.push(`Background jobs started since ${first} (data/jobs):`);
     for (const j of jobs.slice(-12)) lines.push(`  - ${j.id} ${j.name || ""} ${j.label}`);
-    lines.push("A job the stuck attempt started may still be running. If one is, do not relaunch it or redo its work: wait for it (`~/Dev/merlin/bin/job-status <id>`), then check its result.");
+    lines.push("A job the stuck attempt started may still be running. If one is, do not relaunch it or redo its work: wait for it (`~/Dev/edva/bin/job-status <id>`), then check its result.");
   }
   if (own?.kind === "email") {
     if (own.subject) lines.push(`Their email's subject: "${own.subject}".`);
     if (sent.length) {
-      lines.push(`Merlin's sent-mail log since ${first} (data/merlin-sent-mail.jsonl):`);
+      lines.push(`Edva's sent-mail log since ${first} (data/edva-sent-mail.jsonl):`);
       for (const s of sent.slice(-12)) lines.push(`  - ${s.ts} "${s.subject}"${s.replyToThis ? " (a reply on THIS email's thread)" : ""}`);
     }
     if (replyState === "unknown") lines.push("Whether a reply on the user's thread already went out could NOT be determined from the sent-mail log; check the thread before replying.");
-    else if (!sent.length) lines.push(`Merlin's sent-mail log shows nothing sent since ${first}.`);
+    else if (!sent.length) lines.push(`Edva's sent-mail log shows nothing sent since ${first}.`);
   }
   if (noticeQueued) lines.push(`A short note to ${OWNER_NAME} saying this got stuck was queued and may have been held back; don't refer to it.`);
   lines.push("--- original task ---");

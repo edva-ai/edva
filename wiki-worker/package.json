@@ -1,5 +1,5 @@
 {
-  "name": "merlin-wiki-worker",
+  "name": "edva-wiki-worker",
   "version": "1.0.0",
   "private": true,
   "description": "the wiki hostname served from the Supabase wiki mirror — see wrangler.toml"

@@ -30,13 +30,13 @@ test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 function sandbox({ loaded = false, repoPlist = REPO_PLIST, installed = null, bootstrapFails = false } = {}) {
   const home = fs.mkdtempSync(path.join(TMP, "home-"));
   const calls = path.join(home, "calls.log"), mark = path.join(home, "loaded");
-  const tools = path.join(home, "Dev/merlin/tools");
+  const tools = path.join(home, "Dev/edva/tools");
   fs.mkdirSync(path.join(tools, "agent/logs"), { recursive: true });
   if (loaded) write(mark, "");
   if (repoPlist) write(path.join(tools, `agent/launch-agents/${LABEL}.plist`), repoPlist, 0o644);
   const dst = path.join(home, `Library/LaunchAgents/${LABEL}.plist`);
   if (installed) write(dst, installed, 0o644);
-  write(path.join(tools, "bin/merlin-send-curl"), `#!/bin/bash\necho "merlin-send-curl $*" >> "${calls}"\n`);
+  write(path.join(tools, "bin/edva-send-curl"), `#!/bin/bash\necho "edva-send-curl $*" >> "${calls}"\n`);
   const stub = path.join(home, "stub");
   write(path.join(stub, "launchctl"), `#!/bin/bash
 echo "launchctl $*" >> "${calls}"
@@ -53,24 +53,24 @@ esac
   write(path.join(stub, "plutil"), `#!/bin/bash\necho "plutil $*" >> "${calls}"\nexec /usr/bin/plutil "$@"\n`);
   // The page names the machine by the instance's host_label; pinned here so the
   // test reads the same in any installation.
-  const env = { ...process.env, HOME: home, PATH: `${stub}:${process.env.PATH}`, MERLIN_HOST_LABEL: "the server" };
+  const env = { ...process.env, HOME: home, PATH: `${stub}:${process.env.PATH}`, EDVA_HOST_LABEL: "the server" };
   if (bootstrapFails) env.STUB_BOOTSTRAP_FAIL = "1";
   return {
     dst,
     // The repo plist is a template: what lands in ~/Library/LaunchAgents is it rendered for this HOME.
-    rendered: (repoPlist || "").replaceAll("__MERLIN_TOOLS__", path.join(home, "Dev/merlin/tools")).replaceAll("__MERLIN_HOME__", path.join(home, "Dev/merlin")).replaceAll("__HOME__", home),
+    rendered: (repoPlist || "").replaceAll("__EDVA_TOOLS__", path.join(home, "Dev/edva/tools")).replaceAll("__EDVA_HOME__", path.join(home, "Dev/edva")).replaceAll("__HOME__", home),
     // As strict as the strictest callers (the trigger scripts that run under set -euo pipefail).
     kick: () => spawnSync("/bin/bash", ["-c", `set -euo pipefail\nsource "${LIB}"\nlaunchd_kick ${LABEL} hum-explore`],
       { env, encoding: "utf8", timeout: 30000 }),
     calls: () => read(calls),
     resetCalls: () => fs.writeFileSync(calls, ""),
-    pages: () => read(calls).match(/^merlin-send-curl .*$/gm) || [],
+    pages: () => read(calls).match(/^edva-send-curl .*$/gm) || [],
     log: () => read(path.join(tools, "agent/logs/watchdog.log")),
   };
 }
 
 // The page as it read before this change (with the host_label above); system-issue-review clusters on "is not loaded on <host>".
-const PAGE = `merlin-send-curl --channel system --skip-precheck --intent hum-explore hum-explore did not run: its launchd agent ${LABEL} is not loaded on the server. Install it with: ~/Dev/merlin/agent/launch-agents/install.sh ${LABEL} (renders agent/launch-agents/${LABEL}.plist into ~/Library/LaunchAgents and bootstraps it)`;
+const PAGE = `edva-send-curl --channel system --skip-precheck --intent hum-explore hum-explore did not run: its launchd agent ${LABEL} is not loaded on the server. Install it with: ~/Dev/edva/agent/launch-agents/install.sh ${LABEL} (renders agent/launch-agents/${LABEL}.plist into ~/Library/LaunchAgents and bootstraps it)`;
 
 test("added but never installed: installs the repo plist, bootstraps it, kicks again, pages nobody", () => {
   const sb = sandbox();
@@ -83,7 +83,7 @@ test("added but never installed: installs the repo plist, bootstraps it, kicks a
     `launchctl kickstart gui/${UID}/${LABEL}`,
   ]);
   assert.equal(read(sb.dst), sb.rendered, "the installed copy is the repo plist, rendered");
-  assert.doesNotMatch(read(sb.dst), /__MERLIN_HOME__|__MERLIN_TOOLS__|__HOME__/);
+  assert.doesNotMatch(read(sb.dst), /__EDVA_HOME__|__EDVA_TOOLS__|__HOME__/);
   assert.deepEqual(sb.pages(), []);
   assert.match(sb.log(), /\[hum-explore\] installed launchd agent ai\.claude\.hum-explore from the repo \(it was added but never installed\)\n/);
   assert.match(sb.log(), /\[hum-explore\] kicked launchd agent ai\.claude\.hum-explore \(after installing it\)\n$/);

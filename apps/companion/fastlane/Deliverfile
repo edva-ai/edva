@@ -1,4 +1,4 @@
-app_identifier "com.example.Merlin"
+app_identifier "com.example.Edva"
 
 api_key_path "./fastlane/asc-api-key.json"
 

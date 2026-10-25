@@ -1,9 +1,9 @@
-// merlin init — interactive first-run setup for a Merlin checkout.
+// edva init — interactive first-run setup for a Edva checkout.
 //
-// Writes, in the checkout this CLI runs from (MERLIN_HOME when set):
+// Writes, in the checkout this CLI runs from (EDVA_HOME when set):
 //   .env                       secrets + host settings (asks before overwriting)
 //   agent/local/instance.json  who and where this installation is (read by
-//                              lib/instance.cjs; MERLIN_* env vars override it)
+//                              lib/instance.cjs; EDVA_* env vars override it)
 //   agent/local/config/supabase.json   the project's public anon key, if given
 //   secrets/webhook-token      the supervisors' shared webhook Bearer token
 // creates the runtime dirs, seeds data/ and agent/local/ from examples/
@@ -37,8 +37,8 @@ function hostTz() {
 }
 
 function printHelp(c) {
-  console.log(c.bold("merlin init") + " — interactive first-run setup\n");
-  console.log("Usage: merlin init [--force]\n");
+  console.log(c.bold("edva init") + " — interactive first-run setup\n");
+  console.log("Usage: edva init [--force]\n");
   console.log("Asks a few questions and writes, in this checkout:");
   console.log("  .env                         secrets and host settings (see .env.example)");
   console.log("  agent/local/instance.json    owner name, email, time zone, ... (lib/instance.cjs)");
@@ -47,8 +47,8 @@ function printHelp(c) {
   console.log("from examples/ (existing files are never overwritten).\n");
   console.log("  --force   overwrite an existing .env / instance.json without asking\n");
   console.log("Telemetry: init asks before sending one anonymous install ping (no PII,");
-  console.log("no raw IP; payload in apps/telemetry/README.md). MERLIN_NO_TELEMETRY=1 in");
-  console.log("the environment disables it outright. Change later: merlin telemetry on|off.");
+  console.log("no raw IP; payload in apps/telemetry/README.md). EDVA_NO_TELEMETRY=1 in");
+  console.log("the environment disables it outright. Change later: edva telemetry on|off.");
 }
 
 export default {
@@ -79,7 +79,7 @@ export default {
     });
 
     try {
-      console.log(c.bold("Merlin init") + c.dim(` — ${base}\n`));
+      console.log(c.bold("Edva init") + c.dim(` — ${base}\n`));
       if (fs.existsSync(envPath) && !force) {
         const ans = await ask(".env already exists. Overwrite? (yes/no)", "no");
         if (!/^y(es)?$/i.test(ans)) { console.log(c.dim("  aborted — .env left alone")); return; }
@@ -87,7 +87,7 @@ export default {
       console.log(c.dim("  Enter accepts the default; leave optional fields blank to skip.\n"));
 
       const env = {};
-      env.MERLIN_HOME = await ask("MERLIN_HOME (absolute path to this checkout)", base);
+      env.EDVA_HOME = await ask("EDVA_HOME (absolute path to this checkout)", base);
 
       console.log(c.bold("\n  Anthropic auth"));
       console.log(c.dim("  Paste an API key, or leave blank to run on a `claude` login (Max subscription)."));
@@ -119,8 +119,8 @@ export default {
       env.LOCAL_EMBED_MODEL = await ask("LOCAL_EMBED_MODEL", "nomic-embed-text");
 
       let telemetry = "off";
-      if (process.env.MERLIN_NO_TELEMETRY === "1") {
-        console.log(c.dim("\n  Telemetry: MERLIN_NO_TELEMETRY=1 is set — no ping, not asking."));
+      if (process.env.EDVA_NO_TELEMETRY === "1") {
+        console.log(c.dim("\n  Telemetry: EDVA_NO_TELEMETRY=1 is set — no ping, not asking."));
       } else {
         console.log(c.bold("\n  Telemetry"));
         console.log(c.dim("  One anonymous first-run ping tells the maintainers how many installs exist."));
@@ -128,14 +128,14 @@ export default {
         const ans = await ask("Send the anonymous install ping? (Y/n)", "Y");
         telemetry = /^n(o)?$/i.test(ans) ? "off" : "on";
       }
-      env.MERLIN_TELEMETRY = telemetry;
+      env.EDVA_TELEMETRY = telemetry;
       rl.close();
 
       // ── write ───────────────────────────────────────────────────────────
       for (const d of RUNTIME_DIRS) fs.mkdirSync(path.join(base, d), { recursive: true });
 
       const lines = [
-        "# Merlin environment — written by `merlin init`. Every variable is documented in .env.example.",
+        "# Edva environment — written by `edva init`. Every variable is documented in .env.example.",
         `# Generated ${new Date().toISOString()}`,
         "",
         ...Object.entries(env).filter(([, v]) => v !== "").map(([k, v]) => `${k}=${v}`),
@@ -172,7 +172,7 @@ export default {
         console.log(c.green(`  ✓ seeded ${seeded.length} file(s) from examples/:`));
         for (const s of seeded) console.log(c.dim("      " + s));
       }
-      console.log(c.dim("\nNext: ") + c.bold("./bin/merlin doctor") + c.dim(", then ") + c.bold("./bin/merlin up"));
+      console.log(c.dim("\nNext: ") + c.bold("./bin/edva doctor") + c.dim(", then ") + c.bold("./bin/edva up"));
       console.log(c.dim("Per-installation rules and config: docs/architecture-public-private.md."));
 
       if (telemetry === "on") {

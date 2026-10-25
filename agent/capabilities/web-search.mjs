@@ -1,6 +1,6 @@
 // web-search.mjs — CAP A1. Max-safe web_search capability tool.
 //
-// Conway wraps Tavily. Merlin has NO search-API key and a hard Max-only auth
+// Conway wraps Tavily. Edva has NO search-API key and a hard Max-only auth
 // invariant, so the DEFAULT search provider is a `claude -p --allowedTools
 // WebSearch` one-shot with ANTHROPIC_API_KEY stripped — the same Max-billed,
 // zero-marginal-cost pattern as background research forks and the hum

@@ -3,7 +3,7 @@
 // Observed: the ops supervisor paged the auth pause correctly ("the
 // dispatcher is paused for a Max-auth outage, so nothing will drain until auth
 // is back"), then twenty minutes later the SAME process paged "That supervisor may be
-// stuck - check \`merlin status\`" about the same queue. Two contradictory
+// stuck - check \`edva status\`" about the same queue. Two contradictory
 // pages twenty minutes apart, one of them false, from an object that had
 // already set this.authAlertSent in _triggerAuthOutage().
 //

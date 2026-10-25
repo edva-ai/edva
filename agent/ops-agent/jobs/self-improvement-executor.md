@@ -99,7 +99,7 @@ implementer touched:
 ```bash
 PRE_SHA=$(git rev-parse HEAD)
 git status --porcelain | sed 's/^...//' | sort -u > /tmp/dirty-pre-<id>.txt  # paths already dirty
-merlin doctor --json > /tmp/doctor-pre-<id>.json
+edva doctor --json > /tmp/doctor-pre-<id>.json
 ```
 
 ### Dispatch the implementer
@@ -111,17 +111,17 @@ Spawn `Agent` with `subagent_type: "general-purpose"`. Tools the subagent may us
 > You are the Self-Improvement Executor IMPLEMENTER. You are drafting a fix for a self-reviewed action item — **you do not commit it and nobody wakes up because of it; it lands only if the user later approves it with Face ID.** Your turn is heavily constrained:
 >
 > FORBIDDEN (any call to these tools means immediate revert + policy-violation record):
->   - `merlin-send-curl`, `merlin-notify`, `email-send`, `gmail-action send`,
->     `imsg send`, `hum-answer`, `hum-ping`, `merlin hum feedback`,
+>   - `edva-send-curl`, `edva-notify`, `email-send`, `gmail-action send`,
+>     `imsg send`, `hum-answer`, `hum-ping`, `edva hum feedback`,
 >     direct curl/wget to `localhost:9092`, `:9093`, `:9090`, or any external host.
 >
 > ALLOWED: Read, Edit, Write, Glob, Grep, Bash (local filesystem + `node --test`).
 >
-> WRITE RADIUS: only paths under `~/Dev/merlin/` (case-insensitive `dev`/`Dev`). Never `~/.claude/`, never `/Library/`, never `secrets/`, never `credentials/`, never any `.env*`.
+> WRITE RADIUS: only paths under `~/Dev/edva/` (case-insensitive `dev`/`Dev`). Never `~/.claude/`, never `/Library/`, never `secrets/`, never `credentials/`, never any `.env*`.
 >
 > GIT: **you do not commit.** Edit files in the working tree as normal (the executor captures your final file contents and reverts the tree after you finish — see Post-implementer gate). You may NOT `git add`, `git commit`, `git push`, `git reset --hard`, `git rebase`, `git checkout --`, `git clean -f`, `git stash`, `git branch`, or any destructive command. At the end of your turn, report every file you created or modified in `files_edited` (exact repo-relative paths) — the gate reads and reverts by that list.
 >
-> EFFORT: finish the task; write tests if the area has tests; run `node --test` on any test file you touch; run `merlin doctor` before you finish.
+> EFFORT: finish the task; write tests if the area has tests; run `node --test` on any test file you touch; run `edva doctor` before you finish.
 >
 > KERNEL FILES STAY GENERIC (`agent/CLAUDE.md` § Kernel boundary): a file listed in `system/kernel-manifest.json` gets no personal data — no names, places, accounts, routines, dated events, quotes or real IDs; write "the user". The why and the history of the fix go in the `rationale` (it becomes the commit message and the `system/changelog.md` entry), never in a code comment. This installation's rules go in `agent/local/` (`jobs/<job>.md` for a playbook's additions), its values in `agent/local/config/<module>.json` (read with `localConfig`), its behaviour in an `_ext/` hook, real-data tests in a `*-local.test.mjs` file. A new file is added to the manifest (`files` or `personal_globs`) in the same change. Run `bin/kernel-guard` before you finish; it must exit 0.
 >
@@ -149,10 +149,10 @@ COLLISIONS=$(comm -12 /tmp/dirty-pre-<id>.txt <(git diff --name-only HEAD | sort
 
 # 1. Scan the subagent's turn for forbidden tool use. Must mirror the FORBIDDEN
 #    list in the preamble verbatim — this regex silently omitted hum-answer,
-#    hum-ping, and merlin hum feedback until 2026-08-24 (only caught by luck,
+#    hum-ping, and edva hum feedback until 2026-08-24 (only caught by luck,
 #    because the orchestrating agent read the fuller prose list instead of
 #    running this literal command).
-grep -q -E "merlin-send-curl|merlin-notify|email-send|gmail-action send|imsg send|hum-answer|hum-ping|merlin hum feedback" <turn-transcript> && POLICY_VIOLATION=1
+grep -q -E "edva-send-curl|edva-notify|email-send|gmail-action send|imsg send|hum-answer|hum-ping|edva hum feedback" <turn-transcript> && POLICY_VIOLATION=1
 
 # 2. Run the test files that live in the directories the implementer touched.
 TOUCHED_DIRS=$(printf '%s\n' "$OWN_FILES" | xargs -n1 dirname 2>/dev/null | sort -u)
@@ -161,7 +161,7 @@ for dir in $TOUCHED_DIRS; do
 done
 
 # 3. Doctor check.
-merlin doctor --json > /tmp/doctor-post-<id>.json
+edva doctor --json > /tmp/doctor-post-<id>.json
 ```
 
 If `POLICY_VIOLATION`, `TEST_FAIL`, `DIRTY_COLLISION`, or `doctor` regressed (any
@@ -213,7 +213,7 @@ Only if no prior failure. Spawn another `Agent` with the git diff and the implem
      # --risk/--category/--critic, and since v5 --base-rev "$PRE_SHA" — exit 7
      # means a file moved on: re-read, regenerate once, resubmit with --redo);
      # only on its exit 3 file the card:
-     ~/Dev/merlin/bin/self-improve-request --type code-fix \
+     ~/Dev/edva/bin/self-improve-request --type code-fix \
        --summary "[<item-id>] <what changed, one line, plain language>" \
        --problem "<what is wrong>" --impact "<why it matters now>" \
        --fix "<what the change does>" --side-effects "<what else it could affect; the critic's concern if DEFER_TO_OPERATOR>" \

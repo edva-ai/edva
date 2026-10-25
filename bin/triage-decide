@@ -69,12 +69,12 @@ async function buildPacket() {
 }
 
 function execute(plan) {
-  const env = { ...process.env, MERLIN_TRIAGE_ACTOR: "triage-decide" };
+  const env = { ...process.env, EDVA_TRIAGE_ACTOR: "triage-decide" };
   const results = [];
   for (const a of plan.actions) {
     let r;
     if (a.kind === "gmail-action") r = spawnSync(path.join(BIN, "gmail-action"), a.argv, { env, timeout: 15000 });
-    else if (a.kind === "notify") r = spawnSync(path.join(BIN, "merlin-send-curl"), a.argv, { env, timeout: 120000 });
+    else if (a.kind === "notify") r = spawnSync(path.join(BIN, "edva-send-curl"), a.argv, { env, timeout: 120000 });
     else if (a.kind === "p1-task") r = spawnSync(path.join(BIN, "p1-task"), a.argv, { env, timeout: 30000 });
     else if (a.kind === "webhook") {
       let token = "";

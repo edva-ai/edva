@@ -2,7 +2,7 @@
 # install.sh — render launchd plists from this directory into
 # ~/Library/LaunchAgents and load them (macOS).
 #
-# The kernel's plists here are TEMPLATES: __MERLIN_HOME__, __MERLIN_TOOLS__ and __HOME__ are
+# The kernel's plists here are TEMPLATES: __EDVA_HOME__, __EDVA_TOOLS__ and __HOME__ are
 # substituted at install time by launchd_render_plist
 # (agent/scripts/lib/launchd-render.sh), so the repo carries no machine
 # path. A plist without placeholders (an installation's own agent) is installed
@@ -46,7 +46,7 @@ if [ "$LIST" = 1 ]; then
     state="not installed"
     [ -f "$DEST/$l.plist" ] && state="installed"
     command -v launchctl >/dev/null 2>&1 && loaded "$l" && state="loaded"
-    grep -q '__MERLIN_HOME__\|__MERLIN_TOOLS__\|__HOME__' "$f" && state="$state (template)"
+    grep -q '__EDVA_HOME__\|__EDVA_TOOLS__\|__HOME__' "$f" && state="$state (template)"
     printf '  %-48s %s\n' "$l" "$state"
   done
   exit 0

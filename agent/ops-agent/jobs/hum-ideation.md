@@ -2,7 +2,7 @@ HUM IDEATION — Refill the proactive-idea reservoir.
 
 > **This instance's additions** to this playbook (its own people, places and decisions) are in `agent/local/jobs/hum-ideation.md`; the supervisor appends them to the dispatched playbook. If they are not at the end of what you were given (an ephemeral or by-hand run), `Read` that file before you start.
 
-Runs in up to four slots daily (06:00, 11:00, 14:00, 19:00 local) via cron. **Since 2026-10-04 the trigger skips a slot when the reservoir is healthy (≥25 live ideas across ≥5 categories with 2+ each) AND nothing new arrived since the last dispatched run** (`bin/hum-ideation-prefetch`; since 2026-10-20 "new" means a one-off calendar event or a new time for one, a P1 thread that is new or got a reply, a changed task, flights, trip history or a reply-closed task, not timestamps, read state, recurring instances or Merlin's own unanswered emails) — if you are running, either inventory is thin or something new came in. Also runnable on-demand. Reads the current reservoir, recent reactions, live data sources, generates 8-15 new proactive ideas, and appends them to `data/hum-ideas.jsonl`. (Cron rate bumped from 2x → 4x on 2026-04-30 to keep reservoir fresh enough that hum always has something valuable to surface.)
+Runs in up to four slots daily (06:00, 11:00, 14:00, 19:00 local) via cron. **Since 2026-10-04 the trigger skips a slot when the reservoir is healthy (≥25 live ideas across ≥5 categories with 2+ each) AND nothing new arrived since the last dispatched run** (`bin/hum-ideation-prefetch`; since 2026-10-20 "new" means a one-off calendar event or a new time for one, a P1 thread that is new or got a reply, a changed task, flights, trip history or a reply-closed task, not timestamps, read state, recurring instances or Edva's own unanswered emails) — if you are running, either inventory is thin or something new came in. Also runnable on-demand. Reads the current reservoir, recent reactions, live data sources, generates 8-15 new proactive ideas, and appends them to `data/hum-ideas.jsonl`. (Cron rate bumped from 2x → 4x on 2026-04-30 to keep reservoir fresh enough that hum always has something valuable to surface.)
 
 Full design context: `system/hum-ideas-reservoir.md`. Read it before anything else.
 
@@ -14,7 +14,7 @@ Every generation cycle MUST work through SCAMPER as a creative-thinking discipli
 |---|---|
 | **Substitute** | What can be swapped for something better? Replace a habit, route, restaurant, tool, or workflow with an alternative. ("Swap the generic reminder text for a short checklist tailored to the occasion.") |
 | **Combine** | What two unrelated signals merge into a stronger move? A free afternoon + a gallery closing + good weather = one Saturday plan. Two stale P1s on the same vendor = one consolidated reply. |
-| **Adapt** | What pattern from one domain ports to another? Apply the food-taste authenticity-first heuristic to art shows. Apply one job's recon-then-fan-out shape to a different Merlin job. |
+| **Adapt** | What pattern from one domain ports to another? Apply the food-taste authenticity-first heuristic to art shows. Apply one job's recon-then-fan-out shape to a different Edva job. |
 | **Modify / Magnify** | What existing thing is too small? Expand a one-off habit into a tracked metric (a step count → a weekly activity trend), grow a working pattern's frequency (a weekly walk → daily neighborhood loop discovery). |
 | **Put to other use** | What infrastructure could serve a new purpose? Location history → arrival detection for an expected visitor. Photo metadata → automatic companions backfill (already shipped — keep finding more). |
 | **Eliminate** | What can be cut? A stale recurring task, a dead automation, a never-used watchlist row, a contact pattern that no longer fires. Subtraction creates space. |
@@ -32,7 +32,7 @@ Mix target: each generation cycle should produce ideas across ≥4 of the 7 SCAM
 
 1. **Read-only on external systems.** Calendar, Gmail, Tasks, Slack, Drive, web: read. Never send, label, create, modify.
 2. **Only write through `bin/hum-ideas-append`** (Step 7) — never `>>` into `data/hum-ideas.jsonl` yourself. The scorecard is no longer yours to write either (Step 2). The one other file you write is the Step 8 run row.
-3. **Never ping Merlin, never email, never touch any other hum state file.**
+3. **Never ping Edva, never email, never touch any other hum state file.**
 4. **Silent on zero-new-ideas.** If nothing worth adding this cycle, exit 0 with a single `console.log` line — no email, no ping.
 5. **Fact-verify every claim before writing.** Never write an idea that asserts a date, fact, or status from LLM training knowledge alone. Any factual assertion in `subject`, `rationale`, or `why_now` must be grounded in one of the live data sources fetched in Step 4 (calendar, tasks, Gmail, trip history, context index, WebSearch). Examples of claims that must be verified — not assumed:
    - Holiday/event dates (religious or secular)
@@ -50,7 +50,7 @@ Mix target: each generation cycle should produce ideas across ≥4 of the 7 SCAM
 
    **Day-of-week verification (mandatory, not optional).** Whenever you write a named weekday + date in any field ("Sat Jun 28", "Monday July 1"), you MUST verify the DOW is correct before writing — `new Date("2026-06-28").toLocaleDateString("en-US", {weekday:"long", timeZone: <the home zone>})` → "Sunday", so "Sat Jun 28" is wrong. This is a deterministic check, not a judgment call. Incorrect DOW claims are caught by `ideas.mjs`'s `dowValid()` gate and silently dropped, but it is better to write them correctly than to have ideas dropped silently. (2026-06-27 incident: a "Sat Jun 28 is your last window" idea — June 28 was a Sunday. The context now carries `today_date` and `today_dow` fields — use them as your anchor.)
 
-8. **A failure of Merlin's OWN tooling observed from inside your sandbox is NEVER a user-facing idea.** You run with a restricted Bash sandbox that denies the macOS keychain, so `gog` calls fail with `tls: failed to verify certificate: x509: OSStatus -26276` — but `gog` works perfectly in the real cron context (verified: `cron-run -- gog calendar list` returns live data). The same applies to an absent claude.ai MCP connector (Calendar/Gmail can be unavailable in a headless run), a Supabase timeout, a missing `GOG_KEYRING_PASSWORD`, or any "tool X didn't work for me" condition. These are **self-diagnostic / environment signals about your sandbox, not production outages** — you cannot distinguish "broken for the user" from "denied to me" from inside the sandbox, so you must assume the latter. **NEVER write an idea (stuck-task, ops, or any lane) asserting that gog / calendar / tasks / a connector is "broken", "offline", "blind", "failing every tick", or needs an "OAuth reset" / "keychain repair" based on a tool failure you observed.** This is a hard no, even when the failure looks urgent or repeats across runs. (2026-06-22→29 incident: this exact false alarm — "gog x509 TLS / Tasks + Calendar blind in every hum tick" — regenerated for a week and pinged the user repeatedly while gog was actually healthy in production.) If you genuinely suspect a real infra problem, that belongs on the **system channel** via Merlin's self-monitoring path — never the user-facing ideas reservoir. For task data, read the pre-fetched file (Step 4); do not call `gog` yourself.
+8. **A failure of Edva's OWN tooling observed from inside your sandbox is NEVER a user-facing idea.** You run with a restricted Bash sandbox that denies the macOS keychain, so `gog` calls fail with `tls: failed to verify certificate: x509: OSStatus -26276` — but `gog` works perfectly in the real cron context (verified: `cron-run -- gog calendar list` returns live data). The same applies to an absent claude.ai MCP connector (Calendar/Gmail can be unavailable in a headless run), a Supabase timeout, a missing `GOG_KEYRING_PASSWORD`, or any "tool X didn't work for me" condition. These are **self-diagnostic / environment signals about your sandbox, not production outages** — you cannot distinguish "broken for the user" from "denied to me" from inside the sandbox, so you must assume the latter. **NEVER write an idea (stuck-task, ops, or any lane) asserting that gog / calendar / tasks / a connector is "broken", "offline", "blind", "failing every tick", or needs an "OAuth reset" / "keychain repair" based on a tool failure you observed.** This is a hard no, even when the failure looks urgent or repeats across runs. (2026-06-22→29 incident: this exact false alarm — "gog x509 TLS / Tasks + Calendar blind in every hum tick" — regenerated for a week and pinged the user repeatedly while gog was actually healthy in production.) If you genuinely suspect a real infra problem, that belongs on the **system channel** via Edva's self-monitoring path — never the user-facing ideas reservoir. For task data, read the pre-fetched file (Step 4); do not call `gog` yourself.
 
 9. **Behavioral-fit memory check — every lens, not just `event-prep` dining (2026-08-16).** Step 6.5's `claim-check` only catches a candidate that a *fact* contradicts (an authority) or that the user has *strongly, recently talked about* (a searchable utterance overlap) — it is a contradiction/settlement gate, not a "does this fit their taste and habits" gate. It cannot catch a candidate that is merely off-pattern with no prior conversation to contradict (one shipped exactly that way, because nothing on file had ever named it; the case is in the local additions). Before drafting a candidate in ANY lens, read the taste/behavioral memory file(s) for the domain it touches and let their rules constrain or disqualify the candidate — not as a post-hoc rejection lookup, but before you pick the specific thing to propose:
 
@@ -65,7 +65,7 @@ Mix target: each generation cycle should produce ideas across ≥4 of the 7 SCAM
    | Health / caregiving | relevant person's health memory pages |
    | Anything else with no obvious file | `wiki_search`/`context_search` on the domain before assuming there's nothing to check |
 
-   `context.tastes` (already fetched in Step 4 via `merlin context --json`) is a shortcut into some of these, but it is a summary — read the underlying page when the candidate is specific enough that a behavioral rule (not just a like/dislike) could apply. If a domain genuinely has no memory on file, that's fine — proceed — but the check itself (the search) must actually happen, not be assumed away. This generalizes the `event-prep` rule 0 in Step 5's lens table (which stays as the worked example) to every one of the 12 lenses.
+   `context.tastes` (already fetched in Step 4 via `edva context --json`) is a shortcut into some of these, but it is a summary — read the underlying page when the candidate is specific enough that a behavioral rule (not just a like/dislike) could apply. If a domain genuinely has no memory on file, that's fine — proceed — but the check itself (the search) must actually happen, not be assumed away. This generalizes the `event-prep` rule 0 in Step 5's lens table (which stays as the worked example) to every one of the 12 lenses.
 
 ## Step 1 — Read state
 
@@ -112,7 +112,7 @@ On first run with empty scorecard, generation is uniform across all 12 category 
 
 ## Step 4 — Gather live context
 
-**Read `data/hum-ideation-context.json` first** — the trigger wrote it seconds before dispatch (`hum-ideation-prefetch`): `calendar_14d`, `p1_threads` (starred P1, 30d), `flights`, `trip_history`, `context` (`merlin context --json`) and `reply_closed_tasks` (see item 2). A source recorded as `{error}` or `null` is unavailable this run — use the MCP fallback below for calendar/Gmail, and never write an idea about the failure (Critical rule 8). Fetch yourself only when the file is missing or its `generated_at` is over 6h old (e.g. a silent-streak refill dispatched outside the trigger).
+**Read `data/hum-ideation-context.json` first** — the trigger wrote it seconds before dispatch (`hum-ideation-prefetch`): `calendar_14d`, `p1_threads` (starred P1, 30d), `flights`, `trip_history`, `context` (`edva context --json`) and `reply_closed_tasks` (see item 2). A source recorded as `{error}` or `null` is unavailable this run — use the MCP fallback below for calendar/Gmail, and never write an idea about the failure (Critical rule 8). Fetch yourself only when the file is missing or its `generated_at` is over 6h old (e.g. a silent-streak refill dispatched outside the trigger).
 
 1. **Calendar** — `calendar_14d` from the context file; fallback `mcp__claude_ai_Google_Calendar__list_events` (primary, next 14 days)
 2. **Google Tasks** — read the pre-fetched file `data/hum-ideation-tasks.txt` (written by `trigger-hum-ideation.sh`, which runs unsandboxed via `cron-run` where `gog` works). Parse overdue + open items. **Do NOT call `gog` yourself** — it fails inside this agent's sandbox with `OSStatus -26276` (see Critical rule 8). If the file is missing or empty, treat tasks as unavailable for this run and move on — do NOT fall back to calling `gog`, and do NOT write an idea claiming tasks are broken.
@@ -120,7 +120,7 @@ On first run with empty scorecard, generation is uniform across all 12 category 
 3. **Gmail** — `p1_threads` from the context file; fallback `mcp__claude_ai_Gmail__search_threads` for `label:p1 is:starred newer_than:30d`
 4. **Trip history** — `trip_history` from the context file (`data/trip-history.json`) — upcoming trips
 5. **Flights** (`data/flights.json`) — confirmed flights with actual departure AND arrival times, already converted to the correct local offset. **REQUIRED for any idea that mentions an airline and states a departure or arrival/landing time, in ANY category** — not just `travel-prep`. Match the airline/confirmation against this file to get the real `depart`/`arrive` timestamps verbatim before writing `time_sensitive_until` or a clock time into `subject`/`rationale`/`supporting_data`. Never derive an arrival time by relabeling a calendar event's raw offset (see Critical rule 6).
-5. **Context index** — `context` from the context file (`merlin context --json`) for live project state
+5. **Context index** — `context` from the context file (`edva context --json`) for live project state
 6. **WebSearch** for any of these lenses that need it: art/photo shows closing in the next 14 days where the user is, concert announcements matching music-profile, limited-run dining pop-ups, a household member's interests when there is a calendar signal
 
    **Hard cap: ≤ 5 WebSearch calls per ideation run.** WebSearch is the dominant token/latency line in this job (a self-improvement finding: hum was the biggest cost line in the fleet). Spend the budget on the lenses with a genuine time-sensitive discovery need (closing soon, just-announced); for everything else, lean on the curated editorial sources below and the already-fetched calendar/tasks/context rather than burning a search. If more than 5 lenses look search-worthy in one run, pick the 5 most time-sensitive and defer the rest to the next slot — they'll still be discoverable then.
@@ -161,7 +161,7 @@ Target is **8–15 ideas per cycle**. If you are about to finish with **fewer th
 
 Before finishing thin, spend the remaining turns on:
 1. **The under-explored SCAMPER × category cells** the scorecard shows have never been tried — the mix plan in Step 3 names them. <!-- kernel-guard-ok: SCAMPER is the creative-thinking acronym, not a business -->
-2. **The lenses that don't depend on location or on a live web search** — `stuck-task`, the instance's project lenses, `family`, `health-care`, `merlin-systems`. These are always available and never blocked by a trip.
+2. **The lenses that don't depend on location or on a live web search** — `stuck-task`, the instance's project lenses, `family`, `health-care`, `edva-systems`. These are always available and never blocked by a trip.
 3. **Re-reading what dedup rejected.** If Rule 1 blocked an idea as too close to an unconsumed sibling, the right move is often a *different angle on the same subject* that the sibling doesn't cover — not silence.
 
 If after all that the honest answer is still fewer than 6, write what you have and record `thin_cycle: true` in the Step 8 summary **with the specific reason** (e.g. "calendar empty next 14d, 3 lenses blocked by dedup"). A logged thin cycle is diagnosable; a silent one looks identical to a healthy day and is why this went unnoticed for a week.
@@ -204,7 +204,7 @@ It is fail-open (an unreachable authority passes), so it can never block a cycle
 Pipe all of this cycle's ideas — JSONL or one JSON array — to the writer in one call:
 
 ```bash
-printf '%s\n' '<idea 1 JSON>' '<idea 2 JSON>' ... | ~/Dev/merlin/bin/hum-ideas-append
+printf '%s\n' '<idea 1 JSON>' '<idea 2 JSON>' ... | ~/Dev/edva/bin/hum-ideas-append
 ```
 
 It validates the schema below (required fields, enums, `task_id` when `draws_on` has `tasks`, `verify_question` when `confidence` is `low`), refuses an id already in the reservoir, enforces Rules 1 / 9 / 12, runs claim-check, appends the survivors with `consumed:false`, and prints `{written:[…], rejected:[{id, rule, detail}]}`. Rejections are data, not errors: fix and resubmit `schema` and `claim-check-rewrite` refusals once; leave the rest. `--dry-run` checks without writing. Each idea's shape:
@@ -266,7 +266,7 @@ Target: 8-15 new ideas per run. Acceptable range 3-20. Fewer than 3 → prefer w
 
 ## Step 8 — Report
 
-Print to stdout a one-line summary: `wrote N ideas across K categories; claim_check_dropped=D; scorecard: top=<cat>(<score>), bottom=<cat>(<score>)`. Nothing else. No Merlin ping. No email.
+Print to stdout a one-line summary: `wrote N ideas across K categories; claim_check_dropped=D; scorecard: top=<cat>(<score>), bottom=<cat>(<score>)`. Nothing else. No Edva ping. No email.
 
 `claim_check_dropped` is the number of `claim-check-drop` refusals `hum-ideas-append` returned. It is the metric that shows the memory gate is doing work rather than silently passing everything — `hum-review` reads it.
 
@@ -274,7 +274,7 @@ Print to stdout a one-line summary: `wrote N ideas across K categories; claim_ch
 
 ```bash
 echo '{"ts":"<ISO now>","wrote":<N>,"categories":<K>,"idea_lenses":<L>,"claim_check_dropped":<D>,"dedup_blocked":<B>,"thin_cycle":<true|false>,"thin_reason":"<why, or null>","digest_unconsumed_live":<from the digest>,"digest_stale":<true|false>}' \
-  >> ~/Dev/merlin/data/hum-ideation-runs.jsonl
+  >> ~/Dev/edva/data/hum-ideation-runs.jsonl
 ```
 
 `dedup_blocked` is how many generated ideas Step 6 rejected (your own rules plus `hum-ideas-append`'s `rule-1` / `rule-9` / `rule-12` refusals) — the number that distinguishes "nothing to say" from "everything I had to say was vetoed", which are opposite problems with opposite fixes. Write the row on **every** run, including thin and zero-idea ones; those are the rows worth having.

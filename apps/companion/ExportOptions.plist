@@ -12,10 +12,10 @@
     <true/>
     <key>provisioningProfiles</key>
     <dict>
-        <key>com.example.Merlin</key>
-        <string>Merlin AppStore</string>
-        <key>com.example.Merlin.NotificationService</key>
-        <string>Merlin NotificationService AppStore</string>
+        <key>com.example.Edva</key>
+        <string>Edva AppStore</string>
+        <key>com.example.Edva.NotificationService</key>
+        <string>Edva NotificationService AppStore</string>
     </dict>
     <key>signingCertificate</key>
     <string>Apple Distribution</string>

@@ -15,12 +15,12 @@ function fresh() { td._resetForTests(); for (const s of ["", "-wal", "-shm"]) fs
 
 function decided(id, from, label, { star = false, p1 = false, actor = "agent" } = {}) {
   td.register(id, from);
-  process.env.MERLIN_TRIAGE_ACTOR = actor;
+  process.env.EDVA_TRIAGE_ACTOR = actor;
   td.recordAction(id, "label", label);
   if (star) td.recordAction(id, "star");
   if (p1) td.recordAction(id, "label", "p1");
   if (!p1) td.recordAction(id, "mark-read");
-  delete process.env.MERLIN_TRIAGE_ACTOR;
+  delete process.env.EDVA_TRIAGE_ACTOR;
 }
 
 test("priority is derived from the final Gmail state", () => {
@@ -66,7 +66,7 @@ test("register never overwrites a known sender; non-triage labels are ignored", 
   td.register("r1", "first@x.com");
   td.register("r1", "second@x.com");
   assert.equal(td.get("r1").sender_addr, "first@x.com");
-  assert.equal(td.recordAction("r1", "label", "merlin-out"), false);
+  assert.equal(td.recordAction("r1", "label", "edva-out"), false);
 });
 
 test("senderConsensusDetail: structured rows win once there are enough, else email-mem", () => {

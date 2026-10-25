@@ -111,8 +111,8 @@ test("the needs-the-user key is needs_<owner_id>: needs_user by default", async 
   const keyWith = (inst) => {
     const dir = fs.mkdtempSync(path.join(TMP, "local-"));
     if (inst) fs.writeFileSync(path.join(dir, "instance.json"), JSON.stringify(inst));
-    const env = { ...process.env, MERLIN_LOCAL_DIR: dir };
-    delete env.MERLIN_OWNER_ID; delete env.MERLIN_OWNER_NAME;
+    const env = { ...process.env, EDVA_LOCAL_DIR: dir };
+    delete env.EDVA_OWNER_ID; delete env.EDVA_OWNER_NAME;
     const r = spawnSync(process.execPath, ["--input-type=module", "-e",
       `const m = await import(${JSON.stringify(new URL("../lib/jev-email-triage.mjs", import.meta.url).href)}); process.stdout.write(m.NEEDS_KEY);`], { env, encoding: "utf8" });
     return r.stdout;

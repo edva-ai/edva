@@ -1,0 +1,294 @@
+#!/usr/bin/env node
+// edva-allowance-coverage — how much of the Max weekly allowance does the
+// per-job cost ledger actually SEE?
+//
+// edva-cost-report rolls up agent/logs/supervisor-{ops,ops-light,
+// ops-haiku}/job-costs.ndjson. That is the whole of what it can rank, and it is
+// NOT the whole of what the account spends. Two classes are missing by
+// construction:
+//
+//   1. supervisor-chat writes cost.ndjson but NO job-costs.ndjson (a chat turn
+//      has no job/source to attribute a row to), and is absent from the
+//      report's file list entirely.
+//   2. The ephemeral Opus forks — nightly-review, improvement-plan,
+//      system-issue-review, the cost review itself and an installation's own
+//      forks — run OUTSIDE every supervisor. Until 2026-10-06 they wrote
+//      no ledger row at all; since then run-ephemeral-opus.sh and the other
+//      fork triggers write one per run to logs/ephemeral-forks/job-costs.ndjson
+//      (bin/fork-cost-record), which this counts as ledger.
+//
+// Measured 2026-09-10 over the 5.22-day window that peaked at 0.90 of the
+// weekly allowance: the ledger covered 27.9% of the account's token volume.
+// Opus forks alone were 27.5% of list-priced spend, and the largest single one
+// was the cost review itself. None of it had ever appeared in a cost report.
+//
+// That gap is not just a missing line item. edva-cost-report divides ledger
+// tokens by allowance consumed to get `mtok_per_full_allowance`, and its own
+// comment reads the resulting drift as a change "on the metering side, not in
+// the workload". With a complete numerator the same segments move far less —
+// the ledger's SHARE is what shifted. A denominator that meters the whole
+// account against a numerator that sees a quarter of it will keep producing
+// that illusion.
+//
+// Every local `claude` session writes a transcript under ~/.claude/projects,
+// including supervisor children and ephemeral forks, so that tree is the one
+// place the account's real consumption is visible. This reads it.
+//
+// Dollars are list-rate estimates for RANKING, exactly as edva-cost-report
+// treats its own — under Max-only auth nothing here is billed per token. Do not
+// present the output as a bill.
+//
+// Usage:
+//   edva-allowance-coverage [--since 24h|7d|<ISO>] [--json]
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { installRoot } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+
+const HOME = os.homedir();
+const EDVA = installRoot();
+const PROJECTS = path.join(HOME, '.claude/projects');
+
+const argv = process.argv.slice(2);
+const asJson = argv.includes('--json');
+function flag(name, dflt) {
+  const i = argv.indexOf('--' + name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
+}
+
+function parseSince(s) {
+  const m = /^(\d+)([hd])$/.exec(s); // lang-regex-ok: machine-generated duration flag, not language
+  if (m) {
+    const hours = m[2] === 'h' ? Number(m[1]) : Number(m[1]) * 24;
+    return new Date(Date.now() - hours * 3600_000);
+  }
+  const d = new Date(s);
+  if (isNaN(d)) { console.error(`bad --since: ${s}`); process.exit(64); }
+  return d;
+}
+const SINCE = parseSince(flag('since', '24h'));
+
+// List rates per Mtok: [input, output, cache_write, cache_read]. Ranking only.
+// An id missing here is SKIPPED (its tokens count nowhere), so add every new id
+// the day it is pinned in agent/config/models.env. Same prices as
+// MODEL_RATES in edva-cost-report (sources and quotes there).
+const RATES = {
+  'claude-opus-5-5':           [4, 20, 5.00, 0.20],   // 2026-10-06
+  'claude-opus-5':             [5, 25, 6.25, 0.50],
+  'claude-sonnet-5':           [2, 10, 2.50, 0.20],
+  'claude-sonnet-5-5':         [2, 10, 2.50, 0.10],   // cache read $0.20 before 2026-10-07, see RATES_BEFORE
+  'claude-fable-5':            [2, 10, 2.50, 0.20],
+  'claude-haiku-4-5-20251001': [1,  5, 1.25, 0.10],
+  'claude-haiku-5-5':          [0.10, 0.50, 0.125, 0.01], // prompt up to 100k tokens, see LONG_PROMPT
+};
+// An id's earlier price, for messages stamped before `until`.
+const RATES_BEFORE = {
+  'claude-sonnet-5-5': { until: Date.parse('2026-10-07T00:00:00Z'), rate: [2, 10, 2.50, 0.20] },
+};
+// Priced by prompt length: a request whose prompt (input + cache reads + cache
+// writes) is over `over` tokens pays `rate` for the whole request. A transcript
+// line is one request, so this is exact here.
+const LONG_PROMPT = {
+  'claude-haiku-5-5': { over: 100000, rate: [0.50, 2.50, 0.625, 0.05] },
+};
+function rateFor(model, ts, prompt) {
+  if (!RATES[model]) return null;
+  const old = RATES_BEFORE[model];
+  if (old && Date.parse(ts) < old.until) return old.rate;
+  const long = LONG_PROMPT[model];
+  if (long && prompt > long.over) return long.rate;
+  return RATES[model];
+}
+
+// ── What the ledger sees ────────────────────────────────────────────────────
+// `ephemeral-forks` (2026-10-06): the Opus launchd forks, web-read and any
+// other fork the installation runs write their own rows there via
+// bin/fork-cost-record.
+const LEDGER_TIERS = ['supervisor-ops', 'supervisor-ops-light', 'supervisor-ops-haiku', 'ephemeral-forks'];
+let ledgerTokens = 0;
+let ledgerRows = 0;
+const forkSourcesOnLedger = new Set(); // workloads the fork ledger has rows for, this window
+for (const tier of LEDGER_TIERS) {
+  const f = path.join(EDVA, 'agent/logs', tier, 'job-costs.ndjson');
+  if (!fs.existsSync(f)) continue;
+  for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let r; try { r = JSON.parse(line); } catch { continue; }
+    if (!r.ts || new Date(r.ts) < SINCE) continue;
+    ledgerRows++;
+    if (tier === 'ephemeral-forks' && r.source) forkSourcesOnLedger.add(r.source);
+    ledgerTokens += (r.input_tokens || 0) + (r.output_tokens || 0)
+                  + (r.cache_read_tokens || 0) + (r.cache_creation_tokens || 0);
+  }
+}
+
+// ── What the account actually spent ─────────────────────────────────────────
+// One transcript file per session. The file's first user message identifies the
+// workload; a forked `claude -p` gets its own file, so a fork is never folded
+// into its parent.
+function labelProject(dir) {
+  for (const [suffix, name] of [
+    ['ops-light-agent', 'ops-light'], ['ops-haiku-agent', 'ops-haiku'],
+    ['ops-agent', 'ops'], ['chat-agent', 'chat'], ['-tools-agent-supervisor', 'supervisor'],
+  ]) if (dir.endsWith(suffix)) return name;
+  return 'interactive/other';
+}
+// Ephemeral Opus forks share the ops-agent project dir with the ops supervisor,
+// so the dir cannot separate them — the opening prompt is what distinguishes a
+// scheduled fork from a supervisor dispatch.
+// [needle in the opening prompt, workload name]. An installation probes its own
+// forks with extend_workload_probes in agent/local/config/cost-report.json.
+const WORKLOAD_PROBES = localConfig('cost-report', {
+  workload_probes: [
+    ['Self Improvement Review',   'nightly-review'],
+    ['Self Improvement Plan',     'improvement-plan'],
+    ['SYSTEM ISSUE REVIEW',       'system-issue-review'],
+    ['COST EFFICIENCY REVIEW',    'cost-efficiency-review'],
+  ],
+}).workload_probes;
+function labelWorkload(head) {
+  if (!head) return null;
+  const probes = WORKLOAD_PROBES;
+  const upper = head.toUpperCase();
+  for (const [needle, name] of probes) if (upper.includes(needle.toUpperCase())) return name;
+  return null;
+}
+
+const byBucket = new Map();   // label -> {usd, tokens, sessions:Set}
+function add(label, usd, tokens, sessionFile) {
+  let b = byBucket.get(label);
+  if (!b) { b = { usd: 0, tokens: 0, sessions: new Set() }; byBucket.set(label, b); }
+  b.usd += usd; b.tokens += tokens; b.sessions.add(sessionFile);
+}
+
+// One transcript's usage inside the window. A reply with several content
+// blocks (thinking, text, tool_use) is written as several lines that all carry
+// the SAME usage, so each message id counts once. Counting lines read the
+// 2026-10-10 cost-review fork as 41 Mtok / $15.59; its 78 replies were
+// 19.1 Mtok / $7.06, which matches its ledger row (20.8 Mtok). The overcount
+// varies by workload (1x to ~3x) and had doubled account_tokens.
+function scanTranscript(p) {
+  let content = '';
+  try { content = fs.readFileSync(p, 'utf8'); } catch { return null; }
+  let head = null, usd = 0, tokens = 0, any = false;
+  const seen = new Set();
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+    let d; try { d = JSON.parse(line); } catch { continue; }
+    const msg = d.message || {};
+    if (head === null && d.type === 'user') {
+      const c = msg.content;
+      if (typeof c === 'string') head = c.slice(0, 300);
+      else if (Array.isArray(c)) {
+        const t = c.find((x) => x && x.type === 'text');
+        if (t) head = String(t.text).slice(0, 300);
+      }
+    }
+    const u = msg.usage;
+    if (!u || !msg.model || !d.timestamp) continue;
+    if (new Date(d.timestamp) < SINCE) continue;
+    if (!RATES[msg.model]) continue;
+    if (msg.id) { if (seen.has(msg.id)) continue; seen.add(msg.id); }
+    const i = u.input_tokens || 0, o = u.output_tokens || 0;
+    const cr = u.cache_read_input_tokens || 0, cw = u.cache_creation_input_tokens || 0;
+    const r = rateFor(msg.model, d.timestamp, i + cr + cw);
+    usd += (i * r[0] + o * r[1] + cw * r[2] + cr * r[3]) / 1e6;
+    tokens += i + o + cr + cw;
+    any = true;
+  }
+  return { head, usd, tokens, any };
+}
+
+let projectDirs = [];
+try { projectDirs = fs.readdirSync(PROJECTS); } catch { projectDirs = []; }
+// A missing or unreadable transcript tree means we cannot answer, which is NOT
+// the same as "the ledger covers everything" — say so rather than printing a
+// reassuring 100%.
+let sawAnyTranscript = false;
+
+for (const dir of projectDirs) {
+  const full = path.join(PROJECTS, dir);
+  let files = [];
+  try { files = fs.readdirSync(full).filter((f) => f.endsWith('.jsonl')); } catch { continue; }
+  const project = labelProject(dir);
+  for (const file of files) {
+    const p = path.join(full, file);
+    // Cheap skip: a transcript untouched since before the window holds nothing
+    // inside it.
+    try { if (fs.statSync(p).mtime < SINCE) continue; } catch { continue; }
+    const s = scanTranscript(p);
+    if (!s) continue;
+    // Agent-tool subagents write their own transcripts under
+    // <session-id>/subagents/, which a top-level listing never reaches
+    // ($103 list over the 7 days to 2026-10-11, 99% of it in the ops cwd).
+    // Their usage belongs to the session that spawned them.
+    let { usd, tokens, any } = s;
+    const subDir = path.join(full, file.replace(/\.jsonl$/, ''), 'subagents');
+    let subFiles = [];
+    try { subFiles = fs.readdirSync(subDir).filter((f) => f.endsWith('.jsonl')); } catch { subFiles = []; }
+    for (const sf of subFiles) {
+      const sp = path.join(subDir, sf);
+      try { if (fs.statSync(sp).mtime < SINCE) continue; } catch { continue; }
+      const ss = scanTranscript(sp);
+      if (!ss || !ss.any) continue;
+      usd += ss.usd; tokens += ss.tokens; any = true;
+    }
+    if (!any) continue;
+    sawAnyTranscript = true;
+    const workload = labelWorkload(s.head);
+    add(workload ? `${workload} (ephemeral fork)` : project, usd, tokens, p);
+  }
+}
+
+const totalTokens = [...byBucket.values()].reduce((a, b) => a + b.tokens, 0);
+const totalUsd = [...byBucket.values()].reduce((a, b) => a + b.usd, 0);
+const coveragePct = totalTokens > 0 ? (100 * ledgerTokens / totalTokens) : null;
+
+const buckets = [...byBucket.entries()]
+  .map(([label, b]) => ({
+    label, usd: +b.usd.toFixed(2), tokens: b.tokens, sessions: b.sessions.size,
+    pct_of_usd: totalUsd > 0 ? +(100 * b.usd / totalUsd).toFixed(1) : null,
+    // A fork bucket is off-ledger only if the fork ledger has no rows for that
+    // workload in this window — judged from the rows, not from the label, which
+    // stayed "(ephemeral fork)" after the forks started writing rows.
+    off_ledger: (label.endsWith(' (ephemeral fork)') && !forkSourcesOnLedger.has(label.slice(0, -' (ephemeral fork)'.length)))
+      || label === 'chat' || label === 'interactive/other',
+  }))
+  .sort((a, b) => b.usd - a.usd);
+
+const offLedgerUsd = buckets.filter((b) => b.off_ledger).reduce((a, b) => a + b.usd, 0);
+
+const out = {
+  since: SINCE.toISOString(),
+  transcripts_readable: sawAnyTranscript,
+  ledger_rows: ledgerRows,
+  ledger_tokens: ledgerTokens,
+  account_tokens: totalTokens,
+  ledger_coverage_pct: coveragePct === null ? null : +coveragePct.toFixed(1),
+  account_usd_list: +totalUsd.toFixed(2),
+  off_ledger_usd_list: +offLedgerUsd.toFixed(2),
+  off_ledger_pct: totalUsd > 0 ? +(100 * offLedgerUsd / totalUsd).toFixed(1) : null,
+  buckets,
+};
+
+if (asJson) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
+
+if (!sawAnyTranscript) {
+  console.log('No readable session transcripts under ~/.claude/projects for this window.');
+  console.log('Coverage is UNKNOWN — this is a missing input, not a clean bill of health.');
+  process.exit(0);
+}
+console.log(`since ${out.since}`);
+console.log(`ledger sees ${(ledgerTokens / 1e6).toFixed(1)}M of ${(totalTokens / 1e6).toFixed(1)}M tokens `
+          + `— coverage ${out.ledger_coverage_pct}%`);
+console.log(`account spend $${out.account_usd_list.toFixed(0)} list, of which `
+          + `$${out.off_ledger_usd_list.toFixed(0)} (${out.off_ledger_pct}%) is invisible to edva-cost-report\n`);
+console.log('  ' + 'workload'.padEnd(40) + '$ list'.padStart(9) + '%'.padStart(7) + 'Mtok'.padStart(9) + '  ledger?');
+for (const b of buckets) {
+  console.log('  ' + b.label.slice(0, 40).padEnd(40)
+    + b.usd.toFixed(0).padStart(9) + (b.pct_of_usd + '%').padStart(7)
+    + (b.tokens / 1e6).toFixed(1).padStart(9) + '  ' + (b.off_ledger ? 'OFF-LEDGER' : 'counted'));
+}

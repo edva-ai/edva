@@ -19,7 +19,7 @@ after(() => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })))
 const NOW = Date.parse("2026-10-04T18:00:00Z");
 const ago = (m) => new Date(NOW - m * 60000).toISOString();
 const jl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
-const bin = (name, args, dir) => spawnSync(process.execPath, [path.join(HERE, "../bin", name), ...args], { encoding: "utf8", env: { ...process.env, MERLIN_DATA_DIR: dir } });
+const bin = (name, args, dir) => spawnSync(process.execPath, [path.join(HERE, "../bin", name), ...args], { encoding: "utf8", env: { ...process.env, EDVA_DATA_DIR: dir } });
 
 test("[Hum state] is empty when nothing is open", () => {
   const d = tmp(); dirs.push(d);
@@ -36,7 +36,7 @@ test("[Hum state] states the question, the reaction window and the open ideas pi
   const b = humStateBlock(d, NOW);
   assert.match(b, /^\[Hum state\]/);
   assert.match(b, /hum-answer q-1/); // lang-regex-ok: asserts on our own generated routing text, not the user's words
-  assert.match(b, /merlin hum feedback p-new <token>/);
+  assert.match(b, /edva hum feedback p-new <token>/);
   assert.match(b, /hum-ideas-resolve p-idea/);
 });
 

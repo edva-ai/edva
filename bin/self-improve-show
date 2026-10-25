@@ -53,7 +53,7 @@ console.log(`created:   ${row.created_at}`);
 if (row.decided_at) console.log(`decided:   ${row.decided_at}`);
 if (row.applied_at) console.log(`applied:   ${row.applied_at}`);
 if (row.expires_at) console.log(`expires:   ${row.expires_at}`);
-if (row.chat_message_id) console.log(`chat:      thread anchored at merlin_messages ${row.chat_message_id}`);
+if (row.chat_message_id) console.log(`chat:      thread anchored at edva_messages ${row.chat_message_id}`);
 console.log(`\nsummary:   ${row.summary}`);
 if (row.rationale) console.log(`\nrationale:\n${row.rationale}`);
 if (row.result) console.log(`\nresult:\n${JSON.stringify(row.result, null, 2)}`);

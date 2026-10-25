@@ -1,4 +1,4 @@
 {
-  "_comment": "This installation's Supabase public (anon) key — row-level security protects the data, not this key, but it is still per-installation. Copy to agent/local/config/supabase.json. Read by lib/instance.cjs supabaseAnonKey() (context-sync, merlin-notify). The project itself is instance.json `supabase_project`.",
+  "_comment": "This installation's Supabase public (anon) key — row-level security protects the data, not this key, but it is still per-installation. Copy to agent/local/config/supabase.json. Read by lib/instance.cjs supabaseAnonKey() (context-sync, edva-notify). The project itself is instance.json `supabase_project`.",
   "anon_key": "<your project's anon public key>"
 }

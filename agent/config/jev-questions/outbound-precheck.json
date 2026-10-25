@@ -1,5 +1,5 @@
 {
-  "_doc": "Jev question for bin/outbound-precheck.mjs — the relevance gate on every merlin-send-curl message. Ported from that file's Sonnet prompt. Jev acts alone on send/suppress; 'modify' always takes Sonnet's text. See docs/jev.md. Kernel definition; an installation's own data/jev-questions/outbound-precheck.json replaces it (lib/jev.mjs jevSiteDef).",
+  "_doc": "Jev question for bin/outbound-precheck.mjs — the relevance gate on every edva-send-curl message. Ported from that file's Sonnet prompt. Jev acts alone on send/suppress; 'modify' always takes Sonnet's text. See docs/jev.md. Kernel definition; an installation's own data/jev-questions/outbound-precheck.json replaces it (lib/jev.mjs jevSiteDef).",
   "threshold": 0.92,
   "notes": "Asymmetric risk: a wrong 'send' pings the user with something redundant or contradicted (the failure this gate exists for); a wrong 'suppress' silently drops a real signal or question. Both are costly, so the bar is high and, during the shadow window, a Sonnet 'suppress' overrides a Jev 'send'. Protected intents (p1-email, hum:exercise:*, hum:health:*) and private intents never reach Jev.",
   "questions": {

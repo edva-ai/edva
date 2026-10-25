@@ -15,7 +15,7 @@
 //
 // Tracks consecutive-failure runs per (skill, action) pair in
 // data/skill-health-state.json. If any pair has ≥3 consecutive
-// failure days, pings the user via merlin-notify with the skill name + the
+// failure days, pings the user via edva-notify with the skill name + the
 // most recent error code + a pointer to the log line.
 //
 // A caller that deliberately chose not to report its own failure prints
@@ -30,13 +30,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { REPO_ROOT as MERLIN_ROOT } from '../../lib/root.cjs';
+import { REPO_ROOT as EDVA_ROOT } from '../../lib/root.cjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
-const LOGS_DIR = path.join(MERLIN_ROOT, 'data', 'logs');
-const STATE_FILE = path.join(MERLIN_ROOT, 'data', 'skill-health-state.json');
-const NOTIFY_BIN = path.join(MERLIN_ROOT, 'bin', 'merlin-notify');
+const LOGS_DIR = path.join(EDVA_ROOT, 'data', 'logs');
+const STATE_FILE = path.join(EDVA_ROOT, 'data', 'skill-health-state.json');
+const NOTIFY_BIN = path.join(EDVA_ROOT, 'bin', 'edva-notify');
 const ALERT_THRESHOLD = 3;
 const WINDOW_MS = 24 * 3600 * 1000;
 // v1 counters were built by the scanner that re-counted months-old lines, so
@@ -122,20 +122,20 @@ function scanLogs(now) {
 }
 
 function notify(msg) {
-  // merlin-notify is the canonical agent-to-user channel. The text goes as one
+  // edva-notify is the canonical agent-to-user channel. The text goes as one
   // argv entry, never through a shell: it holds error codes read from logs, and
-  // merlin-notify has no --source/--task flags (they used to land in the push).
+  // edva-notify has no --source/--task flags (they used to land in the push).
   try {
     execFileSync(NOTIFY_BIN, [msg], { stdio: 'inherit' });
   } catch (e) {
-    process.stderr.write(`[skill-health] merlin-notify failed: ${e.message}\n`);
+    process.stderr.write(`[skill-health] edva-notify failed: ${e.message}\n`);
   }
 }
 
 async function queueRepairs(findings) {
   let lib;
-  try { lib = await import(path.join(MERLIN_ROOT, 'lib', 'skill-repair.mjs')); } catch { return 0; }
-  const file = path.join(MERLIN_ROOT, 'data', 'skill-repair-queue.json');
+  try { lib = await import(path.join(EDVA_ROOT, 'lib', 'skill-repair.mjs')); } catch { return 0; }
+  const file = path.join(EDVA_ROOT, 'data', 'skill-repair-queue.json');
   let n = 0;
   const done = new Set();
   for (const f of findings) {

@@ -1,6 +1,6 @@
 # Memory — going from empty to useful
 
-Merlin's memory layer is the substrate the agents reach for to answer "what do I know about X?" Two stores, both backed by SQLite, both empty on first run:
+Edva's memory layer is the substrate the agents reach for to answer "what do I know about X?" Two stores, both backed by SQLite, both empty on first run:
 
 - **Wiki pages** — first-class long-term context. User profile, feedback rules, projects, references, day/week/month rollups. The canonical surface for "facts and preferences the agent should know." Lives in `data/memory-index.db` table `pages`.
 - **Auto-memory chunks** — Claude Code's built-in per-project memory (`.claude/projects/<slug>/memory/*.md`). Smaller chunks, FTS5 + embeddings, used by the legacy `memory search` CLI.
@@ -9,7 +9,7 @@ The two coexist during the migration to DB-as-truth. New work should land in the
 
 ## Ground state
 
-Right after `merlin init`:
+Right after `edva init`:
 
 | Surface | State |
 |---|---|
@@ -154,7 +154,7 @@ In normal operation:
 The auto-memory dir (`~/.claude/projects/<slug>/memory/`, where the slug is your session start path — `node lib/instance.cjs --memory-dir` prints it) can be its own git repo. The `memory-snapshot` job (`bin/memory-snapshot`, cron) stages everything, commits when something changed and pushes to that repo's `origin`. Make it a repo with a **private** remote once:
 
 ```bash
-cd "$(node ~/Dev/merlin/lib/instance.cjs --memory-dir)"
+cd "$(node ~/Dev/edva/lib/instance.cjs --memory-dir)"
 git init && git remote add origin https://github.com/<you>/<private-memory-repo>.git
 ```
 

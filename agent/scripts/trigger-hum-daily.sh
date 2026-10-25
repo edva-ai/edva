@@ -9,11 +9,11 @@
 # turn it was a steady daily cost for nothing but counting and table-building.)
 # Failures go to watchdog.log.
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-LOGFILE="$MERLIN_INSTALL_TOOLS/agent/logs/watchdog.log"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+LOGFILE="$EDVA_INSTALL_TOOLS/agent/logs/watchdog.log"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [hum-daily] $1" >> "$LOGFILE"; }
 
-OUT=$("$MERLIN_INSTALL_TOOLS/bin/hum-daily-run" 2>&1); RC=$?
+OUT=$("$EDVA_INSTALL_TOOLS/bin/hum-daily-run" 2>&1); RC=$?
 if [ $RC -eq 0 ]; then log "ok: $(echo "$OUT" | tail -1 | cut -c1-200)"
 else log "FAILED ($RC): $(echo "$OUT" | tail -1 | cut -c1-200)"; fi
 exit $RC

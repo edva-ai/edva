@@ -17,7 +17,7 @@ const dirs = [];
 after(() => dirs.forEach((d) => fs.rmSync(d, { recursive: true, force: true })));
 const jl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
 const DEAD = { OLLAMA_URL: "http://127.0.0.1:9" };
-const bin = (name, args, dir, extra = {}) => spawnSync(process.execPath, [path.join(HERE, "../bin", name), ...args], { encoding: "utf8", env: { ...process.env, MERLIN_DATA_DIR: dir, ...extra }, input: extra.__input });
+const bin = (name, args, dir, extra = {}) => spawnSync(process.execPath, [path.join(HERE, "../bin", name), ...args], { encoding: "utf8", env: { ...process.env, EDVA_DATA_DIR: dir, ...extra }, input: extra.__input });
 
 // unit vectors at a given angle from [1,0] → cosine = cos(angle)
 const at = (cos) => [cos, Math.sqrt(1 - cos * cos)];

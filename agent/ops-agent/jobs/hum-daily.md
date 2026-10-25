@@ -18,7 +18,7 @@ A daily record of what hum actually did, consumed by the improvement loop rather
 
 `trigger-hum-daily.sh` (23:00 local) runs **`bin/hum-daily-run`**. Aggregation and rendering live in `lib/hum-daily-report.mjs` (tests: `tests/hum-daily-report.test.mjs`). Every number is arithmetic over the files below and the HTML is a fixed template, so there is no model in the loop — it used to be a Sonnet turn doing the counting by hand. The row is the aggregate itself (`ticks, decisions, harvestErrors, discoveries, pings, questions, heldBack, reactions, harvesters, silentHarvesters, topTopic, notable, pending, audit`) plus `date`, `window`, `low_ticks`, `skipped_trace_lines`.
 
-**Inputs (trailing 24h):** `hum-runs.jsonl` through `hum-run-log read --since` (unparseable lines are counted and called out in the email, never silently dropped), `hum-feedback.jsonl` (joined by `ping_id`), `hum-learnings.jsonl` (joined by question id), `hum-pending-question.json`, and `merlin hum audit --window 24h --json` for plumbing drift. Canary rows (`mode: canary`) are not ticks.
+**Inputs (trailing 24h):** `hum-runs.jsonl` through `hum-run-log read --since` (unparseable lines are counted and called out in the email, never silently dropped), `hum-feedback.jsonl` (joined by `ping_id`), `hum-learnings.jsonl` (joined by question id), `hum-pending-question.json`, and `edva hum audit --window 24h --json` for plumbing drift. Canary rows (`mode: canary`) are not ticks.
 
 **Output:** one row appended to `data/hum-daily.jsonl` (runtime state, gitignored like the other hum logs). `hum-daily-run --dry-run` prints the HTML view (TL;DR · what hum noticed · pulses sent · questions · held back · harvester activity · reactions · plumbing · pending) and records nothing. Failures land in `watchdog.log` as `[hum-daily] FAILED`.
 
@@ -26,4 +26,4 @@ A daily record of what hum actually did, consumed by the improvement loop rather
 
 ## Why this exists
 
-Merlin Rule #1: self-awareness. Hum is Merlin's densest loop — the system should keep an exact daily record of what it saw and what it chose to do, and improve itself from that record without asking the user to read it. `hum-review` (Sundays) evaluates against intent; `hum-daily` is the raw chronicle.
+Edva Rule #1: self-awareness. Hum is Edva's densest loop — the system should keep an exact daily record of what it saw and what it chose to do, and improve itself from that record without asking the user to read it. `hum-review` (Sundays) evaluates against intent; `hum-daily` is the raw chronicle.

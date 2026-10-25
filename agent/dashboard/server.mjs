@@ -77,7 +77,7 @@ registry.registerRoute("/api/health", async () => ({
   body: JSON.stringify(await snapshot()),
 }));
 
-registry.registerAppScreen("Merlin Live", "/", { icon: "gauge", order: 1 });
+registry.registerAppScreen("Edva Live", "/", { icon: "gauge", order: 1 });
 
 // ---- HTTP server ----------------------------------------------------------
 

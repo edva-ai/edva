@@ -1,5 +1,5 @@
 // app-approval.mjs — verify Face-ID / Secure-Enclave-signed owner approvals,
-// reusing the exact security model as the client's TradeApproval (client/Merlin/
+// reusing the exact security model as the client's TradeApproval (client/Edva/
 // TradeApproval.swift). The paired device holds a P-256 key in the Secure
 // Enclave; signing is gated by Face ID; the app signs a canonical message and we
 // verify the DER-ECDSA signature here against the device's REGISTERED raw public
@@ -32,15 +32,15 @@ export function rawP256ToKey(rawB64) {
 }
 
 // The exact bytes the device signs. MUST match TradeApproval's message() shape
-// (the trade-approval domain → merlin-approve.v1 for self-improvement). Order + newlines
+// (the trade-approval domain → edva-approve.v1 for self-improvement). Order + newlines
 // are load-bearing (they're part of the signed payload).
 //
-// `domain` separates approval kinds: purchases sign `merlin-purchase.v1`
+// `domain` separates approval kinds: purchases sign `edva-purchase.v1`
 // (lib/purchase-approval.mjs), so a self-improvement signature can never
 // be replayed as a purchase authorization or vice versa. Absent → the original
 // self-improvement domain, so existing rows verify unchanged.
 export function canonicalMessage({ id, hash, nonce, expiresAt, domain }) {
-  return `${domain || "merlin-approve.v1"}\n${id}\n${hash}\n${nonce}\n${expiresAt}`;
+  return `${domain || "edva-approve.v1"}\n${id}\n${hash}\n${nonce}\n${expiresAt}`;
 }
 
 // Verify a DER ECDSA (SHA-256) signature over the canonical message. Returns a

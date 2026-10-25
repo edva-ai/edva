@@ -8,7 +8,7 @@
 # usually decides "skip".
 #
 # CRON KICKS, LAUNCHD SENDS. A pick goes out through hum-ping →
-# merlin-send-curl, whose resolve-first gate (Opus) and outbound precheck
+# edva-send-curl, whose resolve-first gate (Opus) and outbound precheck
 # (Sonnet) are `claude -p` calls on the Max login, and cron cannot reach that
 # login: from cron a pick logs "model unavailable: not_logged_in" and goes out
 # unchecked. So cron only kicks the on-demand agent

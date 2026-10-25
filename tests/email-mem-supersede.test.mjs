@@ -39,17 +39,17 @@ test("searchForEmail drops superseded rows and promotes live ones", () => {
   for (let i = 0; i < 5; i++) {
     stale.push(
       em.add({
-        text: `Reply-echo from merlin on the Weekly Digest thread (#${i}) — personal + mark-read, no p1, no star.`,
+        text: `Reply-echo from edva on the Weekly Digest thread (#${i}) — personal + mark-read, no p1, no star.`,
         tags: "personal,example.com,reply-echo",
       })
     );
   }
   const policy = em.add({
-    text: "POLICY 2026-08-17: a Weekly Digest reply-echo from merlin IS P1 — star + p1 label, left unread.",
+    text: "POLICY 2026-08-17: a Weekly Digest reply-echo from edva IS P1 — star + p1 label, left unread.",
     tags: "policy,example.com,reply-echo",
   });
 
-  const query = { from: "Merlin <merlin@example.com>", subject: "Re: Weekly Digest: 3 new shows" };
+  const query = { from: "Edva <edva@example.com>", subject: "Re: Weekly Digest: 3 new shows" };
   assert.equal(em.searchForEmail(query).length, 5, "baseline: the block is full");
 
   for (const id of stale) em.update(id, { tags: `personal,example.com,reply-echo,superseded-by-#${policy}` });
@@ -66,5 +66,5 @@ test("searchForEmail drops superseded rows and promotes live ones", () => {
   );
 
   // History is untouched: `search` still sees every row.
-  assert.equal(em.search("reply-echo merlin", 30).length, 6, "search still returns superseded rows");
+  assert.equal(em.search("reply-echo edva", 30).length, 6, "search still returns superseded rows");
 });

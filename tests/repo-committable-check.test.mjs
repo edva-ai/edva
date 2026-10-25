@@ -60,7 +60,7 @@ test("a stash-pop conflict is reported as unmerged", () => {
   const unmerged = r.blockers.find((b) => b.kind === "unmerged");
   assert.deepEqual(unmerged.files, ["shared.txt"]);
 
-  // And prove the consequence the checker exists to predict: merlin-commit's
+  // And prove the consequence the checker exists to predict: edva-commit's
   // plain `git commit` really does refuse while this is true.
   fs.writeFileSync(path.join(dir, "other.txt"), "changed\n");
   git(["add", "other.txt"]);

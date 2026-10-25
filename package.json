@@ -1,8 +1,8 @@
 {
-  "name": "merlin",
+  "name": "edva",
   "version": "0.1.0",
   "private": true,
-  "description": "Merlin root package: dependencies of the kernel code at the repo root (lib/, bin/cli.d/). Sub-packages under agent/, bin/ and browsing-skills/ carry their own.",
+  "description": "Edva root package: dependencies of the kernel code at the repo root (lib/, bin/cli.d/). Sub-packages under agent/, bin/ and browsing-skills/ carry their own.",
   "engines": {
     "node": ">=22.5"
   },

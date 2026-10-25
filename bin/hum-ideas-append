@@ -46,7 +46,7 @@
 //   <ideas as JSONL or a JSON array on stdin> | hum-ideas-append [--dry-run] [--no-claim-check]
 // Stdout: {written:[id], rejected:[{id, rule, detail}], novelty_checked:bool}
 // Exit 0 always on a processed batch (rejections are data); 2 on unreadable input.
-// Env (tests): MERLIN_DATA_DIR, HUM_IDEAS_DUP_THRESHOLD, HUM_IDEAS_NO_EMBED=1.
+// Env (tests): EDVA_DATA_DIR, HUM_IDEAS_DUP_THRESHOLD, HUM_IDEAS_NO_EMBED=1.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -64,7 +64,7 @@ import { installTools } from "../lib/root.cjs";
 const P = presenceProvider();
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const DIR = process.env.EDVA_DATA_DIR || installTools("data");
 const RESERVOIR = path.join(DIR, "hum-ideas.jsonl");
 const DIGEST = path.join(DIR, "hum-ideas-digest.json");
 const RESOLVED = path.join(DIR, "hum-resolved-topics.jsonl");
@@ -78,7 +78,7 @@ const DUP_THRESHOLD = Number(process.env.HUM_IDEAS_DUP_THRESHOLD || 0.86);
 const { instance, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
 const OWNER = instance().owner_name;
 const CATEGORIES = new Set(localConfig("hum-ideas", { categories: ["event-prep", "stale-p1", "weekend-planning", "travel-prep", "family",
-  "taste-match", "cross-topic", "stuck-task", "seasonal-closing", "health-care", "merlin-systems", "dining"] }).categories);
+  "taste-match", "cross-topic", "stuck-task", "seasonal-closing", "health-care", "edva-systems", "dining"] }).categories);
 const LENSES = new Set(["substitute", "combine", "adapt", "modify", "put-to-other-use", "eliminate", "reverse"]);
 const CONFIDENCE = new Set(["high", "medium", "low"]);
 

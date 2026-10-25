@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 "use strict";
-// doctor-preflight-check — shared pre-flight `merlin doctor` step for job
+// doctor-preflight-check — shared pre-flight `edva doctor` step for job
 // playbooks. Log-and-continue ONLY: never pings the user on any channel.
 //
 // Why this exists (2026-07-15): ~20 job playbooks each hand-rolled the same
-// "run merlin doctor, ping the user on failure" pre-flight step. The agent's
+// "run edva doctor, ping the user on failure" pre-flight step. The agent's
 // own sandboxed Bash tool masks localhost connections (see the SessionStart
 // host-identity banner), so a healthy machine routinely looks broken from
 // inside a job-scoped turn — this fired repeated false "supervisors
@@ -17,10 +17,10 @@
 // Usage:
 //   doctor-preflight-check <job-slug>
 //
-// Runs `merlin doctor --json`, and on any failing check appends one line to
+// Runs `edva doctor --json`, and on any failing check appends one line to
 // data/logs/<job-slug>-doctor.log. Always exits 0 — playbooks can call
 // this unconditionally with no failure handling of their own. Never calls
-// merlin-send-curl / merlin-notify / any outbound channel.
+// edva-send-curl / edva-notify / any outbound channel.
 
 const path = require("node:path");
 const fs = require("node:fs");
@@ -29,7 +29,7 @@ const { spawnSync } = require("node:child_process");
 
 const { installTools } = require("../lib/root.cjs");
 const HOME = process.env.HOME || os.homedir();
-const MERLIN_BIN = installTools("bin/merlin");
+const EDVA_BIN = installTools("bin/edva");
 const LOG_DIR = installTools("data/logs");
 
 function main() {
@@ -39,17 +39,17 @@ function main() {
     process.exit(0); // still exit 0 — pre-flight steps must never block a job
   }
 
-  const r = spawnSync(MERLIN_BIN, ["doctor", "--json"], { encoding: "utf8", timeout: 30_000 });
+  const r = spawnSync(EDVA_BIN, ["doctor", "--json"], { encoding: "utf8", timeout: 30_000 });
   if (r.status !== 0 || !r.stdout) {
     // doctor itself failed to run — log and move on, don't guess why.
-    appendLog(jobSlug, `doctor-preflight-check: merlin doctor did not run cleanly (exit ${r.status}); ${(r.stderr || "").slice(0, 300)}`);
+    appendLog(jobSlug, `doctor-preflight-check: edva doctor did not run cleanly (exit ${r.status}); ${(r.stderr || "").slice(0, 300)}`);
     process.exit(0);
   }
 
   let checks;
   try { checks = JSON.parse(r.stdout); } catch { checks = null; }
   if (!Array.isArray(checks)) {
-    appendLog(jobSlug, "doctor-preflight-check: merlin doctor --json produced unparseable output");
+    appendLog(jobSlug, "doctor-preflight-check: edva doctor --json produced unparseable output");
     process.exit(0);
   }
 

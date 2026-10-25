@@ -2,7 +2,7 @@
 //
 // Conway's snip breadcrumbs (WP2) are id-addressed only — the agent rehydrates a
 // compressed range by `retrieveSnipRange(start, end)`, i.e. it must already know
-// WHICH range it wants. Merlin's landed hybrid recall (local nomic-embed-text +
+// WHICH range it wants. Edva's landed hybrid recall (local nomic-embed-text +
 // RRF, memory-index) lets us do better: when a range is compressed to a
 // breadcrumb, index the embedding of its CONTENT so a later turn can find the
 // right breadcrumb by MEANING and rehydrate it — recall Conway structurally

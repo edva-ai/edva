@@ -71,7 +71,7 @@ describe("app-approval crypto (device-key model)", () => {
     assert.equal(itemHash({ a: 1 }), itemHash({ a: 1 }));
     assert.notEqual(itemHash({ a: 1 }), itemHash({ a: 2 }));
     const req = buildApprovalRequest("id", { a: 1 }, { now: 1, nonce: "n" });
-    assert.match(req.message, /^merlin-approve\.v1\nid\n/);
+    assert.match(req.message, /^edva-approve\.v1\nid\n/);
     assert.equal(req.hash, itemHash({ a: 1 }));
   });
 });

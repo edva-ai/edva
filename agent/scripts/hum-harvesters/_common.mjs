@@ -101,8 +101,8 @@ function countSilencedToday(dedupKey) {
  * Contract: the wrapper writes ONE JSON object:
  *   { situation, context }
  * where:
- *   situation = output of `merlin hum situation --json`
- *   context   = output of `merlin context --json` (profile/tastes/projects/knowledge/recent)
+ *   situation = output of `edva hum situation --json`
+ *   context   = output of `edva context --json` (profile/tastes/projects/knowledge/recent)
  *
  * Backward-compat: if the payload lacks the envelope shape (older callers
  * passed situation directly), treat the whole payload as situation + build
@@ -305,14 +305,14 @@ export function stampRun(topic, hadSignal) {
  */
 export function geoGate(metro, dateStr, artist) {
   if (!metro || !dateStr) return { suppress: false, reason: "no metro/date — gate skipped" };
-  const headlinerBin = artist ? optionalBin(BIN_DIR, "headliner", "MERLIN_HEADLINER_BIN") : null;
+  const headlinerBin = artist ? optionalBin(BIN_DIR, "headliner", "EDVA_HEADLINER_BIN") : null;
   if (headlinerBin) {
     try {
       execFileSync(headlinerBin, ["check", String(artist)], { stdio: "ignore", timeout: 8000 });
       return { suppress: false, reason: `headliner bypass (${artist})` };
     } catch { /* exit 1 = not a headliner → fall through to the geo-gate */ }
   }
-  const travelBin = optionalBin(BIN_DIR, "travel", "MERLIN_TRAVEL_BIN");
+  const travelBin = optionalBin(BIN_DIR, "travel", "EDVA_TRAVEL_BIN");
   if (!travelBin) return { suppress: false, reason: "no travel timeline — gate skipped" };
   try {
     execFileSync(travelBin, ["in-city", String(metro), String(dateStr)], { stdio: "ignore", timeout: 10000 });

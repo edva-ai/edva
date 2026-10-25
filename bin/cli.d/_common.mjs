@@ -1,12 +1,12 @@
-// _common.mjs — helpers shared by Merlin's own `merlin` subcommands in
-// bin/cli.d/. The leading underscore keeps bin/merlin from loading this file
+// _common.mjs — helpers shared by Edva's own `edva` subcommands in
+// bin/cli.d/. The leading underscore keeps bin/edva from loading this file
 // as a subcommand (bin/cli.d/README.md).
 //
 // Roots: the CLI's ctx.ROOT is the installation (lib/root.cjs installRoot():
-// $MERLIN_HOME, else ~/Dev/merlin). Commands that set up or inspect a checkout
+// $EDVA_HOME, else ~/Dev/edva). Commands that set up or inspect a checkout
 // (init, overlay, audit, review-pr) work on the checkout this CLI runs from
-// instead — CHECKOUT below (MERLIN_HOME when set, else the clone holding this
-// file) — so `./bin/merlin init` in a fresh clone configures that clone.
+// instead — CHECKOUT below (EDVA_HOME when set, else the clone holding this
+// file) — so `./bin/edva init` in a fresh clone configures that clone.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -17,8 +17,8 @@ const require = createRequire(import.meta.url);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const root = require(path.join(HERE, "..", "..", "lib", "root.cjs"));
 
-export const CHECKOUT = root.REPO_ROOT;      // the clone (or MERLIN_HOME)
-export const KERNEL = root.TOOLS_DIR;        // its kernel tree (same dir in Merlin)
+export const CHECKOUT = root.REPO_ROOT;      // the clone (or EDVA_HOME)
+export const KERNEL = root.TOOLS_DIR;        // its kernel tree (same dir in Edva)
 export const installRoot = root.installRoot;
 
 // Parse a dotenv file into an object (KEY=value lines; # comments; optional

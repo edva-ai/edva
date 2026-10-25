@@ -4,12 +4,12 @@ import UIKit
 import Supabase
 
 /// Reads Apple Health on-device and ships a trimmed, pre-aggregated view to
-/// **Merlin's** Supabase (not Trainer's own project). Verbatim port of
-/// `client/Merlin/HealthKitManager.swift` from the merlin repo — only
+/// **Edva's** Supabase (not Trainer's own project). Verbatim port of
+/// `client/Edva/HealthKitManager.swift` from the edva repo — only
 /// the supabase client reference is swapped (`TrainerSupabase` here vs
 /// `SupabaseManager` there). Rationale: Trainer is foregrounded for far
 /// longer stretches during workouts, so running this same sync from
-/// Trainer dramatically expands coverage compared to the Merlin app
+/// Trainer dramatically expands coverage compared to the Edva app
 /// alone.
 ///
 /// Three paths:
@@ -35,11 +35,11 @@ final class HealthKitManager: @unchecked Sendable {
 
     private let store = HKHealthStore()
     private let batchSize = 500
-    private let anchorKeyPrefix = "merlin.health.anchor."
+    private let anchorKeyPrefix = "edva.health.anchor."
     /// Vendor id captured on the main actor at `start()` so the rest of the
     /// pipeline can build `device_id` strings without bouncing back to
     /// MainActor on every upload (Trainer compiles with strict concurrency
-    /// complete; Merlin doesn't, which is why this isn't an issue there).
+    /// complete; Edva doesn't, which is why this isn't an issue there).
     private nonisolated(unsafe) var cachedVendorId: String?
 
     // MARK: - Type catalog
@@ -358,7 +358,7 @@ final class HealthKitManager: @unchecked Sendable {
 
     private enum StatGranularity: String { case daily, weekly, yearly }
 
-    private let backfillDoneKey = "merlin.health.backfill.done"
+    private let backfillDoneKey = "edva.health.backfill.done"
     private let backfillCycleDelay: UInt64 = 8 * 1_000_000_000 // 8s between chunks
     private var backfillTask: Task<Void, Never>?
 
@@ -776,13 +776,13 @@ final class HealthKitManager: @unchecked Sendable {
     }
 
     private func currentDeviceId() -> String? {
-        // Match Merlin's behaviour — APNs token if present (Trainer doesn't
+        // Match Edva's behaviour — APNs token if present (Trainer doesn't
         // register for remote notifications, so this falls through to the
         // per-vendor identifier, which is stable across reinstalls within
-        // the same vendor/team-id namespace). Different value than Merlin's
-        // vendor id, so Trainer's aggregate rows sit alongside Merlin's
+        // the same vendor/team-id namespace). Different value than Edva's
+        // vendor id, so Trainer's aggregate rows sit alongside Edva's
         // rather than overwriting them.
-        if let token = UserDefaults.standard.string(forKey: "merlin.apnsDeviceToken"),
+        if let token = UserDefaults.standard.string(forKey: "edva.apnsDeviceToken"),
            !token.isEmpty {
             return token
         }

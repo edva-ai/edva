@@ -1,7 +1,7 @@
 // share-bundle.mjs — one share-sheet send is one message to the agent.
 //
-// The share extension (client/MerlinShare) posts a share as back-to-back
-// merlin_messages rows with metadata.source "share": one bare attachment-URL
+// The share extension (client/EdvaShare) posts a share as back-to-back
+// edva_messages rows with metadata.source "share": one bare attachment-URL
 // row per photo, then one row with the user's note, text and links. Dispatched
 // row by row, whichever reaches the supervisor first starts a turn alone and
 // the other queues as a turn of its own: a photo answered without its caption

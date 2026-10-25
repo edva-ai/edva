@@ -6,8 +6,8 @@
 // two undated not_logged_in lines from months earlier, re-read whole each night.
 //
 // Isolation: the script is copied into a temp tree shaped like the repo, so the
-// logs, state and merlin-notify it derives from its own location are all in
-// that tree; its merlin-notify is a stub that only records argv. Nothing is sent.
+// logs, state and edva-notify it derives from its own location are all in
+// that tree; its edva-notify is a stub that only records argv. Nothing is sent.
 //
 // Run: node --test tests/skill-health.test.mjs
 
@@ -37,7 +37,7 @@ const localStamp = (ms) => {
 };
 const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 const skillLine = (skill, error) => JSON.stringify({ skill, action: "list-active", error, showCount: 0 });
-const runHeader = (ms) => `${localStamp(ms)} [draw-check] start: /Users/x/Dev/merlin/bin/draw-check-run --platform tickets`;
+const runHeader = (ms) => `${localStamp(ms)} [draw-check] start: /Users/x/Dev/edva/bin/draw-check-run --platform tickets`;
 
 const REPAIR_LIB = path.resolve(import.meta.dirname, "..", "lib", "skill-repair.mjs");
 
@@ -49,7 +49,7 @@ function sandbox({ logs, state, repairLib = false, queue = null }) {
   fs.mkdirSync(path.join(tools, "bin"), { recursive: true });
   fs.writeFileSync(path.join(tools, "browsing-skills", "package.json"), JSON.stringify({ type: "module" }));
   fs.copyFileSync(SCRIPT, path.join(tools, "browsing-skills", "tools", "skill-health.js"));
-  fs.writeFileSync(path.join(tools, "bin", "merlin-notify"), NOTIFY_STUB, { mode: 0o755 });
+  fs.writeFileSync(path.join(tools, "bin", "edva-notify"), NOTIFY_STUB, { mode: 0o755 });
   fs.mkdirSync(path.join(tools, "lib"), { recursive: true });
   fs.copyFileSync(path.join(path.dirname(REPAIR_LIB), "root.cjs"), path.join(tools, "lib", "root.cjs")); // the script's root helper
   for (const [name, lines] of Object.entries(logs)) fs.writeFileSync(path.join(tools, "data", "logs", name), lines.join("\n") + "\n");
@@ -65,7 +65,7 @@ function sandbox({ logs, state, repairLib = false, queue = null }) {
 function run(opts) {
   const dir = sandbox(opts);
   const r = spawnSync(process.execPath, [path.join(dir, KERNEL_SUBDIR, "browsing-skills", "tools", "skill-health.js")], {
-    cwd: dir, env: { PATH: process.env.PATH, ...(process.env.TZ ? { TZ: process.env.TZ } : {}), MERLIN_ROOT: dir, SKILL_REPAIR_NO_KICK: "1", SKILL_HEALTH_TEST_NOTIFY_LOG: path.join(dir, "notify.jsonl") }, encoding: "utf8", timeout: 30_000,
+    cwd: dir, env: { PATH: process.env.PATH, ...(process.env.TZ ? { TZ: process.env.TZ } : {}), EDVA_ROOT: dir, SKILL_REPAIR_NO_KICK: "1", SKILL_HEALTH_TEST_NOTIFY_LOG: path.join(dir, "notify.jsonl") }, encoding: "utf8", timeout: 30_000,
   });
   const read = (f) => { try { return fs.readFileSync(path.join(dir, f), "utf8"); } catch { return ""; } };
   const out = {
@@ -117,7 +117,7 @@ test("a real failure inside the window extends the streak; day 3 pushes once, as
   assert.equal(r.pushes.length, 1, r.stdout);
   assert.deepEqual(r.pushes[0], [
     `Browsing-skill health alert: 1 action(s) repeatedly failing\n\n${TC} failing 3 days in a row — last error: not_logged_in\n\nInvestigate: data/logs/ and browsing-skills/skills/<site>/`,
-  ], "merlin-notify has no --source/--task flags: they used to land in the push text, with literal \\n");
+  ], "edva-notify has no --source/--task flags: they used to land in the push text, with literal \\n");
 });
 
 test("a failure its caller kept quiet (an expected-failure day) still counts but is not pushed", () => {

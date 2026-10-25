@@ -1,14 +1,14 @@
 #!/bin/bash
 # cron-boot-catchup — on boot, replay crons missed during system downtime.
-# Triggered by ~/Library/LaunchAgents/com.merlin.cron-boot-catchup.plist
+# Triggered by ~/Library/LaunchAgents/com.edva.cron-boot-catchup.plist
 # (RunAtLoad=true). Waits 300s for daemons + network to settle, then computes
 # the outage window from cron-runs.jsonl (preferred) or `last reboot` (fallback)
 # and invokes cron-catchup --execute if the gap is meaningful (>5 min).
 
 set -u
-# The installation (MERLIN_INSTALL_TOOLS) and the node to run (MERLIN_NODE).
+# The installation (EDVA_INSTALL_TOOLS) and the node to run (EDVA_NODE).
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
-LOG="$MERLIN_INSTALL_TOOLS/agent/logs/cron-boot-catchup.log"
+LOG="$EDVA_INSTALL_TOOLS/agent/logs/cron-boot-catchup.log"
 mkdir -p "$(dirname "$LOG")"
 exec >> "$LOG" 2>&1
 
@@ -17,7 +17,7 @@ echo "===== $(date) boot-catchup check ====="
 # Wait for the system to settle (network, process-manager, supervisors)
 sleep 300
 
-RUNS_LOG="$MERLIN_INSTALL_TOOLS/data/cron-runs.jsonl"
+RUNS_LOG="$EDVA_INSTALL_TOOLS/data/cron-runs.jsonl"
 NOW_FMT=$(date "+%Y-%m-%d %H:%M")
 NOW_S=$(date +%s)
 
@@ -69,5 +69,5 @@ if [ "$GAP_MIN" -le 5 ]; then
 fi
 
 echo "Outage window: $START_FMT → $NOW_FMT (${GAP_MIN}m). Running cron-catchup..."
-exec "${MERLIN_NODE:-node}" "$MERLIN_INSTALL_TOOLS/bin/cron-catchup" \
+exec "${EDVA_NODE:-node}" "$EDVA_INSTALL_TOOLS/bin/cron-catchup" \
   --start "$START_FMT" --end "$NOW_FMT" --execute

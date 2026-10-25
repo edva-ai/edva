@@ -70,7 +70,7 @@ export function createToolRegistry({ allowlist = DEFAULT_DIRECT_ALLOWLIST, defer
     return def.name;
   }
 
-  // Bridge: register Merlin's existing MCP tool definitions (the tools-mcp
+  // Bridge: register Edva's existing MCP tool definitions (the tools-mcp
   // `TOOLS` array shape: { name, description, schema, run }). Each becomes a
   // deferred tool whose handler is `run`. This is how the ~existing MCP surface
   // populates the registry so its schemas leave the prompt.

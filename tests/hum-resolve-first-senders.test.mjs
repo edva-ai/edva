@@ -1,7 +1,7 @@
 // hum-resolve-first-senders.test.mjs — every hum sender routes through the
 // resolve-first gate and reads its outcome honestly.
 //
-//   merlin-send-curl  runs the gate for a chat-channel `hum:` intent; a drop
+//   edva-send-curl  runs the gate for a chat-channel `hum:` intent; a drop
 //                      exits 0 before anything is posted
 //   hum-ask            questions: slot written only for what landed as a question
 //   hum-ping           info pings: exit 12 when resolved first, `resolve` on the
@@ -21,12 +21,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SEND_CURL = path.join(ROOT, "bin/merlin-send-curl");
+const SEND_CURL = path.join(ROOT, "bin/edva-send-curl");
 const HUM_ASK = path.join(ROOT, "bin/hum-ask");
 const HUM_PING = path.join(ROOT, "bin/hum-ping");
 const PATH = `${path.dirname(process.execPath)}:${process.env.PATH}`;
 
-// A fake merlin-send-curl. It records its argv and the --hum-context file it
+// A fake edva-send-curl. It records its argv and the --hum-context file it
 // was handed, then behaves per FAKE_MODE the way the real one does after the
 // gate: a sentinel in the capture file for a hold, an id (+ sidecar) for a send.
 const FAKE_SENDER = `#!${process.execPath}
@@ -50,19 +50,19 @@ switch (process.env.FAKE_MODE) {
   case "resolve-gap": side({ action: "rewrite", verdict: "partial", still_question: true, text: "When are they handing back the keys?" }); break;
 }
 if (cap) fs.writeFileSync(cap, "msg-777\\n");
-process.stdout.write("Message sent to Merlin.\\n");
+process.stdout.write("Message sent to Edva.\\n");
 `;
 
 function home() {
   const h = fs.mkdtempSync(path.join(os.tmpdir(), "hrf-send-"));
-  const bin = path.join(h, "Dev/merlin/bin");
+  const bin = path.join(h, "Dev/edva/bin");
   fs.mkdirSync(bin, { recursive: true });
-  fs.mkdirSync(path.join(h, "Dev/merlin/data"), { recursive: true });
-  fs.writeFileSync(path.join(h, "Dev/merlin/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
-  const sender = path.join(bin, "merlin-send-curl");
+  fs.mkdirSync(path.join(h, "Dev/edva/data"), { recursive: true });
+  fs.writeFileSync(path.join(h, "Dev/edva/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
+  const sender = path.join(bin, "edva-send-curl");
   fs.writeFileSync(sender, FAKE_SENDER);
   fs.chmodSync(sender, 0o755);
-  return { h, sender, record: path.join(h, "record.json"), data: path.join(h, "Dev/merlin/data") };
+  return { h, sender, record: path.join(h, "record.json"), data: path.join(h, "Dev/edva/data") };
 }
 
 // ── hum-ask ────────────────────────────────────────────────────────────────
@@ -169,7 +169,7 @@ test("hum-ping: a non-hum intent is nested under the lane, never dropped", () =>
   assert.equal(rec.argv[rec.argv.indexOf("--intent") + 1], "hum:workshop:booking-check");
 });
 
-// ── merlin-send-curl ──────────────────────────────────────────────────────
+// ── edva-send-curl ──────────────────────────────────────────────────────
 
 const FAKE_GATE = `#!${process.execPath}
 const fs = require("node:fs");
@@ -180,7 +180,7 @@ if (i >= 0) fs.writeFileSync(a[i + 1], JSON.stringify({ suppressed: true, by: "h
 process.stdout.write(JSON.stringify({ action: "drop", verdict: "resolved", decision_id: "hr-g" }) + "\\n");
 `;
 
-test("merlin-send-curl: a chat hum: intent runs the gate; a drop exits 0 before anything is posted", () => {
+test("edva-send-curl: a chat hum: intent runs the gate; a drop exits 0 before anything is posted", () => {
   const env = home();
   const gate = path.join(env.h, "fake-gate");
   fs.writeFileSync(gate, FAKE_GATE);
@@ -201,7 +201,7 @@ test("merlin-send-curl: a chat hum: intent runs the gate; a drop exits 0 before 
   assert.equal(JSON.parse(fs.readFileSync(cap, "utf8")).by, "hum-resolve-first");
 });
 
-test("merlin-send-curl: --hum-context is a known flag (not swallowed into the message)", () => {
+test("edva-send-curl: --hum-context is a known flag (not swallowed into the message)", () => {
   const src = fs.readFileSync(SEND_CURL, "utf8");
   assert.ok(src.includes("--hum-context)    HUM_CONTEXT_FILE="));
   assert.ok(src.includes("--observed-error, --hum-context,"));

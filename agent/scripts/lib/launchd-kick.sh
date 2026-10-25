@@ -28,7 +28,7 @@
 #   source "$(dirname "$0")/lib/launchd-kick.sh"
 #   launchd_kick ai.claude.example-watch example-watch
 
-# The kernel's repo plists are templates (__MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__): an install
+# The kernel's repo plists are templates (__EDVA_HOME__ / __EDVA_TOOLS__ / __HOME__): an install
 # renders them (lib/launchd-render.sh), never copies them verbatim.
 source "$(dirname "${BASH_SOURCE[0]}")/launchd-render.sh"
 
@@ -37,9 +37,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/launchd-render.sh"
 # this call installed it) for the caller.
 launchd_ensure_installed() {
   local label="$1" job="${2:-$1}"
-  local logfile="$HOME/Dev/merlin/agent/logs/watchdog.log"
+  local logfile="$HOME/Dev/edva/agent/logs/watchdog.log"
   local domain="gui/$(id -u)"
-  local src="$HOME/Dev/merlin/agent/launch-agents/$label.plist"
+  local src="$HOME/Dev/edva/agent/launch-agents/$label.plist"
   local dst="$HOME/Library/LaunchAgents/$label.plist"
   local out
   LAUNCHD_INSTALL_ERR="" LAUNCHD_INSTALLED=""
@@ -80,7 +80,7 @@ launchd_ensure_installed() {
 
 launchd_kick() {
   local label="$1" job="${2:-$1}"
-  local logfile="$HOME/Dev/merlin/agent/logs/watchdog.log"
+  local logfile="$HOME/Dev/edva/agent/logs/watchdog.log"
   local out note=""
   if out=$(launchctl kickstart "gui/$(id -u)/$label" 2>&1); then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$job] kicked launchd agent $label" >> "$logfile"
@@ -99,11 +99,11 @@ launchd_kick() {
   [ -z "${LAUNCHD_INSTALL_ERR:-}" ] || note=" (Installing it automatically failed: $LAUNCHD_INSTALL_ERR)"
   # How alerts name this machine: the instance's host_label (lib/instance.sh;
   # "the host" by default).
-  [ -n "${MERLIN_HOST_LABEL:-}" ] || source "$(dirname "${BASH_SOURCE[0]}")/instance.sh"
+  [ -n "${EDVA_HOST_LABEL:-}" ] || source "$(dirname "${BASH_SOURCE[0]}")/instance.sh"
   # A job reporting its own failure (class 5, agent/CLAUDE.md § Outbound Precheck).
   # geo-gate-ok: system-channel infra note about a missing launchd agent, not an event recommendation.
-  "$HOME/Dev/merlin/bin/merlin-send-curl" --channel system --skip-precheck --intent "$job" \
-    "$job did not run: its launchd agent $label is not loaded on ${MERLIN_HOST_LABEL:-the host}. Install it with: ~/Dev/merlin/agent/launch-agents/install.sh $label (renders agent/launch-agents/$label.plist into ~/Library/LaunchAgents and bootstraps it)$note" \
+  "$HOME/Dev/edva/bin/edva-send-curl" --channel system --skip-precheck --intent "$job" \
+    "$job did not run: its launchd agent $label is not loaded on ${EDVA_HOST_LABEL:-the host}. Install it with: ~/Dev/edva/agent/launch-agents/install.sh $label (renders agent/launch-agents/$label.plist into ~/Library/LaunchAgents and bootstraps it)$note" \
     > /dev/null 2>&1 || true
   return 1
 }

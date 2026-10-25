@@ -20,14 +20,14 @@
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/root.sh"   # MERLIN_ROOT, MERLIN_TOOLS
-LOG_FILE="$MERLIN_TOOLS/agent/logs/wiki-assoc.log"
+source "$SCRIPT_DIR/lib/root.sh"   # EDVA_ROOT, EDVA_TOOLS
+LOG_FILE="$EDVA_TOOLS/agent/logs/wiki-assoc.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
 log "wiki-assoc nightly: starting"
-OUT="$(node "$MERLIN_TOOLS/bin/wiki-assoc" nightly 2>>"$LOG_FILE")"
+OUT="$(node "$EDVA_TOOLS/bin/wiki-assoc" nightly 2>>"$LOG_FILE")"
 RC=$?
 log "nightly rc=$RC $(echo "$OUT" | tr -d '\n' | cut -c1-900)"
 

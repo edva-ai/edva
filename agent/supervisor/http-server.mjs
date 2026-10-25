@@ -46,12 +46,12 @@ const JOBS_DIR = installTools("agent/ops-agent/jobs");
 const JOBS_EXT_DIR = path.join(JOBS_DIR, "_ext");
 // The operator's additions to a kernel playbook live at local/jobs/<job>.md and
 // are appended to it at dispatch (dispatch-preamble.mjs withLocalCompanion).
-const LOCAL_DIR = process.env.MERLIN_LOCAL_DIR || installTools("agent/local");
+const LOCAL_DIR = process.env.EDVA_LOCAL_DIR || installTools("agent/local");
 const TOKEN_PATH = installTools("secrets/webhook-token");
 const EMAIL_INBOUND_SECRET_PATH = installTools("secrets/email-inbound-secret");
 const EMAIL_INBOUND_PLAYBOOK_PATH = path.join(JOBS_DIR, "email-inbound.md");
 // OIDC expectations for the Gmail Pub/Sub push path. Written by setup-pubsub.sh;
-// shape: {"audience":"https://gmail-push.<domain>","serviceAccount":"merlin-pubsub@<proj>.iam.gserviceaccount.com"}.
+// shape: {"audience":"https://gmail-push.<domain>","serviceAccount":"edva-pubsub@<proj>.iam.gserviceaccount.com"}.
 const PUBSUB_OIDC_CONFIG_PATH = installTools("secrets/pubsub-oidc.json");
 
 // The playbook file for a webhook-dispatched job: jobs/<job>.md, else
@@ -253,7 +253,7 @@ export function startServers({ ports, gmailSource, supervisor }) {
           return;
         }
         // Structural steps in code (2026-10-04, lib/email-inbound-gate.mjs):
-        // allowlist, Worker-retry dedup on Message-ID, reply-to-Merlin lookup
+        // allowlist, Worker-retry dedup on Message-ID, reply-to-Edva lookup
         // and the handled-log row. Only an allowlisted, new message reaches
         // the agent, and it arrives with its reply context already resolved.
         const gate = prepareInbound(email, { dataDir: INBOUND_DATA_DIR });
@@ -263,7 +263,7 @@ export function startServers({ ports, gmailSource, supervisor }) {
         // A content send, so it takes the outbound precheck like any other.
         if (gate.action === "hold" && gate.notify) {
           try {
-            const p = spawn(installTools("bin/merlin-send-curl"),
+            const p = spawn(installTools("bin/edva-send-curl"),
               ["--intent", "email-held", "--agent", "ops", heldNotice(gate.held)],
               { detached: true, stdio: "ignore" });
             p.unref();

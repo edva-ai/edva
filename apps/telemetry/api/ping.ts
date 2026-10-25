@@ -1,7 +1,7 @@
-// merlin-telemetry — single endpoint serving four purposes:
+// edva-telemetry — single endpoint serving four purposes:
 //
 //   GET  /px[/anything]?r=<tag>  → 1×1 transparent GIF (README/docs pixel)
-//   POST /install                → JSON install ping from `bin/merlin install`
+//   POST /install                → JSON install ping from `bin/edva install`
 //   GET  /stats                  → aggregate, anonymous install/px counters
 //   GET|POST /usage              → private Claude usage/cost rollup (gated)
 //
@@ -19,7 +19,7 @@
 // credentials can never make an install ping fail. If the KV env vars are
 // absent, the function behaves exactly like the pre-KV version.
 //
-// Honors `Do-Not-Track: 1` and the `MERLIN_NO_TELEMETRY=1` env on the client
+// Honors `Do-Not-Track: 1` and the `EDVA_NO_TELEMETRY=1` env on the client
 // side. There is no auth on px/install — anyone can hit either route; the only
 // thing that happens is a log line plus (for installs) a counter bump. The
 // /stats route can optionally be gated with a STATS_TOKEN env var.
@@ -47,7 +47,7 @@ const PIXEL_GIF_B64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 const PIXEL_BYTES = Uint8Array.from(atob(PIXEL_GIF_B64), (c) => c.charCodeAt(0));
 
 // Namespace so this project can share a KV store with anything else.
-const NS = "merlin";
+const NS = "edva";
 
 // Lazily build a Redis client from whichever env-var pair is present. Returns
 // null when no credentials are configured, which switches the function back to
@@ -97,7 +97,7 @@ async function logHit(kind: string, fields: Record<string, unknown>) {
 // Persist durable, anonymous aggregates for an install ping. Best-effort: any
 // failure is swallowed so the install never observes a telemetry error.
 //
-// Keys written (all under the `merlin:` namespace):
+// Keys written (all under the `edva:` namespace):
 //   installs:total            INCR   running total of install pings
 //   installs:day:<YYYY-MM-DD> INCR   per-day install count
 //   installs:hosts            PFADD  HyperLogLog of host_fp → unique-host count
@@ -232,8 +232,8 @@ function unauthorized(): Response {
 // --- usage aggregation (Claude API token/cost monitoring) ---
 //
 // Unlike installs/px, usage data is private operational telemetry pushed by
-// `merlin-cost-report --push` from the operator's own hosts, so /usage is
-// ALWAYS token-gated. Per merlin's Max-only auth invariant the dollar figures
+// `edva-cost-report --push` from the operator's own hosts, so /usage is
+// ALWAYS token-gated. Per edva's Max-only auth invariant the dollar figures
 // are SDK ESTIMATES, not billed spend — we carry a `cost_is_estimated` flag and
 // name the field `est_cost_usd` so nothing downstream mistakes it for real
 // money. The signals that actually matter for cost reduction are token volume
@@ -408,7 +408,7 @@ async function readUsage(days: number): Promise<Record<string, unknown> | null> 
       window_days: days,
       unique_hosts: uniqueHosts ?? 0,
       last_push: lastPush ?? null,
-      // Per merlin's Max-only auth invariant, est_cost_usd is an SDK estimate.
+      // Per edva's Max-only auth invariant, est_cost_usd is an SDK estimate.
       cost_is_estimated: String(phantom) === "1",
       totals,
       cache_hit_rate: cacheHitRate,
@@ -437,7 +437,7 @@ export default async function handler(req: Request): Promise<Response> {
 
   // Usage branch — private Claude usage/cost monitoring. ALWAYS token-gated
   // (unlike /px and /install): POST pushes a per-host daily rollup from
-  // `merlin-cost-report --push`; GET returns the aggregate. Refuses entirely
+  // `edva-cost-report --push`; GET returns the aggregate. Refuses entirely
   // unless STATS_TOKEN is configured, so cost data can't be ingested openly.
   if (url.pathname === "/usage") {
     if (!process.env.STATS_TOKEN) {
@@ -501,7 +501,7 @@ export default async function handler(req: Request): Promise<Response> {
   }
 
   if (req.method === "POST") {
-    // Install-ping branch. Body is a tiny JSON object the merlin CLI sends on
+    // Install-ping branch. Body is a tiny JSON object the edva CLI sends on
     // first run per-host. Keys are all client-supplied; we treat them as
     // opaque strings and clip them. Bad/missing JSON → 204 silently (we never
     // want a telemetry endpoint to be the reason an install fails).

@@ -1,12 +1,12 @@
 ---
-name: merlin-browsing-skills
-description: "Umbrella skill for Merlin's browsing-skills registry. Use when the user's request targets a website covered by either the upstream public registry (Reddit, Amazon, Airbnb, Booking, X, LinkedIn, TikTok, Facebook, Walmart, Target, AliExpress) or one of this installation's private skills (indexed in agent/local/browsing-skills.md). For supported sites, load the site-specific action index at the matching path, then open only the linked reference file for the chosen action. For unsupported sites, fall back to normal browsing — don't force this skill." # kernel-guard-ok: Airbnb here is the upstream public registry skill, not an installation-private one
-merlinPrivate: true
+name: edva-browsing-skills
+description: "Umbrella skill for Edva's browsing-skills registry. Use when the user's request targets a website covered by either the upstream public registry (Reddit, Amazon, Airbnb, Booking, X, LinkedIn, TikTok, Facebook, Walmart, Target, AliExpress) or one of this installation's private skills (indexed in agent/local/browsing-skills.md). For supported sites, load the site-specific action index at the matching path, then open only the linked reference file for the chosen action. For unsupported sites, fall back to normal browsing — don't force this skill." # kernel-guard-ok: Airbnb here is the upstream public registry skill, not an installation-private one
+edvaPrivate: true
 ---
 
-# Merlin — Browsing Skills
+# Edva — Browsing Skills
 
-This is Merlin's internal browsing-skills registry. It complements (and reuses) the public `browsing-skills/browsing-skills` library by way of the operator's fork (named in `agent/local/browsing-skills.md`). The fork is auto-pulled into `external/` daily by `bin/browsing-skills-sync`.
+This is Edva's internal browsing-skills registry. It complements (and reuses) the public `browsing-skills/browsing-skills` library by way of the operator's fork (named in `agent/local/browsing-skills.md`). The fork is auto-pulled into `external/` daily by `bin/browsing-skills-sync`.
 
 ## When to use
 
@@ -36,7 +36,7 @@ This installation's own site skills — sites tied to its accounts, bookings and
 
 ## How to execute an action
 
-All actions run via Merlin's `chrome-devtools-mcp` against the automation Chrome on `localhost:9222` (see `system/architecture.md` § "Host"). The execution shape is identical to the upstream:
+All actions run via Edva's `chrome-devtools-mcp` against the automation Chrome on `localhost:9222` (see `system/architecture.md` § "Host"). The execution shape is identical to the upstream:
 
 ```js
 // In a playbook step, AFTER navigating to the right URL:

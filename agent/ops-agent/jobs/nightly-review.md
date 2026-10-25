@@ -2,9 +2,9 @@ SELF IMPROVEMENT REVIEW — Weekly holistic system self-assessment and improveme
 
 > **This instance's additions** to this playbook (its own people, places and decisions) are in `agent/local/jobs/nightly-review.md`; the supervisor appends them to the dispatched playbook. If they are not at the end of what you were given (an ephemeral or by-hand run), `Read` that file before you start.
 
-Runs weekly Tuesday at 5:00 AM local (moved from 3:00 AM on 2026-10-22, the user's decision: yesterday's daily summary is written at 4:00 AM, so a 3:00 run read a day that did not exist yet). Analyzes the prior 7 days of conversations, email triage, pulse activity, system health, and external ecosystem developments. Every section should include concrete suggestions for making Merlin smarter, faster, and more helpful. Ends with a prioritized action item list.
+Runs weekly Tuesday at 5:00 AM local (moved from 3:00 AM on 2026-10-22, the user's decision: yesterday's daily summary is written at 4:00 AM, so a 3:00 run read a day that did not exist yet). Analyzes the prior 7 days of conversations, email triage, pulse activity, system health, and external ecosystem developments. Every section should include concrete suggestions for making Edva smarter, faster, and more helpful. Ends with a prioritized action item list.
 
-**Runtime (2026-07-28).** This job no longer runs on the ops supervisor. It runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS --effort xhigh` (`claude-opus-5-5` since 2026-10-06; id pinned in `agent/config/models.env`) launched by the **`ai.claude.improvement-review` launchd user agent** (not cron — cron can't unlock the keychain holding the Max credentials), via `agent/scripts/lib/run-ephemeral-opus.sh`. The user's standing rule is that every improvement-related process runs on the Opus tier — the heavy supervisor has run `claude-sonnet-5` since 2026-07-02, so `"model": "opus"` in `job-routing.json` (a tier label, not a model id) had this running on Sonnet.
+**Runtime (2026-07-28).** This job no longer runs on the ops supervisor. It runs as a dedicated ephemeral `claude -p --model $EDVA_MODEL_OPUS --effort xhigh` (`claude-opus-5-5` since 2026-10-06; id pinned in `agent/config/models.env`) launched by the **`ai.claude.improvement-review` launchd user agent** (not cron — cron can't unlock the keychain holding the Max credentials), via `agent/scripts/lib/run-ephemeral-opus.sh`. The user's standing rule is that every improvement-related process runs on the Opus tier — the heavy supervisor has run `claude-sonnet-5` since 2026-07-02, so `"model": "opus"` in `job-routing.json` (a tier label, not a model id) had this running on Sonnet.
 
 **What happens after you finish (2026-07-28).** On a clean exit the trigger chains **`improvement-plan`**, which reads the state file you write and turns your ACTION ITEMS into Face-ID cards in the Improvements channel — the loop the user used to close by hand. Two consequences for how you work: (a) **Step 4d/6 state is now load-bearing for a downstream job, not just for next week** — an action item that never lands in `suggestions[]` is one the plan pass will never see; (b) **write each item concretely enough to be built from** — what is wrong, which files, how you would verify a fix. A vague item ("improve error handling in triage") gets dropped by the plan job's Step 3 rather than becoming a card. The email is unaffected and still goes out; the cards are additive.
 
@@ -20,14 +20,14 @@ Runs weekly Tuesday at 5:00 AM local (moved from 3:00 AM on 2026-10-22, the user
 5. **Web research is scoped.** Only search for Claude Code / Anthropic / agent-framework topics. No open-ended browsing.
 6. **Freshness — verify before reporting.** Before including ANY issue, alert, or error in the memo:
    - Check git log: was it fixed by a subsequent commit? (`git log --oneline --all --grep="<keyword>"` or scan today's commits)
-   - Check current system state: is the service healthy NOW? (`merlin status`, health endpoints)
+   - Check current system state: is the service healthy NOW? (`edva status`, health endpoints)
    - Check log recurrence: did the error repeat after the initial occurrence, or was it a one-time event that self-healed?
    - If an issue was already fixed or self-resolved, mention it ONLY as "resolved" context, NOT as an open action item.
    - Never report stale alerts as current problems. The user should only see issues that need attention RIGHT NOW.
 
 ## Step 1 — Load previous state
 
-Read `~/Dev/merlin/data/nightly-review-state.json`. If missing, initialize:
+Read `~/Dev/edva/data/nightly-review-state.json`. If missing, initialize:
 ```json
 {"schema_version": 4, "last_run": null, "suggestions": [], "patterns": {"frequent_asks": [], "automation_candidates": []}, "context_gaps": [], "skill_proposals": [], "daily_log_drift": [], "live_day_accuracy": []}
 ```
@@ -42,37 +42,37 @@ Note which suggestions are `pending` (no response yet), `implemented` (YES), or 
 
 Issue the following as a **single parallel batch** when possible — not to stay under a budget, but because it's faster. If any query surfaces something that needs a follow-up (anomaly, gap, unexpected number), absolutely run the follow-up; don't suppress curiosity to fit into one turn.
 
-   In every SQL query below, `<TZ>` is this installation's home time zone: `node ~/Dev/merlin/lib/instance.cjs tz`.
+   In every SQL query below, `<TZ>` is this installation's home time zone: `node ~/Dev/edva/lib/instance.cjs tz`.
 
 1. **Supabase SQL** — phone conversations from the last 7 days:
    ```sql
-   SELECT role, content, created_at FROM merlin_messages
+   SELECT role, content, created_at FROM edva_messages
    WHERE created_at >= (now() AT TIME ZONE '<TZ>')::date::timestamptz - INTERVAL '7 days'
    ORDER BY created_at
    ```
 
 2. **Bash** — email triage stats (last 7 days):
    ```bash
-   ~/Dev/merlin/bin/merlin triage stats --since 7d 2>/dev/null \
-     || ~/Dev/merlin/bin/merlin triage stats 2>/dev/null \
+   ~/Dev/edva/bin/edva triage stats --since 7d 2>/dev/null \
+     || ~/Dev/edva/bin/edva triage stats 2>/dev/null \
      || echo "no triage stats"
    ```
 
 3. **Bash** — system health:
    ```bash
-   ~/Dev/merlin/bin/merlin status 2>/dev/null || echo "status unavailable"
+   ~/Dev/edva/bin/edva status 2>/dev/null || echo "status unavailable"
    ```
 
 4. **Bash** — last 7 days of hum runs, selected by each row's own timestamp (`ts`, UTC ISO). Until 2026-10-22 this grepped for local date strings, which matched any row that merely mentioned a date (an upcoming event, a summary) and missed runs whose UTC stamp fell on the next day:
    ```bash
    SINCE=$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
-   jq -c --arg since "$SINCE" 'select((.ts // "") >= $since)' ~/Dev/merlin/data/hum-runs.jsonl 2>/dev/null | tail -100
+   jq -c --arg since "$SINCE" 'select((.ts // "") >= $since)' ~/Dev/edva/data/hum-runs.jsonl 2>/dev/null | tail -100
    ```
 
 5. **Bash** — last 7 days of hum feedback, by its own timestamp (`sent_at`, falling back to `ts`):
    ```bash
    SINCE=$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
-   jq -c --arg since "$SINCE" 'select(((.sent_at // .ts) // "") >= $since)' ~/Dev/merlin/data/hum-feedback.jsonl 2>/dev/null | tail -50
+   jq -c --arg since "$SINCE" 'select(((.sent_at // .ts) // "") >= $since)' ~/Dev/edva/data/hum-feedback.jsonl 2>/dev/null | tail -50
    ```
 
 6. **Google Calendar** — list events for the prior 7 days (T-7 through T-1).
@@ -80,15 +80,15 @@ Issue the following as a **single parallel batch** when possible — not to stay
 7. **Bash** — last 7 days of watchdog alerts. `watchdog.log` rotates at midnight into `watchdog-YYYY-MM-DD.log` and is then gzipped, so the live file holds only today; until 2026-10-22 this step read only it and saw about 3 hours instead of 7 days. Read every file touched in the last 8 days (`gzip -cdf` passes plain files through; macOS `zcat` cannot read `.gz`) and keep lines by their own leading timestamp (the host's local time):
    ```bash
    SINCE=$(date -v-7d '+%Y-%m-%d %H:%M:%S')
-   find ~/Dev/merlin/agent/logs -maxdepth 1 -name 'watchdog*.log*' -mtime -8 -print0 \
+   find ~/Dev/edva/agent/logs -maxdepth 1 -name 'watchdog*.log*' -mtime -8 -print0 \
      | xargs -0 gzip -cdf 2>/dev/null \
      | awk -v since="$SINCE" 'substr($0,1,19) >= since' | sort \
      | grep -i "alert\|error\|fail\|restart\|crash\|disconnect" | tail -60
    ```
 
-7b. **Bash** — last 7 days of supervisor incident signals. The 2026-04-18 hum outage added structured signals the supervisor emits on auth failures, hung turns, queue backups, hard rotations, and forced outer-watchdog kills. Use the `merlin-logs` CLI to merge the sources and grep for named incidents:
+7b. **Bash** — last 7 days of supervisor incident signals. The 2026-04-18 hum outage added structured signals the supervisor emits on auth failures, hung turns, queue backups, hard rotations, and forced outer-watchdog kills. Use the `edva-logs` CLI to merge the sources and grep for named incidents:
    ```bash
-   ~/Dev/merlin/bin/merlin-logs --last 7d --source ops,chat,launch \
+   ~/Dev/edva/bin/edva-logs --last 7d --source ops,chat,launch \
      --grep "TURN WATCHDOG|AUTH ERROR|AUTH OUTAGE|QUOTA REFUSED|QUEUE ALARM|HARD ROTATION|STUCK|disp .* error|dispatch_error" \
      --no-color | tail -120
    ```
@@ -96,17 +96,17 @@ Issue the following as a **single parallel batch** when possible — not to stay
 
 8. **Bash** — git commits from the last 7 days:
    ```bash
-   cd ~/Dev/merlin && git log --oneline --since="7 days ago" --no-color 2>/dev/null || echo "no commits"
+   cd ~/Dev/edva && git log --oneline --since="7 days ago" --no-color 2>/dev/null || echo "no commits"
    ```
 
 9. **Bash** — reclassified emails (triage corrections):
     ```bash
-    ~/Dev/merlin/bin/email-mem search "reclassified" --limit 30 2>/dev/null || echo "none"
+    ~/Dev/edva/bin/email-mem search "reclassified" --limit 30 2>/dev/null || echo "none"
     ```
 
 10. **Bash** — full git log for the week (for cross-checking fixes against issues):
     ```bash
-    cd ~/Dev/merlin && git log --since="7 days ago" --no-color 2>/dev/null || echo "no commits"
+    cd ~/Dev/edva && git log --since="7 days ago" --no-color 2>/dev/null || echo "no commits"
     ```
 
 11. **Daily Log inputs** — yesterday's summary + every drift signal needed for the Step 3 § "Daily Log accuracy" pass. Run as one parallel batch:
@@ -121,22 +121,22 @@ Issue the following as a **single parallel batch** when possible — not to stay
 
     - **Bash** — yesterday's episode file (markdown narrative as written):
       ```bash
-      HOME_TZ=$(node ~/Dev/merlin/lib/instance.cjs tz)
+      HOME_TZ=$(node ~/Dev/edva/lib/instance.cjs tz)
       YDAY=$(TZ=$HOME_TZ date -v-1d +%Y-%m-%d)
       YMONTH=$(TZ=$HOME_TZ date -v-1d +%Y-%m)
-      cat ~/Dev/merlin/data/episodes/$YMONTH/$YDAY.md 2>/dev/null || echo "no episode file"
+      cat ~/Dev/edva/data/episodes/$YMONTH/$YDAY.md 2>/dev/null || echo "no episode file"
       ```
 
     - **Gmail** — the user's reply to yesterday's "Day of" email (canonical correction channel; a reply saying a day email missed a stop is the prototypical case):
       ```
       mcp__claude_ai_Gmail__search_threads with query:
-      from:<the user's address> to:<Merlin's own address> subject:"Day of" newer_than:2d
+      from:<the user's address> to:<Edva's own address> subject:"Day of" newer_than:2d
       ```
       Get any matching thread's full content; classify the reply against the 6 drift signals in Step 3.
 
     - **Supabase** — chat corrections from today that retroactively reference yesterday:
       ```sql
-      SELECT role, content, created_at FROM merlin_messages
+      SELECT role, content, created_at FROM edva_messages
       WHERE created_at >= (now() AT TIME ZONE '<TZ>')::date::timestamptz
         AND role = 'user'
         AND (content ILIKE '%yesterday%' OR content ILIKE '%we were at%' OR content ILIKE '%I wasn''t at%' OR content ILIKE '%actually that was%' OR content ILIKE '%not%' AND content ~* '\\b(at|in)\\b')
@@ -147,42 +147,42 @@ Issue the following as a **single parallel batch** when possible — not to stay
     - **Bash** — `confirmed-stops.json` entries saved AFTER yesterday's resolve-day finalized. These are user answers that didn't make it into the email (reply arrived after 00:10 local, OR the chat-agent path was broken before today's fix). Each is a candidate for a silent re-render of yesterday's summary:
       ```bash
       YDAY_RUN_AT=$(jq -r '.resolved_day_json.generated_at // empty' <<<"$DAILY_SUM_ROW")
-      jq --arg cutoff "$YDAY_RUN_AT" '[.[] | select(.ts > $cutoff)]' ~/Dev/merlin/data/confirmed-stops.json
+      jq --arg cutoff "$YDAY_RUN_AT" '[.[] | select(.ts > $cutoff)]' ~/Dev/edva/data/confirmed-stops.json
       ```
 
     - **Bash** — yesterday's `unknown_stops[]` from the frozen snapshot, plus today's confirmation state (have any been answered?):
       ```bash
       jq '.resolved_day_json.unknown_stops // []' <<<"$DAILY_SUM_ROW"
-      jq '.' ~/Dev/merlin/data/location-confirm-pending.json
-      jq '.' ~/Dev/merlin/data/location-confirm-recent.json 2>/dev/null || echo "[]"
+      jq '.' ~/Dev/edva/data/location-confirm-pending.json
+      jq '.' ~/Dev/edva/data/location-confirm-recent.json 2>/dev/null || echo "[]"
       ```
 
     - **State** — prior `daily_log_drift[]` history for cross-night pattern detection (the 3-corrections-at-same-centroid auto-promote rule):
       ```bash
-      jq '.daily_log_drift // []' ~/Dev/merlin/data/nightly-review-state.json
+      jq '.daily_log_drift // []' ~/Dev/edva/data/nightly-review-state.json
       ```
 
-12. **How often Merlin was wrong about Merlin — the self-report noise rate** (2026-10-06, the user approved; recomputed every week from existing state, no running counter). The week that added this, 13 of 25 signed fixes were the system misdescribing its own state and 18 of 68 alert clusters were `severity: "noise"`, and nobody tracked either as a number. The arithmetic is code's; reading what a fix was ABOUT is yours (Rule #0b). Two passes:
+12. **How often Edva was wrong about Edva — the self-report noise rate** (2026-10-06, the user approved; recomputed every week from existing state, no running counter). The week that added this, 13 of 25 signed fixes were the system misdescribing its own state and 18 of 68 alert clusters were `severity: "noise"`, and nobody tracked either as a number. The arithmetic is code's; reading what a fix was ABOUT is yours (Rule #0b). Two passes:
     ```bash
-    ~/Dev/merlin/bin/self-report-noise-rate --json > /tmp/self-report-noise-pass1.json
+    ~/Dev/edva/bin/self-report-noise-rate --json > /tmp/self-report-noise-pass1.json
     ```
-    `alerts` is done: the share of system-issue clusters active this week that system-issue-review judged noise, plus the all-time share. `fixes.linked_to_noise_cluster[]` are fixes structurally tied to a noise cluster. Every other applied fix is in `fixes.unlabelled[]` — read each `summary` (and `self-improve-show <id>` when the summary is not enough) and decide one thing: **was the defect this fixed Merlin misdescribing its own state** (a report, alert, log or status saying something about Merlin that was false — a success read as failure, a job reported missing that ran, a healthy check paging), yes or no. A fix to the user's data or to an external integration's behaviour is `false`. Write the answers to `/tmp/self-report-labels.json` as `{"<id>": true|false}` and re-run:
+    `alerts` is done: the share of system-issue clusters active this week that system-issue-review judged noise, plus the all-time share. `fixes.linked_to_noise_cluster[]` are fixes structurally tied to a noise cluster. Every other applied fix is in `fixes.unlabelled[]` — read each `summary` (and `self-improve-show <id>` when the summary is not enough) and decide one thing: **was the defect this fixed Edva misdescribing its own state** (a report, alert, log or status saying something about Edva that was false — a success read as failure, a job reported missing that ran, a healthy check paging), yes or no. A fix to the user's data or to an external integration's behaviour is `false`. Write the answers to `/tmp/self-report-labels.json` as `{"<id>": true|false}` and re-run:
     ```bash
-    ~/Dev/merlin/bin/self-report-noise-rate --json --labels /tmp/self-report-labels.json
+    ~/Dev/edva/bin/self-report-noise-rate --json --labels /tmp/self-report-labels.json
     ```
     Use the numbers exactly as printed — do not recount by hand. `fixes.complete` must be `true` before you quote the fix rate as final; if anything is still unlabelled, say so in the memo. Compare against last week's `self_report_noise` in this job's state (Step 1) for the trend.
-13. **Bash** — replies Merlin rewrote after the user could already see them (added 2026-10-06). The chat row holds only the corrected text; the version it replaced is kept ONLY here, in a local append-only log (`lib/superseded-replies.mjs`, written by phone-channel's send-then-correct freshness rewrite before it overwrites the row). This is the only way the review can find a wrong figure that reached their phone and was quietly fixed — a wrong money figure in a draft reply is the motivating case:
+13. **Bash** — replies Edva rewrote after the user could already see them (added 2026-10-06). The chat row holds only the corrected text; the version it replaced is kept ONLY here, in a local append-only log (`lib/superseded-replies.mjs`, written by phone-channel's send-then-correct freshness rewrite before it overwrites the row). This is the only way the review can find a wrong figure that reached their phone and was quietly fixed — a wrong money figure in a draft reply is the motivating case:
     ```bash
-    SINCE=$(TZ=$(node ~/Dev/merlin/lib/instance.cjs tz) date -v-7d +%Y-%m-%d)
+    SINCE=$(TZ=$(node ~/Dev/edva/lib/instance.cjs tz) date -v-7d +%Y-%m-%d)
     jq -c --arg s "$SINCE" 'select(.ts >= $s) | {ts, reason, row_id, original, replacement}' \
-      ~/Dev/merlin/data/superseded-replies.jsonl 2>/dev/null || echo "none"
+      ~/Dev/edva/data/superseded-replies.jsonl 2>/dev/null || echo "none"
     ```
     In § Conversations, read each row and judge (you, not a pattern match) whether the superseded text stated a **money** or **health** figure or claim that was wrong. Every such row is a finding: name the figure that reached them, what replaced it, and which source fed the wrong one. Quote money/health text in the email only as far as needed to identify the incident. Count superseded replies per week alongside the other self-report numbers.
 
 14. **Bash** — the hum improvement loop (added 2026-10-07, the user's request: larger, structural changes go in the weekly improvement recommendation email). The loop's routing is `lib/hum-ideas.mjs`: safe ideas land on their own, high-risk ones become a card, ones needing their yes are asked in the hum chat, and ideas too big for one unattended run have NO other way to reach them but this email.
     ```bash
-    ~/Dev/merlin/bin/hum-ideas-reconcile >/dev/null 2>&1 || true   # settle ledger status against the cards first
-    ~/Dev/merlin/bin/hum-ideas-brief --json > /tmp/hum-ideas-brief.json
+    ~/Dev/edva/bin/hum-ideas-reconcile >/dev/null 2>&1 || true   # settle ledger status against the cards first
+    ~/Dev/edva/bin/hum-ideas-brief --json > /tmp/hum-ideas-brief.json
     ```
     `structural[]` is the part that matters: each is a change too large to design and land in one run, waiting for their call. Report them in Step 5's HUM — IMPROVEMENT LOOP section in plain language (what is wrong today, why it matters, what the change would do, what it could affect — the same four parts as every other item); do NOT file a card or build anything for them here. Report `landed[]` as one line so they can see the loop working. Read-only: never edit `hum-improvement-ideas.jsonl` from this step.
 
@@ -204,7 +204,7 @@ Issue these web searches in a **single parallel batch** using WebSearch. Capped 
 
 The previously-separate `triage-learning` cron (daily 9 PM) is now a step in this review. One Opus dispatch instead of two.
 
-Update `~/Dev/merlin/data/email-triage-playbook.md` based on the last 7 days of email outcomes:
+Update `~/Dev/edva/data/email-triage-playbook.md` based on the last 7 days of email outcomes:
 
 1. **Find sent replies:** Gmail search `is:sent newer_than:7d`. For each sent message, get the thread, find the original inbound, check email-mem for the agent's classification.
 2. **Find priority miscalibrations:** cross-reference `is:sent newer_than:7d` with emails the agent archived (P3). Any match = underclassified; should have been P2.
@@ -225,16 +225,16 @@ Added 2026-04-23 alongside the per-turn job attribution in supervisor/index.mjs.
 
 ```bash
 # 7d cost rollup by job (structured)
-~/Dev/merlin/bin/merlin-cost-report --since 7d --json
+~/Dev/edva/bin/edva-cost-report --since 7d --json
 
 # 7d cost trend (per-day × per-job grid)
-~/Dev/merlin/bin/merlin-cost-report --since 7d --trend --json
+~/Dev/edva/bin/edva-cost-report --since 7d --trend --json
 
 # 7d vs prior-period outliers (auto-flagged — primary signal)
-~/Dev/merlin/bin/merlin-cost-report --outliers --json
+~/Dev/edva/bin/edva-cost-report --outliers --json
 ```
 
-If `merlin-cost-report` errors with "no job-costs.ndjson" the supervisor hasn't written any turns yet (e.g. it was restarted <1 tick ago) — skip this section for this run and say so in the memo.
+If `edva-cost-report` errors with "no job-costs.ndjson" the supervisor hasn't written any turns yet (e.g. it was restarted <1 tick ago) — skip this section for this run and say so in the memo.
 
 **What to surface in the memo:**
 
@@ -275,7 +275,7 @@ Added 2026-08-09. Recall is the one capability whose decay is **completely invis
 
 ```bash
 # ~80 local embeds, a few seconds, no API cost
-~/Dev/merlin/bin/wiki-recall-eval --json
+~/Dev/edva/bin/wiki-recall-eval --json
 ```
 
 27 hand-keyed questions taken from the user's own chat history, scored against the live corpus in three classes (`episodic` / `curated` / `asked`). Answer keys were verified by direct substring over `body_md`, not by the retriever, so the set cannot drift into grading the system against itself.
@@ -293,7 +293,7 @@ Added 2026-08-09. Recall is the one capability whose decay is **completely invis
 2. **A config that has overtaken the production one.** If `fts` starts beating `+cues` overall, the semantic layer has stopped earning its place and should be re-examined rather than left on.
 3. **Nothing at all if it is flat.** This lens is a tripwire; a quiet night deserves one line, not a paragraph.
 
-**Do not tune thresholds against this set.** 27 cases is enough to catch a regression and far too few to fit a constant to — that is how you get a number that scores well here and worse everywhere else. If the set itself starts feeling stale (queries all passing, no headroom), the fix is to add real questions from `merlin_messages`, not to relax the retriever. Rationale and full history: `system/wiki-architecture.md` § Measuring recall.
+**Do not tune thresholds against this set.** 27 cases is enough to catch a regression and far too few to fit a constant to — that is how you get a number that scores well here and worse everywhere else. If the set itself starts feeling stale (queries all passing, no headroom), the fix is to add real questions from `edva_messages`, not to relax the retriever. Rationale and full history: `system/wiki-architecture.md` § Measuring recall.
 
 ## Step 3 — Analyze and recommend
 
@@ -308,16 +308,16 @@ With all data loaded, analyze across these dimensions. **Every section must incl
 
 ### Daily Log accuracy (location + activity narrative)
 
-The 00:10 local daily-summary email is Merlin's foundational record of where the user was and what they did the prior day — every inaccuracy degrades the system's awareness of their life and downgrades the quality of every future suggestion that depends on it. This section is FIRST-CLASS, not an optional sub-pass. Walk it every night, even on quiet days, and surface drift as concrete proposals.
+The 00:10 local daily-summary email is Edva's foundational record of where the user was and what they did the prior day — every inaccuracy degrades the system's awareness of their life and downgrades the quality of every future suggestion that depends on it. This section is FIRST-CLASS, not an optional sub-pass. Walk it every night, even on quiet days, and surface drift as concrete proposals.
 
 **The 6 drift signals to walk in order:**
 
-1. **Email reply correction.** Did the user reply to yesterday's "Day of" thread? Parse the reply for the failure pattern. The prototypical case is a day email that missed a lunch stop and a walk — Merlin's own follow-up found that several 6-9 min stops along the walk got dropped by the 15-min dwell floor. For each correction:
+1. **Email reply correction.** Did the user reply to yesterday's "Day of" thread? Parse the reply for the failure pattern. The prototypical case is a day email that missed a lunch stop and a walk — Edva's own follow-up found that several 6-9 min stops along the walk got dropped by the 15-min dwell floor. For each correction:
    - Identify the exact stop, gap, or mislabel.
    - Classify the fix path: (a) **threshold/floor change** if the data was in raw GPS but filtered out (e.g., `min_stop_min` too aggressive for walk-loops); (b) **data-source fix** if the data was missing (e.g., GPS gap, photo not indexed); (c) **resolver mislabel** → propose a `confirmed-stops.json` entry for future auto-resolution at that centroid; (d) **playbook drift** if the narrator chose to omit something the resolver provided.
    - Surface as an action item with the specific file/line to change.
 
-2. **Chat correction from today about yesterday.** Today's `merlin_messages` show the user retroactively correcting ("we were at X, not Y" / "actually that was Z" / "I wasn't at the dentist"). Same fix-path classification. Cross-reference yesterday's `resolved_day_json.stops[]` to find the corrected stop and propose the patch.
+2. **Chat correction from today about yesterday.** Today's `edva_messages` show the user retroactively correcting ("we were at X, not Y" / "actually that was Z" / "I wasn't at the dentist"). Same fix-path classification. Cross-reference yesterday's `resolved_day_json.stops[]` to find the corrected stop and propose the patch.
 
 3. **Unknown stop unanswered.** Yesterday's email surfaced `unknown_stops[]` as questions in the "Corrections & follow-ups" section. Did the user answer any in chat or email? If yes, propose patching `location_history` retroactively + silent re-render of yesterday's summary. If no, decide: re-ask once more this morning (one-shot, gentle), or accept as truly forgotten and stop asking.
 
@@ -327,9 +327,9 @@ The 00:10 local daily-summary email is Merlin's foundational record of where the
 
 6. **Repeat mislabel pattern (cross-night).** Cross-check today's drifts against `daily_log_drift[]` history. The 1-correction auto-promote in Step 6 already handles authoritative single-reply cases; this signal is for unconfirmed heuristic mislabels — e.g., the resolver picks the same wrong OSM venue at the same centroid 3 days running but the user never explicitly corrected it. Surface as an action item asking the user to confirm the actual venue, then auto-promote on their single reply.
 
-7. **Phantom location questions (since 2026-10-07).** For each day in the window run `~/Dev/merlin/bin/ask-gate audit <YYYY-MM-DD> --tz <that day's timezone>`. Every entry in `phantoms[]` is a location question they answered that the ask gate now refuses: a slice of a stay they never left (`same-stay`) or a stop with no point away from it afterwards (`no-departure`). On days after 2026-10-07 each one means a question got past `ask-gate` — surface it as an action item naming the stop, the check and the ask path that sent it (`data/ask-gate-log.jsonl` shows whether the gate ran for that `visit_id`). Zero phantoms is the expected result; say so in one line.
+7. **Phantom location questions (since 2026-10-07).** For each day in the window run `~/Dev/edva/bin/ask-gate audit <YYYY-MM-DD> --tz <that day's timezone>`. Every entry in `phantoms[]` is a location question they answered that the ask gate now refuses: a slice of a stay they never left (`same-stay`) or a stop with no point away from it afterwards (`no-departure`). On days after 2026-10-07 each one means a question got past `ask-gate` — surface it as an action item naming the stop, the check and the ask path that sent it (`data/ask-gate-log.jsonl` shows whether the gate ran for that `visit_id`). Zero phantoms is the expected result; say so in one line.
 
-8. **Questions they had already answered (since 2026-10-08).** For each day in the window run `~/Dev/merlin/bin/stop-evidence audit <YYYY-MM-DD> --tz <that day's timezone>`. Every entry in `would_have_named[]` is a stop they were asked about although the chat or their own photos already said where they were — their words, Merlin naming the place from their photo and them going along with it, or a sign in a photo. The case that built it: a lunch stop asked about an hour after they had sent a photo saying they were having lunch there and Merlin had named the place. The step (`lib/stop-evidence.mjs`, run inside `stop-passage` before every ask) should have caught these live, so each hit is a defect: surface it as an action item naming the stop, the basis the audit found, and why the live run missed it. The `stop-passage-log.jsonl` row for that `visit_id` shows whether the probe held, what evidence the step saw and what it decided. Zero is the expected result; say so in one line.
+8. **Questions they had already answered (since 2026-10-08).** For each day in the window run `~/Dev/edva/bin/stop-evidence audit <YYYY-MM-DD> --tz <that day's timezone>`. Every entry in `would_have_named[]` is a stop they were asked about although the chat or their own photos already said where they were — their words, Edva naming the place from their photo and them going along with it, or a sign in a photo. The case that built it: a lunch stop asked about an hour after they had sent a photo saying they were having lunch there and Edva had named the place. The step (`lib/stop-evidence.mjs`, run inside `stop-passage` before every ask) should have caught these live, so each hit is a defect: surface it as an action item naming the stop, the basis the audit found, and why the live run missed it. The `stop-passage-log.jsonl` row for that `visit_id` shows whether the probe held, what evidence the step saw and what it decided. Zero is the expected result; say so in one line.
 
 **Cross-cutting health metrics to surface every run:**
 
@@ -346,7 +346,7 @@ DRIFT [signal-type] · YYYY-MM-DD · stop=<HH:MM-HH:MM>
   fix: <specific file + change> · classification: <auto-apply | needs-setup | moonshot>
 ```
 
-Quality over quantity. Don't pad with low-signal drift; the section is for items that actually changed Merlin's behavior or that build toward a recurring fix. Empty sections are honest — say `no drift this run` if the day was clean.
+Quality over quantity. Don't pad with low-signal drift; the section is for items that actually changed Edva's behavior or that build toward a recurring fix. Empty sections are honest — say `no drift this run` if the day was clean.
 
 **Live-Day Accuracy Verification (NEW 2026-04-30)**
 
@@ -355,8 +355,8 @@ This sub-pass runs every review (one walk per day of the window). **The old exit
 Run for yesterday:
 
 ```bash
-YDAY=$(TZ=$(node ~/Dev/merlin/lib/instance.cjs tz) date -v-1d +%Y-%m-%d)
-~/Dev/merlin/bin/live-day accuracy "$YDAY"
+YDAY=$(TZ=$(node ~/Dev/edva/lib/instance.cjs tz) date -v-1d +%Y-%m-%d)
+~/Dev/edva/bin/live-day accuracy "$YDAY"
 ```
 
 Returns:
@@ -383,7 +383,7 @@ Returns:
 
 **Retired: `verified_correctness` and the 99%-for-7-days streak (2026-10-06).**
 
-This was meant to be the lagging truth metric — `1 - drift_count / interval_count` back-filled at T+7 from `daily_log_drift[]`, with a milestone ping after 7 days at ≥99% and a downgrade to weekly. It never produced a figure: `verified_correctness` was null on all 64 stored days, because the drift ledger it counted was written only by this playbook, by hand, and went silent after 2026-09-18. The user chose on the 2026-10-06 review to retire it rather than keep reporting a programme that does not run. **Do not compute it, back-fill it, track a streak, send the milestone ping, or mention it in the email.** The honest correctness number is `name_accuracy` above — and when it is null, say "no correctable evidence", never a substitute. The drift ledger itself is NOT retired: since 2026-10-06 code writes a row whenever an answer corrects Merlin's guess (see the `daily_log_drift[]` note at the top), and those rows are what the Daily Log accuracy pass reads.
+This was meant to be the lagging truth metric — `1 - drift_count / interval_count` back-filled at T+7 from `daily_log_drift[]`, with a milestone ping after 7 days at ≥99% and a downgrade to weekly. It never produced a figure: `verified_correctness` was null on all 64 stored days, because the drift ledger it counted was written only by this playbook, by hand, and went silent after 2026-09-18. The user chose on the 2026-10-06 review to retire it rather than keep reporting a programme that does not run. **Do not compute it, back-fill it, track a streak, send the milestone ping, or mention it in the email.** The honest correctness number is `name_accuracy` above — and when it is null, say "no correctable evidence", never a substitute. The drift ledger itself is NOT retired: since 2026-10-06 code writes a row whenever an answer corrects Edva's guess (see the `daily_log_drift[]` note at the top), and those rows are what the Daily Log accuracy pass reads.
 
 **Persist every drift to `nightly-review-state.json.daily_log_drift[]`** with shape:
 
@@ -424,19 +424,19 @@ This was meant to be the lagging truth metric — `1 - drift_count / interval_co
 - **Recommend:** specific fixes for any open issues. Architecture changes for recurring problems. If a specific dispatch source keeps tripping the turn watchdog, propose either a per-playbook timeout or a prompt change that avoids the hang.
 
 ### Claude Code & Anthropic ecosystem
-- New Claude Code features worth adopting — which ones, and how they'd improve Merlin.
+- New Claude Code features worth adopting — which ones, and how they'd improve Edva.
 - Anthropic releases — model upgrades, API changes, pricing impacts.
 - Community innovations — MCP servers, CLAUDE.md techniques, hook patterns worth stealing.
 - **Recommend:** specific features to adopt with implementation sketch (which files, what changes).
 
 ### Agent research & self-improvement
-- Practical memory/autonomy/RL techniques applicable to Merlin.
+- Practical memory/autonomy/RL techniques applicable to Edva.
 - Only items that are implementable with our current stack (Node.js, Claude Code, Supabase, file-based state).
 - **Recommend:** specific architectural changes with effort estimate (quick win / half-day / multi-day).
 
 ### Tools & Integrations — aggressive capability wishlist
 
-**This section is a brainstorming engine, not a triage gate.** The goal is to surface *new external capabilities* Merlin could gain by wiring in an API, MCP server, SDK, hardware sensor, or service — things that expand what Merlin can *do*, not just what it knows. Propose generously; classification below lets the user filter the noise.
+**This section is a brainstorming engine, not a triage gate.** The goal is to surface *new external capabilities* Edva could gain by wiring in an API, MCP server, SDK, hardware sensor, or service — things that expand what Edva can *do*, not just what it knows. Propose generously; classification below lets the user filter the noise.
 
 **Walk every category on every review.** For each, ask: "what's the highest-leverage integration we haven't built yet, given how the user actually spent today?" If no credible idea surfaces for a category, say `no fit today` — don't silently skip.
 
@@ -447,10 +447,10 @@ This was meant to be the lagging truth metric — `1 - drift_count / interval_co
 - **Financial & markets** — brokerage read-only beyond the connected one (other brokerages), bank-txn feeds (Plaid read-only), crypto portfolio (CoinGecko / CMC / ledger addresses), real-estate valuation (Zillow / Redfin).
 - **Vision & OCR** — document OCR (receipt → expense), business-card scan, whiteboard photo → structured notes, product recognition (visual shopping), handwriting → text (iOS ScribbleKit), license-plate reading.
 - **Reservations & booking** — OpenTable / Resy / Tock, event-ticketing platforms, SeatGeek / Vivid / StubHub secondary, Calendly reverse-booking, Uber / Lyft ride request, Zocdoc for appointments.
-- **Communication & relationship** — Twilio SMS (dedicated Merlin number for third-party comms instead of the user's iMessage), Signal bridge, WhatsApp business, LinkedIn messaging (authorized only), Zoom / Meet scheduling via API, contact-enrichment (Clearbit / Apollo).
+- **Communication & relationship** — Twilio SMS (dedicated Edva number for third-party comms instead of the user's iMessage), Signal bridge, WhatsApp business, LinkedIn messaging (authorized only), Zoom / Meet scheduling via API, contact-enrichment (Clearbit / Apollo).
 - **Productivity & dev** — Linear / Jira / Asana bridges, GitHub beyond current (issues triage, PR comments as tasks), Notion / Coda / Airtable reads, Pinecone / Weaviate / Chroma for vector memory (complements the nomic-embed-text experiment).
 - **Media & entertainment** — JustWatch (fills a streaming-platform lookup gap), Letterboxd export, Last.fm / Spotify listening history, Goodreads / Hardcover, Criterion / MUBI indie libraries.
-- **Health & wearables** — Oura / Whoop if the user adds one, continuous glucose monitors, Dexcom / Libre, Fitbit bridge (if relevant), Strava for runs, MyFitnessPal for calorie tracking, Apple Health → Merlin push webhooks for anomaly triggers.
+- **Health & wearables** — Oura / Whoop if the user adds one, continuous glucose monitors, Dexcom / Libre, Fitbit bridge (if relevant), Strava for runs, MyFitnessPal for calorie tracking, Apple Health → Edva push webhooks for anomaly triggers.
 
 **Classification per proposal (pick exactly one):**
 
@@ -461,7 +461,7 @@ This was meant to be the lagging truth metric — `1 - drift_count / interval_co
 **Output per proposal** (terse — 3 lines max, this is the brainstorm scan, not a design doc):
 
 ```
-<name> — <one-line what it unlocks for Merlin, grounded in a specific the user moment if possible>
+<name> — <one-line what it unlocks for Edva, grounded in a specific the user moment if possible>
 <API / vendor / stack> · <classification: [auto-apply] | [needs-setup] | [moonshot]>
 <the single blocker: credential, vendor signup, hardware, research, etc.>
 ```
@@ -482,18 +482,18 @@ POST http://localhost:9093/dispatch
 Body: {"content": "INTEGRATION IMPLEMENT: <id> <name>", "source": "chat-agent"}
 ```
 
-Ops-agent then reads the `integration_proposals` entry for full spec and builds the wrapper + wires it through the normal tool/playbook/MEMORY cycle per `merlin-docs-sync`. Treat this like the existing `RECLASSIFICATION ACCEPT` flow pattern: ops-agent loads the spec, applies the change, commits, restarts the affected supervisor(s). For `[needs-setup]` items, chat-agent instead surfaces the blocker list so the user can kick off the manual steps — do NOT dispatch a build until they say the blocker is resolved.
+Ops-agent then reads the `integration_proposals` entry for full spec and builds the wrapper + wires it through the normal tool/playbook/MEMORY cycle per `edva-docs-sync`. Treat this like the existing `RECLASSIFICATION ACCEPT` flow pattern: ops-agent loads the spec, applies the change, commits, restarts the affected supervisor(s). For `[needs-setup]` items, chat-agent instead surfaces the blocker list so the user can kick off the manual steps — do NOT dispatch a build until they say the blocker is resolved.
 
-### Context gaps — what Merlin wants to know
+### Context gaps — what Edva wants to know
 
-This is Merlin's self-assessment of its own blindspots. Review today's conversations, triage events, pulse runs, and any moments where the system had to ask a clarifying question, made a wrong assumption, guessed when it should have known, or couldn't help because context was missing.
+This is Edva's self-assessment of its own blindspots. Review today's conversations, triage events, pulse runs, and any moments where the system had to ask a clarifying question, made a wrong assumption, guessed when it should have known, or couldn't help because context was missing.
 
 For each gap identified, provide:
 - **Gap**: what information was missing
 - **When it mattered**: specific moment from today (or recurring pattern from `patterns` in state file)
-- **What it would unlock**: concrete service improvement — be specific about what Merlin could DO differently
+- **What it would unlock**: concrete service improvement — be specific about what Edva could DO differently
 - **How to close it**: one of these approaches, in order of preference:
-  1. **Infer from existing data** — can Merlin derive this from signals it already has? (calendar patterns → daily routine, email frequency → work hours, location history → frequent places)
+  1. **Infer from existing data** — can Edva derive this from signals it already has? (calendar patterns → daily routine, email frequency → work hours, location history → frequent places)
   2. **New sensor/integration** — iOS HealthKit, Apple Watch, Home Assistant, car GPS, browser history, screen time
   3. **Background observation** — the phone app could passively report this without the user doing anything (e.g., continuous location, motion activity, ambient noise level, Wi-Fi network name → "at home" vs "at office")
   4. **Ask the user once** — a one-time question that fills a permanent knowledge gap (e.g., "which credit card do you prefer for travel purchases?")
@@ -527,7 +527,7 @@ For each gap identified, provide:
 **Framing rules:**
 - Present gaps as a WISH LIST. "If I knew X, I could help you with Y" — always lead with the value, not the data collection.
 - **Ground most gaps in today's interactions** — specific moments where better context would have helped. These are the high-priority, immediately actionable ones.
-- **But also dream.** Once or twice per review, include a speculative "moonshot" gap — something ambitious, maybe even crazy, that would fundamentally change what Merlin can do. Examples:
+- **But also dream.** Once or twice per review, include a speculative "moonshot" gap — something ambitious, maybe even crazy, that would fundamentally change what Edva can do. Examples:
   - "If I had your Apple Watch health data, I could correlate your resting heart rate with decision quality and suggest holding off on big calls when your HRV is low"
   - "If I could listen to ambient audio (with consent), I could detect when you're in a social dinner vs alone and adjust my interruption threshold in real-time"
   - "If I had read access to your browser tabs, I could anticipate what you're researching and pre-fetch related information before you ask"
@@ -547,7 +547,7 @@ Every nightly review MUST brainstorm whether skills should be added, updated, or
    - Did today's work reveal a new pattern the skill should codify (a new query shape, a new failure mode, a new clinical scenario, a new data source)?
    - Is the skill's `description` frontmatter specific enough that future Claude sessions will invoke it when relevant? (Generic descriptions → skill sits unused.)
    - For `health-support`: did the user confirm new medication/allergy/condition data, a new trip, or a new clinical finding that should update the medication reference, data-source dictionary, or conditions list?
-   - For `merlin-docs-sync`, `merlin-job-author`, `outbound-comms-policy`: did today's changes expose a pattern the skill missed (a new failure mode, a new channel, a new authoritative doc)?
+   - For `edva-docs-sync`, `edva-job-author`, `outbound-comms-policy`: did today's changes expose a pattern the skill missed (a new failure mode, a new channel, a new authoritative doc)?
    - For `secrets-1password`: did any secret get rotated, added, or expire? Is the expiration table synced with `~/.claude/CLAUDE.md`?
 
 2. **Did any recurring friction point emerge today that suggests a new skill?** Signals to watch for in the data:
@@ -577,7 +577,7 @@ Before writing the email, spawn **one** `Agent` subagent (general-purpose) that 
 
 Prompt for the critic (tune to match this day's draft, don't paste verbatim):
 
-> You are a second reviewer of a draft self-improvement review for Merlin, an always-on AI assistant. Below is the assembled analysis across conversations / triage / hum / system health / ecosystem / research / context gaps / skills.
+> You are a second reviewer of a draft self-improvement review for Edva, an always-on AI assistant. Below is the assembled analysis across conversations / triage / hum / system health / ecosystem / research / context gaps / skills.
 >
 > Your job: find **1–2** concrete blind spots. Candidates:
 > - A claim in the draft that's stated confidently but may be wrong (fact errors, miscounted events, misattributed causes).
@@ -640,7 +640,7 @@ And for **this** week's items, the forecast: how many look likely to apply thems
 
 > **This ordering is the fix for the state-finalization cutoff (2026-06-28).** Twice in a row a run applied + committed improvements but `nightly-review-state.json` never updated — `last_run` stayed days stale and the applied list stayed `[]` — because the expensive email build/send (Step 5) and the bulk state write (Step 6) sat *after* the apply gate, and the run's turn budget ran out / the session rotated before they ran. The email is recoverable; the bookkeeping is not. So write the load-bearing fields HERE, immediately after the stage gate, before spending any budget on the email. (The mechanics changed 2026-08-24 — staging a card instead of committing — but this cutoff risk and its fix are unchanged.)
 
-Do this now — a cheap read-modify-write on `~/Dev/merlin/data/nightly-review-state.json`, do NOT defer it to Step 6:
+Do this now — a cheap read-modify-write on `~/Dev/edva/data/nightly-review-state.json`, do NOT defer it to Step 6:
 - `last_run` = now (ISO 8601) — this is the completion marker the trigger/doctor read to know the run finalized
 - `auto_apply.last_night_staged` / `last_night_blocked` / `last_night_deferred` = the item IDs from Step 4c (empty arrays if none)
 - `auto_apply.last_night_classifications` = the full Step 4a array
@@ -650,7 +650,7 @@ Step 6 below re-writes the complete state (these fields **plus** patterns / cont
 
 ## Step 5 — Build and send email
 
-Write an HTML email body to `/tmp/nightly-review-<YYYYMMDD>.html`. Phone-optimized — short, scannable, no emojis. Any external URL referenced (research links, Anthropic/agent-framework docs, commits) goes through `~/Dev/merlin/bin/og-card` — see ops-agent CLAUDE.md → "Use og-card for every URL in outbound email".
+Write an HTML email body to `/tmp/nightly-review-<YYYYMMDD>.html`. Phone-optimized — short, scannable, no emojis. Any external URL referenced (research links, Anthropic/agent-framework docs, commits) goes through `~/Dev/edva/bin/og-card` — see ops-agent CLAUDE.md → "Use og-card for every URL in outbound email".
 
 **Each section should contain its own inline recommendations**, not just observations. The reader should finish each section knowing exactly what to do.
 
@@ -692,9 +692,9 @@ Suggested: [threshold/weight tuning]
 HUM — IMPROVEMENT LOOP
 [From `hum-ideas-brief` (Step 2 item 14). One line on what landed on its own this week. Then each bigger change that needs their call, in plain language: what hum does today that is not working, why it matters, what the change would do, what it could affect. Omit the section entirely when `structural[]` is empty and nothing landed.]
 
-SELF-REPORT ACCURACY — how often Merlin was wrong about Merlin
+SELF-REPORT ACCURACY — how often Edva was wrong about Edva
 Alerts: [noise_active] of [clusters_active] alert clusters this week were noise ([noise_rate]); all time [noise_all_time] of [clusters_all_time]. Last week: [prior].
-Fixes: [self_misreport] of [applied] fixes applied this week corrected Merlin misdescribing its own state ([self_misreport_rate]). Last week: [prior].
+Fixes: [self_misreport] of [applied] fixes applied this week corrected Edva misdescribing its own state ([self_misreport_rate]). Last week: [prior].
 [Numbers verbatim from Step 2 item 12. Name the two or three largest instances in a line each. If the rate went up, that is an action item: the shared cause (a status vocabulary, an exit code read as failure, a check that cannot tell "could not check" from "fine"), not one patch per instance.]
 
 SYSTEM
@@ -714,7 +714,7 @@ TOOLS & INTEGRATIONS — new external capabilities
 [Classifications: [auto-apply] (accept dispatches ops-agent to build) | [needs-setup] (the user does manual step first) | [moonshot] (research / big build)]
 [Grounded in today's moments where possible]
 
-CONTEXT GAPS — what would make Merlin smarter
+CONTEXT GAPS — what would make Edva smarter
 [3-5 specific information gaps from today's interactions]
 For each: Gap → What it unlocks → How to close it (infer / sensor / app feature / ask once / ask in context)
 [Privacy: low/med/high] [Effort: quick/half-day/multi-day]
@@ -756,12 +756,12 @@ ACTION ITEMS (prioritized)
 Reply: "1: YES" / "2: NO" / "3: LATER" etc.
 ```
 
-Deliver — email, Gmail labels, phone pointer and push in ONE command (2026-10-05: delivery via digest-deliver; the Step 7 pointer + push moved here). `bin/digest-deliver` sends, finds the message by exact subject (bounded wait), labels `personal` + star + mark read, verifies it is still in the INBOX, then sends the pointer and the push. Do not hand-run `email-send`, `gmail-action`, `merlin-send-curl` or `merlin-notify` for delivery. **No `p1`** (a Merlin-initiated digest is not P1 per the 2026-08-17 correction) and no P1 triage-style re-notification — the pointer is the only ping. No content on the phone channel — the full review lives in email:
+Deliver — email, Gmail labels, phone pointer and push in ONE command (2026-10-05: delivery via digest-deliver; the Step 7 pointer + push moved here). `bin/digest-deliver` sends, finds the message by exact subject (bounded wait), labels `personal` + star + mark read, verifies it is still in the INBOX, then sends the pointer and the push. Do not hand-run `email-send`, `gmail-action`, `edva-send-curl` or `edva-notify` for delivery. **No `p1`** (a Edva-initiated digest is not P1 per the 2026-08-17 correction) and no P1 triage-style re-notification — the pointer is the only ping. No content on the phone channel — the full review lives in email:
 ```bash
-HOME_TZ=$(node ~/Dev/merlin/lib/instance.cjs tz)
+HOME_TZ=$(node ~/Dev/edva/lib/instance.cjs tz)
 DATE=$(TZ=$HOME_TZ date +%Y-%m-%d)
 SUBJECT="Self Improvement Review — $DATE"
-~/Dev/merlin/bin/digest-deliver \
+~/Dev/edva/bin/digest-deliver \
   --subject "$SUBJECT" \
   --body-file /tmp/nightly-review-$(TZ=$HOME_TZ date +%Y%m%d).html \
   --intent nightly-review \
@@ -775,7 +775,7 @@ Exit 0 = done. Exit 1 = the email did not send and nothing else ran — note it 
 
 This re-writes the complete state. The load-bearing subset was already written in Step 4d — re-affirm it here and add the rest; do NOT skip this step just because 4d ran. Everything below is idempotent (set-to-current-value), so re-writing `last_run` / `last_night_staged` / `last_night_classifications` is harmless.
 
-Update `~/Dev/merlin/data/nightly-review-state.json`:
+Update `~/Dev/edva/data/nightly-review-state.json`:
 - Set `last_run` to now (ISO 8601)
 - Append this run's action items (top 5) with `status: "pending"`, `response: null`. **Each suggestion additionally carries the Step 4a classification fields:** `risk`, `risk_before_rails`, `category`, `classifier_rationale`, `rails_hits`, `auto_actionable`. Staged items also carry `self_improve_request_id`, `critic_verdict`, `doctor_before`, `doctor_after`, and (when blocked) `reverted_reason`
 - Update `auto_apply.last_night_classifications` with the full JSON array from Step 4a. If the kill switch was on, also populate `auto_apply.last_night_staged`, `auto_apply.last_night_blocked`, `auto_apply.last_night_deferred` with the item IDs from Step 4c

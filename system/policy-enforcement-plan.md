@@ -11,7 +11,7 @@ Three rules have already made this jump, each documenting why in its own comment
 |---|---|---|
 | Rule #0b — no regex on language | `lint-no-language-regex`, pre-commit | *"broken four times when the user raised it, and a fifth time the same day by an agent that had read this file at session start"* |
 | No `git add -A` | pre-commit manifest check | *"Prose did not hold; the hook does."* |
-| No fabricated outage pages | `INFRA_CLAIM_RE` in `merlin-send-curl` | *"that fix was prose-only, and prose does not hold. This is the technical gate."* |
+| No fabricated outage pages | `INFRA_CLAIM_RE` in `edva-send-curl` | *"that fix was prose-only, and prose does not hold. This is the technical gate."* |
 
 Two more went in on 2026-08-04 for the same reason: the retrospective-ask daily
 cap (`hum-ping` exit 10 — the prose cap *"one message per run"* is exactly what
@@ -51,8 +51,8 @@ a prompt-injection adversary, defended by nothing but the model remembering it.
    and its location so an agent reading the error learns the policy rather than
    hunting for a workaround.
 2. **No env override.** Every other gate in the repo has one
-   (`MERLIN_ALLOW_BARE_COMMIT`, `EMAIL_SEND_ALLOW_DASHES`,
-   `MERLIN_INFRA_PROBE`). This one must not, because the threat model is an
+   (`EDVA_ALLOW_BARE_COMMIT`, `EMAIL_SEND_ALLOW_DASHES`,
+   `EDVA_INFRA_PROBE`). This one must not, because the threat model is an
    instruction source persuading the agent, and an agent that can be persuaded
    to raise the cap can be persuaded to set the variable. Raising the cap is a
    commit, reviewed by the user.
@@ -97,7 +97,7 @@ paths write to the calendar and they need different treatments:
    **Requires a supervisor restart to take effect** — per the Effort Policy,
    `agents.json` is read at spawn.
 
-2. **New `bin/merlin-calendar`** — the only sanctioned write path. Shells
+2. **New `bin/edva-calendar`** — the only sanctioned write path. Shells
    to `gog calendar`, and:
    - **Refuses any attendee other than the user** unless `--attendee-authorized "<quote>"`
      is passed carrying the user's actual words from this conversation or dispatch.
@@ -112,7 +112,7 @@ paths write to the calendar and they need different treatments:
 
 3. **Pre-commit lint** (`lint-no-unguarded-calendar-write`, alongside the two
    existing hooks): fail any commit adding `gog calendar create|update` or a
-   `gcal_*_event` reference outside `bin/merlin-calendar` itself. This is
+   `gcal_*_event` reference outside `bin/edva-calendar` itself. This is
    what stops the guard being routed around six months from now by someone
    writing a new job — the same failure mode the geo-gate has had twice.
 
@@ -159,9 +159,9 @@ enshrine the drift.
    Then fix the two drift cases by removing the flag and confirming they still
    send.
 2. **Enforce at the chokepoint**, which is the flag's own script:
-   `merlin-send-curl` refuses `--skip-precheck` unless `--intent` matches the
-   allowlist, or `MERLIN_PRECHECK_BYPASS=1` is exported (set by the
-   out-of-sandbox probers, exactly like the `MERLIN_INFRA_PROBE=1` gate twenty
+   `edva-send-curl` refuses `--skip-precheck` unless `--intent` matches the
+   allowlist, or `EDVA_PRECHECK_BYPASS=1` is exported (set by the
+   out-of-sandbox probers, exactly like the `EDVA_INFRA_PROBE=1` gate twenty
    lines above it — copy that shape rather than inventing a second one).
 3. Log refusals to `data/logs/precheck-bypass-blocked.log`, mirroring the
    existing blocked-alert log.
@@ -195,13 +195,13 @@ That is precisely criterion 3.
 **Change.** Move the gate from "every author remembers" to "the send path
 checks":
 
-1. `merlin-send-curl` accepts `--event-city <metro> --event-date <YYYY-MM-DD>`
+1. `edva-send-curl` accepts `--event-city <metro> --event-date <YYYY-MM-DD>`
    and runs `travel in-city` itself, refusing when the timeline says away.
    Fail-open on gate error and on unknown dates, exactly as `geoGate` does today
    — an unpopulated timeline must never silence a lane.
 2. `headliner check` bypass preserved, at the same chokepoint.
 3. **Pre-commit lint:** a playbook that mentions a dated place-bound event *and*
-   calls `merlin-send-curl` without either the geo flags or an explicit
+   calls `edva-send-curl` without either the geo flags or an explicit
    `# geo-gate-ok: <reason>` fails the commit. Same declared-exception shape as
    `// lang-regex-ok:`, which is already the house pattern for "this looks like
    a violation and here is why it isn't".
@@ -232,7 +232,7 @@ the bank-sync tool remembering to pass `--skip-precheck`.
 
 **Change.**
 
-1. **Make the pairing structural**: in `merlin-send-curl`, an `--intent`
+1. **Make the pairing structural**: in `edva-send-curl`, an `--intent`
    matching a bank-alert / `health*` / a brokerage intent **implies** `--skip-precheck`
    rather than requiring it. A caller that forgets the flag currently leaks the
    row into the precheck log; after this, it cannot.
@@ -263,8 +263,8 @@ the bank-sync tool remembering to pass `--skip-precheck`.
    first, narrow the MCP grant second.**
 
 Each item follows the standing requirements: **Rule #1** (`architecture.md` plus
-the affected playbook updated in the same change — Merlin never learns from git
-log) and `merlin-job-author` where a job's wiring changes.
+the affected playbook updated in the same change — Edva never learns from git
+log) and `edva-job-author` where a job's wiring changes.
 
 ## What deliberately stays prose
 
@@ -276,7 +276,7 @@ kind of work is trying to lint judgment:
   are judgment with a feedback loop (`email-mem`, the reclassification digest),
   which is the correct enforcement for a judgment.
 - **The harvesters' taste rules** — venue preferences, someone's food dislikes. Enforced by the model reading them, corrected by 👎.
-- **`merlin doctor` pre-flight** — already solved the right way, with a shared
+- **`edva doctor` pre-flight** — already solved the right way, with a shared
   helper (`doctor-preflight-check`) that cannot page by construction. Worth
   citing as precedent: the fix was removing the capability, not adding a rule
   about when to use it.

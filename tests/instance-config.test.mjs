@@ -10,8 +10,8 @@ import { loadHook, runHook, clearHookCache } from "../lib/ext-hooks.mjs";
 
 const require = createRequire(import.meta.url);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "instance-"));
-process.env.MERLIN_LOCAL_DIR = tmp;
-for (const k of ["MERLIN_TZ", "MERLIN_OWNER_EMAIL", "MERLIN_OWNER_NAME", "MERLIN_OWNER_ID"]) delete process.env[k];
+process.env.EDVA_LOCAL_DIR = tmp;
+for (const k of ["EDVA_TZ", "EDVA_OWNER_EMAIL", "EDVA_OWNER_NAME", "EDVA_OWNER_ID"]) delete process.env[k];
 const { instance, instanceValue, localConfig, ownerIdOf, supabaseAnonKey } = require("../lib/instance.cjs");
 
 test("defaults without a local dir: generic owner, host time zone", () => {
@@ -35,9 +35,9 @@ test("owner_id: derived from owner_name, or set explicitly", () => {
   assert.equal(instanceValue("owner_id"), "alex");
   fs.writeFileSync(path.join(tmp, "instance.json"), JSON.stringify({ owner_name: "Alex Doe", owner_id: "alex" }));
   assert.equal(instanceValue("owner_id"), "alex");
-  process.env.MERLIN_OWNER_ID = "sam";
+  process.env.EDVA_OWNER_ID = "sam";
   assert.equal(instanceValue("owner_id"), "sam");
-  delete process.env.MERLIN_OWNER_ID;
+  delete process.env.EDVA_OWNER_ID;
   fs.rmSync(path.join(tmp, "instance.json"));
 });
 
@@ -45,9 +45,9 @@ test("local instance.json, then env, override defaults", () => {
   fs.writeFileSync(path.join(tmp, "instance.json"), JSON.stringify({ owner_email: "alex@example.com", tz: "Asia/Tokyo" }));
   assert.equal(instanceValue("owner_email"), "alex@example.com");
   assert.equal(instanceValue("tz"), "Asia/Tokyo");
-  process.env.MERLIN_TZ = "Europe/Rome";
+  process.env.EDVA_TZ = "Europe/Rome";
   assert.equal(instanceValue("tz"), "Europe/Rome");
-  delete process.env.MERLIN_TZ;
+  delete process.env.EDVA_TZ;
   assert.throws(() => instanceValue("nope"), /unknown instance key/);
 });
 

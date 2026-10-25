@@ -6,9 +6,9 @@ struct SettingsView: View {
     @Environment(AuthService.self) private var auth
     @Environment(BiometricAuth.self) private var biometric
     @Query private var settingsList: [AppSettings]
-    @State private var merlinConnected: Bool? = nil
-    @State private var merlinBusy = false
-    @State private var merlinError: String?
+    @State private var edvaConnected: Bool? = nil
+    @State private var edvaBusy = false
+    @State private var edvaError: String?
 
     private var settings: AppSettings? { settingsList.first }
 
@@ -21,7 +21,7 @@ struct SettingsView: View {
                         if let s = settings { preferencesCard(s) }
                         accountCard
                         backendCard
-                        merlinHealthCard
+                        edvaHealthCard
                         aboutCard
                         Color.clear.frame(height: 30)
                     }
@@ -30,7 +30,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbarColorScheme(.dark, for: .navigationBar)
-            .task { merlinConnected = await TrainerSupabase.hasSession() }
+            .task { edvaConnected = await TrainerSupabase.hasSession() }
         }
     }
 
@@ -130,7 +130,7 @@ struct SettingsView: View {
                     .foregroundStyle(.white.opacity(0.9))
                     .font(.callout)
             }
-            Text("Finished sessions sync automatically so Merlin can query your history.")
+            Text("Finished sessions sync automatically so Edva can query your history.")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.7))
         }
@@ -139,60 +139,60 @@ struct SettingsView: View {
         .liquidCard()
     }
 
-    private var merlinHealthCard: some View {
+    private var edvaHealthCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Merlin health sync").font(.headline).foregroundStyle(.white)
+            Text("Edva health sync").font(.headline).foregroundStyle(.white)
 
             HStack(spacing: 10) {
                 Circle()
-                    .fill(merlinConnected == true ? .green : .gray)
+                    .fill(edvaConnected == true ? .green : .gray)
                     .frame(width: 10, height: 10)
                 Text(statusLabel)
                     .foregroundStyle(.white.opacity(0.9))
                     .font(.callout)
             }
 
-            Text("Uploads Apple Health metrics, workouts, and clinical records to Merlin's Supabase so your assistant has the same context the Merlin iOS app provides. Trainer is foregrounded longer than Merlin, so this is where most of the sync happens.")
+            Text("Uploads Apple Health metrics, workouts, and clinical records to Edva's Supabase so your assistant has the same context the Edva iOS app provides. Trainer is foregrounded longer than Edva, so this is where most of the sync happens.")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.7))
 
-            if let msg = merlinError {
+            if let msg = edvaError {
                 Text(msg).foregroundStyle(.orange.opacity(0.9)).font(.caption)
             }
 
             HStack {
-                if merlinConnected == true {
+                if edvaConnected == true {
                     Button("Sign out", role: .destructive) {
-                        merlinBusy = true
+                        edvaBusy = true
                         Task {
                             await TrainerSupabase.signOut()
-                            merlinConnected = await TrainerSupabase.hasSession()
-                            merlinBusy = false
+                            edvaConnected = await TrainerSupabase.hasSession()
+                            edvaBusy = false
                         }
                     }
-                    .disabled(merlinBusy)
+                    .disabled(edvaBusy)
                 } else {
-                    Button("Connect to Merlin") {
-                        merlinBusy = true
-                        merlinError = nil
+                    Button("Connect to Edva") {
+                        edvaBusy = true
+                        edvaError = nil
                         Task {
                             do {
                                 try await TrainerSupabase.signInWithGoogle()
-                                merlinConnected = await TrainerSupabase.hasSession()
-                                if merlinConnected == true {
+                                edvaConnected = await TrainerSupabase.hasSession()
+                                if edvaConnected == true {
                                     HealthKitManager.shared.syncOnForeground()
                                 }
                             } catch {
-                                merlinError = error.localizedDescription
+                                edvaError = error.localizedDescription
                             }
-                            merlinBusy = false
+                            edvaBusy = false
                         }
                     }
-                    .disabled(merlinBusy)
+                    .disabled(edvaBusy)
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
                 }
-                if merlinBusy { ProgressView().tint(.white) }
+                if edvaBusy { ProgressView().tint(.white) }
                 Spacer()
             }
         }
@@ -202,8 +202,8 @@ struct SettingsView: View {
     }
 
     private var statusLabel: String {
-        switch merlinConnected {
-        case .some(true): return "Connected — syncing to Merlin"
+        switch edvaConnected {
+        case .some(true): return "Connected — syncing to Edva"
         case .some(false): return "Not connected"
         case .none: return "Checking…"
         }

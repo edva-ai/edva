@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// email-send — send mail via smtp2go HTTP API as the Merlin identity.
+// email-send — send mail via smtp2go HTTP API as the Edva identity.
 //
 // Designed for agent-originated emails (memos, alerts, reports).
-// Defaults to the Merlin identity (name + agent address) with Reply-To set to
-// the agent address so replies route back through the inbound Merlin channel.
+// Defaults to the Edva identity (name + agent address) with Reply-To set to
+// the agent address so replies route back through the inbound Edva channel.
 //
 // Usage:
 //   email-send --to <addr>[,<addr>...] --subject <s> --body <text> [--html] [--attach <file>]...
@@ -37,9 +37,9 @@ const INSTANCE = instance();
 const AGENT_ADDRESS = INSTANCE.agent_email;
 const OWNER_ADDRESS = INSTANCE.owner_email;
 const DEFAULT_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || AGENT_ADDRESS;
-const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || "Merlin";
+const DEFAULT_FROM_NAME = process.env.EMAIL_FROM_NAME || "Edva";
 const DEFAULT_REPLY_TO = process.env.EMAIL_REPLY_TO || AGENT_ADDRESS;
-const SENT_LOG = installTools("data/merlin-sent-mail.jsonl");
+const SENT_LOG = installTools("data/edva-sent-mail.jsonl");
 
 function parseArgs(argv) {
   const a = {
@@ -84,7 +84,7 @@ function looksLikeHtml(body) {
 }
 
 function printUsage() {
-  console.log(`email-send — send mail via smtp2go as Merlin
+  console.log(`email-send — send mail via smtp2go as Edva
 Usage:
   email-send --to <addr> --subject <s> (--body <text> | --body-file <path>)
              [--html] [--attach <file>]...
@@ -266,7 +266,7 @@ async function send(a) {
       reply_to: a.replyTo || null,
       in_reply_to: a.inReplyTo || null,
       references: a.references || null,
-      originating_task: process.env.MERLIN_TASK_ID || null,
+      originating_task: process.env.EDVA_TASK_ID || null,
     };
     await fs.promises.appendFile(SENT_LOG, JSON.stringify(entry) + "\n");
   } catch (err) {
@@ -275,7 +275,7 @@ async function send(a) {
 
   // Auto-label agent-originated mail in the user's inbox so triage/search can
   // distinguish it from inbound mail. Only labels when the From identity is
-  // the default Merlin address and the recipient is the user's address — i.e.
+  // the default Edva address and the recipient is the user's address — i.e.
   // a self-addressed agent memo. Fires in the background; failures are silent.
   // The try/catch is load-bearing, not defensive habit. SMTP2Go has already
   // accepted the message by this point, so a throw here cannot un-send it. It
@@ -289,7 +289,7 @@ async function send(a) {
     if (AGENT_ADDRESS && a.fromAddress === AGENT_ADDRESS && toHasOwner) {
       const { spawn } = await import("node:child_process");
       spawn(
-        path.join(path.dirname(new URL(import.meta.url).pathname), "merlin-email-label.sh"),
+        path.join(path.dirname(new URL(import.meta.url).pathname), "edva-email-label.sh"),
         [a.subject],
         { detached: true, stdio: "ignore" }
       ).unref();

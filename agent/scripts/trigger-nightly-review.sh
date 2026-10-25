@@ -41,10 +41,10 @@ export PATH="/opt/homebrew/bin:$PATH"
 # The operator's name for the task text (lib/instance.cjs).
 source "$(dirname "$0")/lib/instance.sh"
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-ROOT="$MERLIN_INSTALL"
-JOB_MD="$MERLIN_INSTALL_TOOLS/agent/ops-agent/jobs/nightly-review.md"
-LOG="$MERLIN_INSTALL_TOOLS/agent/logs/nightly-review.log"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+ROOT="$EDVA_INSTALL"
+JOB_MD="$EDVA_INSTALL_TOOLS/agent/ops-agent/jobs/nightly-review.md"
+LOG="$EDVA_INSTALL_TOOLS/agent/logs/nightly-review.log"
 
 CHAIN=1
 for arg in "$@"; do
@@ -55,7 +55,7 @@ done
 
 # `ultrathink` must appear in the OPENING message — a thinking hint inside a file
 # the agent later reads as a tool result does not allocate the budget.
-TASK="Run the Self Improvement Review job (cadence: weekly Tuesday, scope: prior 7 days). Follow the playbook below end-to-end, including sending the review email — that memo is the analysis of record and ${MERLIN_OWNER_NAME:-the user} reads it. ultrathink — this is a holistic system self-assessment that warrants the maximum reasoning budget for pattern-spotting across the week and prioritizing improvements. No tool-call budget on this job: it is one of the two most important things the system runs (the other is named in this instance's additions to the playbook). Take as many tool calls as the analysis genuinely needs — re-query, cross-check, dig into anomalies, iterate until the picture is honest. Quality of insight is the only thing that matters; throughput and cost are not constraints. NOTE: when you finish, a separate improvement-plan pass reads your state file and turns your ACTION ITEMS into approvable Face-ID cards — so write each item concretely enough to be built from (what is wrong, which files, how you would verify it)."
+TASK="Run the Self Improvement Review job (cadence: weekly Tuesday, scope: prior 7 days). Follow the playbook below end-to-end, including sending the review email — that memo is the analysis of record and ${EDVA_OWNER_NAME:-the user} reads it. ultrathink — this is a holistic system self-assessment that warrants the maximum reasoning budget for pattern-spotting across the week and prioritizing improvements. No tool-call budget on this job: it is one of the two most important things the system runs (the other is named in this instance's additions to the playbook). Take as many tool calls as the analysis genuinely needs — re-query, cross-check, dig into anomalies, iterate until the picture is honest. Quality of insight is the only thing that matters; throughput and cost are not constraints. NOTE: when you finish, a separate improvement-plan pass reads your state file and turns your ACTION ITEMS into approvable Face-ID cards — so write each item concretely enough to be built from (what is wrong, which files, how you would verify it)."
 
 "$SCRIPTS/lib/run-ephemeral-opus.sh" nightly-review "$JOB_MD" --task "$TASK" --timeout-min 90
 RC=$?

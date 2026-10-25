@@ -13,7 +13,7 @@ Runs Sundays at 09:30 local. Examines every aspect of hum — what we built, wha
 1. **Read-only.** Never modify hum state files, memory files, or config. Proposals only in the email; the user applies.
 2. **Intent-driven.** Every metric reported must tie back to a criterion in `data/hum-intent.md`. If a criterion isn't in the intent file, you aren't allowed to grade against it — add a proposal to update the intent file instead.
 3. **Silent-on-empty.** If fewer than 20 tick traces in the 7-day window, send a short "not enough data" email and exit.
-4. **One email, one phone ping.** Sent to the user's address via `email-send` plus a one-line Merlin notification that the review is ready.
+4. **One email, one phone ping.** Sent to the user's address via `email-send` plus a one-line Edva notification that the review is ready.
 
 ## Step 1 — Load the north star
 
@@ -30,16 +30,16 @@ Issue all in a single parallel turn:
 5. `data/hum-state.json` — daily counter history
 6. `data/hum-interests.json` — topic registry (changed during the week?)
 7. `data/hum-interests-state.json` — per-topic last_run_at / last_signal_at
-8. `merlin hum insight --since 7d --json` — pre-computed aggregate (fast path)
-8a. `merlin hum reactions --since 7d --json` — per-lane reaction-rate (added 2026-05-20). Surfaces `lanes[lane].decay` ∈ {`low_engagement`, `mostly_negative`, null} so the review can call out specific topics that are silent or actively disliked. Use this to populate a "lane decay" section in the email when any lane is flagged.
-9. `git log --since="7 days ago" -- agent/ops-agent/jobs/hum.md agent/scripts/hum-harvesters/ bin/merlin data/hum-interests.json data/hum-intent.md` — what we built or changed this week
-10. **Memory growth — measure the WIKI, not the retired flat files.** hum consolidation (`hum-consolidate`) writes durable answers into the general wiki now, not the 6 hardcoded flat files (4 of which don't even exist, so `wc -l` always read 0 — the perennial false FAIL). Measure hum-attributable memory growth this week as the SUM of: (a) wiki pages created or updated in the last 7 days — `~/Dev/merlin/bin/wiki list --json` and count entries whose `updated_at` (or `revised_at`) falls in the window; if the CLI doesn't expose timestamps, fall back to `wiki search` over the week's hum subjects, or query `pages.updated_at` in memory-index.db directly; plus (b) rows added to `hum-learnings.jsonl` in the window (answered questions) and consolidated rows in `hum-responses.jsonl` — the direct hum→memory contribution. Report both components. Do NOT `wc -l` the old flat files.
+8. `edva hum insight --since 7d --json` — pre-computed aggregate (fast path)
+8a. `edva hum reactions --since 7d --json` — per-lane reaction-rate (added 2026-05-20). Surfaces `lanes[lane].decay` ∈ {`low_engagement`, `mostly_negative`, null} so the review can call out specific topics that are silent or actively disliked. Use this to populate a "lane decay" section in the email when any lane is flagged.
+9. `git log --since="7 days ago" -- agent/ops-agent/jobs/hum.md agent/scripts/hum-harvesters/ bin/edva data/hum-interests.json data/hum-intent.md` — what we built or changed this week
+10. **Memory growth — measure the WIKI, not the retired flat files.** hum consolidation (`hum-consolidate`) writes durable answers into the general wiki now, not the 6 hardcoded flat files (4 of which don't even exist, so `wc -l` always read 0 — the perennial false FAIL). Measure hum-attributable memory growth this week as the SUM of: (a) wiki pages created or updated in the last 7 days — `~/Dev/edva/bin/wiki list --json` and count entries whose `updated_at` (or `revised_at`) falls in the window; if the CLI doesn't expose timestamps, fall back to `wiki search` over the week's hum subjects, or query `pages.updated_at` in memory-index.db directly; plus (b) rows added to `hum-learnings.jsonl` in the window (answered questions) and consolidated rows in `hum-responses.jsonl` — the direct hum→memory contribution. Report both components. Do NOT `wc -l` the old flat files.
 11. `agent/logs/watchdog.log` grep `[hum:` — dispatch-level skip reasons
 12. Structural-validity scan of `hum-runs.jsonl` — count rows lacking `sonnet.decision` (legacy schema; ignore for metrics but count for completeness)
 
 ## Step 3 — Score every intent criterion
 
-For every row in the success-criteria table, report the measurement and `PASS` / `FAIL` / `N/A`. **This is computed in code — do not re-derive it.** `merlin hum insight --since 7d --json` (Step 2 item 8) returns a `criteria[]` array with `{criterion, value, target, status, detail?, note?}` for every row below (since 2026-10-04). Quote its values and statuses verbatim. Only rows with `status: "MODEL"` need you: **Memory growth** (the CLI counts `hum-learnings.jsonl` rows; add the wiki half from Step 2 item 10), **Attention hit-rate** and **LLM-invocation efficiency** (they need the situation fields / `watchdog.log` judgement the CLI does not read). The table stays here as the definition of what the code computes.
+For every row in the success-criteria table, report the measurement and `PASS` / `FAIL` / `N/A`. **This is computed in code — do not re-derive it.** `edva hum insight --since 7d --json` (Step 2 item 8) returns a `criteria[]` array with `{criterion, value, target, status, detail?, note?}` for every row below (since 2026-10-04). Quote its values and statuses verbatim. Only rows with `status: "MODEL"` need you: **Memory growth** (the CLI counts `hum-learnings.jsonl` rows; add the wiki half from Step 2 item 10), **Attention hit-rate** and **LLM-invocation efficiency** (they need the situation fields / `watchdog.log` judgement the CLI does not read). The table stays here as the definition of what the code computes.
 
 | Criterion | Measurement | Target |
 |---|---|---|
@@ -143,7 +143,7 @@ Risk: lose coverage of that interest; re-enable if the user asks.
 
 ## Step 8 — Compose memo
 
-HTML email to `/tmp/hum-review-<YYYY-MM-DD>.html`. Phone-readable; no emojis. Any external URL referenced in the body goes through `~/Dev/merlin/bin/og-card` — see ops-agent CLAUDE.md → "Use og-card for every URL in outbound email". Structure:
+HTML email to `/tmp/hum-review-<YYYY-MM-DD>.html`. Phone-readable; no emojis. Any external URL referenced in the body goes through `~/Dev/edva/bin/og-card` — see ops-agent CLAUDE.md → "Use og-card for every URL in outbound email". Structure:
 
 ```
 HUM WEEKLY — <YYYY-MM-DD>
@@ -188,13 +188,13 @@ PROPOSED TUNING
 
 Send:
 ```bash
-~/Dev/merlin/bin/email-send \
+~/Dev/edva/bin/email-send \
   --to <the user's address> \
   --subject "Hum weekly — <YYYY-MM-DD>" \
   --body-file /tmp/hum-review-<YYYY-MM-DD>.html \
   --html
 
-~/Dev/merlin/bin/merlin-send-curl "Hum weekly review emailed — <one-line top finding>"
+~/Dev/edva/bin/edva-send-curl "Hum weekly review emailed — <one-line top finding>"
 ```
 
 ## Step 9 — Persist state for next review
@@ -217,7 +217,7 @@ Next week's review diffs memory sizes, compares registry (was a proposal adopted
 ## Edge cases
 
 - **First run / no data**: short email ("Hum weekly — first run, <N> ticks, need ≥20. Next week will be comprehensive."), exit after minimal state write.
-- **Intent file missing**: abort with one system-channel line (`merlin-send-curl --channel system --skip-precheck --intent hum-review "⚠️ hum-review: data/hum-intent.md missing, no memo this week"`), not a chat message. Don't send a memo.
+- **Intent file missing**: abort with one system-channel line (`edva-send-curl --channel system --skip-precheck --intent hum-review "⚠️ hum-review: data/hum-intent.md missing, no memo this week"`), not a chat message. Don't send a memo.
 - **All tick traces legacy schema**: treat as no-data, note in memo, wait for new-schema week.
 - **Pending question mid-review**: quote subject; do not clear or alter.
 - **Previous-week state file missing**: run the review without growth numbers; note "first baseline."

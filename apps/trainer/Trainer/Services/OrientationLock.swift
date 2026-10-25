@@ -17,8 +17,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         // Request HealthKit authorization and start background delivery into
-        // Merlin's Supabase. No-ops gracefully if the user hasn't connected
-        // their Merlin account yet — observers + auth are still installed
+        // Edva's Supabase. No-ops gracefully if the user hasn't connected
+        // their Edva account yet — observers + auth are still installed
         // so once they sign in, the next foreground tick uploads the
         // captured anchor delta.
         HealthKitManager.shared.start()

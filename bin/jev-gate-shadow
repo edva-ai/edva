@@ -37,7 +37,7 @@ function section(file, startHeading, maxChars) {
   } catch { return ""; }
 }
 
-// Tool-less, Max-only, off the merlin tree's settings (lib/jev-claude.mjs).
+// Tool-less, Max-only, off the edva tree's settings (lib/jev-claude.mjs).
 // `--allowedTools ""` alone left built-ins + MCP + allow rules live, and the p1
 // prompt quotes the playbook section that explains p1-downgrade.
 async function runClaude(model, prompt) {

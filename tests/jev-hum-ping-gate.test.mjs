@@ -40,7 +40,7 @@ const daily = () => (fs.existsSync(SH) ? fs.readdirSync(SH).filter((f) => /^\d{4
 const ev = (over = {}) => ({ id: `e${Math.random()}`, sensor: "location", type: "location.arrived", summary: "Arrived near Main Square", salience: 0.6, lanes: ["nearby", "dining"], dedup_key: `loc:main-sq:${Math.random()}` /* unique: the gate caches per bundle */, data: { lat: 10.0, lon: 20.0, hr: 150 }, ...over });
 const verdict = (events) => ({ decision: "dispatch", accepted: events, lanes: [...new Set(events.flatMap((e) => e.lanes))], score: 0.62 });
 let spawned;
-// previewGate stubbed: the real one shells out to `merlin hum situation` + a preview harvest.
+// previewGate stubbed: the real one shells out to `edva hum situation` + a preview harvest.
 const deps = () => ({ spawnShadow: (id) => spawned.push(id), previewGate: async () => ({ skip: false, reason: "stub: something eligible" }) });
 
 beforeEach(() => {

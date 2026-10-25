@@ -17,7 +17,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-questions-"));
-process.env.MERLIN_DATA_DIR = dir;
+process.env.EDVA_DATA_DIR = dir;
 process.env.SUPABASE_SERVICE_ROLE_KEY = ""; // stampRows must stay offline
 after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -94,10 +94,10 @@ test("retired questions close; the chat agent sees every open one and its route"
 test("hum-answer files a late answer to an open question with no slot", () => {
   reset();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "oq-home-"));
-  const data = path.join(home, "Dev/merlin/data");
+  const data = path.join(home, "Dev/edva/data");
   fs.mkdirSync(data, { recursive: true });
   fs.writeFileSync(path.join(data, "hum-pending-question.json"), "null\n");
-  const env = { ...process.env, HOME: home, MERLIN_DATA_DIR: data, SUPABASE_SERVICE_ROLE_KEY: "" };
+  const env = { ...process.env, HOME: home, EDVA_DATA_DIR: data, SUPABASE_SERVICE_ROLE_KEY: "" };
   fs.writeFileSync(path.join(data, "open-questions.jsonl"),
     JSON.stringify({ ev: "asked", id: "q-old", at: iso(Date.now() - 80 * H), question: "Learn to sail?", lane: "dream_asks", msg_id: "m9" }) + "\n");
   const bin = path.join(path.dirname(new URL(import.meta.url).pathname), "../bin/hum-answer");

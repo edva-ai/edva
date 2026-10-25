@@ -38,7 +38,7 @@ jobs:
       - name: Install root dependencies (@anthropic-ai/sdk)
         run: npm ci --no-audit --no-fund
 
-      - name: Run merlin review-pr
+      - name: Run edva review-pr
         id: review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -52,7 +52,7 @@ jobs:
           # --json puts the structured findings on stdout; tee saves a copy
           # for the comment step. `|| true` keeps the workflow non-blocking
           # even on a "block" verdict (Claude exits 1 in that case).
-          ./bin/merlin review-pr ${{ github.event.pull_request.number }} --json | tee /tmp/review.json || true
+          ./bin/edva review-pr ${{ github.event.pull_request.number }} --json | tee /tmp/review.json || true
 
       - name: Post findings as PR comment
         if: ${{ steps.review.outputs.skipped != 'true' && always() }}

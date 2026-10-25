@@ -25,7 +25,7 @@
 # fail_since is the first failing check of the current run of failures, so
 # the reader can wait for a second failing check before paging.
 
-MAX_AUTH_PROBE_FILE="${MAX_AUTH_PROBE_FILE:-$HOME/Dev/merlin/data/max-auth-probe.json}"
+MAX_AUTH_PROBE_FILE="${MAX_AUTH_PROBE_FILE:-$HOME/Dev/edva/data/max-auth-probe.json}"
 
 # A failing check only carries an earlier fail_since forward when the previous
 # record is this recent, so a failure left on disk by a week-old run cannot

@@ -5,13 +5,13 @@
 # lib/ext-hooks.mjs: $<ENV_VAR>, else bin/_ext/<name>, else bin/<name>, else
 # none (the feature is skipped). Names the kernel asks for:
 #
-#   apple-weather   JSON weather for the weather sensor (MERLIN_WEATHER_BIN)
+#   apple-weather   JSON weather for the weather sensor (EDVA_WEATHER_BIN)
 #   location-ask closers used by bin/hum-ping (see that file)
 #
-# bin/merlin-send-curl's event geo-gate takes two optional CLIs: an itinerary
-# check, `<cli> in-city <city> <date>` (MERLIN_TRAVEL_BIN), and a
+# bin/edva-send-curl's event geo-gate takes two optional CLIs: an itinerary
+# check, `<cli> in-city <city> <date>` (EDVA_TRAVEL_BIN), and a
 # must-see-performer check that bypasses the gate, `<cli> check <name>`
-# (MERLIN_HEADLINER_BIN); point those variables at copies kept here.
+# (EDVA_HEADLINER_BIN); point those variables at copies kept here.
 # bin/hum-sense kicks bin/watch when it exists (with lib/_ext/watches.mjs).
 #
 # Everything here except this file is gitignored — see .gitignore and

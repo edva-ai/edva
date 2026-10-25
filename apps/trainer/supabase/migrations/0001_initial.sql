@@ -1,6 +1,6 @@
 -- Exercise app schema — mirrors the SwiftData models.
 -- Every row is owned by auth.users(id). Row-Level Security restricts reads/writes
--- to the signed-in user. Merlin queries happen under the service_role key from
+-- to the signed-in user. Edva queries happen under the service_role key from
 -- the backend / MCP server, which bypasses RLS.
 
 create extension if not exists "pgcrypto";
@@ -70,7 +70,7 @@ create policy "own set_logs" on public.set_logs
     using (auth.uid() = user_id)
     with check (auth.uid() = user_id);
 
--- Convenience view used by Merlin/analytics: per-exercise max weight + last date.
+-- Convenience view used by Edva/analytics: per-exercise max weight + last date.
 create or replace view public.exercise_highlights as
 select
     user_id,

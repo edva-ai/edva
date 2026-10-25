@@ -34,11 +34,11 @@ import { localLlmEmbed } from "../../lib/local-llm.mjs";
 // WP14 self-wake (Conway-substrate Multiplier 2). The supervisor already drains
 // due wakes on a 15s tick and re-dispatches each as a self-message; this is the
 // missing half — the model-callable creator. The wake is keyed to the calling
-// agent (MERLIN_AGENT_ID, set per-agent in the mcp-config; the chat supervisor's
+// agent (EDVA_AGENT_ID, set per-agent in the mcp-config; the chat supervisor's
 // ticker fires only wakes whose session_id matches its Agent's id, "chat").
 import { checkLater } from "../core/check-later.mjs";
 import { requestFork, listForks, MAX_INFLIGHT_FORKS } from "../core/fork-queue.mjs";
-const AGENT_ID = process.env.MERLIN_AGENT_ID || "chat";
+const AGENT_ID = process.env.EDVA_AGENT_ID || "chat";
 // WP11 self-improvement (gated). tools-mcp SERVES owner-approved ext/ modules as
 // real tools; the chat agent (only) can PROPOSE new ones — which stay staged and
 // inert until the user approves out-of-band via `bin/self-improve`.
@@ -91,7 +91,7 @@ async function run(cmd, args = [], opts = {}) {
 // The server's instructions (the tool overview every session reads). An
 // installation whose tool set differs keeps its own overview in
 // agent/local/prompts/tools-mcp-instructions.md, which replaces this one.
-const DEFAULT_INSTRUCTIONS = `Merlin's built-in tools. Keep responses short — ${OWNER} is usually on the phone.
+const DEFAULT_INSTRUCTIONS = `Edva's built-in tools. Keep responses short — ${OWNER} is usually on the phone.
 
 ## Quick Reference
 
@@ -127,7 +127,7 @@ const DEFAULT_INSTRUCTIONS = `Merlin's built-in tools. Keep responses short — 
 - wiki_backlinks — what links to <id>
 - wiki_associate — associative recall: what is tied to these pages / this query
 - wiki_map — table of contents over memory (what exists to ask for)
-- recall_events — full-text search over Merlin's own activity stream (dispatches, job outcomes, triage decisions) — "what did I actually do/decide about X?", even if it never became a wiki page
+- recall_events — full-text search over Edva's own activity stream (dispatches, job outcomes, triage decisions) — "what did I actually do/decide about X?", even if it never became a wiki page
 
 ### Daily activities (episodic memory)
 - episode_get — narrative for a specific day (YYYY-MM-DD or 'yesterday'/'today')
@@ -178,8 +178,8 @@ const TOOLS = [
     description:
       "Hand a self-contained research task to a background sub-agent, then END YOUR TURN. It inherits the recent conversation as background, runs on its own (web search available), and its findings come back to you as a message minutes later — you relay them to " + OWNER + " then.\n\n" +
       "Use it when the work would otherwise make " + OWNER + " wait mid-conversation, or would dump a lot of raw material into this conversation: 'compare these four hotels', 'find out what changed in X since June', 'dig up the reviews for these three places'.\n\n" +
-      "What it HAS: web search/fetch, and Merlin's own skills — " + TEXT.delegate_skill_example + ".\n" +
-      "What it LACKS: any shell, file, calendar, wiki, email, home-control or money access. It reads a skill's judgment but cannot execute a skill step that shells out" + (TEXT.delegate_shell_examples ? " " + TEXT.delegate_shell_examples : "") + ", so anything needing live Merlin data must come from YOU in the task text, or be done by you afterward. It is deliberately read-only: it exists to digest untrusted web content, which is not something to hand a shell.\n" +
+      "What it HAS: web search/fetch, and Edva's own skills — " + TEXT.delegate_skill_example + ".\n" +
+      "What it LACKS: any shell, file, calendar, wiki, email, home-control or money access. It reads a skill's judgment but cannot execute a skill step that shells out" + (TEXT.delegate_shell_examples ? " " + TEXT.delegate_shell_examples : "") + ", so anything needing live Edva data must come from YOU in the task text, or be done by you afterward. It is deliberately read-only: it exists to digest untrusted web content, which is not something to hand a shell.\n" +
       "Do NOT use it for anything you can answer directly, for anything needing a tool it lacks, or to avoid a short lookup. Tell " + OWNER + " you're looking into it before you end the turn, otherwise the reply lands with no explanation.",
     schema: {
       type: "object",
@@ -220,7 +220,7 @@ const TOOLS = [
   // of the inbox while leaving it UNREAD). P3 = gmail_label_read.
   {
     name: "gmail_mark_read",
-    description: "Mark a Gmail message read (refuses a P1 Merlin email)",
+    description: "Mark a Gmail message read (refuses a P1 Edva email)",
     schema: { type: "object", properties: { message_id: { type: "string" } }, required: ["message_id"] },
     run: (a) => run("node", [`${BIN}/gmail-action`, "mark-read", a.message_id]),
   },
@@ -521,13 +521,13 @@ const TOOLS = [
   },
   {
     name: "recall",
-    description: "ONE recall across everything Merlin knows — fuses recent chat (what " + OWNER + " just typed, from the merlin_messages semantic index), the curated wiki (hybrid page search), and optionally the activity log — ranked together via RRF. Reach for this FIRST when answering 'what do we know / did " + OWNER + " say / did I decide about X', especially anything recent: a fact stated in chat this morning won't be in the wiki yet, and this is the only surface that sees both. Each result is tagged with its source (chat|wiki|events). Set events:true to also fuse the activity log. Falls back gracefully if a source is unavailable.",
+    description: "ONE recall across everything Edva knows — fuses recent chat (what " + OWNER + " just typed, from the edva_messages semantic index), the curated wiki (hybrid page search), and optionally the activity log — ranked together via RRF. Reach for this FIRST when answering 'what do we know / did " + OWNER + " say / did I decide about X', especially anything recent: a fact stated in chat this morning won't be in the wiki yet, and this is the only surface that sees both. Each result is tagged with its source (chat|wiki|events). Set events:true to also fuse the activity log. Falls back gracefully if a source is unavailable.",
     schema: {
       type: "object",
       properties: {
         query: { type: "string", description: "What to recall" },
         k: { type: "number", description: "Max fused results (default 10)" },
-        events: { type: "boolean", description: "Also fuse Merlin's own activity log (default false)" },
+        events: { type: "boolean", description: "Also fuse Edva's own activity log (default false)" },
         chat: { type: "boolean", description: "Include recent chat (default true)" },
         wiki: { type: "boolean", description: "Include the curated wiki (default true)" },
         chatSinceDays: { type: "number", description: "Bound chat recall to the last N days (default 21)" },
@@ -572,7 +572,7 @@ const TOOLS = [
   },
   {
     name: "recall_events",
-    description: "Full-text search over Merlin's own activity stream — every event the ops/chat supervisors logged (dispatches, job outcomes, triage decisions, digests, errors), not just curated wiki pages. Use this for 'what did I actually do / decide / see about X?' when it may never have been promoted to a memory page. Backed by an FTS5 index (events_fts) over the append-only event log. Complements wiki_search (curated) and episode_search (day narratives).",
+    description: "Full-text search over Edva's own activity stream — every event the ops/chat supervisors logged (dispatches, job outcomes, triage decisions, digests, errors), not just curated wiki pages. Use this for 'what did I actually do / decide / see about X?' when it may never have been promoted to a memory page. Backed by an FTS5 index (events_fts) over the append-only event log. Complements wiki_search (curated) and episode_search (day narratives).",
     schema: {
       type: "object",
       properties: {
@@ -821,7 +821,7 @@ const unifiedApproval = createUnifiedApproval({
     async findByItemHash(h) { const r = await fetch(`${_supaBase}/rest/v1/self_improve_approvals?item_hash=eq.${encodeURIComponent(h)}&select=id,status,skipped,risk,expires_at,expires_at_ms`, { headers: _supaH }); if (!r.ok) throw new Error(`lookup ${r.status}`); return r.json(); },
   },
   deviceKeys: { getKey: async () => null },   // verify/apply live in the poller, not here
-  postSuggestion: async (summary, rationale) => { try { await run(`${BIN}/merlin-send-curl`, ["--channel", "improvements", "--skip-precheck", `🔧 New capability proposed: ${summary}\n${rationale || ""}\n\nApprove in the app (Face ID) to load it.`]); } catch {} },
+  postSuggestion: async (summary, rationale) => { try { await run(`${BIN}/edva-send-curl`, ["--channel", "improvements", "--skip-precheck", `🔧 New capability proposed: ${summary}\n${rationale || ""}\n\nApprove in the app (Face ID) to load it.`]); } catch {} },
   applyItem: async () => ({ ok: false, error: "apply is the poller's job" }),
 });
 // Serve already-approved ext/ modules as REAL, callable MCP tools.
@@ -839,11 +839,11 @@ try {
 } catch (e) { console.error(`[tools-mcp] ext/ load error: ${e.message}`); }
 
 // Only the chat agent may author + propose new modules (never ops/cron/inbound).
-if (process.env.MERLIN_AGENT_ID === "chat") {
+if (process.env.EDVA_AGENT_ID === "chat") {
   TOOLS.push(
     {
       name: "read_own_source",
-      description: "Read one of Merlin's own source files (READ-ONLY; secrets denied). Use to understand your own code before proposing a new capability.",
+      description: "Read one of Edva's own source files (READ-ONLY; secrets denied). Use to understand your own code before proposing a new capability.",
       schema: { type: "object", properties: { path: { type: "string", description: "repo-relative path" } }, required: ["path"] },
       run: (a) => { const r = selfImprove.readOwnSource(String(a.path || "")); return r.ok ? r.content : `Error: ${r.error}`; },
     },

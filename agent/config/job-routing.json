@@ -10,7 +10,7 @@
       "script": "Tier C \u2014 runs as cron/launchd CODE, never dispatched to a supervisor (no webhook, no agent turn). `model` is the tier of its optional single tool-less judgment call made from inside the script (claude -p / max-judge), or null when the script makes no model call. webhook-auth.sh never sees these jobs. Added 2026-10-04 (determinism pass) to replace the mixed `eliminate`/`local` labels the scripted jobs had picked up."
     },
     "models": "opus = deep synthesis only | sonnet = digests/drafting/moderate reasoning | haiku = cheap classify/poll | local = on-device Gemma",
-    "mcp_manifest": "OPTIONAL per-job `mcp` array declaring which MCP servers the job actually uses (vocab: tools, health, supabase-merlin, gsc, chrome-devtools). tools+health are the universal baseline. Omit = 'the routed tier's default .mcp.json is fine' (no assertion). PURPOSE: make each job's MCP surface explicit + checkable via `bin/mcp-manifest-check` \u2014 it fails closed if a declared need can't be met by any tier, and flags jobs whose needs exceed their model-default tier (e.g. Chrome jobs \u2192 must route to `ops`, which webhook-auth.sh already does via override) plus per-tier servers no declaring job needs (trim candidates). NOTE: this is a declaration + audit layer only. Spawn-time enforcement (spawn ONLY a job's subset) is NOT wired \u2014 the supervisor runs one long-lived session per tier and spawns MCP servers once per session, not per dispatch; true per-dispatch subsetting needs the ephemeral-subprocess architecture (deferred, see architecture.md). Seeded 2026-07-08 on the 5 Chrome jobs.",
+    "mcp_manifest": "OPTIONAL per-job `mcp` array declaring which MCP servers the job actually uses (vocab: tools, health, supabase-edva, gsc, chrome-devtools). tools+health are the universal baseline. Omit = 'the routed tier's default .mcp.json is fine' (no assertion). PURPOSE: make each job's MCP surface explicit + checkable via `bin/mcp-manifest-check` \u2014 it fails closed if a declared need can't be met by any tier, and flags jobs whose needs exceed their model-default tier (e.g. Chrome jobs \u2192 must route to `ops`, which webhook-auth.sh already does via override) plus per-tier servers no declaring job needs (trim candidates). NOTE: this is a declaration + audit layer only. Spawn-time enforcement (spawn ONLY a job's subset) is NOT wired \u2014 the supervisor runs one long-lived session per tier and spawns MCP servers once per session, not per dispatch; true per-dispatch subsetting needs the ephemeral-subprocess architecture (deferred, see architecture.md). Seeded 2026-07-08 on the 5 Chrome jobs.",
     "consumed_by": [
       "supervisor ephemeral router (A3)",
       "scheduled-task roster (#6)",
@@ -34,7 +34,7 @@
       "model": "opus",
       "effort": "xhigh",
       "runtime": "ephemeral-opus",
-      "rationale": "7d self-assessment (Tue). Needs deep reasoning. Weekly slot. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.improvement-review), because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02, so this was silently a Sonnet job. Chains improvement-plan on a clean exit."
+      "rationale": "7d self-assessment (Tue). Needs deep reasoning. Weekly slot. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $EDVA_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.improvement-review), because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02, so this was silently a Sonnet job. Chains improvement-plan on a clean exit."
     },
     "improvement-plan": {
       "disposition": "scheduled",
@@ -42,7 +42,7 @@
       "model": "opus",
       "effort": "xhigh",
       "runtime": "ephemeral-opus",
-      "rationale": "Acts on every ACTION ITEM of the weekly review: safe changes land through self-improve-auto-apply, complex or high-blast-radius ones become Face-ID cards in the Improvements channel (rubric schema v4, 2026-09-29) \u2014 authors real code changes to Merlin's own source, so it gets the deepest tier. Chained by trigger-nightly-review.sh; launchd ai.claude.improvement-plan (Tue 10:30) is a safety-net slot."
+      "rationale": "Acts on every ACTION ITEM of the weekly review: safe changes land through self-improve-auto-apply, complex or high-blast-radius ones become Face-ID cards in the Improvements channel (rubric schema v4, 2026-09-29) \u2014 authors real code changes to Edva's own source, so it gets the deepest tier. Chained by trigger-nightly-review.sh; launchd ai.claude.improvement-plan (Tue 10:30) is a safety-net slot."
     },
     "cost-efficiency-review": {
       "disposition": "scheduled",
@@ -50,7 +50,7 @@
       "model": "opus",
       "effort": "xhigh",
       "runtime": "ephemeral-opus",
-      "rationale": "DAILY review of WHERE the Max budget went \u2014 cost split by token type, measured context floor per supervisor, working window, compact/rotate churn. Added 2026-08-06 after one overnight window burned a large slice of the weekly cap, most of it cache traffic rather than work, and nothing noticed: nightly-review's cost lens is weekly and job-shaped, so it could not see a structural context-floor problem (a job re-writing a 100k prefix every dispatch looks like a job doing work). Improvement process \u2192 Opus 5 per the standing rule; `runtime: ephemeral-opus` because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02. Launched by launchd (ai.claude.cost-efficiency-review, 02:37 local slot from merlin-cron-slots), NOT cron \u2014 cron cannot unlock the keychain for a claude -p. The trigger gates below 20 dispatches/24h, so a quiet day costs nothing."
+      "rationale": "DAILY review of WHERE the Max budget went \u2014 cost split by token type, measured context floor per supervisor, working window, compact/rotate churn. Added 2026-08-06 after one overnight window burned a large slice of the weekly cap, most of it cache traffic rather than work, and nothing noticed: nightly-review's cost lens is weekly and job-shaped, so it could not see a structural context-floor problem (a job re-writing a 100k prefix every dispatch looks like a job doing work). Improvement process \u2192 Opus 5 per the standing rule; `runtime: ephemeral-opus` because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02. Launched by launchd (ai.claude.cost-efficiency-review, 02:37 local slot from edva-cron-slots), NOT cron \u2014 cron cannot unlock the keychain for a claude -p. The trigger gates below 20 dispatches/24h, so a quiet day costs nothing."
     },
     "system-issue-review": {
       "disposition": "scheduled",
@@ -58,7 +58,7 @@
       "model": "opus",
       "effort": "xhigh",
       "runtime": "ephemeral-opus",
-      "rationale": "Nightly root-cause pass over the system channel that authors real code fixes. Capped at 3 clusters/night. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.system-issue-review{,-critical}), same reason as nightly-review. Its trigger's gate is unchanged and still decides whether to run at all."
+      "rationale": "Nightly root-cause pass over the system channel that authors real code fixes. Capped at 3 clusters/night. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $EDVA_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.system-issue-review{,-critical}), same reason as nightly-review. Its trigger's gate is unchanged and still decides whether to run at all."
     },
     "hum": {
       "disposition": "realtime-api",

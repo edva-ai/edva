@@ -23,7 +23,7 @@ secrets/
 # agent rules (shared.md, chat.md, ops.md, jobs/<job>.md, prompts/), its
 # values (config/<name>.json) and its registry entries (tasks.json, ...).
 # The kernel reads it through lib/instance.cjs, lib/registry.cjs and the
-# supervisors; it never belongs in the public tree. `merlin overlay add`
+# supervisors; it never belongs in the public tree. `edva overlay add`
 # links it in from a private repo.
 agent/local/
 # Legacy root-level overlay dir (pre agent/local/).
@@ -40,7 +40,7 @@ agent/ext/*
 !agent/ext/README.md
 # The operator's own browsing skills (the kernel ships the runner, not skills).
 browsing-skills/skills/
-# Host registry for `merlin whereami` (hostnames + hardware UUIDs);
+# Host registry for `edva whereami` (hostnames + hardware UUIDs);
 # template: examples/hosts.example.json.
 system/hosts.json
 # Personal scratch outside the well-known dirs.

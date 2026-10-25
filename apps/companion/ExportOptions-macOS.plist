@@ -16,8 +16,8 @@
     <string>3rd Party Mac Developer Installer</string>
     <key>provisioningProfiles</key>
     <dict>
-        <key>com.example.Merlin</key>
-        <string>com.example.Merlin AppStore</string>
+        <key>com.example.Edva</key>
+        <string>com.example.Edva AppStore</string>
     </dict>
 </dict>
 </plist>

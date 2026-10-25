@@ -1,0 +1,655 @@
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
+// edva-cron-slots — registry + collision detector for Edva cron jobs.
+// (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
+// string and a comment. cron runs this with a bare PATH that has no node, so
+// `#!/usr/bin/env node` would exit 127; the launcher tries the stable Homebrew
+// and /usr/local paths first, then PATH. Same as lib/root.cjs nodeBin.)
+//
+// Why: cron entries pile up at round-number minutes (e.g. 8 jobs at 09:00),
+// causing supervisor queue spikes, watchdog stale flags, and lost tasks on
+// process restart (pre queue-persist fix). This tool gives each job a
+// reserved slot and refuses to register conflicting ones.
+//
+// Storage: data/cron-slots.json
+//
+// Commands:
+//   list                       Show all registered jobs sorted by schedule
+//   list --conflicts           Show every pair of colliding registrations
+//   show <name>                Show one job's registration
+//   register <name> --schedule <cron5> --duration <min> [--trigger <path>] [--criticality low|med|high] [--force]
+//   modify <name> [--schedule <cron5>] [--duration <min>] [--criticality ...] [--trigger ...]
+//   release <name>             Remove a registration (does NOT edit crontab)
+//   request --name <name> --duration <min> --cadence daily|weekly|monthly [--day <sun-sat>] [--prefer <HH:MM>] [--criticality ...]
+//   audit                      Diff crontab against registry — reports unregistered entries + drifted schedules
+//   propose-fixes              Suggest slot moves for all current conflicts
+//   seed                       (one-time) Bulk-register jobs from current crontab using heuristics for duration
+//
+// The tool does NOT write to crontab. It emits proposed lines you copy in manually.
+
+import fs from "node:fs";
+import path from "node:path";
+import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { installTools } from "../lib/root.cjs";
+const { localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+
+const HOME = process.env.HOME;
+const REG_PATH = installTools("data/cron-slots.json");
+
+function loadReg() {
+  if (!fs.existsSync(REG_PATH)) return { version: 1, jobs: {}, createdAt: new Date().toISOString() };
+  return JSON.parse(fs.readFileSync(REG_PATH, "utf8"));
+}
+
+function saveReg(reg) {
+  reg.updatedAt = new Date().toISOString();
+  const tmp = REG_PATH + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
+  fs.renameSync(tmp, REG_PATH);
+}
+
+// --------- cron parsing ---------
+
+function parseField(s, lo, hi) {
+  const out = new Set();
+  for (const part of String(s).split(",")) {
+    let body = part, step = 1;
+    if (body.includes("/")) {
+      const [b, st] = body.split("/");
+      body = b;
+      step = Number(st);
+    }
+    if (body === "*") {
+      for (let i = lo; i <= hi; i += step) out.add(i);
+    } else if (body.includes("-")) {
+      const [a, b] = body.split("-").map(Number);
+      for (let i = a; i <= b; i += step) out.add(i);
+    } else {
+      out.add(Number(body));
+    }
+  }
+  return out;
+}
+
+// Returns: { weekly: Set<"d:hhmm">, monthly: bool, schedule: original } occupying the
+// minute the job FIRES (start). The duration is layered on later when computing collisions.
+function expandSchedule(cronStr) {
+  const parts = String(cronStr).trim().split(/\s+/);
+  if (parts.length < 5) throw new Error("invalid cron 5-field schedule: " + cronStr);
+  const [min, hour, dom, mon, dow] = parts;
+  const monthly = dom !== "*" || mon !== "*";
+  const mins = parseField(min, 0, 59);
+  const hours = parseField(hour, 0, 23);
+  const dows = parseField(dow, 0, 6);
+  const weekly = new Set();
+  if (!monthly) {
+    for (const d of dows) for (const h of hours) for (const m of mins) {
+      weekly.add(`${d}:${String(h).padStart(2,"0")}${String(m).padStart(2,"0")}`);
+    }
+  }
+  return { weekly, monthly, schedule: cronStr };
+}
+
+// Expand to include the duration window. Returns Set<"d:hhmm">.
+function occupiedSet(reg) {
+  const { weekly, monthly } = expandSchedule(reg.schedule);
+  if (monthly) return { weekly: new Set(), monthly: true };
+  const out = new Set();
+  for (const slot of weekly) {
+    const [d, hm] = slot.split(":");
+    const startMin = Number(hm.slice(0, 2)) * 60 + Number(hm.slice(2));
+    for (let i = 0; i < (reg.duration_min || 1); i++) {
+      const total = startMin + i;
+      const wrapDay = (Number(d) + Math.floor(total / 1440)) % 7;
+      const minOfDay = total % 1440;
+      const hh = String(Math.floor(minOfDay / 60)).padStart(2, "0");
+      const mm = String(minOfDay % 60).padStart(2, "0");
+      out.add(`${wrapDay}:${hh}${mm}`);
+    }
+  }
+  return { weekly: out, monthly: false };
+}
+
+function isHeartbeat(reg) {
+  // A heartbeat job fires at regular sub-hour intervals (e.g. */10 * * * *,
+  // */20 * * * *). They trivially overlap with everything; excluded from
+  // collision detection so the supervisor's natural serialization handles them.
+  const min = String(reg.schedule).trim().split(/\s+/)[0];
+  return min.startsWith("*/");
+}
+
+function collides(a, b) {
+  if (isHeartbeat(a) || isHeartbeat(b)) return false;
+  const aOcc = occupiedSet(a);
+  const bOcc = occupiedSet(b);
+  if (aOcc.monthly || bOcc.monthly) return false;
+  for (const s of aOcc.weekly) if (bOcc.weekly.has(s)) return true;
+  return false;
+}
+
+// --------- subcommands ---------
+
+function parseArgs(args) {
+  const out = { positional: [], flags: {} };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = args[i + 1];
+      if (next && !next.startsWith("--")) { out.flags[key] = next; i++; }
+      else { out.flags[key] = true; }
+    } else {
+      out.positional.push(a);
+    }
+  }
+  return out;
+}
+
+function cmdList(args) {
+  const { flags } = parseArgs(args);
+  const reg = loadReg();
+  const entries = Object.values(reg.jobs).sort((a, b) => {
+    const ka = scheduleSortKey(a.schedule);
+    const kb = scheduleSortKey(b.schedule);
+    return ka.localeCompare(kb);
+  });
+  if (flags.conflicts) {
+    const pairs = [];
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        if (collides(entries[i], entries[j])) pairs.push([entries[i], entries[j]]);
+      }
+    }
+    if (pairs.length === 0) { console.log("No conflicts."); return; }
+    console.log(`${pairs.length} conflict pair(s):\n`);
+    for (const [a, b] of pairs) {
+      console.log(`  • ${a.name} (${a.schedule}, ${a.duration_min}min) ⨯ ${b.name} (${b.schedule}, ${b.duration_min}min)`);
+    }
+    console.log("");
+    // Also: per-slot summary — how many jobs fire in each :00 :15 :30 :45 minute-of-hour?
+    const minOfHour = new Map();
+    for (const e of entries) {
+      const { weekly, monthly } = expandSchedule(e.schedule);
+      if (monthly) continue;
+      const seen = new Set();
+      for (const slot of weekly) {
+        const mm = slot.split(":")[1].slice(2);
+        if (!seen.has(mm)) { seen.add(mm); minOfHour.set(mm, (minOfHour.get(mm) || 0) + 1); }
+      }
+    }
+    console.log("Minute-of-hour load (count of unique jobs firing at this minute, any hour):");
+    for (const [mm, count] of [...minOfHour.entries()].sort((a,b) => b[1]-a[1]).slice(0, 10)) {
+      console.log(`  :${mm}  ${count} jobs`);
+    }
+    return;
+  }
+  if (entries.length === 0) { console.log("(no registered jobs — run `edva-cron-slots seed`)"); return; }
+  console.log(`${entries.length} registered job(s):\n`);
+  for (const e of entries) {
+    const crit = e.criticality || "med";
+    console.log(`  ${e.schedule.padEnd(18)}  ${String(e.duration_min || 1).padStart(3)}min  [${crit.padEnd(4)}]  ${e.name}`);
+  }
+}
+
+function scheduleSortKey(s) {
+  // Sort by: hour, minute, day-of-week, day-of-month. So daily 08:00 comes first.
+  const [min, hour, dom, mon, dow] = String(s).split(/\s+/);
+  const h = String(hour === "*" ? 99 : Number(hour.split(",")[0].split("-")[0].replace("*/", ""))).padStart(2, "0");
+  const m = String(min === "*" ? 99 : Number(min.split(",")[0].split("-")[0].replace("*/", ""))).padStart(2, "0");
+  return `${h}${m} ${dow} ${dom}`;
+}
+
+function cmdShow(args) {
+  const { positional } = parseArgs(args);
+  const name = positional[0];
+  if (!name) { console.error("usage: show <name>"); process.exit(2); }
+  const reg = loadReg();
+  const j = reg.jobs[name];
+  if (!j) { console.error(`not registered: ${name}`); process.exit(1); }
+  console.log(JSON.stringify(j, null, 2));
+}
+
+function cmdRegister(args) {
+  const { positional, flags } = parseArgs(args);
+  const name = positional[0];
+  if (!name || !flags.schedule || !flags.duration) {
+    console.error("usage: register <name> --schedule '<cron5>' --duration <min> [--trigger PATH] [--criticality low|med|high] [--force]");
+    process.exit(2);
+  }
+  const reg = loadReg();
+  const entry = {
+    name,
+    schedule: String(flags.schedule),
+    duration_min: Number(flags.duration),
+    criticality: flags.criticality || "med",
+    trigger: flags.trigger || null,
+    registered_at: new Date().toISOString(),
+  };
+  expandSchedule(entry.schedule); // validates
+  // Check conflicts
+  if (!flags.force) {
+    const conflicts = [];
+    for (const other of Object.values(reg.jobs)) {
+      if (other.name === name) continue;
+      if (collides(entry, other)) conflicts.push(other);
+    }
+    if (conflicts.length > 0) {
+      console.error(`Conflicts with ${conflicts.length} existing job(s):`);
+      for (const c of conflicts) console.error(`  • ${c.name} (${c.schedule}, ${c.duration_min}min)`);
+      console.error("\nUse --force to override (will allow the collision), or run `request` to find a free slot, or `modify` an existing job.");
+      process.exit(1);
+    }
+  }
+  reg.jobs[name] = entry;
+  saveReg(reg);
+  console.log(`Registered: ${name} @ ${entry.schedule} (${entry.duration_min}min, ${entry.criticality})`);
+}
+
+function cmdModify(args) {
+  const { positional, flags } = parseArgs(args);
+  const name = positional[0];
+  if (!name) { console.error("usage: modify <name> [--schedule CRON] [--duration MIN] [--criticality ...] [--trigger ...]"); process.exit(2); }
+  const reg = loadReg();
+  const j = reg.jobs[name];
+  if (!j) { console.error(`not registered: ${name}`); process.exit(1); }
+  const updated = { ...j };
+  if (flags.schedule) updated.schedule = String(flags.schedule);
+  if (flags.duration) updated.duration_min = Number(flags.duration);
+  if (flags.criticality) updated.criticality = String(flags.criticality);
+  if (flags.trigger) updated.trigger = String(flags.trigger);
+  if (flags.runtime) {
+    updated.runtime = String(flags.runtime);
+    if (!RUNTIMES.has(updated.runtime)) {
+      console.error(`unknown --runtime '${updated.runtime}' (expected: ${[...RUNTIMES].join(", ")})`);
+      process.exit(2);
+    }
+  }
+  if (flags.note) updated.note = String(flags.note);
+  updated.modified_at = new Date().toISOString();
+  expandSchedule(updated.schedule);
+  if (!flags.force && runtimeOf(updated) === "cron") {
+    const conflicts = [];
+    for (const other of Object.values(reg.jobs)) {
+      if (other.name === name) continue;
+      if (runtimeOf(other) !== "cron") continue;
+      if (collides(updated, other)) conflicts.push(other);
+    }
+    if (conflicts.length > 0) {
+      console.error(`Modified schedule would conflict with ${conflicts.length} job(s):`);
+      for (const c of conflicts) console.error(`  • ${c.name} (${c.schedule}, ${c.duration_min}min)`);
+      console.error("\nUse --force to override.");
+      process.exit(1);
+    }
+  }
+  reg.jobs[name] = updated;
+  saveReg(reg);
+  console.log(`Modified: ${name} @ ${updated.schedule} (${updated.duration_min}min, ${updated.criticality})`);
+}
+
+function cmdRelease(args) {
+  const { positional } = parseArgs(args);
+  const name = positional[0];
+  if (!name) { console.error("usage: release <name>"); process.exit(2); }
+  const reg = loadReg();
+  if (!reg.jobs[name]) { console.error(`not registered: ${name}`); process.exit(1); }
+  delete reg.jobs[name];
+  saveReg(reg);
+  console.log(`Released: ${name}`);
+}
+
+function cmdRequest(args) {
+  const { flags } = parseArgs(args);
+  if (!flags.name || !flags.duration || !flags.cadence) {
+    console.error("usage: request --name <name> --duration <min> --cadence daily|weekly|monthly [--day sun..sat] [--prefer HH:MM] [--criticality ...]");
+    process.exit(2);
+  }
+  const duration = Number(flags.duration);
+  const cadence = String(flags.cadence);
+  const reg = loadReg();
+  const dayMap = { sun:0, mon:1, tue:2, wed:3, thu:4, fri:5, sat:6 };
+  // Build search space: candidate (day, minute-of-day) starting points.
+  const candidates = [];
+  if (cadence === "daily") {
+    for (let m = 0; m < 1440; m++) {
+      const h = Math.floor(m / 60), mm = m % 60;
+      candidates.push({ schedule: `${mm} ${h} * * *`, score: scoreSlot(h, mm, flags.prefer) });
+    }
+  } else if (cadence === "weekly") {
+    const days = flags.day ? [dayMap[String(flags.day).toLowerCase()]] : [0,1,2,3,4,5,6];
+    for (const d of days) {
+      for (let m = 0; m < 1440; m++) {
+        const h = Math.floor(m / 60), mm = m % 60;
+        candidates.push({ schedule: `${mm} ${h} * * ${d}`, score: scoreSlot(h, mm, flags.prefer) });
+      }
+    }
+  } else if (cadence === "monthly") {
+    console.error("monthly cadence: pass --day-of-month manually via register (this picker covers daily/weekly only)");
+    process.exit(2);
+  }
+  // Sort by preference score: lower minute-of-hour offsets (NOT :00, prefer :15/:30/:45) score better,
+  // closer to --prefer HH:MM scores better.
+  candidates.sort((a, b) => a.score - b.score);
+  for (const c of candidates) {
+    const trial = { name: flags.name, schedule: c.schedule, duration_min: duration };
+    let conflict = false;
+    for (const other of Object.values(reg.jobs)) {
+      if (other.name === flags.name) continue;
+      if (collides(trial, other)) { conflict = true; break; }
+    }
+    if (!conflict) {
+      console.log(`Free slot found: ${c.schedule}  (duration ${duration}min)`);
+      console.log(`To reserve, run:`);
+      console.log(`  edva-cron-slots register ${flags.name} --schedule '${c.schedule}' --duration ${duration} --criticality ${flags.criticality || "med"}`);
+      return;
+    }
+  }
+  console.error("No free slot found in the requested cadence. Try widening --day or reducing --duration.");
+  process.exit(1);
+}
+
+function scoreSlot(h, m, prefer) {
+  // Prefer off-the-hour offsets (avoid :00, prefer :15 :30 :45).
+  // Prefer something near --prefer HH:MM.
+  let s = 0;
+  // Hour score: stay in 6-22 local as default-good unless prefer overrides.
+  let preferH = 9, preferM = 30;
+  if (prefer) {
+    const [ph, pm] = String(prefer).split(":").map(Number);
+    if (!isNaN(ph)) preferH = ph;
+    if (!isNaN(pm)) preferM = pm;
+  }
+  s += Math.abs(h - preferH) * 60 + Math.abs(m - preferM);
+  // Penalize :00 heavily (typical congestion zone)
+  if (m === 0) s += 200;
+  // Mild penalty for :30 (also popular)
+  if (m === 30) s += 30;
+  return s;
+}
+
+function cmdSeed() {
+  // Parse current crontab. For each trigger-*.sh line we recognize, register it
+  // with a heuristic duration. Skip the inline-curl reminder entries.
+  const out = execSync("crontab -l", { encoding: "utf8" });
+  const reg = loadReg();
+  let added = 0, skipped = 0, alreadyHave = 0;
+  const lines = out.split("\n");
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    // Skip inline curl reminders (one-shot date entries) and any line that doesn't reference trigger-*.sh
+    if (!line.includes("trigger-") || !line.includes(".sh")) { skipped++; continue; }
+    // Skip self-deleting one-shot reminders (they have ` # NAME` markers)
+    if (/#\s+[A-Z0-9_]+$/.test(line) && line.includes("crontab -")) { skipped++; continue; }
+    // Extract schedule = first 5 fields
+    const parts = line.split(/\s+/);
+    if (parts.length < 6) { skipped++; continue; }
+    const schedule = parts.slice(0, 5).join(" ");
+    const cmdPart = parts.slice(5).join(" ");
+    // Pull trigger path
+    const triggerMatch = cmdPart.match(/(\/[^\s>]+trigger-[a-z0-9-]+\.sh)/);
+    if (!triggerMatch) { skipped++; continue; }
+    const trigger = triggerMatch[1];
+    const name = trigger.split("/").pop().replace(/^trigger-/, "").replace(/\.sh$/, "");
+    if (reg.jobs[name]) { alreadyHave++; continue; }
+    // Heuristic durations based on name patterns
+    const duration = guessDuration(name);
+    const criticality = guessCriticality(name);
+    reg.jobs[name] = {
+      name,
+      schedule,
+      duration_min: duration,
+      criticality,
+      trigger,
+      registered_at: new Date().toISOString(),
+      seeded: true,
+    };
+    added++;
+  }
+  saveReg(reg);
+  console.log(`Seeded: added=${added}, already-registered=${alreadyHave}, skipped=${skipped}`);
+  console.log(`\nDurations are heuristic estimates. Run \`edva-cron-slots list --conflicts\` to see collisions.`);
+}
+
+// This installation's own job names in the seed heuristics, beyond the kernel's
+// (agent/local/config/cron-slots.json, all optional):
+//   fast_prefixes            name prefixes of fast (no-LLM, ~1 min) jobs
+//   extend_slow_substrings   name substrings of LLM-heavy (~5 min) jobs
+//   long_jobs                { "<name substring>": minutes } for anything slower
+//   extend_high_substrings / extend_low_substrings   criticality by name substring
+const SLOTS_CFG = localConfig("cron-slots", {
+  fast_prefixes: [],
+  slow_substrings: ["digest", "draft", "ideation", "consolidat", "review", "brainstorm", "summary"],
+  long_jobs: {},
+  high_substrings: ["hum", "reviews", "metrics-collect"],
+  low_substrings: ["watchdog", "chrome", "skills-sync", "edva-sync"],
+});
+const FAST_PREFIXES = SLOTS_CFG.fast_prefixes;
+const hasAny = (name, subs) => subs.some((s) => name.includes(s));
+
+function guessDuration(name) {
+  // Fast tactical/heartbeat jobs (no LLM): 1 min
+  if (/^(watchdog|chrome-cdp|skills-sync|edva-sync|embed-messages|memory-snapshot|context-sync|p1-resolution|wiki-|apns-token|gmail-watch)/.test(name)
+    || FAST_PREFIXES.some((p) => name.startsWith(p))) return 1;
+  // Watchers that scrape one or two sources: 2 min
+  if (/-(watch|scan|pulse|monitor|radar|push|health)$/.test(name)) return 2;
+  // LLM-heavy digests / drafts / agencies: 5 min
+  if (hasAny(name, SLOTS_CFG.slow_substrings)) return 5;
+  // Jobs the installation knows run long (many API calls, a lot of state work)
+  for (const [sub, min] of Object.entries(SLOTS_CFG.long_jobs)) if (name.includes(sub)) return min;
+  // Default: 2 min (typical LLM turn)
+  return 2;
+}
+
+function guessCriticality(name) {
+  if (hasAny(name, SLOTS_CFG.high_substrings)) return "high";
+  if (hasAny(name, SLOTS_CFG.low_substrings)) return "low";
+  return "med";
+}
+
+// A registered job does not have to be a CRON job, and until 2026-09-06 the
+// registry could not say so — which is why an audit reported 32 entries
+// "missing from crontab" when most of them were exactly where they belong.
+// Three legitimate reasons a job is absent from crontab:
+//
+//   launchd — cron cannot authenticate a `claude -p` (no GUI session → no
+//             keychain → "Not logged in", exit 0), so every ephemeral-Opus job
+//             runs from a launchd user agent instead. nightly-review,
+//             improvement-plan and system-issue-review are all this, by
+//             design, and documented as such in ops-agent/CLAUDE.md.
+//   paused  — deliberately switched off, e.g. a `#MARKER#`-paused family of crons.
+//             A settled decision, not a gap to close.
+//   retired — the job is gone; the row is kept so its slot is not silently
+//             reused and so the name still resolves.
+//
+// Only `runtime: "cron"` (the default) is expected to appear in crontab. The
+// others are reported as their own line so the summary means something: a
+// non-zero "missing" now genuinely means a cron job that is not scheduled.
+const RUNTIMES = new Set(["cron", "launchd", "paused", "retired"]);
+const runtimeOf = (e) => e.runtime || "cron";
+
+function cmdAudit() {
+  const reg = loadReg();
+  const out = execSync("crontab -l", { encoding: "utf8" });
+  const lines = out.split("\n");
+  const cronJobs = new Map(); // name → schedule
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/(\/[^\s>]+trigger-[a-z0-9-]+\.sh)/);
+    if (!m) continue;
+    const name = m[1].split("/").pop().replace(/^trigger-/, "").replace(/\.sh$/, "");
+    const schedule = line.split(/\s+/).slice(0, 5).join(" ");
+    cronJobs.set(name, schedule);
+  }
+  console.log("Audit (crontab vs registry):\n");
+  let unregistered = 0, drifted = 0, missing = 0;
+  const elsewhere = { launchd: [], paused: [], retired: [] };
+  for (const [name, schedule] of cronJobs) {
+    const r = reg.jobs[name];
+    if (!r) { console.log(`  [UNREGISTERED] ${name} in crontab @ ${schedule}`); unregistered++; }
+    else if (runtimeOf(r) !== "cron") {
+      // In crontab but the registry says it should not be — the sharper of the
+      // two directions, because a "paused" job that is actually running is a
+      // decision being silently undone.
+      console.log(`  [RUNTIME-MISMATCH] ${name} is in crontab @ ${schedule} but registry says runtime=${runtimeOf(r)}`);
+      drifted++;
+    }
+    else if (r.schedule !== schedule) { console.log(`  [DRIFTED] ${name} crontab=${schedule} registry=${r.schedule}`); drifted++; }
+  }
+  for (const name of Object.keys(reg.jobs)) {
+    if (cronJobs.has(name)) continue;
+    const rt = runtimeOf(reg.jobs[name]);
+    if (rt === "cron") { console.log(`  [MISSING-FROM-CRONTAB] ${name} (registry @ ${reg.jobs[name].schedule})`); missing++; }
+    else elsewhere[rt].push(name);
+  }
+  for (const rt of ["launchd", "paused", "retired"]) {
+    if (elsewhere[rt].length) console.log(`\n  ${elsewhere[rt].length} ${rt}: ${elsewhere[rt].sort().join(", ")}`);
+  }
+  if (unregistered + drifted + missing === 0) console.log("\n  ✓ crontab and registry match.");
+  else console.log(`\nSummary: ${unregistered} unregistered, ${drifted} drifted, ${missing} missing from crontab.`);
+}
+
+function cmdProposeFixes() {
+  const reg = loadReg();
+  // Cluster by (minute-of-week) start. Each non-heartbeat job lands in 1+ clusters.
+  const entries = Object.values(reg.jobs).filter(e => !isHeartbeat(e));
+  // Group jobs by their *schedule string* first. Per-day clusters create noise
+  // (a weekday watcher shows up at Mon 09:00 AND Tue 09:00 AND ...). We want
+  // one decision per job, not one per day-of-week.
+  // Find a representative start time: the (hour:minute) where the job fires.
+  function startKey(e) {
+    const parts = String(e.schedule).split(/\s+/);
+    return parts[1] + ":" + parts[0]; // hour:minute
+  }
+  const byStart = new Map();
+  for (const e of entries) {
+    const k = startKey(e);
+    if (!byStart.has(k)) byStart.set(k, []);
+    byStart.get(k).push(e);
+  }
+  // Only flag clusters where the JOBS actually collide on some day. Different
+  // day-restricted jobs at 09:00 (e.g. a Fri-only job + a Wed-only job
+  // only) are not a real problem.
+  const realClusters = [];
+  for (const [start, jobs] of byStart) {
+    if (jobs.length < 2) continue;
+    // Sub-cluster: which jobs actually share a day?
+    // Compute day sets for each.
+    const daysOf = jobs.map(j => {
+      const parts = String(j.schedule).split(/\s+/);
+      const dow = parts[4];
+      return parseField(dow, 0, 6);
+    });
+    // Find any pair sharing a day. We report the cluster if ≥2 share at least one day.
+    let realPair = false;
+    outer: for (let i = 0; i < daysOf.length; i++) {
+      for (let j = i + 1; j < daysOf.length; j++) {
+        for (const d of daysOf[i]) if (daysOf[j].has(d)) { realPair = true; break outer; }
+      }
+    }
+    if (realPair) realClusters.push({ start, jobs });
+  }
+  realClusters.sort((a, b) => b.jobs.length - a.jobs.length);
+  if (realClusters.length === 0) { console.log("No real collision clusters. ✓"); return; }
+  // Simulate: as we propose moves, update a working copy of the registry so subsequent suggestions consider them.
+  const working = JSON.parse(JSON.stringify(reg));
+  console.log(`Found ${realClusters.length} cluster(s) (sorted by size):\n`);
+  for (const { start, jobs } of realClusters) {
+    console.log(`  ${start} — ${jobs.length} jobs colliding:`);
+    const sorted = [...jobs].sort((a, b) => critRank(b) - critRank(a));
+    const keeper = sorted[0];
+    console.log(`    KEEP: ${keeper.name} (${keeper.criticality}, ${keeper.schedule})`);
+    for (const j of sorted.slice(1)) {
+      const proposed = suggestMove(j, working);
+      if (proposed) {
+        working.jobs[j.name] = { ...j, schedule: proposed };
+        console.log(`    MOVE: ${j.name} (${j.criticality}, ${j.schedule}) → ${proposed}`);
+      } else {
+        console.log(`    MOVE: ${j.name} (${j.criticality}, ${j.schedule}) → [no free nearby slot]`);
+      }
+    }
+    console.log("");
+  }
+  console.log("To apply, run for each move:");
+  console.log("  edva-cron-slots modify <name> --schedule '<new schedule>'");
+  console.log("Then update crontab to match (the tool does not edit crontab).");
+}
+
+function critRank(j) { return { low: 1, med: 2, high: 3 }[j.criticality || "med"]; }
+
+function suggestMove(job, reg) {
+  // Try to find a free slot within ±90 minutes of the current start, preferring non-:00 minutes.
+  const { weekly, monthly } = expandSchedule(job.schedule);
+  if (monthly) return null;
+  const firstSlot = [...weekly][0];
+  if (!firstSlot) return null;
+  const [d, hm] = firstSlot.split(":");
+  const startMin = Number(hm.slice(0,2)) * 60 + Number(hm.slice(2));
+  // Search ±90 minutes; prefer non-zero minute-of-hour.
+  const candidates = [];
+  for (let offset = -90; offset <= 90; offset += 5) {
+    if (offset === 0) continue;
+    const targetMin = (startMin + offset + 1440) % 1440;
+    const targetH = Math.floor(targetMin / 60);
+    const targetM = targetMin % 60;
+    // Build same-day-of-week schedule
+    const sched = parseDayPattern(job.schedule);
+    const newSched = `${targetM} ${targetH} * * ${sched.dow}`;
+    candidates.push({ schedule: newSched, offset });
+  }
+  // Score: prefer small |offset|, prefer non-:00 minute, slight bonus for :15/:30/:45
+  candidates.sort((a, b) => {
+    const aM = Number(a.schedule.split(" ")[0]), bM = Number(b.schedule.split(" ")[0]);
+    let aS = Math.abs(a.offset);
+    let bS = Math.abs(b.offset);
+    if (aM === 0) aS += 100;
+    if (bM === 0) bS += 100;
+    if ([15,30,45].includes(aM)) aS -= 5;
+    if ([15,30,45].includes(bM)) bS -= 5;
+    return aS - bS;
+  });
+  for (const c of candidates) {
+    const trial = { ...job, schedule: c.schedule };
+    let conflict = false;
+    for (const other of Object.values(reg.jobs)) {
+      if (other.name === job.name) continue;
+      if (collides(trial, other)) { conflict = true; break; }
+    }
+    if (!conflict) return c.schedule;
+  }
+  return null;
+}
+
+function parseDayPattern(schedule) {
+  const parts = String(schedule).split(/\s+/);
+  return { min: parts[0], hour: parts[1], dom: parts[2], mon: parts[3], dow: parts[4] };
+}
+
+// --------- main ---------
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const rest = argv.slice(1);
+try {
+  switch (cmd) {
+    case "list":            cmdList(rest); break;
+    case "show":            cmdShow(rest); break;
+    case "register":        cmdRegister(rest); break;
+    case "modify":          cmdModify(rest); break;
+    case "release":         cmdRelease(rest); break;
+    case "request":         cmdRequest(rest); break;
+    case "audit":           cmdAudit(); break;
+    case "seed":            cmdSeed(); break;
+    case "propose-fixes":   cmdProposeFixes(); break;
+    case "--help": case "-h": case undefined:
+      console.log(fs.readFileSync(process.argv[1], "utf8").split("\n").slice(0, 30).join("\n"));
+      break;
+    default:
+      console.error("unknown command: " + cmd);
+      process.exit(2);
+  }
+} catch (err) {
+  console.error("Error: " + err.message);
+  process.exit(1);
+}

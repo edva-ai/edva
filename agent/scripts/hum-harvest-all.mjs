@@ -190,13 +190,13 @@ async function main() {
   for await (const chunk of process.stdin) chunks.push(chunk);
   const situationJson = Buffer.concat(chunks).toString("utf8").trim() || "{}";
 
-  // Build the unified merlin-context once per tick and pass it to every
+  // Build the unified edva-context once per tick and pass it to every
   // harvester alongside the situation. Harvesters receive envelope shape:
   //   { situation, context }
-  // on stdin. See lib/merlin-context.js for fields.
+  // on stdin. See lib/edva-context.js for fields.
   let contextJson = "{}";
   try {
-    const ctxBuilder = await import(installTools("lib/merlin-context.js"));
+    const ctxBuilder = await import(installTools("lib/edva-context.js"));
     const ctx = ctxBuilder.default.build ? ctxBuilder.default.build() : ctxBuilder.build();
     contextJson = JSON.stringify(ctx);
   } catch (e) {
@@ -436,7 +436,7 @@ async function main() {
 
   // ─── Claim-check every candidate against the authorities ────────────────
   //
-  // Deterministic stage only (no LLM, no tokens): attach what Merlin's own
+  // Deterministic stage only (no LLM, no tokens): attach what Edva's own
   // live data says about the places and dates each candidate names, and DROP
   // the ones whose asserted premise the timeline flatly refutes. The costly
   // adjudication stage runs once, later, on the single winner — at send time

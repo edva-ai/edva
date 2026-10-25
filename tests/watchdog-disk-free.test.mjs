@@ -67,7 +67,7 @@ function makeSandbox() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wd-disk-"));
   const bin = path.join(root, "bin");
   fs.mkdirSync(bin);
-  fs.mkdirSync(path.join(root, "home/Dev/merlin/data"), { recursive: true });
+  fs.mkdirSync(path.join(root, "home/Dev/edva/data"), { recursive: true });
   const stub = (name, body) => {
     const p = path.join(bin, name);
     fs.writeFileSync(p, `#!/bin/bash\n${body}\n`);
@@ -89,7 +89,7 @@ function bashEnv(sb, extra = {}) {
     HOME: sb.home,
     STUB_LOG_DIR: sb.root,
     // The alerts name the machine by the instance's host title / label.
-    MERLIN_HOST_TITLE: "Server", MERLIN_HOST_LABEL: "the server",
+    EDVA_HOST_TITLE: "Server", EDVA_HOST_LABEL: "the server",
     ...extra,
   };
 }
@@ -129,7 +129,7 @@ test("plenty of free space reads ok", () => {
 test("probe asks df -Pk about the volume holding data by default", () => {
   const r = probe({ df: dfOut(121880000, 74) });
   assert.equal(r.dfCalls.length, 1);
-  assert.ok(r.dfCalls[0].startsWith("-Pk ") && r.dfCalls[0].endsWith("/Dev/merlin/data"), r.dfCalls[0]);
+  assert.ok(r.dfCalls[0].startsWith("-Pk ") && r.dfCalls[0].endsWith("/Dev/edva/data"), r.dfCalls[0]);
 });
 
 test("about 20 GiB free reads low", () => {
@@ -202,7 +202,7 @@ test("a malformed threshold override falls back to the default instead of disabl
 // ---- the section, tick by tick, through the real incident machinery ----------
 
 // Each tick is a fresh bash process, as under cron; incident state persists in
-// $HOME/Dev/merlin/data/watchdog-incidents between ticks.
+// $HOME/Dev/edva/data/watchdog-incidents between ticks.
 function ticker() {
   const sb = makeSandbox();
   const dfFile = path.join(sb.root, "df.out");
@@ -212,7 +212,7 @@ function ticker() {
     `SEND=${JSON.stringify(sb.send)}`,
     'EMAIL_SEND="/nonexistent/email-send"',
     'PENDING_ALERT_KEY=""',
-    'INCIDENT_DIR="$HOME/Dev/merlin/data/watchdog-incidents"',
+    'INCIDENT_DIR="$HOME/Dev/edva/data/watchdog-incidents"',
     'mkdir -p "$INCIDENT_DIR"',
     'ISSUES=""',
     fnSrc("log_throttled"),
@@ -228,7 +228,7 @@ function ticker() {
     'printf "ISSUES=%s\\n" "$ISSUES"',
   ].join("\n");
   let seen = 0;
-  const tick = (df, { dfRc = 0, duOut = `${gib(40)}\t${sb.home}/Dev/merlin/data/memory-db-snapshots`, duRc = 0, env = {} } = {}) => {
+  const tick = (df, { dfRc = 0, duOut = `${gib(40)}\t${sb.home}/Dev/edva/data/memory-db-snapshots`, duRc = 0, env = {} } = {}) => {
     fs.writeFileSync(dfFile, df);
     const duBefore = readLines(path.join(sb.root, "du.calls")).length;
     const out = execFileSync("bash", ["-c", harness], {
@@ -351,7 +351,7 @@ test("an unreadable df neither counts toward a page nor clears an incident", () 
       assert.equal(r.issues, " disk(unknown)");
     }
     assert.deepEqual(t.tick("", { dfRc: 1 }).pages, []);
-    const incDir = path.join(t.sb.home, "Dev/merlin/data/watchdog-incidents");
+    const incDir = path.join(t.sb.home, "Dev/edva/data/watchdog-incidents");
     assert.deepEqual(fs.readdirSync(incDir).filter((f) => f.startsWith("disk-")), [], "unknown writes no incident state");
 
     // unknown between two critical ticks does not count: the page needs a second CRITICAL tick
@@ -425,10 +425,10 @@ test("the section uses the two incident keys through the shared machinery", () =
     assert.ok(sec.includes(`incident_clear "${key}"`), `incident_clear "${key}"`);
     assert.ok(sec.includes(`[ "$ATTEMPT" -ge 2 ] && incident_should_alert "${key}"`), `2-tick gate for ${key}`);
   }
-  assert.ok(sec.includes('notify "🔴 ${MERLIN_HOST_TITLE:-Host} disk space critical: '), "stable 🔴 prefix");
-  assert.ok(sec.includes('notify "⚠️ ${MERLIN_HOST_TITLE:-Host} disk space low: '), "stable ⚠️ prefix");
-  assert.match(SRC, /disk-low\)\s+echo "\$\{MERLIN_HOST_TITLE:-Host\} free disk space" ;;/);
-  assert.match(SRC, /disk-critical\)\s+echo "\$\{MERLIN_HOST_TITLE:-Host\} free disk space \(critical\)" ;;/);
+  assert.ok(sec.includes('notify "🔴 ${EDVA_HOST_TITLE:-Host} disk space critical: '), "stable 🔴 prefix");
+  assert.ok(sec.includes('notify "⚠️ ${EDVA_HOST_TITLE:-Host} disk space low: '), "stable ⚠️ prefix");
+  assert.match(SRC, /disk-low\)\s+echo "\$\{EDVA_HOST_TITLE:-Host\} free disk space" ;;/);
+  assert.match(SRC, /disk-critical\)\s+echo "\$\{EDVA_HOST_TITLE:-Host\} free disk space \(critical\)" ;;/);
 });
 
 test("the probe uses df -Pk and env thresholds with 25/10 defaults", () => {

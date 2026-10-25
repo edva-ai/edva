@@ -94,9 +94,9 @@ export function buildLocalRulesFile({ localDir, role, stateDir }) {
  * Which local rules a `claude -p` started in `cwd` should get: the role whose
  * CLAUDE.md hierarchy that cwd loads. "chat" (chat-agent), "ops" (an ops-*
  * agent dir), "shared" (elsewhere under agent, which loads only
- * agent/CLAUDE.md), or null outside `<root>/tools/agent` (no Merlin
+ * agent/CLAUDE.md), or null outside `<root>/tools/agent` (no Edva
  * CLAUDE.md is loaded there, so no local rules either). The shell twin is
- * merlin_local_rules_role in agent/scripts/lib/local-rules.sh.
+ * edva_local_rules_role in agent/scripts/lib/local-rules.sh.
  */
 export function localRulesRoleForCwd(cwd, root) {
   if (!cwd || !root) return null;
@@ -113,7 +113,7 @@ export function localRulesRoleForCwd(cwd, root) {
 /**
  * The local rules file for a fork that runs outside the supervisors (a
  * one-shot, a fork executor) in `cwd`: built under `stateDir` like the
- * supervisors' own, or null when the cwd loads no Merlin CLAUDE.md or there
+ * supervisors' own, or null when the cwd loads no Edva CLAUDE.md or there
  * are no local rules. Never throws.
  */
 export function localRulesFileForCwd({ cwd, root, localDir, stateDir }) {
@@ -243,11 +243,11 @@ export class ClaudeSession extends EventEmitter {
       // API key over the Max credentials in ~/.claude/.credentials.json.
       for (const k of this.opts.unsetEnv || []) delete env[k];
       // The MCP configs name this installation's Supabase project as
-      // ${MERLIN_SUPABASE_PROJECT}; give the child the instance's value when
+      // ${EDVA_SUPABASE_PROJECT}; give the child the instance's value when
       // the environment has none (lib/instance.cjs).
-      if (!env.MERLIN_SUPABASE_PROJECT) {
+      if (!env.EDVA_SUPABASE_PROJECT) {
         const project = instance().supabase_project;
-        if (project) env.MERLIN_SUPABASE_PROJECT = project;
+        if (project) env.EDVA_SUPABASE_PROJECT = project;
       }
       const child = spawn(bin, args, {
         cwd: this.opts.cwd,

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // hum-resolve-first — the "work it out before asking" gate for every hum send.
 //
-// Called by bin/merlin-send-curl for each chat-channel message whose
+// Called by bin/edva-send-curl for each chat-channel message whose
 // --intent starts with `hum:` (hum-ping, hum-ask, hum-deliver-qual all pass
-// one). Reads Merlin's own records, asks Opus whether they already answer what
+// one). Reads Edva's own records, asks Opus whether they already answer what
 // the message asks or leaves open, and says what to do with it. Design and
 // rationale: lib/hum-resolve-first.mjs, docs/hum-resolve-first.md.
 //
@@ -108,7 +108,7 @@ try {
   if (cmd === "gate") {
     await gate();
     // Exit now rather than when the last child process does: after the
-    // backstop fires, a hung source must not keep merlin-send-curl waiting.
+    // backstop fires, a hung source must not keep edva-send-curl waiting.
     process.exit(0);
   }
   else if (cmd === "stats") stats();

@@ -13,11 +13,11 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { event, MERLIN } from "./_common.mjs";
+import { event, EDVA } from "./_common.mjs";
 
 export const meta = { name: "comms", lanes: ["email_followups", "tasks", "situation"] };
 
-const TRIAGE_LOG = path.join(MERLIN, "logs/triage.log");
+const TRIAGE_LOG = path.join(EDVA, "logs/triage.log");
 const WAVE_THRESHOLD = 5;
 
 export default async function detect(ctx) {

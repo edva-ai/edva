@@ -59,10 +59,10 @@ function prompt(pages, previous) {
   const prev = previous?.topics?.length
     ? `\nThe current topics are listed below. Keep a topic's slug and name when it still fits, so links stay stable; change what needs changing.\n${previous.topics.map((t) => `- ${t.slug}: ${t.name}`).join("\n")}\n`
     : "";
-  return `You are organising the home page of a personal memory wiki: everything an AI assistant called Merlin remembers about ${PORTAL_SUBJECT}. The home page shows a handful of TOPICS a person browses by. Design them.
+  return `You are organising the home page of a personal memory wiki: everything an AI assistant called Edva remembers about ${PORTAL_SUBJECT}. The home page shows a handful of TOPICS a person browses by. Design them.
 
 Rules:
-- 6 to 12 topics. Each is something a person would think to look under ("Family & friends", "Homes & rentals", "Travel", "Money", "Health", "Work", "How Merlin works"). Plain names, at most 3 words.
+- 6 to 12 topics. Each is something a person would think to look under ("Family & friends", "Homes & rentals", "Travel", "Money", "Health", "Work", "How Edva works"). Plain names, at most 3 words.
 - "blurb": one short line saying what is in the topic, at most 14 words. Say what KIND of thing is there, never specifics: no names of medical conditions, amounts, account numbers, codes, addresses or passwords.
 - File EVERY page below under at least one topic. Use "prefixes" for families of pages whose ids share a prefix and all belong together (e.g. "travel_hotel_"), and "ids" for the rest. A page may sit in two topics when it truly belongs to both.
 - "featured": 3 to 6 ids from that topic that are the best place to start.

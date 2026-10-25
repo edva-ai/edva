@@ -1,6 +1,6 @@
 // app-screens.mjs — WP12: HTML routes + a server-push event stream (dashboards
 // that push). Conway's ROUTE / APP contribution kinds + emitStreamEvent,
-// adapted for Merlin.
+// adapted for Edva.
 //
 //   registerRoute(path, handler)      — handler(req) => { status, headers, body }
 //   registerAppScreen(name, path, o)  — manifest a route as a full-screen app

@@ -18,7 +18,7 @@ process.env.HUM_NOVELTY_SIDECAR = path.join(tmp, "vectors.jsonl");
 const LOCAL = path.join(tmp, "local");
 fs.mkdirSync(path.join(LOCAL, "config"), { recursive: true });
 fs.writeFileSync(path.join(LOCAL, "config", "hum-lanes.json"), JSON.stringify({ protected_lanes: ["practice"] }));
-process.env.MERLIN_LOCAL_DIR = LOCAL;
+process.env.EDVA_LOCAL_DIR = LOCAL;
 
 const core = await import("../lib/hum-tick-core.mjs");
 const { extractJsonObject, balancedObjectSpans } = await import("../lib/extract-json.mjs");
@@ -135,7 +135,7 @@ test("previewVerdict skips only when nothing is eligible and nothing went unseen
 test("HUM_HARVEST_PREVIEW=1 turns data writes into no-ops (fs default + named imports)", async () => {
   const { execFileSync } = await import("node:child_process");
   const common = new URL("../agent/scripts/hum-harvesters/_common.mjs", import.meta.url).href;
-  const probe = path.join(os.homedir(), "Dev/merlin/data", `__preview_probe_${process.pid}.json`);
+  const probe = path.join(os.homedir(), "Dev/edva/data", `__preview_probe_${process.pid}.json`);
   const outside = path.join(tmp, "outside.txt");
   const script = `
     const c = await import(${JSON.stringify(common)});

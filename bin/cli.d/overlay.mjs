@@ -1,4 +1,4 @@
-// merlin overlay — attach a private overlay repo to this checkout.
+// edva overlay — attach a private overlay repo to this checkout.
 //
 // An installation's own rules, config and code live outside the public tree:
 // in agent/local/ (identity, local rules, config, registries — read by
@@ -147,12 +147,12 @@ function resolveOverlay(arg, HOME) {
 }
 
 function help(c) {
-  console.log(c.bold("merlin overlay") + " — link a private overlay repo into agent/local/ and the _ext/ dirs\n");
+  console.log(c.bold("edva overlay") + " — link a private overlay repo into agent/local/ and the _ext/ dirs\n");
   console.log("Usage:");
-  console.log("  merlin overlay add <path> [--dry-run]   register an overlay and link its files");
-  console.log("  merlin overlay status                   registered overlays and the state of each link");
-  console.log("  merlin overlay sync                     re-link every registered overlay (after it changed)");
-  console.log("  merlin overlay remove <path>            unlink an overlay (the overlay repo is untouched)\n");
+  console.log("  edva overlay add <path> [--dry-run]   register an overlay and link its files");
+  console.log("  edva overlay status                   registered overlays and the state of each link");
+  console.log("  edva overlay sync                     re-link every registered overlay (after it changed)");
+  console.log("  edva overlay remove <path>            unlink an overlay (the overlay repo is untouched)\n");
   console.log("Overlay layout (paths mirror this checkout):");
   console.log("  local/instance.json, local/shared.md, local/config/<name>.json, ...  → agent/local/");
   console.log("  lib/_ext/presence.mjs, agent/supervisor/_ext/routes.mjs, ...       → same path here");
@@ -171,7 +171,7 @@ export default {
 
     if (sub === "add") {
       const target = args.find((a, i) => i > 0 && !a.startsWith("--"));
-      if (!target) die("usage: merlin overlay add <path-to-overlay-repo> [--dry-run]");
+      if (!target) die("usage: edva overlay add <path-to-overlay-repo> [--dry-run]");
       const root = resolveOverlay(target, HOME);
       if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) die(`overlay path not found: ${root}`);
       if (root === path.resolve(CHECKOUT) || root.startsWith(path.resolve(CHECKOUT) + path.sep)) die("the overlay must live outside this checkout");
@@ -197,7 +197,7 @@ export default {
 
     if (sub === "sync") {
       const reg = readRegistry();
-      if (!reg.overlays.length) { console.log(c.dim("  no overlays registered. Use: merlin overlay add <path>")); return; }
+      if (!reg.overlays.length) { console.log(c.dim("  no overlays registered. Use: edva overlay add <path>")); return; }
       for (const o of reg.overlays) {
         if (!fs.existsSync(o.path)) { console.log(c.yellow(`  ! ${o.path}: not found — skipped`)); continue; }
         const made = applyPlan(planLinks(o.path).plan, c);
@@ -225,7 +225,7 @@ export default {
 
     if (sub === "remove") {
       const target = args[1];
-      if (!target) die("usage: merlin overlay remove <path>");
+      if (!target) die("usage: edva overlay remove <path>");
       const root = resolveOverlay(target, HOME);
       const reg = readRegistry();
       const before = reg.overlays.length;
@@ -239,6 +239,6 @@ export default {
       return;
     }
 
-    die(`unknown: overlay ${sub}. Try: merlin overlay help`);
+    die(`unknown: overlay ${sub}. Try: edva overlay help`);
   },
 };

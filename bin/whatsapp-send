@@ -105,7 +105,7 @@ async function cmdSend(a) {
       body: JSON.stringify({
         to: a.to,
         text: a.text,
-        originating_task: process.env.MERLIN_TASK_ID || null,
+        originating_task: process.env.EDVA_TASK_ID || null,
       }),
     });
   } catch (err) {
@@ -132,7 +132,7 @@ async function cmdSend(a) {
       message_id: json.message_id,
       to: a.to,
       text: a.text,
-      originating_task: process.env.MERLIN_TASK_ID || null,
+      originating_task: process.env.EDVA_TASK_ID || null,
       via: "cli",
     }) + "\n");
   } catch (err) {

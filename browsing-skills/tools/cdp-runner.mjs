@@ -21,7 +21,7 @@
 // LAST block containing an `execute:` is the canonical action body.
 //
 // The Chrome target must already be running with --remote-debugging-port=9222
-// on the host (LaunchAgent com.merlin.chrome-cdp keeps it alive per
+// on the host (LaunchAgent com.edva.chrome-cdp keeps it alive per
 // system/architecture.md § Host).
 //
 // ── Network + frame capture ─────────────────────────────────────────────────

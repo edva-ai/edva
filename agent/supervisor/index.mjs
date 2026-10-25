@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// index.mjs — Merlin ops-agent supervisor.
+// index.mjs — Edva ops-agent supervisor.
 //
 // Responsibilities:
 //   1. Spawn `claude -p --input-format stream-json --output-format stream-json ...`
@@ -64,11 +64,11 @@ import {
 import { installRoot, installTools } from "../../lib/root.cjs";
 
 const HOME = process.env.HOME;
-const MERLIN_ROOT = installRoot();
+const EDVA_ROOT = installRoot();
 // The operator's own rules and playbook additions (agent/local/; see
 // claude-session.mjs § Local agent rules). Overridable for tests.
-const LOCAL_DIR = process.env.MERLIN_LOCAL_DIR || path.join(MERLIN_ROOT, "agent/local");
-const TRIAGE_RULES_KERNEL = path.join(MERLIN_ROOT, "agent/ops-agent/email-triage-rules.md");
+const LOCAL_DIR = process.env.EDVA_LOCAL_DIR || path.join(EDVA_ROOT, "agent/local");
+const TRIAGE_RULES_KERNEL = path.join(EDVA_ROOT, "agent/ops-agent/email-triage-rules.md");
 
 // No-op counter — observability metric exposed via /health. Prompt-cached
 // Max turns can legitimately complete in well under 1500ms, so this counter
@@ -117,7 +117,7 @@ const NO_OP_DURATION_MS = 1500;
 //
 // email-inbound-instruction is the dispatch source the "dispatch, don't chase
 // inline" fix (agent/ops-agent/CLAUDE.md, 2026-07-27) created:
-// a substantive freeform instruction from the user's reply to a Merlin-originated
+// a substantive freeform instruction from the user's reply to a Edva-originated
 // email gets forwarded here as its own top-level task instead of being executed
 // inline inside the triage turn. That fix closed one way instructions were silently
 // dropped — but this new source was never added to the map, so it inherited the
@@ -284,7 +284,7 @@ function loadAgentConfig(configPath, agentName) {
 }
 
 async function importTriageLog() {
-  const mod = await import(path.join(MERLIN_ROOT, "lib/triage-log.js"));
+  const mod = await import(path.join(EDVA_ROOT, "lib/triage-log.js"));
   return mod.triageLog;
 }
 
@@ -306,13 +306,13 @@ class Supervisor {
     // unsuffixed filename for back-compat (zero-change on restart); any other
     // agent gets a "-<agent>" suffix.
     this.queuePersist = new QueuePersist(path.join(
-      MERLIN_ROOT,
+      EDVA_ROOT,
       `data/dispatcher-queue${args.agent === "ops" ? "" : "-" + args.agent}.json`
     ));
     this.queueRestored = false;
     this.gmailSource = new GmailSource({
-      lastHistoryFile: path.join(MERLIN_ROOT, "data/last-history-id.json"),
-      pauseFlagFile: path.join(MERLIN_ROOT, "data/.triage-paused"),
+      lastHistoryFile: path.join(EDVA_ROOT, "data/last-history-id.json"),
+      pauseFlagFile: path.join(EDVA_ROOT, "data/.triage-paused"),
       triageLog,
     });
     this.session = null;
@@ -423,18 +423,18 @@ class Supervisor {
         // A quota hold is the same shape, and it already paged once when it
         // began (rate_limited below), so its arm is written without a push.
         this._sendPush(quotaHeld
-          ? `⚠️ Merlin ${this.args.agent} queue depth=${depth} — dispatch is on hold until ${fmtHome(this.dispatcher.holdUntil)} because the Max allowance is used up; the queue runs then.`
+          ? `⚠️ Edva ${this.args.agent} queue depth=${depth} — dispatch is on hold until ${fmtHome(this.dispatcher.holdUntil)} because the Max allowance is used up; the queue runs then.`
           : this.authAlertSent
-          ? `⚠️ Merlin ${this.args.agent} queue depth=${depth} — dispatch is paused for the Max-auth outage, so nothing will drain until auth is back.`
-          : `⚠️ Merlin ${this.args.agent} queue depth=${depth}. That supervisor may be stuck — check \`merlin status\`.`, { push: !quotaHeld });
+          ? `⚠️ Edva ${this.args.agent} queue depth=${depth} — dispatch is paused for the Max-auth outage, so nothing will drain until auth is back.`
+          : `⚠️ Edva ${this.args.agent} queue depth=${depth}. That supervisor may be stuck — check \`edva status\`.`, { push: !quotaHeld });
       },
       onClear: (depth) => {
         this.eventLog.append({ kind: "queue_alarm.clear", depth });
-        this._sendPush(`✅ Merlin ${this.args.agent} recovered: queue drained (depth=${depth}) — dispatch caught up.`);
+        this._sendPush(`✅ Edva ${this.args.agent} recovered: queue drained (depth=${depth}) — dispatch caught up.`);
       },
     });
     attachClaudeMdWatcher(this, {
-      claudeMdPath: path.join(MERLIN_ROOT, this.cfg.cwd, "CLAUDE.md"),
+      claudeMdPath: path.join(EDVA_ROOT, this.cfg.cwd, "CLAUDE.md"),
       logPrefix: "[supervisor]",
     });
     // The triage ruleset the agent reads (`triage-rules core|section`, which
@@ -492,7 +492,7 @@ class Supervisor {
   async startSession({ resume }) {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
-    const mcpConfigPath = path.join(MERLIN_ROOT, "agent/supervisor/mcp-config.json");
+    const mcpConfigPath = path.join(EDVA_ROOT, "agent/supervisor/mcp-config.json");
     this._refreshTriageRules();
     const localRulesFile = this._buildLocalRules();
     const sessionOpts = {
@@ -509,8 +509,8 @@ class Supervisor {
       // dispatch (see claude-session.mjs); allowedTools does not under
       // bypassPermissions. Per-agent, so it never touches the user's own sessions.
       disallowedTools: (cfg.disallowedTools || []).join(" ") || undefined,
-      cwd: path.join(MERLIN_ROOT, cfg.cwd),
-      addDirs: [MERLIN_ROOT],
+      cwd: path.join(EDVA_ROOT, cfg.cwd),
+      addDirs: [EDVA_ROOT],
       claudeBin: this.args.claudeBin,
       // Ops runs on the Max subscription (intended auth). Hide
       // ANTHROPIC_API_KEY from the child so claude -p uses the Max
@@ -544,7 +544,7 @@ class Supervisor {
       // ops-light-agent/ and ops-haiku-agent/ never had one). The host sandbox
       // denies reading ~/Library/Keychains, where the Max login lives, so on
       // those two tiers every `claude -p` a CLI forks from Bash (the outbound
-      // precheck and claim-freshness gates behind merlin-send-curl,
+      // precheck and claim-freshness gates behind edva-send-curl,
       // claim-check, hum-ideas-append) printed "Not logged in" and the gate
       // failed open: the message went out unchecked. 2026-10-13/14: 11 of 11
       // precheck failures were sandboxed calls, 11 of 11 successes were calls
@@ -562,7 +562,7 @@ class Supervisor {
       // 2026-10-20 review. Guarded by tests/supervisor-idle-compaction.test.mjs.
       //
       // hooks — the git-rollback guard (D2): a PreToolUse hook that snapshots
-      // uncommitted work to refs/merlin/pre-destructive/* before any
+      // uncommitted work to refs/edva/pre-destructive/* before any
       // destructive git command, or blocks it. lib/rollback-guard.mjs.
       settings: JSON.stringify({ sandbox: { enabled: false }, idleCompaction: false, hooks: gitGuardHooks() }),
       // The other half of the stable prefix: the default system prompt also
@@ -686,7 +686,7 @@ class Supervisor {
         // fresh session is processing real turns again — parity with the alert
         // (§ System Channel: a self-heal that fixes an issue is reported too).
         if (this.crashLoopAlerted) {
-          this._sendPush(`✅ Merlin ${this.args.agent} recovered: the fresh session is processing turns again after the crash-loop.`);
+          this._sendPush(`✅ Edva ${this.args.agent} recovered: the fresh session is processing turns again after the crash-loop.`);
           this.crashLoopAlerted = false;
         }
       }
@@ -841,7 +841,7 @@ class Supervisor {
       preamble: (item) => {
         if (!shouldPreamble(item)) return null;
         const handoff = this._takeHandoffBlock(item);
-        const live = PREAMBLE_DISABLED ? null : buildPreamble({ cacheDir: path.join(MERLIN_ROOT, "data") });
+        const live = PREAMBLE_DISABLED ? null : buildPreamble({ cacheDir: path.join(EDVA_ROOT, "data") });
         return (handoff + (live || "")) || null;
       },
     });
@@ -930,7 +930,7 @@ class Supervisor {
       const kept = requeued
         ? "The job that was refused is back at the front of the queue"
         : `The job that was running (${item.source}) got partway before the limit hit and won't be repeated`;
-      this._sendPush(`⚠️ Merlin has hit its Max ${which}, so background jobs are on hold ${when}. ${kept}, queued jobs will run once the limit clears, and hum check-ins pause until then.`, { push: true });
+      this._sendPush(`⚠️ Edva has hit its Max ${which}, so background jobs are on hold ${when}. ${kept}, queued jobs will run once the limit clears, and hum check-ins pause until then.`, { push: true });
     });
     this.dispatcher.on("hold_released", () => {
       console.error(`[supervisor] quota hold released — resuming dispatch (queue=${this.dispatcher.queue.length})`);
@@ -949,7 +949,7 @@ class Supervisor {
       if (this.rateLimitAlerted && !this.dispatcher.isHeld() && info.message && info.message.source !== "context-guard") {
         this.rateLimitAlerted = false;
         this.rateLimitHoldUntil = 0;
-        this._sendPush(`✅ Merlin's Max allowance is back — queued background jobs are running again.`);
+        this._sendPush(`✅ Edva's Max allowance is back — queued background jobs are running again.`);
       }
       const shortId = info.message?.id ? info.message.id.slice(0, 6) : "------";
       // A result with no in-flight item is a background-wake turn; charge it
@@ -964,7 +964,7 @@ class Supervisor {
       this.eventLog.append({ kind: "dispatcher.turn_complete", id: info.message?.id, durationMs: info.result.duration_ms, costUsd: info.result.total_cost_usd });
       this._clearHungTurnAlert(info);
 
-      // Per-job cost attribution — drives merlin-cost-report + nightly-review
+      // Per-job cost attribution — drives edva-cost-report + nightly-review
       // cost lens. Sum token counters across modelUsage so rollups can group
       // by job without re-iterating model dicts.
       // NB: the stream-json result event uses camelCase `modelUsage` — it's
@@ -1261,28 +1261,28 @@ class Supervisor {
   //
   // Every alert below must name `this.args.agent`. This file is spawned once
   // per agent (ops / ops-light / ops-haiku / chat), so a message that says
-  // "Merlin ops" or "Ops turn" is wrong for three of the four supervisors —
+  // "Edva ops" or "Ops turn" is wrong for three of the four supervisors —
   // and since 2026-07 the system channel's text is an input to
   // system-issue-review's clustering, a misattributed emitter root-causes to
   // the wrong process. Observed 2026-08-26T22:01Z: three identical
-  // "✅ Merlin back up: Max auth restored — resuming." pings 6s apart
+  // "✅ Edva back up: Max auth restored — resuming." pings 6s apart
   // with nothing to tell them apart.
   // push=true: the alert needs the user to act, so it notifies even though it is
-  // not 🔴 — every other system row is written silently (merlin-send-curl §
+  // not 🔴 — every other system row is written silently (edva-send-curl §
   // System-channel push policy).
   _sendPush(text, { push = false } = {}) {
     try {
-      const bin = installTools("bin/merlin-send-curl");
+      const bin = installTools("bin/edva-send-curl");
       // --skip-precheck: supervisor alerts (auth outages, queue alarms) must
       // bypass the Sonnet-gated outbound precheck. The precheck depends on
       // the agents being up to dispatch; gating supervisor self-alerts
       // through it is the wrong direction — a stuck supervisor would silence
       // its own alert. See system/architecture.md § Outbound Precheck.
-      // MERLIN_INFRA_PROBE=1 — the supervisor reports on its OWN process state
+      // EDVA_INFRA_PROBE=1 — the supervisor reports on its OWN process state
       // (auth outage, queue alarm, crash-loop) from outside the agent sandbox,
       // so it is an authorized author of machine-health pages. See the
-      // fabricated-outage gate in bin/merlin-send-curl.
-      const p = spawnProc(bin, ["--suppress-hook", "--skip-precheck", "--intent", "supervisor-alert", "--channel", "system", ...(push ? ["--push"] : []), text], { stdio: "ignore", detached: true, env: { ...process.env, MERLIN_INFRA_PROBE: "1" } });
+      // fabricated-outage gate in bin/edva-send-curl.
+      const p = spawnProc(bin, ["--suppress-hook", "--skip-precheck", "--intent", "supervisor-alert", "--channel", "system", ...(push ? ["--push"] : []), text], { stdio: "ignore", detached: true, env: { ...process.env, EDVA_INFRA_PROBE: "1" } });
       p.unref();
     } catch (err) {
       console.error(`[supervisor] _sendPush failed: ${err.message}`);
@@ -1292,16 +1292,16 @@ class Supervisor {
   // The supervisor's one send to the user's MAIN chat: the note that a request
   // of theirs got stuck (_deadLetter). It is not an infra alert, so it takes the
   // path every content send takes: default chat channel, outbound precheck ON
-  // (no --skip-precheck), and MERLIN_INFRA_PROBE / MERLIN_PRECHECK_BYPASS
+  // (no --skip-precheck), and EDVA_INFRA_PROBE / EDVA_PRECHECK_BYPASS
   // stripped in case this process inherited them. The precheck may hold it
   // back; its decision lands in data/outbound-precheck-log.jsonl.
   // geo-gate-ok: never about an event, only about a stuck request of theirs.
   _sendChatNotice(text, { intent }) {
     try {
-      const bin = installTools("bin/merlin-send-curl");
+      const bin = installTools("bin/edva-send-curl");
       const env = { ...process.env };
-      delete env.MERLIN_INFRA_PROBE;
-      delete env.MERLIN_PRECHECK_BYPASS;
+      delete env.EDVA_INFRA_PROBE;
+      delete env.EDVA_PRECHECK_BYPASS;
       const p = spawnProc(bin, ["--intent", intent, "--evidence-as-of", "live", "--agent", "ops", text], { stdio: "ignore", detached: true, env });
       p.unref();
     } catch (err) {
@@ -1319,7 +1319,7 @@ class Supervisor {
     // / "authentication_error" (expired/invalid creds, no keychain issue at all),
     // which the old fixed wording misdiagnosed every time it fired.
     const errText = this.lastAuthError ? `Captured error: "${this.lastAuthError}". ` : "";
-    this._sendPush(`⚠️ Merlin down: Max auth broken on ${HOST_LABEL} for the ${this.args.agent} supervisor (no valid login). ${errText}If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\` and restore login.keychain-db if renamed; otherwise it's likely just expired/invalid creds. Either way: \`claude /login\`. See changelog.md 2026-06-17.`, { push: true });
+    this._sendPush(`⚠️ Edva down: Max auth broken on ${HOST_LABEL} for the ${this.args.agent} supervisor (no valid login). ${errText}If it mentions a keychain, check \`security default-keychain\` + \`security list-keychains\` and restore login.keychain-db if renamed; otherwise it's likely just expired/invalid creds. Either way: \`claude /login\`. See changelog.md 2026-06-17.`, { push: true });
     this._startAuthWatcher();
     // Kill the current child so it stops burning through the queue on 401s.
     try { this.session?.child?.kill("SIGKILL"); } catch {}
@@ -1381,7 +1381,7 @@ class Supervisor {
         this.authWatcher = null;
         this.authErrorCount = 0;
         this.authAlertSent = false;
-        this._sendPush(`✅ Merlin back up: Max auth restored on ${HOST_LABEL} — ${this.args.agent} is resuming.`);
+        this._sendPush(`✅ Edva back up: Max auth restored on ${HOST_LABEL} — ${this.args.agent} is resuming.`);
         if (this.dispatcher) this.dispatcher.setPaused(false);
         // Force a clean session so the new creds are used from a fresh state.
         this.state.data.everInitialized = false;
@@ -1537,7 +1537,7 @@ class Supervisor {
     if (this.consecutiveZeroTurns >= CRASH_LOOP_THRESHOLD) {
       console.error(`[supervisor] CRASH LOOP DETECTED: ${this.consecutiveZeroTurns} consecutive zero-turn exits — rotating to fresh session`);
       if (!this.crashLoopAlerted) {
-        this._sendPush(`⚠️ Merlin ${this.args.agent} crash-loop: ${this.consecutiveZeroTurns} consecutive zero-turn child exits — rotated to a fresh session. If the review/digests look late, check the spawn path + MCP init.`);
+        this._sendPush(`⚠️ Edva ${this.args.agent} crash-loop: ${this.consecutiveZeroTurns} consecutive zero-turn child exits — rotated to a fresh session. If the review/digests look late, check the spawn path + MCP init.`);
         this.crashLoopAlerted = true;
       }
       this.state.data.everInitialized = false;
@@ -1574,7 +1574,7 @@ class Supervisor {
   // unexpected CLI layout can never wrongly force a fresh session.
   _sessionPersisted(id) {
     try {
-      const cwd = fs.realpathSync(path.join(MERLIN_ROOT, this.cfg.cwd));
+      const cwd = fs.realpathSync(path.join(EDVA_ROOT, this.cfg.cwd));
       const dir = path.join(HOME, ".claude", "projects", cwd.replace(/[/.]/g, "-"));
       if (!fs.existsSync(dir)) return true;
       return fs.existsSync(path.join(dir, `${id}.jsonl`));
@@ -1916,10 +1916,10 @@ class Supervisor {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const configPath = args.config || path.join(MERLIN_ROOT, "agent/config/agents.json");
+  const configPath = args.config || path.join(EDVA_ROOT, "agent/config/agents.json");
   const agentCfg = loadAgentConfig(configPath, args.agent);
-  const dataDir = args.stateDir || path.join(MERLIN_ROOT, `agent/supervisor/state/${args.agent}`);
-  const eventDir = path.join(MERLIN_ROOT, `agent/logs/supervisor-${args.agent}`);
+  const dataDir = args.stateDir || path.join(EDVA_ROOT, `agent/supervisor/state/${args.agent}`);
+  const eventDir = path.join(EDVA_ROOT, `agent/logs/supervisor-${args.agent}`);
   const triageLog = await importTriageLog();
 
   const supervisor = new Supervisor({ args, agentCfg, dataDir, eventDir, triageLog });
@@ -1953,7 +1953,7 @@ async function main() {
         supervisor.gmailSource._triageDispatchFn = makeTriageRouter({
           target,
           localDispatch: (content, source) => supervisor.dispatcher.dispatch(content, source),
-          tokenFile: path.join(MERLIN_ROOT, "secrets/webhook-token"),
+          tokenFile: path.join(EDVA_ROOT, "secrets/webhook-token"),
           log: (line) => { try { triageLog(line); } catch {} },
         });
         console.error(`[supervisor] gmail per-message triage → ${target.agent} (:${target.webhookPort}), fallback ${args.agent}`);

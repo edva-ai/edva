@@ -1,18 +1,18 @@
 # Resolve-first — work the answer out before hum floats anything
 
-**Added 2026-10-15.** Every hum question and every hum comment is checked against Merlin's own records before it reaches the user's phone. If the records already answer what it asks or leaves open, the question is not asked.
+**Added 2026-10-15.** Every hum question and every hum comment is checked against Edva's own records before it reaches the user's phone. If the records already answer what it asks or leaves open, the question is not asked.
 
 ## Why
 
-Working out the answer before asking applies to EVERY question and hum comment before it is floated, regardless of type or context — not to hide anything from the user, but because floating something Merlin should already know is unhelpful. It uses the best available model.
+Working out the answer before asking applies to EVERY question and hum comment before it is floated, regardless of type or context — not to hide anything from the user, but because floating something Edva should already know is unhelpful. It uses the best available model.
 
-The trigger was a hum question whose answer was already on file: the booking records and the user's own travel on the timeline together settled it, so asking only made the user do the lookup Merlin could have done.
+The trigger was a hum question whose answer was already on file: the booking records and the user's own travel on the timeline together settled it, so asking only made the user do the lookup Edva could have done.
 
-Every gate in front of a hum send already asked something: is it relevant now (outbound precheck), is it new (dedup, novelty), is it still true (claim-freshness), can the user read it now (motion gate). None asked **does Merlin already know the answer?**
+Every gate in front of a hum send already asked something: is it relevant now (outbound precheck), is it new (dedup, novelty), is it still true (claim-freshness), can the user read it now (motion gate). None asked **does Edva already know the answer?**
 
 ## Where it runs: the one point every hum send passes
 
-`bin/merlin-send-curl`, for every **chat-channel** message whose `--intent` starts with `hum:`. Every hum sender guarantees one:
+`bin/edva-send-curl`, for every **chat-channel** message whose `--intent` starts with `hum:`. Every hum sender guarantees one:
 
 | sender | what it sends | intent |
 |---|---|---|
@@ -30,7 +30,7 @@ Not covered, by design: `hum-debug` (a system-channel diagnostic, not hum conten
 
 1. **Code reads a bounded bundle**, in parallel, 12 s per source, each stamped with when it was read. The kernel's own sources: `calendar` (all calendars, −2/+35 days), `tasks` (Google Tasks), `recent_chat` (24 h of the chat channel), `recall` (wiki, inbox, the user's dated replies, chat — retrieved by the message itself), `email_memory` (`context-search`), `resolved_before` (this gate's own answers, 14 days). An installation adds its own sources as overlay modules in `agent/scripts/hum-resolve-first-sources/_ext/` (one `.mjs` per source, default-exporting `{ id, live?, read() }`; contract in that dir's `.gitkeep`; a kernel id always wins over an overlay one) — for example a travel timeline, a flights file, a reservations store, location history. `agent/local/config/hum-resolve-first.json` sets the bundle's section order (`source_order`; unlisted sources follow, kernel first) and the live sources of record the prompt names (`live_sources`; default the kernel's `calendar` and `tasks` plus any overlay source marked `live`).
    It never reads bank, brokerage or health rows: no source reads them, and an overlay source must not.
-2. **One Opus call** (`MERLIN_MODEL_OPUS` from `agent/config/models.env`, effort `medium`, tool-less, Max session only via `lib/jev-claude.mjs` — no API key) reads the message, the finding it came from, and the bundle, and returns a verdict: `resolved` / `partial` / `unresolved` / `nothing_to_resolve`, the answer, the sections it relied on, one plain line on what it checked, and the replacement text.
+2. **One Opus call** (`EDVA_MODEL_OPUS` from `agent/config/models.env`, effort `medium`, tool-less, Max session only via `lib/jev-claude.mjs` — no API key) reads the message, the finding it came from, and the bundle, and returns a verdict: `resolved` / `partial` / `unresolved` / `nothing_to_resolve`, the answer, the sections it relied on, one plain line on what it checked, and the replacement text.
 3. **Code checks it**: a resolution must cite at least one section that was actually in the bundle (a citation of a section that failed to load does not count), must carry an answer, and its text must be under 600 characters. A failed check is retried once with the errors; a second failure sends the message unchanged.
 4. **Code owns the action table:**
 
@@ -54,7 +54,7 @@ Tappable answer choices survive a rewrite only when the model says they still an
 
 ## What the senders do with the outcome
 
-The gate tells the sender through the `--capture-id` file `merlin-send-curl` already uses:
+The gate tells the sender through the `--capture-id` file `edva-send-curl` already uses:
 
 - **drop** → the same `{"suppressed": true}` sentinel the precheck writes, tagged `"by": "hum-resolve-first"`, plus a sidecar `<capture>.resolve.json`.
 - **rewrite** → a sidecar `{action, verdict, still_question, text, decision_id}`; the id is written as usual once the message posts.
@@ -76,11 +76,11 @@ Settled answers go to `data/hum-resolve-first.jsonl` (`lib/hum-resolve-first-sto
 - the pre-rank filter (`lib/hum-vetoes.mjs`) vetoes a candidate whose `dedup_key` was **fully** resolved in the last 7 days (`HUM_RESOLVED_WINDOW_D`) as `resolved_first` — a key match, cheap, before the ranker. Same carve-outs as dedup: a protected lane or urgency ≥ 0.9 passes, because a key can stay the same while the situation changes (`travel:<flight>:<depart>`), and the send-time gate re-judges it against fresh records anyway;
 - the gate shows its last 14 days of answers to the model, which catches a reworded re-ask.
 
-These are Merlin's conclusions, so they are deliberately **not** written to `hum-responses.jsonl`, whose rows are rendered as *"<user> said: …"* (`lib/utterance-store.mjs`). When the user says one is wrong, the chat agent records the correction as usual and runs `hum-resolve-first forget <decision_id|dedup_key>` (`jobs/hum-operations.md` § Step 0c).
+These are Edva's conclusions, so they are deliberately **not** written to `hum-responses.jsonl`, whose rows are rendered as *"<user> said: …"* (`lib/utterance-store.mjs`). When the user says one is wrong, the chat agent records the correction as usual and runs `hum-resolve-first forget <decision_id|dedup_key>` (`jobs/hum-operations.md` § Step 0c).
 
 ## Privacy
 
-Bank and health data are merlin-model-only. The gate never reads those rows into its bundle. A finance/stocks/health-lane message and its finding reach Merlin's own model here (the Max-session Opus fork; no API key, no connector). Downstream nothing changes: finance/stocks intents still skip the outbound precheck, and `hum:health` still goes through it (deliberately, for its protected-lane treatment there; see `merlin-send-curl`). For those three lanes the gate's log row keeps a hash and length instead of any text, and the stored answer keeps only the key and verdict.
+Bank and health data are edva-model-only. The gate never reads those rows into its bundle. A finance/stocks/health-lane message and its finding reach Edva's own model here (the Max-session Opus fork; no API key, no connector). Downstream nothing changes: finance/stocks intents still skip the outbound precheck, and `hum:health` still goes through it (deliberately, for its protected-lane treatment there; see `edva-send-curl`). For those three lanes the gate's log row keeps a hash and length instead of any text, and the stored answer keeps only the key and verdict.
 
 ## Failure modes
 

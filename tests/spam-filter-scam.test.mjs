@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 
 const BIN = new URL("../bin/spam-filter", import.meta.url).pathname;
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "spam-filter-"));
-const DATA = path.join(HOME, "Dev/merlin/data");
+const DATA = path.join(HOME, "Dev/edva/data");
 const FILE = path.join(DATA, "spam-blocklist.json");
 const GA = path.join(HOME, "gmail-action-stub");
 const GA_LOG = path.join(HOME, "gmail-action-calls.txt");

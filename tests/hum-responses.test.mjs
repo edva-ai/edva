@@ -14,7 +14,7 @@ import path from "node:path";
 // POSIX). Point HOME at a fixture so the test never touches the real log.
 const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "hum-resp-"));
 const fakeHome = path.join(fixtureDir, "home");
-fs.mkdirSync(path.join(fakeHome, "Dev/merlin/data"), { recursive: true });
+fs.mkdirSync(path.join(fakeHome, "Dev/edva/data"), { recursive: true });
 const realHome = process.env.HOME;
 process.env.HOME = fakeHome;
 
@@ -24,7 +24,7 @@ after(() => {
   fs.rmSync(fixtureDir, { recursive: true, force: true });
 });
 
-const RESP_PATH = path.join(fakeHome, "Dev/merlin/data/hum-responses.jsonl");
+const RESP_PATH = path.join(fakeHome, "Dev/edva/data/hum-responses.jsonl");
 
 test("appendResponse writes a normalized row and requires reply_text", async () => {
   const { appendResponse } = await import("../lib/hum-responses.mjs");

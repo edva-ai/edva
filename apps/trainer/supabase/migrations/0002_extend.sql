@@ -1,4 +1,4 @@
--- Adds remaining state so Merlin / analytics can see the full picture:
+-- Adds remaining state so Edva / analytics can see the full picture:
 -- per-exercise target overrides, day overrides, weekly plan defaults, and app settings.
 
 create table if not exists public.exercise_targets (

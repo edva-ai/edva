@@ -230,13 +230,13 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     tmp = null;
   });
 
-  // Everything — MERLIN_ROOT, queue file, event log, dead-letter file, the
+  // Everything — EDVA_ROOT, queue file, event log, dead-letter file, the
   // ledger and sent log it reads, and both send paths (_sendPush and the new
-  // chat note) — resolves under the throwaway HOME. merlin-send-curl is a
+  // chat note) — resolves under the throwaway HOME. edva-send-curl is a
   // fake that only writes its arguments to a file.
   async function boot({ ledger = [] } = {}) {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "hang-dl-"));
-    const root = path.join(tmp, "Dev/merlin/tools");
+    const root = path.join(tmp, "Dev/edva/tools");
     for (const d of ["bin", "data", "logs", "agent/ops-agent", "agent/supervisor", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
     fs.symlinkSync(path.join(REPO_TOOLS, "lib"), path.join(root, "lib"));
     const sup = path.join(root, "agent/supervisor");
@@ -252,7 +252,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     const data = path.join(root, "data");
     fs.writeFileSync(path.join(data, "email-inbound-handled.jsonl"), ledger.length ? jsonl(ledger) : "");
     const sends = path.join(tmp, "sends.log");
-    fs.writeFileSync(path.join(root, "bin/merlin-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(root, "bin/edva-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
     const mock = path.join(tmp, "hang-claude.mjs");
     fs.writeFileSync(mock, HANG_CLAUDE);
     const record = path.join(tmp, "record.log");
@@ -267,7 +267,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     fs.mkdirSync(stateDir, { recursive: true });
     const env = { ...process.env, HOME: tmp, OPS_HANDOFF_DISABLED: "1", OPS_DISPATCH_PREAMBLE_DISABLED: "1", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db") };
     delete env.EMAIL_INBOUND_HANDLED_FILE;
-    delete env.MERLIN_HOME;   // outranks HOME (lib/root.cjs): the child's installation is the sandbox
+    delete env.EDVA_HOME;   // outranks HOME (lib/root.cjs): the child's installation is the sandbox
     proc = spawn(NODE, [path.join(sup, "index.mjs"), "--agent", "test-ops", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--record", record])], { cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env });
     const stderr = [];
@@ -287,7 +287,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     const sb = await boot({ ledger: [ledgerRow("fake-msg-a01", `Alex Owner <${OWNER}>`, { ts: new Date().toISOString() })] });
     await httpJson("POST", sb.port, "/dispatch", { content: "New email received. MessageId: fake-msg-a01 HANG-TWICE", source: "gmail:fake-msg-a01" });
     // What the killed attempt managed to send before it hung.
-    fs.writeFileSync(path.join(sb.data, "merlin-sent-mail.jsonl"), jsonl([{ ts: new Date().toISOString(), subject: "Garden club agenda for March 3", in_reply_to: null }]));
+    fs.writeFileSync(path.join(sb.data, "edva-sent-mail.jsonl"), jsonl([{ ts: new Date().toISOString(), subject: "Garden club agenda for March 3", in_reply_to: null }]));
     fs.mkdirSync(path.join(sb.data, "jobs"));
     const jobId = `${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-")}-agenda-rebuild-0303-5c2d`;
     fs.writeFileSync(path.join(sb.data, "jobs", `${jobId}.json`), JSON.stringify({ id: jobId, name: "agenda-rebuild-0303", status: "running", pid: process.pid, started_at: new Date().toISOString() }));
@@ -334,7 +334,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     const sb = await boot({ ledger: [ledgerRow("abc", OWNER, { ts: new Date().toISOString() })] });
     await httpJson("POST", sb.port, "/dispatch", { content: "New email received. MessageId: abc HANG-ALWAYS", source: "gmail:abc" });
     // The first attempt got its threaded reply out before it hung.
-    fs.writeFileSync(path.join(sb.data, "merlin-sent-mail.jsonl"), jsonl([{ ts: new Date().toISOString(), subject: `Re: ${SUBJECT}`, in_reply_to: "<abc@mail.gmail.com>" }]));
+    fs.writeFileSync(path.join(sb.data, "edva-sent-mail.jsonl"), jsonl([{ ts: new Date().toISOString(), subject: `Re: ${SUBJECT}`, in_reply_to: "<abc@mail.gmail.com>" }]));
     assert.ok(await waitFor(() => sb.deadLetters().length >= 2, 45000), `second drop never came: ${sb.stderr.join("").slice(-2500)}`);
     const h = await httpJson("GET", sb.port, "/health");
     assert.equal(h.queueDepth, 0, "nothing left to run");
@@ -358,7 +358,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     assert.ok(sb.allSends().some((l) => l.includes("--channel system") && l.includes("on its one retry") && l.includes("dropping it and restarting")));
   });
 
-  it("mail to Merlin from anyone else is dead-lettered only: no note, no retry", async () => {
+  it("mail to Edva from anyone else is dead-lettered only: no note, no retry", async () => {
     const sb = await boot({ ledger: [ledgerRow("other1", "Sam Friend <friend@example.org>")] });
     await httpJson("POST", sb.port, "/dispatch", { content: "New email received. MessageId: other1 HANG-TWICE", source: "gmail:other1" });
     assert.ok(await waitFor(() => sb.deadLetters().length >= 1, 30000), `never dropped: ${sb.stderr.join("").slice(-2500)}`);

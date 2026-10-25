@@ -40,7 +40,7 @@ function triageDecisions() {
 // triage_decisions consensus (which counts only agent/human-decided rows) can
 // never be fed by intake agreeing with itself. Per-call env, never process.env:
 // the supervisor's own claude children must keep the default "agent" actor.
-const GA_OPTS = { timeout: 8000, env: { ...process.env, MERLIN_TRIAGE_ACTOR: "intake:gmail-source" } };
+const GA_OPTS = { timeout: 8000, env: { ...process.env, EDVA_TRIAGE_ACTOR: "intake:gmail-source" } };
 
 // Intake-side spam-filter fast-path. Before dispatching
 // "New email received" to the ops-agent, run `spam-filter check --sender <addr>`.
@@ -265,21 +265,21 @@ async function runExtIntake(messageId, fromHeader, subject) {
   }
 }
 
-// Merlin's own P1 mail, finished in code. That is ALL Merlin mail (the
-// p1-senders.json entry for MERLIN_SENDER, exceptions only via its
+// Edva's own P1 mail, finished in code. That is ALL Edva mail (the
+// p1-senders.json entry for EDVA_SENDER, exceptions only via its
 // unless_subject_re — today the push-failed fallback). Their whole target state is fixed:
 // topical label `personal` + star + `p1`, left UNREAD, NO notify and NO task (a
-// ping about Merlin's own email is a loop). The stampers above have already
+// ping about Edva's own email is a loop). The stampers above have already
 // applied star + `p1`; the only thing an agent turn added was the `personal`
 // label — a full ops dispatch to apply one label. No judgment is involved, so
 // it runs here and the dispatch is skipped. Fail-open: if the stamp did not
 // apply or the label fails, the message dispatches as before.
-export const MERLIN_SENDER = AGENT_EMAIL;
-function finishMerlinP1(messageId, fromHeader, stamp) {
-  if (!MERLIN_SENDER || extractEmailAddr(fromHeader) !== MERLIN_SENDER || !stamp || !stamp.applied) return { handled: false };
+export const EDVA_SENDER = AGENT_EMAIL;
+function finishEdvaP1(messageId, fromHeader, stamp) {
+  if (!EDVA_SENDER || extractEmailAddr(fromHeader) !== EDVA_SENDER || !stamp || !stamp.applied) return { handled: false };
   try {
     const r = spawnSync(GMAIL_ACTION_BIN, ["label", messageId, "personal"], GA_OPTS);
-    // ALL Merlin mail is P1 and stays unread. A sending job may have
+    // ALL Edva mail is P1 and stays unread. A sending job may have
     // marked its own email read before this push arrived (an older
     // "star + mark read" playbook); put it back. Later mark-reads are refused by
     // gmail-action itself.
@@ -288,29 +288,29 @@ function finishMerlinP1(messageId, fromHeader, stamp) {
   } catch { return { handled: false }; }
 }
 
-async function runIntakeCascade(messageId, fromHeader, subject, toMerlin = false) {
+async function runIntakeCascade(messageId, fromHeader, subject, toEdva = false) {
   const spam = intakeSpamCheck(messageId, fromHeader, subject);
   if (spam.blocked) return { skip: true, kind: "spam", detail: `spam-blocklist ${spam.via} (${spam.reason})` };
   const ext = await runExtIntake(messageId, fromHeader, subject);
   if (ext) return { skip: true, kind: ext.kind || "ext-intake", detail: ext.detail || "handled by _ext/gmail-intake" };
   const p1s = intakeP1Sender(messageId, fromHeader, subject);
   if (p1s.stamped) {
-    if (finishMerlinP1(messageId, fromHeader, p1s).handled) return { skip: true, kind: "merlin-p1", detail: "merlin memo (p1-sender) -> personal+p1+star, unread — finished in code" };
+    if (finishEdvaP1(messageId, fromHeader, p1s).handled) return { skip: true, kind: "edva-p1", detail: "edva memo (p1-sender) -> personal+p1+star, unread — finished in code" };
     return { skip: false, kind: "p1-sender", detail: `p1-sender ${p1s.sender} -> p1+star applied=${p1s.applied}` };
   }
   const p1 = intakeReplyToMeP1(messageId);
   if (p1.stamped) {
-    if (finishMerlinP1(messageId, fromHeader, p1).handled) return { skip: true, kind: "merlin-p1", detail: `merlin reply to ${OWNER_NAME} -> personal+p1+star, unread — finished in code` };
+    if (finishEdvaP1(messageId, fromHeader, p1).handled) return { skip: true, kind: "edva-p1", detail: `edva reply to ${OWNER_NAME} -> personal+p1+star, unread — finished in code` };
     return { skip: false, kind: "reply-to-me-p1", detail: `reply-to-me -> p1+star applied=${p1.applied}` };
   }
   const mr = intakeMeetingRequestP1(messageId);
   if (mr.stamped) return { skip: false, kind: "meeting-request-p1", detail: `meeting-request -> p1+star applied=${mr.applied}` };
-  // Command channel (isAddressedToMerlin). Mail the user addressed TO Merlin is an
+  // Command channel (isAddressedToEdva). Mail the user addressed TO Edva is an
   // instruction, and both filters below end in "label it and skip the dispatch",
   // so an instruction that lands here is filed instead of obeyed. Short-circuit
   // them exactly as a stamped P1 does on the live path, and let it dispatch.
   // Defaults to false, so a caller that cannot know stays on today's behaviour.
-  if (toMerlin) return { skip: false, kind: "command-channel", detail: "addressed to Merlin -> always dispatch" };
+  if (toEdva) return { skip: false, kind: "command-channel", detail: "addressed to Edva -> always dispatch" };
   const fp = intakeFastPathCheck(messageId, fromHeader, subject);
   if (fp.matched) return { skip: true, kind: "fastpath", detail: `intake-skip rule=${fp.rule} -> label=${fp.label}${fp.starred ? "+star(P2)" : ""} applied=${fp.applied}` };
   const cl = await intakeClassifyP3(messageId, fromHeader, subject);
@@ -503,17 +503,17 @@ export function isDraftMessage(message) {
   return labels ? labels.includes("DRAFT") : false;
 }
 
-// The addresses that make one of the user's OWN outgoing messages Merlin's
-// business. Everything Merlin can do with a message the user sent — `approve|edit|
+// The addresses that make one of the user's OWN outgoing messages Edva's
+// business. Everything Edva can do with a message the user sent — `approve|edit|
 // decline <draft-id>`, `RECLASSIFY:`, `RESOLVE P1:`, and the freeform-instruction
 // dispatch (email-triage-rules.md line 165 and § "Freeform instructions in
-// the user's reply emails") — is scoped to a reply on a Merlin-originated thread,
-// i.e. one addressed to Merlin's inbound address. Extend this list if Merlin ever gains
+// the user's reply emails") — is scoped to a reply on a Edva-originated thread,
+// i.e. one addressed to Edva's inbound address. Extend this list if Edva ever gains
 // a second inbound address; do not widen it to "any self-sent mail".
-export const MERLIN_INBOUND_ADDRESSES = AGENT_EMAIL ? [AGENT_EMAIL] : [];
+export const EDVA_INBOUND_ADDRESSES = AGENT_EMAIL ? [AGENT_EMAIL] : [];
 
 // True for a message this account SENT that never landed in the inbox and is not
-// addressed to Merlin — i.e. the user writing to a third party. That is not
+// addressed to Edva — i.e. the user writing to a third party. That is not
 // inbound mail and there is no triage outcome defined for it, but it still
 // reaches intake: when the user replies inside an INBOX-labelled thread the
 // INBOX-filtered history feed carries a messagesAdded record for the outgoing
@@ -526,7 +526,7 @@ export const MERLIN_INBOUND_ADDRESSES = AGENT_EMAIL ? [AGENT_EMAIL] : [];
 // break the user's command channel:
 //   - `SENT` without `INBOX`: a message sent to oneself carries both, and
 //     must still be triaged.
-//   - recipients include a Merlin address → keep it: that is the instruction
+//   - recipients include a Edva address → keep it: that is the instruction
 //     channel, and such messages must still be dispatched.
 //   - no labels in the payload → false. Fail open; dropping real inbound mail is
 //     far worse than one outgoing message reaching triage.
@@ -535,20 +535,20 @@ export function isOwnSentToThirdParty(labelIds, recipients) {
   if (!labels) return false;
   if (!labels.includes("SENT") || labels.includes("INBOX")) return false;
   const to = String(recipients || "").toLowerCase();
-  return !MERLIN_INBOUND_ADDRESSES.some((addr) => to.includes(addr));
+  return !EDVA_INBOUND_ADDRESSES.some((addr) => to.includes(addr));
 }
 
 // Returned by _resolveHistoryToMessageId when a historyId carries messagesAdded
 // records but every one is a draft. Distinct from null, which means "could not
 // resolve" and must still fail open into a dispatch.
-// True when a Merlin inbound address is among the recipients. This is the user's
+// True when a Edva inbound address is among the recipients. This is the user's
 // COMMAND CHANNEL. `approve <draft-id>` / `edit` / `decline`, `RECLASSIFY: <id>`,
 // `RESOLVE P1: <topic>` and plain-English instructions ("Move that to Friday",
 // "Summarize the attachment", "What changed?") all arrive this way,
-// addressed to Merlin's inbound address. Shares
-// MERLIN_INBOUND_ADDRESSES with isOwnSentToThirdParty above so the guard that
+// addressed to Edva's inbound address. Shares
+// EDVA_INBOUND_ADDRESSES with isOwnSentToThirdParty above so the guard that
 // KEEPS this mail and the guard that must never auto-file it can't disagree
-// about what counts as a Merlin address.
+// about what counts as a Edva address.
 //
 // Why it is needed: isOwnSentToThirdParty
 // deliberately lets this mail through to triage — but "reaches triage" was one
@@ -557,14 +557,14 @@ export function isOwnSentToThirdParty(labelIds, recipients) {
 // message read and SKIPS the dispatch. Local-classify's mem-consensus in
 // particular answers at confidence 1 from the SENDER's past decisions and so can
 // never see that this particular message is an order.
-export function isAddressedToMerlin(recipients) {
+export function isAddressedToEdva(recipients) {
   const to = String(recipients || "").toLowerCase();
-  return MERLIN_INBOUND_ADDRESSES.some((addr) => to.includes(addr));
+  return EDVA_INBOUND_ADDRESSES.some((addr) => to.includes(addr));
 }
 
 export const DRAFTS_ONLY = "__drafts_only__";
 
-// ---- Merlin inbound-address single-handler ledger -------------------------
+// ---- Edva inbound-address single-handler ledger -------------------------
 // data/email-inbound-handled.jsonl is written by the /email-inbound route
 // (lib/email-inbound-gate.mjs) for every Message-ID it dispatches. The
 // Gmail command channel reads it before dispatching and appends to it when it
@@ -615,7 +615,7 @@ const STAMP_TEXT = {
   "p1-sender": "p1-sender (P1 sender list matched — `p1` + star ALREADY applied, left unread)",
   "reply-to-me-p1": `reply-to-me-p1 (this answers something ${OWNER_NAME} sent — \`p1\` + star ALREADY applied, left unread; Step 4a)`,
   "meeting-request-p1": "meeting-request-p1 (a calendar invitation to attend — `p1` + star ALREADY applied, left unread; always P1)",
-  "command-channel": `command-channel (addressed to ${MERLIN_INBOUND_ADDRESSES[0] || "the agent's address"} — ${OWNER_NAME}'s instruction channel)`,
+  "command-channel": `command-channel (addressed to ${EDVA_INBOUND_ADDRESSES[0] || "the agent's address"} — ${OWNER_NAME}'s instruction channel)`,
 };
 
 export function buildTriageDispatch(p, rulesIdx = "") {
@@ -645,16 +645,16 @@ export function buildTriageDispatch(p, rulesIdx = "") {
     const subj = /^\s*re:/i.test(p.subject || "") ? p.subject : `Re: ${p.subject || ""}`;
     const refs = [p.rfcReferences, p.rfcMessageId].filter(Boolean).join(" ");
     lines.push(
-      "REPLY ON THIS THREAD WHEN DONE. The user asked by email, so the result goes back as a reply on this email thread — that reply IS the confirmation (a chat ping is optional, never a substitute). Send it once the instruction is carried out (or blocked, saying why); one short plain-text paragraph in their words, signed \"Merlin\". This is a substantive result, not an acknowledgment, so the no-ack rule does not apply; still no \"on it\" reply before the work. If you hand the work off as its own dispatched task, copy these reply details into that task so the turn that finishes the work sends the reply.",
+      "REPLY ON THIS THREAD WHEN DONE. The user asked by email, so the result goes back as a reply on this email thread — that reply IS the confirmation (a chat ping is optional, never a substitute). Send it once the instruction is carried out (or blocked, saying why); one short plain-text paragraph in their words, signed \"Edva\". This is a substantive result, not an acknowledgment, so the no-ack rule does not apply; still no \"on it\" reply before the work. If you hand the work off as its own dispatched task, copy these reply details into that task so the turn that finishes the work sends the reply.",
       `  To: ${extractEmailAddr(p.from) || p.from}`,
       `  Subject: ${subj}`,
       `  In-Reply-To: ${p.rfcMessageId}`,
       `  References: ${refs}`,
-      "  Send with: ~/Dev/merlin/bin/email-send --to <To> --subject <Subject> --body-file <file> --in-reply-to <In-Reply-To> --references <References>  (quote every value).",
+      "  Send with: ~/Dev/edva/bin/email-send --to <To> --subject <Subject> --body-file <file> --in-reply-to <In-Reply-To> --references <References>  (quote every value).",
     );
   }
   lines.push(
-    "Triage this ONE email per the Email Triage Rules. Read the decision core first: `~/Dev/merlin/bin/triage-rules core`. Then read ONLY the category rules that could apply to this email: `~/Dev/merlin/bin/triage-rules section <slug> [<slug>…]`. Do not read email-triage-rules.md whole.",
+    "Triage this ONE email per the Email Triage Rules. Read the decision core first: `~/Dev/edva/bin/triage-rules core`. Then read ONLY the category rules that could apply to this email: `~/Dev/edva/bin/triage-rules section <slug> [<slug>…]`. Do not read email-triage-rules.md whole.",
   );
   if (rulesIdx) lines.push("Category rules index:", rulesIdx);
   return lines.join("\n");
@@ -829,16 +829,16 @@ export class GmailSource {
       // which reads email-triage-rules.md and handles self-sent mail itself.
       const recipients = ["To", "Cc", "Bcc"].map(n => headers.find(h => h.name === n)?.value || "").join(", ");
       if (isOwnSentToThirdParty(msg.labelIds, recipients)) {
-        this.triageLog?.(`own-sent skip ${messageId} to ${recipients.slice(0, 80)} — SENT, never in INBOX, not addressed to Merlin`);
+        this.triageLog?.(`own-sent skip ${messageId} to ${recipients.slice(0, 80)} — SENT, never in INBOX, not addressed to Edva`);
         return null;
       }
       // Date + RFC Message-ID ride along so the dispatch can carry the
-      // evidence date (Step 5 --evidence-as-of) and the merlin@ dedup can key
+      // evidence date (Step 5 --evidence-as-of) and the edva@ dedup can key
       // on the same Message-ID the email Worker sees. Header names are
       // case-insensitive in RFC 5322 (Gmail returns "Message-Id" or "Message-ID").
       const hdr = (n) => headers.find(h => String(h.name).toLowerCase() === n.toLowerCase())?.value || "";
       triageDecisions()?.register(messageId, from);
-      return { messageId, from, subject, to: ["To", "Cc"].map(hdr).filter(Boolean).join(", "), date: hdr("Date"), rfcMessageId: hdr("Message-ID"), rfcReferences: hdr("References"), toMerlin: isAddressedToMerlin(recipients) };
+      return { messageId, from, subject, to: ["To", "Cc"].map(hdr).filter(Boolean).join(", "), date: hdr("Date"), rfcMessageId: hdr("Message-ID"), rfcReferences: hdr("References"), toEdva: isAddressedToEdva(recipients) };
     } catch { return null; }
   }
 
@@ -899,7 +899,7 @@ export class GmailSource {
   async _filterCatchupMetas(metas, label) {
     const survivors = [];
     for (const m of metas) {
-      const cascade = await runIntakeCascade(m.messageId, m.from, m.subject, m.toMerlin);
+      const cascade = await runIntakeCascade(m.messageId, m.from, m.subject, m.toEdva);
       if (cascade.skip) {
         this.triageLog(`${label} intake-skip (${cascade.kind}) ${m.messageId}: ${cascade.detail}`);
         continue;
@@ -972,7 +972,7 @@ export class GmailSource {
   //
   // Per-message triage goes through `_triageDispatchFn` when the supervisor
   // wired one (triage-route.mjs → the ops-light tier); mail
-  // addressed to Merlin (the command channel) always stays on the local ops
+  // addressed to Edva (the command channel) always stays on the local ops
   // dispatcher. The attempt is recorded first either way.
   _dispatchTriage(content, messageId, { commandChannel = false } = {}) {
     try { recordAttempt(messageId, "triage", { file: this._trackingFile() }); } catch {}
@@ -1012,7 +1012,7 @@ export class GmailSource {
   //   live       — `triage-decide live` decides + executes Step 5 in code; the
   //                agent is dispatched only if it declines (failure, invalid
   //                output, or an action tag that needs an agent).
-  // The command channel (mail addressed to Merlin) always goes to the agent.
+  // The command channel (mail addressed to Edva) always goes to the agent.
   async _routeForTriage(p) {
     const body = await this._fetchBodyText(p.messageId);
     const packet = { ...p, body, history: this._historyLine(p.from) };
@@ -1177,19 +1177,19 @@ export class GmailSource {
               }
             }
           }
-          // Merlin's own P1 mail (a reply to the user, a memo): fixed
-          // target state, finished in code, no dispatch. See finishMerlinP1.
-          if (stampedP1 && finishMerlinP1(m.messageId, m.from, stamp).handled) {
-            this.triageLog(`merlin-p1 ${m.messageId} (${stamps[0]}) → personal+p1+star, unread — finished in code, dispatch skipped`);
+          // Edva's own P1 mail (a reply to the user, a memo): fixed
+          // target state, finished in code, no dispatch. See finishEdvaP1.
+          if (stampedP1 && finishEdvaP1(m.messageId, m.from, stamp).handled) {
+            this.triageLog(`edva-p1 ${m.messageId} (${stamps[0]}) → personal+p1+star, unread — finished in code, dispatch skipped`);
             continue;
           }
-          // One handler per message to Merlin's address: the Cloudflare Email
+          // One handler per message to Edva's address: the Cloudflare Email
           // Worker route (/email-inbound, lib/email-inbound-gate.mjs) logs
           // every Message-ID it dispatches to email-inbound-handled.jsonl. If it
           // got this one first, the user's SENT copy arriving here is the same
           // instruction — file it, don't dispatch it twice. If we get it first,
           // we write the same ledger so the Worker path skips it instead.
-          if (m.toMerlin === true && m.rfcMessageId) {
+          if (m.toEdva === true && m.rfcMessageId) {
             if (inboundAlreadyHandled(m.rfcMessageId)) {
               try { spawnSync(GMAIL_ACTION_BIN, ["label", m.messageId, "personal"], GA_OPTS); spawnSync(GMAIL_ACTION_BIN, ["mark-read", m.messageId], GA_OPTS); } catch {}
               this.triageLog(`command-channel ${m.messageId} already handled via email-inbound (${m.rfcMessageId}) — filed, dispatch skipped`);
@@ -1202,12 +1202,12 @@ export class GmailSource {
           // mark-read with no LLM needed): newsletters, status pages, etc.
           // (rules in data/intake-skip-rules.json). Skip
           // dispatch entirely on match.
-          // Command channel (isAddressedToMerlin) — an instruction the user addressed
-          // to Merlin must reach an agent, so it gates the two auto-handling
+          // Command channel (isAddressedToEdva) — an instruction the user addressed
+          // to Edva must reach an agent, so it gates the two auto-handling
           // filters exactly as a stamped P1 does.
-          const skipAutoHandle = stampedP1 || m.toMerlin === true;
-          if (m.toMerlin === true && !stampedP1) {
-            this.triageLog(`command-channel ${m.messageId} from ${extractEmailAddr(m.from)} → addressed to Merlin, auto-handling skipped`);
+          const skipAutoHandle = stampedP1 || m.toEdva === true;
+          if (m.toEdva === true && !stampedP1) {
+            this.triageLog(`command-channel ${m.messageId} from ${extractEmailAddr(m.from)} → addressed to Edva, auto-handling skipped`);
           }
           const fp = skipAutoHandle ? { matched: false } : intakeFastPathCheck(m.messageId, m.from, m.subject);
           if (fp.matched) {
@@ -1223,7 +1223,7 @@ export class GmailSource {
             this.triageLog(`${lc.kind} intake ${m.messageId} from ${extractEmailAddr(m.from)} → ${lc.label}/P3 (${lc.source}) — dispatch skipped`);
             continue;
           }
-          const packet = { ...m, stamps: m.toMerlin === true ? [...stamps, "command-channel"] : stamps, jev: lc.jev || null };
+          const packet = { ...m, stamps: m.toEdva === true ? [...stamps, "command-channel"] : stamps, jev: lc.jev || null };
           await this._routeForTriage(packet);
         }
         this._lastRealDispatchAt = Date.now();
@@ -1273,7 +1273,7 @@ export class GmailSource {
             continue;
           }
         } catch {}
-        const content = `New email received. Email: ${item.emailAddress}, History ID: ${item.historyId}. Fetch and triage this ONE email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+        const content = `New email received. Email: ${item.emailAddress}, History ID: ${item.historyId}. Fetch and triage this ONE email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
         this._dispatchFn(content, `gmail:${item.historyId}`);
       }
     } catch (err) {
@@ -1292,7 +1292,7 @@ export class GmailSource {
             continue;
           }
         } catch {}
-        const content = `New email received. Email: ${item.emailAddress}, History ID: ${item.historyId}. Fetch and triage this ONE email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+        const content = `New email received. Email: ${item.emailAddress}, History ID: ${item.historyId}. Fetch and triage this ONE email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
         this._dispatchFn(content, `gmail:${item.historyId}`);
       }
     }
@@ -1359,7 +1359,7 @@ export class GmailSource {
               return;
             }
             const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
-            const content = `STORM CATCHUP: Gmail notification storm detected (${stormCounter}+ pushes in ${STORM_WINDOW_MS / 1000}s). ${survivors.length} message(s) NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify):\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+            const content = `STORM CATCHUP: Gmail notification storm detected (${stormCounter}+ pushes in ${STORM_WINDOW_MS / 1000}s). ${survivors.length} message(s) NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify):\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
             console.error(`[gmail-source] storm detected (${stormCounter} pushes) — ${survivors.length}/${metas.length} need real triage`);
             this._dispatchFn(content, `gmail-storm:${historyId}`);
             return;
@@ -1380,7 +1380,7 @@ export class GmailSource {
     }
 
     // Fallback: if no dispatchFn wired yet, return content for legacy direct dispatch.
-    const content = `New email received. Email: ${emailAddress}, History ID: ${historyId}. Fetch and triage this email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+    const content = `New email received. Email: ${emailAddress}, History ID: ${historyId}. Fetch and triage this email now using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
     return { accept: true, historyId, emailAddress, content };
   }
 
@@ -1401,7 +1401,7 @@ export class GmailSource {
         return null;
       }
       const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
-      return `STARTUP CATCHUP: Supervisor just (re)started. ${survivors.length} message(s) since ${last.ts} (historyId ${last.historyId}) were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+      return `STARTUP CATCHUP: Supervisor just (re)started. ${survivors.length} message(s) since ${last.ts} (historyId ${last.historyId}) were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
     }
 
     // Prefetch failed or history expired — fall back to the original broad
@@ -1451,7 +1451,7 @@ export class GmailSource {
         return;
       }
       const lines = survivors.map(m => `  - MessageId: ${m.messageId} | From: ${m.from} | Subject: ${m.subject}`);
-      const content = `PERIODIC CATCHUP: No Gmail push received in ${gapMin} minutes. ${survivors.length} message(s) since history ID ${last.historyId} were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/merlin/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
+      const content = `PERIODIC CATCHUP: No Gmail push received in ${gapMin} minutes. ${survivors.length} message(s) since history ID ${last.historyId} were NOT resolved by the deterministic intake-skip cascade (spam-filter / intake-skip-rules.json / local-classify) and need real triage:\n\n${lines.join("\n")}\n\nFetch and triage each one using the Gmail connector, following the Email Triage Rules. FIRST read the decision core: \`~/Dev/edva/bin/triage-rules core\`, then only the category rules that apply (\`triage-rules index\`, \`triage-rules section <slug>\`) — not email-triage-rules.md whole.`;
       console.error(`[gmail-source] push gap detected (${gapMin}min) — ${survivors.length}/${metas.length} need real triage`);
       this._dispatchFn(content, "periodic-catchup");
       return;

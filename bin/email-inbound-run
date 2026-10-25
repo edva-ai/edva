@@ -4,7 +4,7 @@
 //
 // Spawned (detached) by the supervisor's /email-inbound route AFTER the code
 // gate (lib/email-inbound-gate.mjs: DKIM alignment, sender allowlist,
-// Message-ID dedup, reply-to-Merlin lookup) has passed the message.
+// Message-ID dedup, reply-to-Edva lookup) has passed the message.
 //
 // Tool grant — explicit, and the whole of it (see jobs/email-inbound.md § Tool
 // grant): built-in tools OFF (--tools ""), --strict-mcp-config to ONE server,

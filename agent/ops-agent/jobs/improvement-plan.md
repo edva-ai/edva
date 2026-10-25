@@ -15,8 +15,8 @@ Runs immediately after the weekly Self Improvement Review (`nightly-review`, Tue
 1. **The boundary is code, not your judgment.** Every verified change goes to `bin/self-improve-auto-apply` first. It applies the change itself when `lib/self-improve-landing.mjs` says it may — low or moderate risk, at most 5 files and 300 changed lines, no high-blast-radius path (money, outbound messages, calendar, triage, the supervisor, the enforcement hooks), not a new capability, critic `SAFE` — and **exits 3 with the reasons when the change belongs on a card**. Only then do you file it with `self-improve-request`. Never file a card for something auto-apply would have taken, and never try to get something past auto-apply by relabelling it; the rails are judged from the real file set.
 2. **Never re-propose something they skipped.** `bin/self-improve-skip list` is the do-not-repropose roster and Step 2 is not optional. A skip that comes back next Tuesday is not a skip, it's a snooze, and it teaches them the button doesn't work. Same for items already `pending` (unsigned) or `applied`.
 3. **This job cannot rewrite its own controls.** `data/self-improvement-risk-rubric.md` is the source of truth. FORBIDDEN paths are a hard refusal. The recursion-guard paths (rubric §2.2: this playbook, `nightly-review.md`, `system-issue-review.md`, `self-improvement-executor.md`, the rubric, `self-improve-landing.mjs`, the `self-improve-*` CLIs, the approval core, the agent `CLAUDE.md` files) are out of scope entirely: an improvement to the improvement machinery goes to the user as a question (Step 6c), never into a draft. `self-improve-auto-apply` refuses them too. **Exception, card-only (rubric §2.2, schema v5, 2026-10-22):** the daily-summary repair loop's own files (`bin/daily-summary-fix`, `jobs/daily-summary-fix.md`, `trigger-daily-summary-fix.sh`, `tests/daily-summary-fix.test.mjs`) may be drafted and filed as a Face-ID card; auto-apply exits 3 on them whatever their size.
-4. **Every item gets a disposition; only cards are capped.** Automatic changes are not capped — that is the point of them. **Cards are capped at 5 unsigned at any time**, because a card is a decision and five is what a person gets through. **Count them with `~/Dev/merlin/bin/self-improve-queue count --json` (`unsigned_live`, `room`) — never by reading `status = pending` off the table.** A card expires 24 hours after it is filed; an expired card can never be signed, so it does not count. Until 2026-10-06 this job counted raw `pending` rows, seven of which were 2 to 55 days past expiry, and filed nothing at all for that reason. The CLI uses `isApprovalRowPending` (`lib/apns-push.mjs`), the same test as the app's badge. A card-worthy item over the cap is carried to next week (`carried: "card-cap"`), not dropped, and the review email lists it.
-5. **Nothing lands unverified.** See Step 5. An automatic change has no signature behind it, so its verification is the only thing between the review and the repo: tests, `merlin doctor`, and a critic that says `SAFE`. If you cannot exercise a change, shrink it until you can, or turn it into a question.
+4. **Every item gets a disposition; only cards are capped.** Automatic changes are not capped — that is the point of them. **Cards are capped at 5 unsigned at any time**, because a card is a decision and five is what a person gets through. **Count them with `~/Dev/edva/bin/self-improve-queue count --json` (`unsigned_live`, `room`) — never by reading `status = pending` off the table.** A card expires 24 hours after it is filed; an expired card can never be signed, so it does not count. Until 2026-10-06 this job counted raw `pending` rows, seven of which were 2 to 55 days past expiry, and filed nothing at all for that reason. The CLI uses `isApprovalRowPending` (`lib/apns-push.mjs`), the same test as the app's badge. A card-worthy item over the cap is carried to next week (`carried: "card-cap"`), not dropped, and the review email lists it.
+5. **Nothing lands unverified.** See Step 5. An automatic change has no signature behind it, so its verification is the only thing between the review and the repo: tests, `edva doctor`, and a critic that says `SAFE`. If you cannot exercise a change, shrink it until you can, or turn it into a question.
 6. **Plain language, four parts, every time.** Automatic or carded, a change is explained as *What's wrong / Why it matters now / The fix / Side effects*, for a reader without the background. Both CLIs refuse to run without `--problem`, `--impact`, `--fix` and `--side-effects`. Write them as you would to a smart friend who has not seen the code: no file names in the first three parts unless they are the point, no jargon, the evidence in numbers they would recognise.
 7. **Budget the turn: ~3 hours** (the trigger caps it at 180 minutes). Per-item durability (Step 6d) makes a truncated run survivable: an item applied or filed and recorded is banked, and the next run carries on from the rest.
 8. **Silent by default.** No email, no phone ping, no chat message. An automatic change shows as a green check in the Improvements channel; a card is its own notification; the review email already told them the week's story, and next week's review reports what landed.
@@ -39,16 +39,16 @@ trigger (runs after nightly-review's memo is sent)
 
 Read, in one parallel batch:
 
-1. `~/Dev/merlin/data/nightly-review-state.json` — the review that just ran. The material is:
+1. `~/Dev/edva/data/nightly-review-state.json` — the review that just ran. The material is:
    - `suggestions[]` where `status: "pending"` — this week's action items, each already carrying the review's own classification (`risk`, `risk_before_rails`, `category`, `rails_hits`, `auto_actionable`, `classifier_rationale`).
    - `auto_apply.last_night_classifications` — the full Step 4a array, including items that did not make the top-5 email cut.
    - `context_gaps[]` / `skill_proposals[]` with `status: "open"` / `"pending"` — lower priority than action items, but eligible when the action items are thin.
-2. `~/Dev/merlin/data/improvement-plan-state.json` — this job's own state (see § State file). If missing, initialize:
+2. `~/Dev/edva/data/improvement-plan-state.json` — this job's own state (see § State file). If missing, initialize:
    ```json
    {"schema_version": 1, "last_run": null, "planned": [], "declined": []}
    ```
-3. `~/Dev/merlin/data/self-improvement-risk-rubric.md` — read it before classifying anything. **If it is unreadable, stop the run and exit**: a missing rubric means missing rails, and this job's entire output is changes to Merlin's own source.
-4. `~/Dev/merlin/data/system-issue-review-state.json` — clusters in `verifying` / `awaiting_approval` / `escalated`. Those are another job's work in flight; do not plan against them.
+3. `~/Dev/edva/data/self-improvement-risk-rubric.md` — read it before classifying anything. **If it is unreadable, stop the run and exit**: a missing rubric means missing rails, and this job's entire output is changes to Edva's own source.
+4. `~/Dev/edva/data/system-issue-review-state.json` — clusters in `verifying` / `awaiting_approval` / `escalated`. Those are another job's work in flight; do not plan against them.
 
 **Freshness check.** If `nightly-review-state.json.last_run` is more than 24h old, the review did not run (or died before Step 4d). Do not plan from a stale week: log it, write `last_run` with `outcome: "skipped-stale-review"`, and exit. Planning off a week-old analysis produces cards for problems that have already been fixed.
 
@@ -57,7 +57,7 @@ Read, in one parallel batch:
 Build the exclusion set BEFORE ranking anything, and match on substance (same file + same defect), not on wording — the review re-phrases a recurring finding differently every week.
 
 ```bash
-~/Dev/merlin/bin/self-improve-skip list          # skipped: NEVER re-propose (Critical Rule 2)
+~/Dev/edva/bin/self-improve-skip list          # skipped: NEVER re-propose (Critical Rule 2)
 ```
 
 Exclude an item when any of these is true:
@@ -76,7 +76,7 @@ Exclude an item when any of these is true:
 Query the card table directly rather than trusting state alone — state can lag a run that was cut short:
 
 ```bash
-source ~/Dev/merlin/.env
+source ~/Dev/edva/.env
 curl -s "$SUPABASE_URL/rest/v1/self_improve_approvals?select=id,summary,status,skipped,created_at&order=created_at.desc&limit=60" \
   -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
 ```
@@ -104,7 +104,7 @@ This is the step the job is named for, and it happens **before** any code is wri
 Ranking, in order of weight:
 
 1. **Recurrence** — a finding the review has now made 2+ weeks running outranks a fresh one. Re-surfacing is the strongest evidence a system has that something genuinely hurts.
-2. **Correctness over polish** — a wrong answer Merlin gives the user outranks a slow one. Silent wrongness (a mis-filed reply, a missed calendar event, a hallucinated status) outranks a loud failure, which at least announces itself.
+2. **Correctness over polish** — a wrong answer Edva gives the user outranks a slow one. Silent wrongness (a mis-filed reply, a missed calendar event, a hallucinated status) outranks a loud failure, which at least announces itself.
 3. **Cost of the failure to them** — a missed flight change beats a suboptimal restaurant pick.
 4. **Size** — prefer several small, independently-approvable changes over one sprawling refactor. Each card is an atomic approve/skip decision, so a card they can only partly agree with is a card they skip whole.
 
@@ -132,11 +132,11 @@ Write the change as a **staged payload**, never into the working tree:
 
 ```bash
 WT=$(mktemp -d -t improvement-plan)
-git -C ~/Dev/merlin worktree add --detach "$WT" HEAD
+git -C ~/Dev/edva worktree add --detach "$WT" HEAD
 # write the payload's files into $WT at their repo-relative paths, then:
 cd "$WT" && node --check <each changed .mjs/.js>
 cd "$WT" && node --test <the tests covering the touched directories>
-git -C ~/Dev/merlin worktree remove --force "$WT"
+git -C ~/Dev/edva worktree remove --force "$WT"
 ```
 
 The worktree is disposable and isolated — it cannot dirty the host's working tree or trip the pre-commit hook. Clean it up even when verification fails (`worktree remove --force`); an abandoned worktree wedges the next run's `worktree add`.
@@ -155,7 +155,7 @@ Per surviving `build` item, after Step 5 verified it and the critic said `SAFE` 
 cat > /tmp/plan-<id>-files.json <<'JSON'
 {"files": {"<path>": "<complete new content>"}}
 JSON
-~/Dev/merlin/bin/self-improve-auto-apply \
+~/Dev/edva/bin/self-improve-auto-apply \
   --summary "<what changes, one line, plain language>" \
   --problem "<what is wrong, as they would notice it>" \
   --impact "<what it costs today, with the evidence>" \
@@ -167,7 +167,7 @@ JSON
   --base-rev "$BASE_REV"
 ```
 
-`BASE_REV` is `git -C ~/Dev/merlin rev-parse HEAD`, taken **right before you read the files for THIS item**, not once at the start of the run: an earlier item you landed this run may have changed a file this one also touches (`system/changelog.md` almost always), and its content must be re-read, not reused.
+`BASE_REV` is `git -C ~/Dev/edva rev-parse HEAD`, taken **right before you read the files for THIS item**, not once at the start of the run: an earlier item you landed this run may have changed a file this one also touches (`system/changelog.md` almost always), and its content must be re-read, not reused.
 
 Exit codes decide the next move — do not second-guess them:
 
@@ -184,7 +184,7 @@ Exit codes decide the next move — do not second-guess them:
 **6b. File a Face-ID card** — only for exit 3, or a critic that was not `SAFE`, and only while `self-improve-queue count --json` reports `room > 0` (Critical Rule 4). Re-run the count before each card, not once per run:
 
 ```bash
-~/Dev/merlin/bin/self-improve-request --type code-fix \
+~/Dev/edva/bin/self-improve-request --type code-fix \
   --summary "<one line, plain language — the card's title>" \
   --problem "..." --impact "..." --fix "..." --side-effects "..." \
   --details "<the auto-apply refusal reasons; how it was verified; how to revert>" \
@@ -218,7 +218,7 @@ Write `improvement-plan-state.json`:
 
 ## State file
 
-`~/Dev/merlin/data/improvement-plan-state.json` — written only by this job.
+`~/Dev/edva/data/improvement-plan-state.json` — written only by this job.
 
 | field | meaning |
 |---|---|
@@ -233,7 +233,7 @@ Card status is authoritative in Supabase, never here — this file records what 
 ## Guardrails
 
 - **Never `git add` / `git commit` / edit the working tree yourself.** Changes land only through `self-improve-auto-apply` (which commits file-scoped, pushes, and logs) or `self-improve-request` (which commits only on the user's signature). The exceptions are this job's own state file and the tracker sync in `nightly-review-state.json` (Step 7), which are data, not code.
-- **Never send outbound** — no email, no `merlin-send-curl`, no `merlin-notify`. Cards are the channel.
+- **Never send outbound** — no email, no `edva-send-curl`, no `edva-notify`. Cards are the channel.
 - **Never approve or sign a card.** A card lands only on a verified Enclave signature from the user's device; the only path from this job to a change landing on its own is `self-improve-auto-apply`, which decides from code what it may take.
 - **Clean up worktrees and temp payloads** on every exit path, including failures.
 - **Rubric unreadable → exit** (Step 1.3). Rails missing means no run.

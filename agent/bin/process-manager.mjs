@@ -2,7 +2,7 @@
 // process-manager.mjs — direct process supervisor, replaces tmux session management.
 //
 // Manages 4 child processes with independent restart:
-//   1. Chat supervisor   (Node.js — manages Claude session for Merlin messages)
+//   1. Chat supervisor   (Node.js — manages Claude session for Edva messages)
 //   2. Ops supervisor    (Node.js — manages Claude session for email triage + tasks)
 //   3. Wiki server       (HTTP wiki browser at 127.0.0.1:9096)
 //   4. WhatsApp channel  (Baileys gateway for the user's personal WhatsApp on :9100)
@@ -26,11 +26,11 @@ import { installRoot, installTools, nodeBin } from "../../lib/root.cjs";
 const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 const HOME = process.env.HOME;
-const MERLIN = installRoot();
-const AGENT_DIR = path.join(MERLIN, "agent");
+const EDVA = installRoot();
+const AGENT_DIR = path.join(EDVA, "agent");
 const LOG_DIR = path.join(AGENT_DIR, "logs");
 const SUPERVISOR_DIR = path.join(AGENT_DIR, "supervisor");
-// The node every managed child runs on (lib/root.cjs nodeBin: $MERLIN_NODE,
+// The node every managed child runs on (lib/root.cjs nodeBin: $EDVA_NODE,
 // else a stable Homebrew / /usr/local path, else this interpreter).
 const NODE = nodeBin();
 
@@ -38,7 +38,7 @@ const NODE = nodeBin();
 // propagate to every child process — supervisors, Claude, and MCP servers
 // that use ${VAR} substitution in .mcp.json. Does NOT override existing env vars.
 function loadDotEnv() {
-  const envPath = path.join(MERLIN, ".env");
+  const envPath = path.join(EDVA, ".env");
   try {
     for (const line of readFileSync(envPath, "utf8").split("\n")) {
       const trimmed = line.trim();
@@ -62,7 +62,7 @@ function log(msg) {
 function createProcesses() {
   const children = [];
 
-  // 1. Chat supervisor — manages Claude session for Merlin messages
+  // 1. Chat supervisor — manages Claude session for Edva messages
   children.push(
     new ManagedProcess({
       name: "chat-supervisor",
@@ -127,8 +127,8 @@ function createProcesses() {
     new ManagedProcess({
       name: "wiki-server",
       command: NODE,
-      args: [path.join(MERLIN, "bin/wiki"), "serve", "--port", "9096", "--host", "0.0.0.0"],
-      cwd: MERLIN,
+      args: [path.join(EDVA, "bin/wiki"), "serve", "--port", "9096", "--host", "0.0.0.0"],
+      cwd: EDVA,
       logFile: path.join(LOG_DIR, "wiki-server.log"),
       log,
     })
@@ -151,8 +151,8 @@ function createProcesses() {
     new ManagedProcess({
       name: "wiki-server-public",
       command: NODE,
-      args: [path.join(MERLIN, "bin/wiki"), "serve", "--port", "9097", "--host", "127.0.0.1"],
-      cwd: MERLIN,
+      args: [path.join(EDVA, "bin/wiki"), "serve", "--port", "9097", "--host", "127.0.0.1"],
+      cwd: EDVA,
       env: { WIKI_PUBLIC: "1" },
       logFile: path.join(LOG_DIR, "wiki-server-public.log"),
       log,
@@ -206,7 +206,7 @@ for (const child of children) {
   child.start();
 }
 
-// HTTP health endpoint — consumed by merlin status, heartbeat-sender, watchdog.
+// HTTP health endpoint — consumed by edva status, heartbeat-sender, watchdog.
 const HEALTH_PORT = 9095;
 const healthServer = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -359,7 +359,7 @@ const pendingLostSince = new Map();
 
 function readWebhookToken() {
   try {
-    return readFileSync(path.join(MERLIN, "secrets/webhook-token"), "utf8").trim() || null;
+    return readFileSync(path.join(EDVA, "secrets/webhook-token"), "utf8").trim() || null;
   } catch {
     return null;
   }

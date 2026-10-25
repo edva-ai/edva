@@ -1,5 +1,5 @@
 // jev-claude-toolless.test.mjs — every claude -p in the Jev batches is tool-less,
-// Max-only, and runs off the merlin tree's settings (lib/jev-claude.mjs).
+// Max-only, and runs off the edva tree's settings (lib/jev-claude.mjs).
 // Regression for the 2026-09-23 review: `--allowedTools ""` left built-ins, MCP
 // servers and allow rules live, and most spawns leaked ANTHROPIC_API_KEY.
 import { test } from "node:test";

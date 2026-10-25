@@ -60,7 +60,7 @@
       "enabled": false,
       "script": "weather.mjs",
       "interval_sec": 900,
-      "detects": "rain becoming likely / clearing, a temperature swing >=12F (needs MERLIN_WEATHER_BIN)",
+      "detects": "rain becoming likely / clearing, a temperature swing >=12F (needs EDVA_WEATHER_BIN)",
       "cost": "1 weather CLI call"
     },
     {

@@ -2,7 +2,7 @@
 // sees them (a self-improvement review item).
 //
 // Before this, every Opus job ran as an ephemeral launchd fork outside the
-// three supervisors, wrote no ledger row, and merlin-cost-report said
+// three supervisors, wrote no ledger row, and edva-cost-report said
 // "opus: 0 dispatches" in a week where four Opus jobs ran.
 //
 // Run: node --test tests/fork-cost-ledger.test.mjs
@@ -71,7 +71,7 @@ test("usage-only results (stateless executor) still make a row; empty ones make 
 test("fork-cost-record writes the row and hands back the plain text; garbage passes through", () => {
   const dir = tmp();
   const ledger = path.join(dir, "ledger.ndjson");
-  const env = { ...process.env, MERLIN_FORK_COST_LEDGER: ledger };
+  const env = { ...process.env, EDVA_FORK_COST_LEDGER: ledger };
   const cli = path.join(ROOT, "bin/fork-cost-record");
   try {
     const json = path.join(dir, "out.json");
@@ -98,11 +98,11 @@ test("fork-cost-record writes the row and hands back the plain text; garbage pas
   }
 });
 
-// A throwaway $HOME whose Dev/merlin points at this checkout's code but has its
+// A throwaway $HOME whose Dev/edva points at this checkout's code but has its
 // own logs, so nothing here touches a real ledger or log.
 function fakeHome() {
   const home = tmp();
-  const g = path.join(home, "Dev/merlin");
+  const g = path.join(home, "Dev/edva");
   fs.mkdirSync(path.join(g, "agent/logs"), { recursive: true });
   fs.mkdirSync(path.join(g, "agent/ops-agent"), { recursive: true });
   for (const rel of ["bin", "lib", "agent/config", "agent/scripts"]) {
@@ -111,14 +111,14 @@ function fakeHome() {
   return { home, g };
 }
 
-test("merlin-cost-report counts the fork ledger and prices Opus 5.5 at its own rates", () => {
+test("edva-cost-report counts the fork ledger and prices Opus 5.5 at its own rates", () => {
   const { home, g } = fakeHome();
   try {
     const dir = path.join(g, "agent/logs/ephemeral-forks");
     fs.mkdirSync(dir, { recursive: true });
     const row = rowFromResult({ job: "nightly-review", result: ENVELOPE, model: "claude-opus-5-5", now: new Date() });
     fs.writeFileSync(path.join(dir, "job-costs.ndjson"), JSON.stringify(row) + "\n");
-    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/merlin-cost-report"), "--since", "7d", "--json"],
+    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/edva-cost-report"), "--since", "7d", "--json"],
       { env: { ...process.env, HOME: home }, encoding: "utf8" }));
     const opus = out.by_tier.find((t) => t.tier === "opus");
     assert.equal(opus.dispatches, 1, "the Opus fork must show up as an opus dispatch");

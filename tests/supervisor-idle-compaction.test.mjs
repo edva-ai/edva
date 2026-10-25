@@ -1,6 +1,6 @@
 // Claude Code 2.1.299 added
 // "idle compaction" (a long conversation is compacted after ~54 idle minutes);
-// 2.1.302 made it switchable with `"idleCompaction": false`. Merlin's
+// 2.1.302 made it switchable with `"idleCompaction": false`. Edva's
 // long-running supervisor sessions (chat + every ops tier) turn it off through
 // the per-session --settings JSON, so the operator's own Claude Code sessions keep the
 // default. This guards both spawn paths.

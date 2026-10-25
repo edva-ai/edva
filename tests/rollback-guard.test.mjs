@@ -1,5 +1,5 @@
 // The git-rollback guard. Every spelling of a destructive whole-tree git
-// command is caught, uncommitted work is saved to refs/merlin/pre-destructive/*
+// command is caught, uncommitted work is saved to refs/edva/pre-destructive/*
 // before it runs, and the command is blocked when that save fails. Harmless git
 // commands pass untouched.
 
@@ -28,8 +28,8 @@ test("every destructive spelling is caught", () => {
     "git stash drop", "git stash drop stash@{2}", "git stash clear",
     "git switch --discard-changes main", "git switch -f main",
     "git checkout-index -f -a",
-    "git -C ~/Dev/merlin reset --hard", "git -c core.pager=cat checkout .",
-    "cd ~/Dev/merlin && git checkout -- .", "git fetch && git reset --hard origin/main",
+    "git -C ~/Dev/edva reset --hard", "git -c core.pager=cat checkout .",
+    "cd ~/Dev/edva && git checkout -- .", "git fetch && git reset --hard origin/main",
     "bash -c 'git reset --hard'", "sh -lc \"cd /x; git clean -fd\"", "eval git restore .",
     "env GIT_TRACE=1 git reset --hard", "FOO=1 git reset --hard", "command git restore .",
     "timeout 30 git reset --hard", "/usr/bin/git reset --hard",
@@ -44,7 +44,7 @@ test("harmless git commands and look-alikes pass", () => {
     "git reset --soft HEAD~1", "git clean -n", "git clean -fdn", "git clean --dry-run -fd",
     "git stash list", "git stash push -u -m tag", "git stash apply abc123", "git stash show",
     "git add -A", "git commit -m 'git reset --hard is blocked'", "echo 'git reset --hard'",
-    "grep -rn 'git checkout .' tools", "# git reset --hard", "bin/merlin-commit -m 'x' -- a",
+    "grep -rn 'git checkout .' tools", "# git reset --hard", "bin/edva-commit -m 'x' -- a",
     "git push origin main", "git merge --ff-only origin/main",
   ]) assert.ok(!destructive(cmd), `false positive: ${cmd}`);
 });
@@ -73,7 +73,7 @@ test("reset --hard: the uncommitted edit is saved to a ref and can be restored",
   g("add", "b.json");
   const r = hook("git reset --hard", d);
   assert.equal(r.code, 0);
-  assert.match(r.stdout, /refs\/merlin\/pre-destructive\//);
+  assert.match(r.stdout, /refs\/edva\/pre-destructive\//);
   const ref = g("for-each-ref", "--format=%(refname)", REF_PREFIX);
   assert.ok(ref.startsWith(REF_PREFIX));
   g("reset", "--hard");
@@ -162,6 +162,6 @@ test("both supervisors put the guard hook in their session settings", () => {
   }
   // (this installation's own runners: rollback-guard-local.test.mjs)
   for (const f of ["agent/scripts/lib/run-ephemeral-opus.sh"]) {
-    assert.ok(fs.readFileSync(path.join(ROOT, f), "utf8").includes("merlin_fork_settings"), `${f} does not merge the guard`);
+    assert.ok(fs.readFileSync(path.join(ROOT, f), "utf8").includes("edva_fork_settings"), `${f} does not merge the guard`);
   }
 });

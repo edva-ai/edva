@@ -22,7 +22,7 @@ const { MODELS, parseModelsEnv } = require("../lib/models.cjs");
 test("shell (bash and zsh) and node read the same ids from models.env", () => {
   for (const sh of ["/bin/bash", "/bin/zsh"]) {
     if (!fs.existsSync(sh)) continue;
-    const out = execFileSync(sh, ["-c", `source ${JSON.stringify(ENV)}; printf '%s %s' "$MERLIN_MODEL_OPUS" "$MERLIN_MODEL_SONNET"`], { encoding: "utf8" });
+    const out = execFileSync(sh, ["-c", `source ${JSON.stringify(ENV)}; printf '%s %s' "$EDVA_MODEL_OPUS" "$EDVA_MODEL_SONNET"`], { encoding: "utf8" });
     assert.equal(out, `${MODELS.opus} ${MODELS.sonnet}`, `${sh} disagrees with models.cjs`);
   }
 });
@@ -42,7 +42,7 @@ test("the Opus forks are on Opus 5.5 and the Sonnet tier is on Sonnet 5.5", () =
 // the old id (old transcript rows still need pricing), so they are exempt.
 test("no code still runs the previous Sonnet id", () => {
   const RATE_TABLES = new Set([
-    "bin/merlin-allowance-coverage",
+    "bin/edva-allowance-coverage",
     "bin/cost-review-prefetch.mjs",
     "agent/ext/cost-review-prefetch/tools/bin/cost-review-prefetch.mjs",
   ]);
@@ -79,7 +79,7 @@ test("models.env stays plain KEY=value — sourceable by zsh and bash without ex
     if (!l || l.startsWith("#")) continue;
     assert.ok(/^[A-Z_]+=[a-z0-9.-]+$/.test(l), `not a plain KEY=value line: ${l}`);
   }
-  assert.deepEqual(Object.keys(parseModelsEnv(text)).sort(), ["MERLIN_MODEL_OPUS", "MERLIN_MODEL_SONNET"]);
+  assert.deepEqual(Object.keys(parseModelsEnv(text)).sort(), ["EDVA_MODEL_OPUS", "EDVA_MODEL_SONNET"]);
 });
 
 // Every site that used to carry its own Opus id. Comment lines are ignored —
@@ -94,17 +94,17 @@ test("no Opus call site hard-codes a model id any more", () => {
     const code = fs.readFileSync(path.join(ROOT, rel), "utf8").split("\n")
       .filter((l) => !l.trimStart().startsWith("#") && !l.trimStart().startsWith("//") && !l.trimStart().startsWith("*"))
       .join("\n");
-    assert.ok(!code.includes("claude-opus-"), `${rel} hard-codes an Opus id — read MERLIN_MODEL_OPUS / MODELS.opus instead`);
+    assert.ok(!code.includes("claude-opus-"), `${rel} hard-codes an Opus id — read EDVA_MODEL_OPUS / MODELS.opus instead`);
     assert.ok(code.includes("models.env") || code.includes("models.cjs"), `${rel} does not read the central model file`);
   }
 });
 
 test("every cost tool can price the pinned Opus id", () => {
-  // merlin-allowance-coverage and cost-review-prefetch SKIP a transcript
+  // edva-allowance-coverage and cost-review-prefetch SKIP a transcript
   // message whose model has no rate, so a missing row silently drops the spend.
   for (const rel of [
-    "bin/merlin-allowance-coverage",
-    "bin/merlin-cost-report",
+    "bin/edva-allowance-coverage",
+    "bin/edva-cost-report",
   ]) { // (this installation's cost-review-prefetch: models-central-local.test.mjs)
     const src = fs.readFileSync(path.join(ROOT, rel), "utf8");
     assert.ok(src.includes(`'${MODELS.opus}'`), `${rel} has no rate for ${MODELS.opus}`);

@@ -4,8 +4,8 @@ platform :ios do
   desc "Register App ID and enable capabilities"
   lane :setup_capabilities do
     produce(
-      app_identifier: "com.example.Merlin",
-      app_name: "Merlin",
+      app_identifier: "com.example.Edva",
+      app_name: "Edva",
       skip_itc: true,
       enable_services: {
         push_notification: "on",
@@ -31,11 +31,11 @@ platform :ios do
     new_build = latest_testflight_build_number(api_key: api_key) + 1
     increment_build_number(
       build_number: new_build,
-      xcodeproj: "Merlin.xcodeproj"
+      xcodeproj: "Edva.xcodeproj"
     )
 
     build_app(
-      scheme: "Merlin",
+      scheme: "Edva",
       export_method: "app-store",
       xcodebuild_formatter: "",
       export_options: {

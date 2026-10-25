@@ -1,4 +1,4 @@
-// claude-binaries.test.mjs — which Claude Code a Merlin script runs.
+// claude-binaries.test.mjs — which Claude Code a Edva script runs.
 // Run: node --test tests/claude-binaries.test.mjs  (CLAUDE_SCAN_ROOT=<clone> rescans another checkout)
 // Doctor check on a faked fs; a scan of tracked scripts for bare `claude`. (A
 // script run with a decoy `claude` first on PATH: claude-binaries-local.test.mjs.)
@@ -81,7 +81,7 @@ describe("doctor: one Claude Code on a job's PATH", () => {
 // (This installation's daily-summary-review honouring CLAUDE_BIN: claude-binaries-local.test.mjs.)
 
 // Tracked files only (never agent/logs or untracked); 200 bytes decide the kind; only scripts are read whole.
-describe("no Merlin script spawns a bare `claude`", () => {
+describe("no Edva script spawns a bare `claude`", () => {
   const scanRoot = process.env.CLAUDE_SCAN_ROOT || ROOT;
   const tracked = execFileSync("git", ["-C", scanRoot, "ls-files", "-z", "--", "bin", "lib", "agent"], { encoding: "utf8" })
     .split("\0").filter((f) => f && !f.includes("node_modules/") && !f.includes("/logs/") && !f.includes("/data/"));

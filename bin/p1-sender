@@ -27,8 +27,8 @@ const require = createRequire(import.meta.url);
 const { triageLog } = require("../lib/triage-log.js");
 
 const HOME = process.env.HOME || "";
-const FILE = path.join(HOME, "Dev/merlin/data/p1-senders.json");
-const SPAM_FILE = path.join(HOME, "Dev/merlin/data/spam-blocklist.json");
+const FILE = path.join(HOME, "Dev/edva/data/p1-senders.json");
+const SPAM_FILE = path.join(HOME, "Dev/edva/data/spam-blocklist.json");
 
 function load() {
   try {

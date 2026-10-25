@@ -1,0 +1,3427 @@
+#!/usr/bin/env node
+// edva — Edva system self-awareness CLI
+// Registry at system/. Use `edva help` for subcommands.
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
+const os = require('os');
+const { installRoot, installTools } = require("../lib/root.cjs");
+
+// The shared hum ping budget as lib/ping-budget.mjs pingCaps() enforces
+// it (same env overrides and defaults; this CLI is CommonJS and cannot import
+// the ESM module synchronously). hum-state.json's max_pings_per_day /
+// min_ping_interval_minutes are NOT read: nothing mirrors them since the code
+// tick runner was retired (2026-10-22), and the seeded 999/0 is misleading.
+function enforcedPingCaps(env = process.env) {
+  const num = (k, d) => { const n = Number(env[k]); return env[k] !== undefined && env[k] !== '' && Number.isFinite(n) ? n : d; };
+  return { maxPerDay: num('HUM_MAX_PINGS_PER_DAY', 6), minIntervalMin: num('HUM_MIN_PING_INTERVAL_MIN', 45) };
+}
+
+// --- Paths ---
+const HOME = os.homedir();
+const ROOT = installRoot();
+const TOOLS = installTools();
+const SYSTEM = path.join(TOOLS, 'system');
+// tasks.json / services.json are the kernel's registries; this installation's
+// own entries live in agent/local/{tasks,services}.json. Every read goes
+// through lib/registry.cjs, which merges the two; writes (pause/resume,
+// doctor --repair) go to the local file only.
+const registry = require(path.join(__dirname, '..', 'lib', 'registry.cjs'));
+const { instance } = require(path.join(__dirname, '..', 'lib', 'instance.cjs'));
+const OWNER = instance().owner_name;
+const OWNER_EMAIL = instance().owner_email;
+const ARCH_MD = path.join(SYSTEM, 'architecture.md');
+const OPS_CLAUDE = path.join(TOOLS, 'agent/ops-agent/CLAUDE.md');
+const AGENT_LOGS = path.join(TOOLS, 'agent/logs');
+const TOP_LOGS = path.join(TOOLS, 'logs');
+const TRIAGE_LOG = path.join(TOP_LOGS, 'triage.log');
+const PAUSE_FLAG = path.join(TOOLS, 'data/.triage-paused');
+const TRIAGE_PLAYBOOK = path.join(TOOLS, 'data/email-triage-playbook.md');
+const SPAM_FILTER_BIN = path.join(TOOLS, 'bin/spam-filter');
+const P1_SENDER_BIN = path.join(TOOLS, 'bin/p1-sender');
+const EMAIL_MEM_BIN = path.join(TOOLS, 'bin/email-mem');
+
+// --- Per-installation hooks ---
+// bin/_ext/edva-cli.cjs (CommonJS, every export optional) plugs this
+// installation's own signals into the CLI without the kernel naming them:
+//   sleepInfo({ TOOLS, shSafe })   → { wake_time_today, sleep_time_yesterday,
+//                                    asleep_now } or null (hum context `time`)
+//   activityOverride({ tz, localHour, ageMin, dataDir, readJson })
+//                                  → { state, reason } or null: a device signal
+//                                    that beats the clock rules of
+//                                    inferActivityState
+// No file: no hooks, and the CLI runs on its generic signals.
+let _cliExt;
+function cliExt() {
+  if (_cliExt === undefined) {
+    const f = path.join(__dirname, '_ext', 'edva-cli.cjs');
+    _cliExt = fs.existsSync(f) ? require(f) : {};
+  }
+  return _cliExt;
+}
+
+// --- TTY + colors ---
+const NO_COLOR = !process.stdout.isTTY || process.env.NO_COLOR || process.argv.includes('--no-color');
+const c = {
+  dim: s => NO_COLOR ? s : `\x1b[2m${s}\x1b[0m`,
+  bold: s => NO_COLOR ? s : `\x1b[1m${s}\x1b[0m`,
+  green: s => NO_COLOR ? s : `\x1b[32m${s}\x1b[0m`,
+  red: s => NO_COLOR ? s : `\x1b[31m${s}\x1b[0m`,
+  yellow: s => NO_COLOR ? s : `\x1b[33m${s}\x1b[0m`,
+  cyan: s => NO_COLOR ? s : `\x1b[36m${s}\x1b[0m`,
+  gray: s => NO_COLOR ? s : `\x1b[90m${s}\x1b[0m`,
+};
+
+// --- Utilities ---
+function die(msg, code = 1) { console.error(c.red('Error: ') + msg); process.exit(code); }
+
+function shSafe(cmd, opts = {}) {
+  try { return execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }); }
+  catch (e) { return null; }
+}
+
+// A registry read with no install at the expected root (installRoot():
+// $EDVA_HOME, else ~/Dev/edva) says so instead of dying on an ENOENT stack.
+function loadRegistryOrHint(name) {
+  try { return registry.loadRegistryList(name, { root: ROOT }); }
+  catch (e) {
+    if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
+      die(`no Edva install at ${ROOT} (${SYSTEM} is missing). Set EDVA_HOME to the repo root, e.g. EDVA_HOME=${path.resolve(__dirname, '..', '..')} edva ${process.argv.slice(2).join(' ')}`, 2);
+    }
+    throw e;
+  }
+}
+function loadTasks() { return loadRegistryOrHint('tasks'); }
+function loadServices() { return loadRegistryOrHint('services'); }
+
+function hasFlag(args, ...names) { return names.some(n => args.includes(n)); }
+function getFlag(args, name, def = null) {
+  const i = args.indexOf(name);
+  return i >= 0 && i < args.length - 1 ? args[i + 1] : def;
+}
+function expandHome(p) { return p.startsWith('~/') ? path.join(HOME, p.slice(2)) : p; }
+
+// --- Table formatter (ANSI-aware) ---
+function visibleLen(s) { return String(s ?? '').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').length; }
+function padVisible(s, width) { const str = String(s ?? ''); const pad = Math.max(0, width - visibleLen(str)); return str + ' '.repeat(pad); }
+function table(rows, headers) {
+  if (!rows.length) return c.dim('(empty)');
+  const cols = headers || Object.keys(rows[0]);
+  const widths = cols.map(h => Math.max(h.length, ...rows.map(r => visibleLen(r[h]))));
+  const sep = '  ';
+  const out = [];
+  out.push(cols.map((h, i) => c.bold(padVisible(h, widths[i]))).join(sep));
+  out.push(cols.map((h, i) => c.dim('─'.repeat(widths[i]))).join(sep));
+  for (const r of rows) out.push(cols.map((h, i) => padVisible(r[h], widths[i])).join(sep));
+  return out.join('\n');
+}
+
+// ========================================================================
+// SUBCOMMANDS
+// ========================================================================
+
+function cmdHelp(extensions = []) {
+  console.log(c.bold('edva') + ' — Edva system self-awareness CLI\n');
+  console.log('Usage: edva <subcommand> [args...] [--flags]\n');
+  console.log(c.bold('TASKS'));
+  console.log('  tasks [list] [--json]         list automated tasks');
+  console.log('  tasks show <name>             show full task detail');
+  console.log('  tasks match "<phrase>"        find task by natural-language phrase');
+  console.log('  tasks run <name>              dispatch task via webhook\n');
+  console.log(c.bold('HEALTH'));
+  console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
+  console.log('  status                        system health dashboard');
+  console.log('  services [--json]             LaunchAgents + tmux status');
+  console.log('  doctor [--json] [--repair]    run drift checks; --repair auto-fixes schedule drift + orphan scripts');
+  console.log(`  activity [--json]             ${OWNER}'s inferred state (active/winding_down/sleeping)`);
+  console.log('  context [--json] [--fresh]    unified edva knowledge — profile + tastes + sources + recent\n');
+  console.log(c.bold('TRIAGE'));
+  console.log('  triage <subcmd>               email triage subsystem (see: triage help)');
+  console.log('  triage status                 running? paused? last event?');
+  console.log('  triage recent [N] | pending | rules | playbook');
+  console.log('  triage pause | resume | reclassify <msgId>');
+  console.log('  triage memory ... | spam ... | p1 ...  (wrap email-mem / spam-filter / p1-sender)\n');
+  console.log(c.bold('HUM'));
+  console.log('  hum status                  next run, pings today, cool-down, pause state');
+  console.log('  hum pause <duration>        "2h" | "today" | "until-morning" | "weekend"');
+  console.log('  hum resume                  unpause');
+  console.log('  hum feedback <id> <reaction>  record reaction (id="last" for latest)');
+  console.log('  hum runs [--tail N]         tail hum-runs.jsonl');
+  console.log('  hum review [--since Nd]     what was surfaced / reacted to');
+  console.log('  hum test                    fire a one-shot run (bypasses cron + jitter)\n');
+  console.log(c.bold('STATE'));
+  console.log('  logs <component> [--tail N]   tail log file');
+  console.log('  cron                          crontab with descriptions from tasks.json');
+  console.log('  git                           branch + status + recent commits');
+  console.log('  ci [--limit N]                GitHub Actions runs\n');
+  console.log(c.bold('CONTROL'));
+  console.log('  restart <target>            bounce a supervised process; target:');
+  console.log('     ops | chat                 rotate the agent\'s claude session (POST supervisor /restart)');
+  console.log('     whatsapp-channel | wiki-server  SIGTERM the process-manager child; it respawns');
+  console.log('     session                    kickstart launchd — restart the whole stack\n');
+  console.log(c.bold('DISCOVERY'));
+  console.log('  arch                          print architecture.md (+ architecture-local.md, changelog.md)');
+  console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)');
+  console.log('  watchdog [status] [--json]    open incidents from watchdog-incidents/ (consecutive failures, alert state)\n');
+  if (extensions.length) {
+    console.log(c.bold('EXTENSIONS') + c.dim(' (cli.d/)'));
+    for (const e of extensions) console.log(`  ${e.usage.padEnd(28)}  ${e.summary}`);
+    console.log('');
+  }
+  console.log(c.dim('Flags: --json  --no-color  --help'));
+}
+
+// --- tasks ---
+function cmdTasks(args) {
+  const sub = args[0];
+  if (!sub || sub === 'list' || sub.startsWith('--')) return cmdTasksList(args);
+  if (sub === 'show') return cmdTasksShow(args.slice(1));
+  if (sub === 'match') return cmdTasksMatch(args.slice(1));
+  if (sub === 'run') return cmdTasksRun(args.slice(1));
+  if (sub === 'pause') return cmdTasksPause(args.slice(1));
+  if (sub === 'resume') return cmdTasksResume(args.slice(1));
+  die(`unknown: tasks ${sub}. Try: edva tasks`);
+}
+
+function writeTasks(tasks) {
+  // The merged list goes back as local entries/overrides (agent/local/tasks.json);
+  // the kernel's tasks.json is never rewritten from here.
+  registry.writeRegistryList('tasks', tasks, { root: ROOT });
+}
+
+function cmdTasksPause(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks pause: missing <name>. Usage: edva tasks pause <name> --until YYYY-MM-DD [--reason "..."]');
+  const untilIdx = args.indexOf('--until');
+  if (untilIdx < 0 || !args[untilIdx + 1]) die('tasks pause: --until YYYY-MM-DD required');
+  const until = args[untilIdx + 1];
+  if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:?\d{2})?)?$/.test(until)) {
+    die(`tasks pause: invalid --until "${until}" (expect YYYY-MM-DD or full ISO)`);
+  }
+  const reasonIdx = args.indexOf('--reason');
+  const reason = reasonIdx >= 0 ? args[reasonIdx + 1] : null;
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: edva tasks`);
+  task.paused_until = until;
+  if (reason) task.paused_reason = reason;
+  else if (!task.paused_reason) task.paused_reason = `Paused ${new Date().toISOString().slice(0, 10)} via edva tasks pause.`;
+  writeTasks(tasks);
+  console.log(`${name}: paused until ${until}${reason ? ` (${reason})` : ''}`);
+  console.log(`Doctor will skip this task's crontab check until then. Resume with: edva tasks resume ${name}`);
+}
+
+function cmdTasksResume(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks resume: missing <name>. Usage: edva tasks resume <name>');
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: edva tasks`);
+  if (!task.paused_until && !task.paused_reason) {
+    console.log(`${name}: not paused (nothing to do)`);
+    return;
+  }
+  delete task.paused_until;
+  delete task.paused_reason;
+  writeTasks(tasks);
+  console.log(`${name}: resumed. Doctor will now enforce this task's crontab check.`);
+}
+
+function cmdTasksList(args) {
+  const tasks = loadTasks();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(tasks, null, 2)); return; }
+  const rows = tasks.map(t => ({
+    name: t.name,
+    schedule: t.schedule_human || t.schedule || 'manual',
+    description: t.description,
+  }));
+  console.log(table(rows, ['name', 'schedule', 'description']));
+}
+
+function cmdTasksShow(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks show: missing <name>. Try: edva tasks');
+  const task = loadTasks().find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: edva tasks`);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(task, null, 2)); return; }
+  console.log(c.bold(task.name));
+  console.log(c.dim('  schedule:         ') + (task.schedule_human || 'manual'));
+  console.log(c.dim('  cron:             ') + (task.schedule || '—'));
+  console.log(c.dim('  trigger_script:   ') + task.trigger_script);
+  if (task.cron_label) console.log(c.dim('  cron line label:  ') + task.cron_label);
+  // A launchd job has no webhook — it is exec'd directly by its LaunchAgent
+  // (the ephemeral-Opus family: cron/webhook can't unlock the Max keychain).
+  // Printing "POST undefined" invited exactly the wrong next move.
+  console.log(c.dim('  dispatch:         ') + (task.webhook_url
+    ? `POST ${task.webhook_url}`
+    : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
+  console.log(c.dim('  webhook_task:     ') + task.webhook_task);
+  console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
+  console.log(c.dim('  delivers_to:      ') + task.delivers_to);
+  if (task.paused_until) {
+    console.log(c.dim('  paused_until:     ') + task.paused_until + (task.paused_reason ? ` — ${task.paused_reason}` : ''));
+  }
+  console.log(c.dim('  phrases:          ') + task.phrases.join(', '));
+  console.log(c.dim('  description:      ') + task.description);
+}
+
+function matchTask(phrase) {
+  const needle = ' ' + phrase.toLowerCase().trim() + ' ';
+  const matches = [];
+  for (const t of loadTasks()) {
+    let best = null;
+    for (const p of t.phrases) {
+      if (needle.includes(' ' + p.toLowerCase() + ' ') || needle.trim() === p.toLowerCase()) {
+        best = p; break;
+      }
+    }
+    if (!best) {
+      for (const p of t.phrases) {
+        if (needle.includes(p.toLowerCase())) { best = p; break; }
+      }
+    }
+    if (best) matches.push({ task: t, matched_phrase: best });
+  }
+  return matches;
+}
+
+function cmdTasksMatch(args) {
+  const flagless = args.filter(a => !a.startsWith('--'));
+  const phrase = flagless.join(' ');
+  if (!phrase) die('tasks match: missing phrase');
+  const matches = matchTask(phrase);
+  const confidence = matches.length === 1 ? 'high' : matches.length > 1 ? 'ambiguous' : 'none';
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({
+      phrase, confidence, count: matches.length,
+      matches: matches.map(m => ({
+        name: m.task.name,
+        matched_phrase: m.matched_phrase,
+        webhook_task: m.task.webhook_task,
+        description: m.task.description,
+      })),
+    }, null, 2));
+    process.exit(confidence === 'high' ? 0 : confidence === 'ambiguous' ? 2 : 1);
+  }
+  if (matches.length === 0) { console.log(c.yellow('no match')); process.exit(1); }
+  if (matches.length === 1) {
+    const m = matches[0];
+    console.log(c.green('high confidence: ') + c.bold(m.task.name));
+    console.log(c.dim('matched phrase: ') + `"${m.matched_phrase}"`);
+    console.log(c.dim('run with:       ') + `edva tasks run ${m.task.name}`);
+    return;
+  }
+  console.log(c.yellow(`ambiguous — ${matches.length} matches:`));
+  for (const m of matches) console.log(`  ${c.bold(m.task.name)} (matched "${m.matched_phrase}")`);
+  process.exit(2);
+}
+
+function taskBody(task) {
+  // If the task has a job field, use {"job": "..."} so the webhook handler
+  // loads full instructions from the jobs/*.md file at dispatch time.
+  if (task.job) return JSON.stringify({ job: task.job });
+  // Legacy fallback for tasks without a job file.
+  const bodyText = task.webhook_body
+    || `${task.webhook_task}: ${task.description} Follow the ${task.ops_playbook_section} instructions in CLAUDE.md.`;
+  return JSON.stringify({ task: bodyText });
+}
+
+function postWebhook(url, body) {
+  const headers = ['-H', 'Content-Type: application/json'];
+  // Every supervisor webhook (ops :9092, ops-light :9082) checks the same shared
+  // Bearer token (supervisor/http-server.mjs checkAuth), so attach it for any
+  // local target, same as the restart auth below. Until 2026-10-13 only :9092
+  // got it, so the :9082 tasks would come back 401 whenever chat ran one by hand.
+  let local = false;
+  try { local = ['localhost', '127.0.0.1'].includes(new URL(url).hostname); } catch {}
+  if (local) {
+    const token = readWebhookToken();
+    if (token) headers.push('-H', `Authorization: Bearer ${token}`);
+  }
+  const result = spawnSync('curl', [
+    '-s', '-o', '/dev/null', '-w', '%{http_code}',
+    '--max-time', '10',
+    '-X', 'POST', url,
+    ...headers,
+    '-d', body,
+  ], { encoding: 'utf8' });
+  return { code: (result.stdout || '').trim() || '000', stderr: (result.stderr || '').trim(), error: result.error };
+}
+
+function cmdTasksRun(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('tasks run: missing <name>. Try: edva tasks');
+  const task = loadTasks().find(t => t.name === name);
+  if (!task) die(`No task named '${name}'. Try: edva tasks`);
+  // Refuse rather than POST to `undefined`. A launchd job (the ephemeral-Opus
+  // family) has no webhook by design — dispatching one through the supervisor
+  // would run it on the resident Sonnet supervisor instead of the Opus fork it
+  // is specified to use, which is the exact bug the 2026-07-28 migration fixed.
+  if (!task.webhook_url) {
+    die(`tasks run: '${task.name}' is a launchd job, not a webhook job — it has no dispatch endpoint.\n` +
+        `  Run it now:   ${task.trigger_script || '(see tasks.json)'}\n` +
+        `  Or via launchd: launchctl kickstart -k gui/$(id -u)/ai.claude.${task.name}`);
+  }
+  const body = taskBody(task);
+  if (hasFlag(args, '--dry-run')) {
+    console.log(c.dim('(dry-run — no dispatch)'));
+    console.log(c.bold('would POST ') + task.webhook_url);
+    console.log(c.bold('body: ') + body);
+    return;
+  }
+  const { code, stderr, error } = postWebhook(task.webhook_url, body);
+  if (code.startsWith('2')) {
+    console.log(c.green('✓ dispatched: ') + c.bold(task.name) + c.dim(` (HTTP ${code})`));
+    console.log(c.dim('  webhook_task: ') + task.webhook_task);
+    console.log(c.dim('  delivers to:  ') + task.delivers_to);
+  } else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    console.error(c.dim('  webhook: ') + task.webhook_url);
+    if (error) console.error(c.dim('  error:   ') + error.message);
+    if (stderr) console.error(c.dim('  stderr:  ') + stderr);
+    if (code === '000') console.error(c.dim('  hint: is the ops-supervisor listening? (edva triage status)'));
+    process.exit(1);
+  }
+}
+
+// --- status ---
+function cmdStatus(args) {
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(collectStatus(), null, 2)); return; }
+  const s = collectStatus();
+  console.log(c.bold('SYSTEM STATUS') + c.dim('  ' + new Date().toISOString()) + '\n');
+
+  // Process Manager
+  const pm = s.processManager;
+  if (pm) {
+    const upStr = pm.uptimeMs > 3600000 ? `${(pm.uptimeMs / 3600000).toFixed(1)}h` : `${Math.floor(pm.uptimeMs / 60000)}m`;
+    console.log(c.bold('Process Manager:') + c.dim(`  pid ${pm.pid}, uptime ${upStr}`));
+    for (const ch of pm.children || []) {
+      const mark = ch.alive ? c.green('✓') : c.red('✗');
+      const upMs = ch.uptimeMs || 0;
+      const up = upMs > 3600000 ? `${(upMs / 3600000).toFixed(1)}h` : `${Math.floor(upMs / 60000)}m`;
+      console.log(`  ${mark} ${ch.name.padEnd(20)} ${c.dim(`pid=${ch.pid || '-'} restarts=${ch.restarts} up=${up}`)}`);
+    }
+  } else {
+    console.log(c.bold('Process Manager:') + '  ' + c.red('unreachable on :9095'));
+  }
+
+  // Chat Agent
+  const ch = s.chat;
+  if (ch) {
+    const sid = ch.sessionId?.slice(0, 8) || '?';
+    console.log('\n' + c.bold('Chat Agent:') + c.dim(`  session ${sid}, ${ch.model}`));
+    const aliveMark = ch.childAlive ? c.green('✓') : c.red('✗');
+    console.log(`  ${aliveMark} child alive${c.dim(`       turns=${ch.totalTurns} cost=$${(ch.totalCostUsd || 0).toFixed(2)}`)}`);
+    const hbAge = ch.phoneChannelHeartbeatAgeMs;
+    if (hbAge !== null && hbAge !== undefined) {
+      const hbMark = hbAge < 120000 ? c.green('✓') : c.yellow('○');
+      console.log(`  ${hbMark} phone-channel${c.dim(`     heartbeat ${Math.floor(hbAge / 1000)}s ago`)}`);
+    } else {
+      console.log(`  ${c.yellow('○')} phone-channel${c.dim('     no heartbeat yet')}`);
+    }
+    const qd = ch.queueDepth || 0;
+    const inf = ch.inFlight ? 'in-flight' : 'idle';
+    console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
+  } else {
+    console.log('\n' + c.bold('Chat Agent:') + '  ' + c.red('unreachable on :9094'));
+  }
+
+  // Ops Agent
+  const op = s.ops;
+  if (op) {
+    const sid = op.sessionId?.slice(0, 8) || '?';
+    console.log('\n' + c.bold('Ops Agent:') + c.dim(`  session ${sid}, ${op.model}`));
+    const aliveMark = op.childAlive ? c.green('✓') : c.red('✗');
+    console.log(`  ${aliveMark} child alive${c.dim(`       turns=${op.totalTurns} cost=$${(op.totalCostUsd || 0).toFixed(2)}`)}`);
+    const qd = op.queueDepth || 0;
+    const inf = op.inFlight ? 'in-flight' : 'idle';
+    console.log(`  ${c.dim('○')} queue${c.dim(`             ${qd} queued, ${inf}`)}`);
+  } else {
+    console.log('\n' + c.bold('Ops Agent:') + '  ' + c.red('unreachable on :9093'));
+  }
+
+  // Services
+  console.log('\n' + c.bold('Services:'));
+  for (const sv of s.services) {
+    const mark = sv.status === 'running' ? c.green('✓') : sv.status === 'loaded' ? c.yellow('○') : c.red('✗');
+    const detail = sv.pid ? `pid ${sv.pid}` : sv.status;
+    console.log(`  ${mark} ${sv.label.padEnd(50)} ${c.dim(detail)}`);
+  }
+
+  // Heartbeat
+  console.log('\n' + c.bold('Heartbeat:'));
+  if (s.heartbeat_age_seconds !== null) {
+    const mins = Math.floor(s.heartbeat_age_seconds / 60);
+    const age = mins === 0 ? `${s.heartbeat_age_seconds}s ago` : `${mins}m ago`;
+    const mark = s.heartbeat_age_seconds < 300 ? c.green('✓') : c.yellow('○');
+    console.log(`  ${mark} last post ${age}`);
+  } else {
+    console.log('  ' + c.yellow('○') + ' log empty / no heartbeat yet');
+  }
+
+  // Triage today
+  console.log('\n' + c.bold('Triage (today):'));
+  const pauseMark = s.triage.paused ? '  ' + c.yellow('PAUSED') + '\n' : '';
+  console.log(pauseMark + `  ${s.triage.received} received, ${s.triage.actions} actions taken`);
+
+  // Next cron task
+  console.log('\n' + c.bold('Next scheduled task:'));
+  if (s.next_task) {
+    console.log(`  ${c.bold(s.next_task.name)} in ${s.next_task.in_human} ${c.dim('(' + s.next_task.schedule + ')')}`);
+  } else {
+    console.log('  ' + c.dim('(none)'));
+  }
+}
+
+function fetchJson(url) {
+  try { return JSON.parse(execSync(`curl -sf --max-time 3 "${url}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })); }
+  catch { return null; }
+}
+
+function collectStatus() {
+  const status = { processManager: null, chat: null, ops: null, services: [], heartbeat_age_seconds: null, triage: { received: 0, actions: 0, paused: fs.existsSync(PAUSE_FLAG) }, next_task: null };
+
+  // process-manager health
+  status.processManager = fetchJson('http://127.0.0.1:9095/health');
+
+  // supervisor health
+  status.chat = fetchJson('http://127.0.0.1:9094/health');
+  status.ops = fetchJson('http://127.0.0.1:9093/health');
+
+  // services from launchctl
+  const lc = shSafe('launchctl list') || '';
+  const svcLabels = loadServices().filter(s => s.type === 'launchagent').map(s => s.label);
+  for (const label of svcLabels) {
+    const line = lc.split('\n').find(l => l.endsWith('\t' + label));
+    if (!line) { status.services.push({ label, status: 'not loaded', pid: null }); continue; }
+    const [pid, exit, lbl] = line.split('\t');
+    status.services.push({
+      label,
+      status: pid === '-' ? 'loaded' : 'running',
+      pid: pid === '-' ? null : Number(pid),
+      last_exit: exit,
+    });
+  }
+
+  // heartbeat age
+  try {
+    const st = fs.statSync(path.join(TOP_LOGS, 'heartbeat.log'));
+    const errSt = fs.statSync(path.join(TOP_LOGS, 'heartbeat.err.log'));
+    const newest = Math.max(st.mtimeMs, errSt.mtimeMs);
+    status.heartbeat_age_seconds = Math.floor((Date.now() - newest) / 1000);
+  } catch {}
+
+  // triage today
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const log = fs.readFileSync(TRIAGE_LOG, 'utf8');
+    for (const line of log.split('\n')) {
+      if (!line.startsWith(today)) continue;
+      if (line.includes('EMAIL-RECEIVED')) status.triage.received++;
+      else if (line.includes('|')) status.triage.actions++;
+    }
+  } catch {}
+
+  // next cron task
+  const tasks = loadTasks().filter(t => t.schedule && t.schedule.split(/\s+/).length === 5);
+  const now = new Date();
+  let best = null;
+  for (const t of tasks) {
+    const next = nextCronFire(t.schedule, now);
+    if (next && (!best || next < best.when)) best = { task: t, when: next };
+  }
+  if (best) {
+    const diff = Math.floor((best.when - now) / 1000);
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    status.next_task = {
+      name: best.task.name,
+      schedule: best.task.schedule,
+      in_seconds: diff,
+      in_human: h > 0 ? `${h}h${m.toString().padStart(2, '0')}m` : `${m}m`,
+    };
+  }
+
+  return status;
+}
+
+// Minimal 5-field cron parser (no step/range exotica needed for our schedules).
+function nextCronFire(expr, from) {
+  const [mm, hh, dom, mon, dow] = expr.split(/\s+/);
+  const parse = (s, min, max) => {
+    if (s === '*') return null; // any
+    return new Set(s.split(',').flatMap(p => {
+      const [a, b] = p.split('-').map(Number);
+      if (b === undefined) return [a];
+      const out = []; for (let i = a; i <= b; i++) out.push(i); return out;
+    }));
+  };
+  const mins = parse(mm, 0, 59), hours = parse(hh, 0, 23), doms = parse(dom, 1, 31), mons = parse(mon, 1, 12), dows = parse(dow, 0, 6);
+  const d = new Date(from);
+  d.setSeconds(0, 0);
+  d.setMinutes(d.getMinutes() + 1);
+  for (let i = 0; i < 60 * 24 * 8; i++) { // 8 days out
+    const M = d.getMinutes(), H = d.getHours(), Dm = d.getDate(), Mo = d.getMonth() + 1, Dw = d.getDay();
+    if ((!mins || mins.has(M)) && (!hours || hours.has(H)) && (!mons || mons.has(Mo)) && (!doms || doms.has(Dm)) && (!dows || dows.has(Dw))) return d;
+    d.setMinutes(d.getMinutes() + 1);
+  }
+  return null;
+}
+
+// --- services ---
+function cmdServices(args) {
+  const services = loadServices();
+  const lc = shSafe('launchctl list') || '';
+  const enriched = services.map(sv => {
+    if (sv.type === 'tmux') {
+      const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
+      return { ...sv, status: tmuxOut ? 'running' : 'not running' };
+    }
+    const line = lc.split('\n').find(l => l.endsWith('\t' + sv.label));
+    if (!line) return { ...sv, status: 'not loaded', pid: null };
+    const [pid] = line.split('\t');
+    return { ...sv, status: pid === '-' ? 'loaded' : 'running', pid: pid === '-' ? null : Number(pid) };
+  });
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(enriched, null, 2)); return; }
+  const rows = enriched.map(s => ({
+    name: s.name,
+    type: s.type,
+    status: s.status,
+    pid: s.pid ?? '—',
+    description: s.description.slice(0, 60),
+  }));
+  console.log(table(rows, ['name', 'type', 'status', 'pid', 'description']));
+}
+
+// --- logs ---
+function cmdLogs(args) {
+  const name = args.find(a => !a.startsWith('--'));
+  if (!name) die('logs: missing <component>. Available: chat-agent, ops-agent, wiki-server, watchdog, heartbeat, triage, claude-launchagent');
+  const tail = Number(getFlag(args, '--tail', '50'));
+  const candidates = {
+    'chat-agent': path.join(AGENT_LOGS, 'chat-agent.log'),
+    'ops-agent': path.join(AGENT_LOGS, 'ops-agent.log'),
+    'wiki-server': path.join(AGENT_LOGS, 'wiki-server.log'),
+    'watchdog': path.join(AGENT_LOGS, 'watchdog.log'),
+    'claude-launchagent': path.join(AGENT_LOGS, 'claude-launchagent.log'),
+    'heartbeat': path.join(TOP_LOGS, 'heartbeat.log'),
+    'heartbeat-err': path.join(TOP_LOGS, 'heartbeat.err.log'),
+    'triage': TRIAGE_LOG,
+    'webhooks': path.join(AGENT_LOGS, 'webhooks.log'),
+    'resilience': path.join(AGENT_LOGS, 'resilience-test.log'),
+  };
+  const p = candidates[name];
+  if (!p) die(`unknown log '${name}'. Available: ${Object.keys(candidates).join(', ')}`);
+  if (!fs.existsSync(p)) die(`log file does not exist: ${p}`);
+  const out = shSafe(`tail -n ${tail} "${p}"`) || '';
+  // Strip ANSI from terminal capture logs
+  const clean = out.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  process.stdout.write(clean);
+}
+
+// --- cron ---
+function cmdCron(args) {
+  const cron = shSafe('crontab -l') || '';
+  const lines = cron.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const tasks = loadTasks();
+  const rows = lines.map(line => {
+    const m = line.match(/^([\d*,/\- ]+) (.+)$/);
+    if (!m) return { schedule: '(?)', script: line.slice(0, 60), task: '' };
+    const schedule = m[1].trim();
+    const cmd = m[2];
+    // Find matching task by its explicit cron_label, else by trigger_script path
+    // (skip on-demand tasks with no trigger_script)
+    const task = tasks.find(t => t.cron_label && cmd.includes(`--label ${t.cron_label} `))
+      || tasks.find(t => t.trigger_script && cmd.includes(path.basename(t.trigger_script)));
+    // Extract script name: find first arg that ends in .sh/.mjs/.js, else first path-like arg
+    let script = '';
+    for (const part of cmd.split(/\s+/)) {
+      if (part.startsWith('-') || part.includes('=')) continue;
+      if (part.match(/\.(sh|mjs|js)$/) || part.includes('/tools/')) { script = path.basename(part); break; }
+    }
+    if (!script) script = cmd.slice(0, 40);
+    return { schedule, script, task: task ? task.name : c.dim('—') };
+  });
+  console.log(table(rows, ['schedule', 'script', 'task']));
+}
+
+// --- git ---
+function cmdGit(args) {
+  const opts = { cwd: ROOT };
+  const branch = (shSafe('git rev-parse --abbrev-ref HEAD', opts) || '').trim();
+  const status = shSafe('git status --short', opts) || '';
+  const log = shSafe('git log --oneline -5', opts) || '';
+  const ahead = (shSafe('git rev-list --count @{u}..HEAD 2>/dev/null', opts) || '0').trim();
+  const behind = (shSafe('git rev-list --count HEAD..@{u} 2>/dev/null', opts) || '0').trim();
+  console.log(c.bold('Branch: ') + branch + c.dim(` (ahead ${ahead}, behind ${behind})`));
+  console.log('\n' + c.bold('Working tree:'));
+  console.log(status.trim() || c.dim('  (clean)'));
+  console.log('\n' + c.bold('Recent commits:'));
+  console.log(log.trim());
+}
+
+// --- ci ---
+function cmdCi(args) {
+  const raw = getFlag(args, '--limit', '5');
+  const limit = Number.parseInt(raw, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) die(`ci: --limit must be an integer 1-100 (got "${raw}")`);
+  const out = shSafe(`gh run list --limit ${limit} --json name,status,conclusion,createdAt,headBranch,displayTitle`, { cwd: ROOT });
+  if (!out) die('gh run list failed (check: gh auth status)');
+  const runs = JSON.parse(out);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(runs, null, 2)); return; }
+  const rows = runs.map(r => ({
+    status: r.status === 'completed'
+      ? (r.conclusion === 'success' ? c.green('✓ success') : r.conclusion === 'failure' ? c.red('✗ failure') : r.conclusion)
+      : c.yellow(r.status),
+    workflow: r.name,
+    branch: r.headBranch,
+    title: (r.displayTitle || '').slice(0, 50),
+    when: new Date(r.createdAt).toISOString().slice(5, 16).replace('T', ' '),
+  }));
+  console.log(table(rows, ['status', 'workflow', 'branch', 'title', 'when']));
+}
+
+// --- triage (subsystem) ---
+function cmdTriage(args) {
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help') return cmdTriageHelp();
+  const subs = {
+    status: cmdTriageStatus, stats: cmdTriageStats, recent: cmdTriageRecent,
+    pending: cmdTriagePending, rules: cmdTriageRules, playbook: cmdTriagePlaybook,
+    memory: cmdTriageMemory, spam: cmdTriageSpam, p1: cmdTriageP1, pause: cmdTriagePause,
+    resume: cmdTriageResume, reclassify: cmdTriageReclassify, resolve: cmdTriageResolve,
+  };
+  const fn = subs[sub];
+  if (!fn) die(`unknown: triage ${sub}. Try: edva triage help`);
+  fn(args.slice(1));
+}
+
+function cmdTriageHelp() {
+  console.log(c.bold('edva triage') + ' — email triage subsystem\n');
+  console.log('  status                   is triage running? paused? last event?');
+  console.log('  stats [--today|--since Nh]   event counts by action');
+  console.log('  recent [N]               last N triage events, color-coded');
+  console.log(`  pending                  drafts awaiting ${OWNER}'s review (last 24h)`);
+  console.log('  rules                    print § Email Triage Rules from ops-agent/CLAUDE.md');
+  console.log('  playbook                 print email-triage-playbook.md');
+  console.log('  memory <search|list> ... wrap email-mem (classification memory)');
+  console.log('  spam <list|block|unblock|check> ... wrap spam-filter');
+  console.log('  p1 <list|add|remove|check> ...   wrap p1-sender (always-P1 sender list)');
+  console.log('  pause                    stop forwarding Gmail events to ops-agent');
+  console.log('  resume                   re-enable + dispatch CATCH UP to process missed');
+  console.log('  reclassify <messageId>   dispatch RECLASSIFY: <msgId> to ops-agent');
+  console.log('  resolve "<topic>"        dispatch RESOLVE P1: <topic> — matches + downgrades');
+  console.log('');
+  console.log(c.dim('To change rules: edit agent/ops-agent/CLAUDE.md, then `edva restart ops`'));
+}
+
+function cmdTriageStatus(args) {
+  const s = {
+    paused: fs.existsSync(PAUSE_FLAG),
+    supervisor_up: false,
+    supervisor_health: null,
+    ops_agent_running: false,
+    last_event: null,
+    last_event_age_seconds: null,
+  };
+  // Check supervisor health
+  const health = shSafe('curl -s --max-time 3 http://127.0.0.1:9093/health');
+  if (health) {
+    s.supervisor_up = true;
+    try { s.supervisor_health = JSON.parse(health); } catch {}
+  }
+  // ops-agent process in pane 1
+  const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
+  if (tmuxOut) {
+    const line = tmuxOut.split('\n').find(l => l.startsWith('1 '));
+    if (line) {
+      const cmd = line.slice(2);
+      s.ops_agent_running = cmd !== 'zsh' && cmd !== 'bash';
+    }
+  }
+  // last event from triage log
+  if (fs.existsSync(TRIAGE_LOG)) {
+    const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n');
+    const last = lines[lines.length - 1];
+    if (last) {
+      const ts = last.split('|')[0].trim();
+      const dt = Date.parse(ts);
+      if (!isNaN(dt)) {
+        s.last_event = last;
+        s.last_event_age_seconds = Math.floor((Date.now() - dt) / 1000);
+      }
+    }
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(s, null, 2)); return; }
+  const h = s.supervisor_health;
+  console.log(c.bold('Email Triage Status') + '\n');
+  console.log(`  ${s.paused ? c.yellow('⏸ PAUSED') : c.green('▶ active')}`);
+  console.log(`  supervisor (HTTP 9093):     ${s.supervisor_up ? c.green('up') : c.red('down')}`);
+  console.log(`  ops-agent (pane 1):         ${s.ops_agent_running ? c.green('running') : c.red('not running')}`);
+  if (h) {
+    console.log(`  model:                      ${h.model || 'unknown'}`);
+    console.log(`  child alive:                ${h.childAlive ? c.green('yes') : c.red('no')}`);
+    console.log(`  queue depth:                ${h.queueDepth || 0}`);
+    console.log(`  turns completed:            ${h.completed || 0}`);
+    if (h.totalCostUsd != null) console.log(`  cost (session):             $${h.totalCostUsd.toFixed(4)}`);
+    if (h.lastEventAgeMs != null) {
+      const sec = Math.floor(h.lastEventAgeMs / 1000);
+      const age = sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.floor(sec/60)}m` : `${Math.floor(sec/3600)}h${Math.floor((sec%3600)/60)}m`;
+      console.log(`  last event:                 ${age} ago`);
+    }
+  }
+  if (s.last_event_age_seconds !== null) {
+    const m = Math.floor(s.last_event_age_seconds / 60);
+    const age = m < 1 ? `${s.last_event_age_seconds}s` : m < 60 ? `${m}m` : `${Math.floor(m/60)}h${m%60}m`;
+    console.log(`  last triage log:            ${age} ago`);
+    console.log(c.dim(`  ${s.last_event}`));
+  }
+}
+
+// triage.log rotates daily into `triage-YYYY-MM-DD.log` siblings, so reading
+// only the live file caps every window at "today" no matter what --since says.
+// Returns the live log plus every rotated sibling whose date falls inside the
+// window, oldest first. (2026-09-08 nightly-review: `--since 168h` reported 80
+// events for a week that actually held 6,360 lines / 789 distinct messages.)
+function triageLogFilesForWindow(cutoffMs) {
+  const files = [];
+  if (cutoffMs !== null) {
+    const dir = path.dirname(TRIAGE_LOG);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { names = []; }
+    const dated = names
+      .map(n => ({ n, m: /^triage-(\d{4}-\d{2}-\d{2})\.log$/.exec(n) }))
+      .filter(x => x.m)
+      // A file named for date D is rotated at the START of D and therefore holds
+      // D-1's entries; keep anything that could overlap the window, and let the
+      // per-line timestamp cutoff below do the exact filtering.
+      .filter(x => Date.parse(x.m[1] + 'T23:59:59Z') >= cutoffMs - 86400000)
+      .sort((a, b) => a.m[1].localeCompare(b.m[1]))
+      .map(x => path.join(dir, x.n));
+    files.push(...dated);
+  }
+  files.push(TRIAGE_LOG);
+  return files;
+}
+
+function cmdTriageStats(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const today = new Date().toISOString().slice(0, 10);
+  const since = getFlag(args, '--since'); // e.g. "24h" or "3h"
+  const useToday = hasFlag(args, '--today') || !since;
+  let cutoff = null;
+  if (since) {
+    const m = since.match(/^(\d+)h$/);
+    if (!m) die('--since must be like "24h"');
+    cutoff = Date.now() - Number(m[1]) * 3600 * 1000;
+  }
+  const counts = {};
+  let total = 0;
+  const lines = triageLogFilesForWindow(cutoff)
+    .flatMap(f => { try { return fs.readFileSync(f, 'utf8').split('\n'); } catch { return []; } });
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const [ts, action] = line.split('|').map(s => s.trim());
+    if (!ts || !action) continue;
+    if (useToday && !ts.startsWith(today)) continue;
+    if (cutoff !== null) { const d = Date.parse(ts); if (isNaN(d) || d < cutoff) continue; }
+    counts[action] = (counts[action] || 0) + 1;
+    total++;
+  }
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ window: since || 'today', total, counts }, null, 2));
+    return;
+  }
+  console.log(c.bold(`Triage (${since ? 'last ' + since : 'today'}):  ${total} events`));
+  const rows = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ action: k, count: v }));
+  console.log(table(rows, ['action', 'count']));
+}
+
+function cmdTriageRecent(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const n = Number(args.find(a => !a.startsWith('--')) || 20);
+  const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n').slice(-n);
+  if (hasFlag(args, '--json')) {
+    const events = lines.map(line => {
+      const [ts, action, ...rest] = line.split('|').map(s => s.trim());
+      return { ts, action, detail: rest.join(' | ') };
+    });
+    console.log(JSON.stringify(events, null, 2));
+    return;
+  }
+  const actionColor = { 'EMAIL-RECEIVED': c.dim, 'DRAFT-REPLY': c.yellow, 'STAR': c.yellow, 'LABEL': c.cyan, 'LABEL+ARCHIVE': c.cyan, 'MARK-READ': c.gray, 'PAUSED-SKIP': c.yellow, 'UNLABEL': c.cyan };
+  for (const line of lines) {
+    const parts = line.split('|').map(s => s.trim());
+    const ts = parts[0], action = parts[1], rest = parts.slice(2).join(' | ');
+    const clr = actionColor[action] || (x => x);
+    const time = ts.slice(11, 19);
+    console.log(`${c.dim(time)} ${clr(action.padEnd(15))} ${c.dim(rest.slice(0, 100))}`);
+  }
+}
+
+function cmdTriagePending(args) {
+  if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const drafts = [];
+  for (const line of fs.readFileSync(TRIAGE_LOG, 'utf8').trim().split('\n')) {
+    if (!line.includes('DRAFT-REPLY')) continue;
+    const parts = line.split('|').map(s => s.trim());
+    const ts = parts[0]; const dt = Date.parse(ts);
+    if (isNaN(dt) || dt < cutoff) continue;
+    const detail = parts.slice(2).join(' | ');
+    const msgIdM = detail.match(/messageId=([a-f0-9]+)/);
+    const subjectM = detail.match(/subject=(.+?)(?: \| |$)/);
+    const toM = detail.match(/to="?([^"|]+)"?/);
+    drafts.push({ ts, messageId: msgIdM?.[1], to: toM?.[1]?.trim(), subject: subjectM?.[1]?.trim() });
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(drafts, null, 2)); return; }
+  if (!drafts.length) { console.log(c.dim('(no drafts created in last 24h)')); return; }
+  console.log(c.bold(`Drafts awaiting review (last 24h): ${drafts.length}`) + '\n');
+  for (const d of drafts) {
+    console.log(`  ${c.dim(d.ts.slice(11,19))} ${c.yellow(d.messageId || '?')} ${c.dim('→')} ${(d.to || '').slice(0, 40)}`);
+    console.log(`    ${(d.subject || '').slice(0, 90)}`);
+  }
+}
+
+function cmdTriageRules() {
+  if (!fs.existsSync(OPS_CLAUDE)) die('ops-agent/CLAUDE.md not found');
+  const md = fs.readFileSync(OPS_CLAUDE, 'utf8');
+  const m = md.match(/## Email Triage Rules\s*\n([\s\S]*?)(?=\n## |\n---\n|$)/);
+  if (!m) die('Email Triage Rules section not found');
+  process.stdout.write('## Email Triage Rules\n' + m[1]);
+  // + this instance's own part of the section (agent/local/ops.md), which
+  // the ops supervisor appends to the agent's system prompt beside it.
+  const localDir = process.env.EDVA_LOCAL_DIR || path.join(TOOLS, 'agent/local');
+  let local = '';
+  try { local = fs.readFileSync(path.join(localDir, 'ops.md'), 'utf8'); } catch {}
+  const l = local.match(/(## Email Triage Rules[^\n]*)\n([\s\S]*?)(?=\n## |\n---\n|$)/);
+  if (l) process.stdout.write('\n' + l[1] + '\n' + l[2]);
+}
+
+function cmdTriagePlaybook() {
+  if (!fs.existsSync(TRIAGE_PLAYBOOK)) die('email-triage-playbook.md not found at ' + TRIAGE_PLAYBOOK);
+  process.stdout.write(fs.readFileSync(TRIAGE_PLAYBOOK, 'utf8'));
+}
+
+function cmdTriageMemory(args) {
+  if (!fs.existsSync(EMAIL_MEM_BIN)) die('email-mem not found at ' + EMAIL_MEM_BIN);
+  // pass through to email-mem
+  try {
+    execFileSync(EMAIL_MEM_BIN, args, { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriageP1(args) {
+  if (!fs.existsSync(P1_SENDER_BIN)) die('p1-sender not found at ' + P1_SENDER_BIN);
+  try {
+    execFileSync(P1_SENDER_BIN, args.length ? args : ['list'], { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriageSpam(args) {
+  if (!fs.existsSync(SPAM_FILTER_BIN)) die('spam-filter not found at ' + SPAM_FILTER_BIN);
+  try {
+    execFileSync(SPAM_FILTER_BIN, args, { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriagePause() {
+  if (fs.existsSync(PAUSE_FLAG)) { console.log(c.yellow('already paused')); return; }
+  fs.writeFileSync(PAUSE_FLAG, new Date().toISOString() + '\n');
+  console.log(c.yellow('⏸ triage paused'));
+  console.log(c.dim('  gmail-channel will drop notifications (historyId still saved).'));
+  console.log(c.dim('  Note: takes effect immediately for NEW gmail-channel events.'));
+  console.log(c.dim('  Use `edva triage resume` to re-enable.'));
+}
+
+function cmdTriageResume() {
+  if (!fs.existsSync(PAUSE_FLAG)) { console.log(c.dim('not paused')); return; }
+  const since = fs.readFileSync(PAUSE_FLAG, 'utf8').trim();
+  fs.unlinkSync(PAUSE_FLAG);
+  console.log(c.green('▶ triage resumed') + c.dim(` (was paused since ${since})`));
+  // Dispatch CATCH UP task so ops-agent processes emails missed during pause
+  const body = JSON.stringify({ task: `CATCH UP: Triage was paused since ${since}. Fetch all emails received since the last saved historyId and triage each one.` });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('  ✓ dispatched CATCH UP to ops-agent'));
+  else {
+    console.log(c.yellow(`  catch-up dispatch failed (HTTP ${code}) — ops-agent may not be listening`));
+    if (stderr) console.log(c.dim('  stderr: ') + stderr);
+  }
+}
+
+function cmdTriageReclassify(args) {
+  const msgId = args.find(a => !a.startsWith('--'));
+  if (!msgId) die('reclassify: missing <messageId>');
+  // messageId validation: Gmail IDs are hex, 14-20 chars typically
+  if (!/^[a-zA-Z0-9_-]{8,40}$/.test(msgId)) die(`reclassify: messageId looks invalid (got "${msgId}")`);
+  const body = JSON.stringify({ task: `RECLASSIFY: ${msgId}` });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RECLASSIFY ${msgId}`));
+  else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    if (stderr) console.error(c.dim('  stderr: ') + stderr);
+    process.exit(1);
+  }
+}
+
+function cmdTriageResolve(args) {
+  const topic = args.filter(a => !a.startsWith('--')).join(' ').trim();
+  if (!topic) die('resolve: missing <topic>. Usage: edva triage resolve "<topic text>"');
+  if (topic.length > 300) die('resolve: topic too long (>300 chars)');
+  const body = JSON.stringify({ task: `RESOLVE P1: ${topic}`, source: 'edva-triage-resolve' });
+  const { code, stderr } = postWebhook('http://localhost:9092', body);
+  if (code.startsWith('2')) console.log(c.green('✓ dispatched: ') + c.bold(`RESOLVE P1: ${topic}`));
+  else {
+    console.error(c.red(`✗ dispatch failed (HTTP ${code})`));
+    if (stderr) console.error(c.dim('  stderr: ') + stderr);
+    process.exit(1);
+  }
+}
+
+// --- restart ---
+// Bearer token for authenticated supervisor POSTs (ops :9093 gates /restart on
+// it; chat :9094 does not). Absent file → null (ops auth degrades open).
+function readWebhookToken() {
+  try { return fs.readFileSync(path.join(TOOLS, 'secrets/webhook-token'), 'utf8').trim() || null; }
+  catch { return null; }
+}
+
+// restart — bounce a supervised process the way the LIVE architecture expects:
+// process-manager (agent/bin/process-manager.mjs) + launchd, NOT tmux.
+// (The previous tmux respawn-pane implementation was dead — there is no tmux
+//  in the supervision path; see changelog.md 2026-06-02.)
+//
+//   ops | chat        → POST the supervisor's own /restart (rotates the inner
+//                       claude session, re-reads agents.json; supervisor stays up)
+//   whatsapp-channel  → SIGTERM the process-manager child; ManagedProcess
+//   wiki-server         respawns it on exit. Confirms a fresh pid comes up.
+//   session           → launchctl kickstart -k of ai.claude.session (restarts
+//                       process-manager + every child)
+function cmdRestart(args) {
+  const raw = args.find(a => !a.startsWith('--'));
+  if (!raw) die('restart: usage: edva restart <ops|chat|whatsapp-channel|wiki-server|session>');
+
+  const ALIASES = {
+    ops: 'ops', chat: 'chat', session: 'session',
+    whatsapp: 'whatsapp-channel', wa: 'whatsapp-channel', 'whatsapp-channel': 'whatsapp-channel',
+    wiki: 'wiki-server', 'wiki-server': 'wiki-server',
+  };
+  const target = ALIASES[raw];
+  if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, wiki-server, session.`);
+
+  const PM = 'http://127.0.0.1:9095/health';
+
+  // session: restart the whole stack. process-manager is booted by the
+  // ai.claude.session LaunchAgent; kickstart -k kills + relaunches it, tearing
+  // down and respawning every supervised child.
+  if (target === 'session') {
+    const uid = process.getuid();
+    console.log(c.dim('kickstarting launchd ai.claude.session — restarts process-manager + all supervised children...'));
+    const out = shSafe(`launchctl kickstart -k gui/${uid}/ai.claude.session 2>&1`);
+    if (out === null) die('restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/ai.claude.session');
+    console.log(c.green('✓ kickstart sent. Wait ~30s, then: edva status'));
+    return;
+  }
+
+  // ops / chat: graceful — the supervisor's own /restart endpoint rotates the
+  // inner `claude -p` session (and re-reads agents.json) without killing the
+  // supervisor. Documented path: CLAUDE.md § Effort Policy. ops :9093 gates the
+  // POST behind a bearer token (secrets/webhook-token); chat :9094 does
+  // not — sending the header is harmless either way. The session warm-resumes
+  // (same sessionId), so success is verified by restartCount advancing.
+  const SUPERVISOR_PORT = { ops: 9093, chat: 9094 };
+  if (SUPERVISOR_PORT[target]) {
+    const port = SUPERVISOR_PORT[target];
+    const before = fetchJson(`http://127.0.0.1:${port}/health`);
+    if (!before) {
+      die(`restart: ${target} supervisor not reachable on :${port}. Is the stack up? (edva status) — to restart everything: edva restart session`);
+    }
+    const oldCount = before.restartCount ?? 0;
+    const token = readWebhookToken();
+    const authArg = token ? `-H "Authorization: Bearer ${token}" ` : '';
+    const code = shSafe(`curl -s --max-time 6 -o /dev/null -w "%{http_code}" ${authArg}-X POST http://127.0.0.1:${port}/restart`);
+    if (!code || !/^2\d\d$/.test(code.trim())) {
+      const hint = code && code.trim() === '401' ? ' (401 unauthorized — missing/stale secrets/webhook-token)' : '';
+      die(`restart: POST :${port}/restart returned ${code ? code.trim() : 'no response'}${hint} — check edva logs ${target}-supervisor`);
+    }
+    console.log(c.dim(`restart requested (HTTP ${code.trim()}) — waiting for the ${target} session to rotate...`));
+    let after = null;
+    for (let i = 0; i < 20; i++) {
+      execFileSync('sleep', ['1']);
+      const h = fetchJson(`http://127.0.0.1:${port}/health`);
+      if (h && (h.restartCount ?? 0) > oldCount && h.childAlive) { after = h; break; }
+    }
+    if (!after) {
+      console.log(c.yellow(`  ${target}: POST accepted but restartCount didn't advance within 20s — check edva logs ${target}-supervisor`));
+      process.exit(1);
+    }
+    console.log(c.green(`✓ ${target} supervisor restarted`) + c.dim(` (session ${after.sessionId} resumed; restartCount ${oldCount}→${after.restartCount}; agents.json re-read).`));
+    return;
+  }
+
+  // whatsapp-channel / wiki-server: plain process-manager children with no
+  // inner session. SIGTERM the child; process-manager (ManagedProcess) sees the
+  // exit (stopping=false → _scheduleRestart) and respawns it.
+  const CHILD = {
+    'whatsapp-channel': { verify: 'http://127.0.0.1:9100/health', verifyNote: 'paired + listening' },
+    'wiki-server':      { verify: 'http://127.0.0.1:9096/',       verifyNote: 'serving' },
+  };
+  const spec = CHILD[target];
+
+  const pm = fetchJson(PM);
+  if (!pm) {
+    die(`restart: process-manager unreachable on :9095 — it supervises ${target}, so a kill would NOT auto-respawn. Bring the stack up first: edva restart session`);
+  }
+  const before = (pm.children || []).find((ch) => ch.name === target);
+  if (!before) {
+    die(`restart: process-manager has no child '${target}' (children: ${(pm.children || []).map((ch) => ch.name).join(', ')})`);
+  }
+  const oldPid = before.alive ? before.pid : null;
+
+  if (oldPid) {
+    console.log(c.dim(`stopping ${target} (pid ${oldPid}) — process-manager will respawn it...`));
+    try { process.kill(oldPid, 'SIGTERM'); }
+    catch (e) { die(`restart: failed to signal pid ${oldPid}: ${e.message}`); }
+  } else {
+    console.log(c.yellow(`  ${target} is not currently alive — waiting for process-manager to bring it up...`));
+  }
+
+  // Poll process-manager health until a fresh pid is alive (bounded ~25s,
+  // covering ManagedProcess restart backoff).
+  let fresh = null;
+  for (let i = 0; i < 25; i++) {
+    execFileSync('sleep', ['1']);
+    const h = fetchJson(PM);
+    const ch = h && (h.children || []).find((x) => x.name === target);
+    if (ch && ch.alive && ch.pid && ch.pid !== oldPid) { fresh = ch; break; }
+  }
+  if (!fresh) {
+    console.log(c.yellow(`  ${target} did not report a new pid within 25s — it may be in restart backoff. Check: edva status ; edva logs ${target}`));
+    process.exit(1);
+  }
+
+  // Best-effort service-level verification — the process is alive per
+  // process-manager, but its HTTP port can take a few seconds to bind, so
+  // retry briefly before deciding.
+  let note = '';
+  if (spec && spec.verify) {
+    let ok = false;
+    for (let i = 0; i < 8 && !ok; i++) {
+      ok = !!shSafe(`curl -sf --max-time 3 -o /dev/null "${spec.verify}" && echo ok`);
+      if (!ok) execFileSync('sleep', ['1']);
+    }
+    note = ok ? c.dim(` (${spec.verifyNote})`) : c.yellow(' — process up but health endpoint not responding yet; may still be starting');
+  }
+  console.log(c.green(`✓ ${target} restarted — new pid ${fresh.pid}`) + note);
+}
+
+// --- arch ---
+// The map, then the private halves it points to when present: the personal
+// subsystems (architecture-local.md) and the dated history (changelog.md),
+// which lived inside architecture.md until 2026-10-24.
+function cmdArch() {
+  if (!fs.existsSync(ARCH_MD)) die('architecture.md not found');
+  process.stdout.write(fs.readFileSync(ARCH_MD, 'utf8'));
+  for (const extra of ['architecture-local.md', 'changelog.md']) {
+    const p = path.join(SYSTEM, extra);
+    if (fs.existsSync(p)) process.stdout.write('\n' + fs.readFileSync(p, 'utf8'));
+  }
+}
+
+// --- where ---
+function cmdWhere(args) {
+  const q = args.find(a => !a.startsWith('--'));
+  if (!q) die('where: missing <name>');
+  const ql = q.toLowerCase();
+  const hits = [];
+  // tasks
+  for (const t of loadTasks()) {
+    if (t.name.includes(ql) || t.webhook_task.toLowerCase().includes(ql) || t.phrases.some(p => p.includes(ql)))
+      hits.push({ kind: 'task', name: t.name, location: t.trigger_script });
+  }
+  // services
+  for (const s of loadServices()) {
+    if ((s.name || '').includes(ql) || (s.label || '').toLowerCase().includes(ql))
+      hits.push({ kind: 'service', name: s.name, location: s.plist || s.session || '' });
+  }
+  // files
+  const findOut = shSafe(`find "${TOOLS}" -maxdepth 6 -type f -name "*${q}*" -not -path "*/node_modules/*" -not -path "*/vendor/*" -not -path "*/.git/*" -not -path "*/SourcePackages/*" 2>/dev/null`) || '';
+  for (const line of findOut.trim().split('\n').filter(Boolean).slice(0, 20)) {
+    hits.push({ kind: 'file', name: path.basename(line), location: line.replace(ROOT + '/', '') });
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(hits, null, 2)); return; }
+  if (!hits.length) { console.log(c.yellow('no matches')); process.exit(1); }
+  console.log(table(hits, ['kind', 'name', 'location']));
+}
+
+// --- doctor ---
+function cmdDoctor(args) {
+  const checks = [];
+  // `warn`: passing but wants a human look. Yellow "!", `warn: true` in --json,
+  // never a failure (doctor-preflight-check and the failing-count pings key on `ok`).
+  const add = (name, ok, detail, warn = false) => checks.push(warn ? { name, ok, detail, warn: true } : { name, ok, detail });
+  const tasks = loadTasks();
+  const services = loadServices();
+
+  // 1. cron entries → scripts exist
+  const cron = shSafe('crontab -l') || '';
+  const cronLines = cron.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const missingScripts = [];
+  for (const line of cronLines) {
+    const m = line.match(/(\/Users\/[^\s>]+\.(sh|mjs|js))/);
+    if (!m) continue;
+    if (!fs.existsSync(m[1])) missingScripts.push(m[1]);
+  }
+  add('cron → scripts exist', missingScripts.length === 0, missingScripts.length ? `missing: ${missingScripts.join(', ')}` : `${cronLines.length} cron entries, all targets exist`);
+
+  // 2. trigger-*.sh → tasks.json
+  const scriptsDir = path.join(TOOLS, 'agent/scripts');
+  const triggerScripts = fs.readdirSync(scriptsDir).filter(f => f.startsWith('trigger-') && f.endsWith('.sh'));
+  // check-*.sh that hit webhook also count as triggers
+  const checkScripts = fs.readdirSync(scriptsDir).filter(f => f.startsWith('check-') && f.endsWith('.sh'));
+  const allTriggers = [...triggerScripts, ...checkScripts];
+  // Exclude event-driven scripts (not scheduled tasks) from orphan check
+  const eventDriven = new Set(['trigger-startup-catchup.sh']);
+  const orphans = allTriggers.filter(f => !eventDriven.has(f) && !tasks.some(t => t.trigger_script && t.trigger_script.endsWith(f)));
+  add('trigger scripts in tasks.json', orphans.length === 0, orphans.length ? `orphans: ${orphans.join(', ')}` : `${allTriggers.length} trigger scripts, all registered`);
+
+  // A task with paused_until = YYYY-MM-DD (or full ISO) is expected to be
+  // absent from crontab until that date. When it passes, the check starts
+  // enforcing again — forcing a resume/retire decision. Bare YYYY-MM-DD is
+  // anchored to end-of-day in the installation's home zone (instance().tz, the
+  // zone the crontab runs in), not UTC midnight, which resumes hours early.
+  const nowMs = Date.now();
+  const ZONE_OFFSET_FMT = new Intl.DateTimeFormat('en-US', {
+    timeZone: instance().tz, timeZoneName: 'shortOffset',
+  });
+  const pausedUntilMs = (val) => {
+    if (!val) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+      const ms = Date.parse(val);
+      return Number.isFinite(ms) ? ms : null;
+    }
+    const [y, m, d] = val.split('-').map(Number);
+    const nextUtc = Date.UTC(y, m - 1, d + 1);
+    const tzPart = ZONE_OFFSET_FMT.formatToParts(new Date(nextUtc)).find(p => p.type === 'timeZoneName')?.value || 'GMT';
+    if (tzPart === 'GMT' || tzPart === 'UTC') return nextUtc; // a zone at UTC+0
+    const match = tzPart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    const sign = match?.[1] === '-' ? -1 : 1;
+    const hrs = match ? parseInt(match[2], 10) : 0;
+    const mins = match?.[3] ? parseInt(match[3], 10) : 0;
+    return nextUtc - sign * (hrs * 60 + mins) * 60 * 1000;
+  };
+  const isPaused = (t) => {
+    const until = pausedUntilMs(t.paused_until);
+    return until !== null && until > nowMs;
+  };
+  // `scheduler: "launchd"` tasks are fired by a launchd agent (see services.json +
+  // the plist), NOT crontab — cron can't reach the in-session Max keychain. Their
+  // plist existence is verified by the services.json check, so skip the cron check.
+  const scheduledTasks = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && t.scheduler !== 'launchd' && !isPaused(t));
+  const pausedCount = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && t.scheduler !== 'launchd' && isPaused(t)).length;
+  // Clock-anchored jobs (data/clock-jobs.json) have their crontab
+  // MM/HH/DOW fields intentionally rewritten nightly by cron-tz-sync to match
+  // the user's actual local time — so their live crontab entry legitimately
+  // diverges from tasks.json's nominal `schedule` field whenever the user is outside
+  // the instance's home zone. Match by label (= trigger_script basename minus .sh,
+  // the same key cron-tz-sync matches on) and compare against the
+  // currently-expected home-zone time instead of the literal tasks.json field.
+  const { loadClockJobs, resolveTz, localToHomeZone } = require(path.join(TOOLS, 'lib/clock-jobs.js'));
+  const clockJobList = loadClockJobs();
+  const clockJobsByLabel = new Map(clockJobList.map(j => [j.label, j]));
+  let clockTz = null;
+  const unscheduled = [];
+  for (const t of scheduledTasks) {
+    // A cron-run-direct task (trigger_script: null, since 2026-10-10) is found by
+    // its `--label <name>`; path.basename(null) threw and took doctor down.
+    // A task whose cron line runs something OTHER than its trigger_script names
+    // that line's label in `cron_label` (2026-10-20): daily-summary-fix's trigger
+    // is launched by launchd off its queue directory, and its one cron line is the
+    // hourly `daily-summary-fix sweep`, labelled daily-summary-fix-sweep, so the
+    // trigger's basename is in no crontab line and doctor read the healthy sweep
+    // as "missing cron". Explicit, like clock-jobs.json's "task" field, never a
+    // label prefix; the trailing space stops a label matching a longer one.
+    const want = t.cron_label ? `--label ${t.cron_label} `
+      : t.trigger_script ? path.basename(t.trigger_script) : `--label ${t.name} `;
+    const base = t.cron_label || want.replace(/\.sh$/, '');
+    // One clock job keyed by the task's own label, or several when one script
+    // runs at more than one local time with a label per cron line, which
+    // clock-jobs.json ties back to the task by name ("task": "hum-explore" on
+    // trigger-hum-explore-midday and -evening). Before 2026-10-13 that second
+    // shape fell through to the literal tasks.json schedule and read as
+    // "missing cron". Matched explicitly, never by label prefix: trigger-hum
+    // is a prefix of trigger-hum-explore-midday.
+    const clockJobs = clockJobsByLabel.has(base)
+      ? [clockJobsByLabel.get(base)]
+      : clockJobList.filter(j => j.task === t.name);
+    let schedParts;
+    if (clockJobs.length) {
+      if (clockTz === null) clockTz = resolveTz().tz;
+      schedParts = clockJobs.map((j) => {
+        const { hour, minute, dow } = localToHomeZone(clockTz, j.local_time, j.dow);
+        return `${Number(minute)} ${Number(hour)} * * ${j.dow != null ? dow : '*'}`;
+      });
+    } else {
+      // Multi-schedule separator is " / " (space-slash-space). Require
+      // whitespace on both sides so we don't split on the step-value "/"
+      // inside "*/20 * * * *" etc.
+      schedParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).filter(Boolean);
+    }
+    const found = schedParts.every(sched => cronLines.some(l => l.includes(want) && l.startsWith(sched)));
+    if (!found) unscheduled.push(clockJobs.length ? `${t.name} (tz-adjusted)` : t.name);
+  }
+  const pausedSuffix = pausedCount ? `, ${pausedCount} paused` : '';
+  const tzSuffix = clockTz && clockTz !== instance().tz ? ` (${clockJobsByLabel.size} clock-anchored, tz=${clockTz})` : '';
+  add('tasks.json schedules ↔ crontab', unscheduled.length === 0, unscheduled.length ? `missing cron: ${unscheduled.join(', ')}` : `${scheduledTasks.length} scheduled tasks, all in cron${pausedSuffix}${tzSuffix}`);
+
+  // 4. ops_playbook_section headers exist
+  const opsMd = fs.existsSync(OPS_CLAUDE) ? fs.readFileSync(OPS_CLAUDE, 'utf8') : '';
+  const missingSections = tasks.filter(t => t.ops_playbook_section && !t.job && !new RegExp(`^## ${escRe(t.ops_playbook_section)}( \\(.*\\))?\\s*$`, 'm').test(opsMd)).map(t => `${t.name} → ${t.ops_playbook_section}`);
+  add('ops playbook sections exist', missingSections.length === 0, missingSections.length ? `missing: ${missingSections.join('; ')}` : `${tasks.length} sections verified in ops-agent/CLAUDE.md`);
+
+  // 5. services.json plists → exist
+  const missingPlists = [];
+  for (const s of services) {
+    if (s.type !== 'launchagent') continue;
+    const p = expandHome(s.plist);
+    if (!fs.existsSync(p)) missingPlists.push(s.label);
+  }
+  add('services.json plists exist', missingPlists.length === 0, missingPlists.length ? `missing: ${missingPlists.join(', ')}` : `${services.filter(s => s.type === 'launchagent').length} plists verified`);
+
+  // 6. no old Dev/Tools paths in tracked text files
+  // Use git grep — it natively skips binary files and respects .gitignore.
+  // Exclude files that legitimately contain the pattern (this tool + its test harness).
+  const grepOut = shSafe(`git grep -l -E "${HOME}/Dev/Tools/|~/Dev/Tools/|\\$HOME/Dev/Tools/" -- ":!*.png" ":!*.jpg" ":!*.pdf" ":!*.p8" ":!*.provisionprofile" ":!bin/edva" ":!system/test-edva.sh" ":!system/architecture.md" ":!system/changelog.md" || true`, { cwd: ROOT }) || '';
+  const badPaths = grepOut.split('\n').filter(Boolean);
+  add('no Dev/Tools/ residuals in tracked files', badPaths.length === 0,
+      badPaths.length ? `found in: ${badPaths.slice(0, 5).join(', ')}${badPaths.length > 5 ? ` (+${badPaths.length-5})` : ''}` : 'clean');
+
+  // 7. phrase uniqueness
+  const phraseMap = new Map();
+  for (const t of tasks) for (const p of t.phrases) {
+    const k = p.toLowerCase();
+    if (!phraseMap.has(k)) phraseMap.set(k, []);
+    phraseMap.get(k).push(t.name);
+  }
+  const dupes = [...phraseMap.entries()].filter(([_, v]) => v.length > 1);
+  add('task phrases are unique', dupes.length === 0, dupes.length ? `shared: ${dupes.map(([p, ts]) => `"${p}" in [${ts.join(',')}]`).join('; ')}` : `${phraseMap.size} unique phrases`);
+
+  // 8. trigger_script paths exist (skip tasks with null trigger_script — those are on-demand dispatch-only entries)
+  const missingTrigs = tasks.filter(t => t.trigger_script && !fs.existsSync(path.join(ROOT, t.trigger_script))).map(t => t.name);
+  add('trigger_script paths exist', missingTrigs.length === 0, missingTrigs.length ? `missing: ${missingTrigs.join(', ')}` : `${tasks.filter(t => t.trigger_script).length} trigger scripts verified`);
+
+  // 8b. trigger scripts are executable. cron-run spawns the script directly (not
+  // `bash script`), so a script lacking the +x bit fails with EACCES/exit 127 and
+  // the job silently never runs while every wiring check above still passes
+  // (a 3-day job outage: a set of per-platform scripts shipped
+  // -rw-r--r-- and failed for 3 days, undetected).
+  const notExec = tasks
+    .filter(t => t.trigger_script && fs.existsSync(path.join(ROOT, t.trigger_script)))
+    .filter(t => { try { return !(fs.statSync(path.join(ROOT, t.trigger_script)).mode & 0o100); } catch { return false; } })
+    .map(t => t.name);
+  add('trigger scripts executable', notExec.length === 0, notExec.length ? `NOT executable (cron-run → EACCES/127): ${notExec.join(', ')} — chmod +x` : `${tasks.filter(t => t.trigger_script).length} trigger scripts +x`);
+
+  // 8c. recent cron-run outcomes. The wiring checks pass even when a job RUNS and
+  // FAILS — only the `cron-runs.jsonl` ledger knows. We flag the high-signal
+  // "could not execute at all" band — exit 126 (not executable) / 127 (spawn
+  // ENOENT/EACCES, bad shebang/interpreter, command-not-found) — for any label
+  // whose most-recent run within 48h is in that band. This is exactly the
+  // EACCES outage class above, with no false positives. We do NOT
+  // flag generic non-zero (exit 1): it's ambiguous — edva-sync/skills-sync
+  // exit 1 by design (divergence/dirty-tree), conditional reminders exit 1 when
+  // their condition isn't met. Those need per-job logic, not a blanket gate.
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'data/cron-runs.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    const latest = new Map();
+    for (const line of raw) { try { const r = JSON.parse(line); if (r.label && r.start) latest.set(r.label, r); } catch {} }
+    const failing = [...latest.values()]
+      .filter(r => new Date(r.start).getTime() >= cutoff && (r.exit === 126 || r.exit === 127))
+      .map(r => `${r.label}(exit ${r.exit})`);
+    add('recent cron runs executable', failing.length === 0, failing.length ? `couldn't execute (126/127) in last 48h: ${failing.join('; ')} — chmod +x / fix interpreter PATH` : `${latest.size} labels, no exec failures`);
+  } catch (e) { if (e.code !== 'ENOENT') add('recent cron runs executable', false, `cron-runs.jsonl read failed: ${e.message}`); }
+
+  // 8d. trigger scripts have a valid shebang. cron-run spawns scripts directly via
+  // execve, which requires the file to begin with the exact bytes "#!". A script
+  // that is +x but whose first line is malformed (e.g. "#\!/bin/bash" — a stray
+  // backslash from an echo/printf !-escape) throws ENOEXEC at spawn time; cron-run
+  // then crashes BEFORE writing a cron-runs.jsonl entry, so the 126/127 ledger
+  // check (8c) never even sees it — only a static scan catches this class.
+  // (db-retention shipped #\!/bin/bash on 2026-06-08 and silently never ran until
+  // 2026-06-24.) Scan every .sh cron-run executes directly: tasks.json triggers +
+  // any `… -- /Users/…/x.sh` target in the crontab (skips `-- bash -c '…'` lines).
+  const directShTargets = new Set();
+  for (const t of tasks) if (t.trigger_script && t.trigger_script.endsWith('.sh')) directShTargets.add(path.join(ROOT, t.trigger_script));
+  for (const line of cronLines) {
+    const after = line.split(/\s--\s/)[1];
+    const m = after && after.match(/^(\/Users\/\S+\.sh)\b/);
+    if (m) directShTargets.add(m[1]);
+  }
+  const badShebang = [];
+  for (const p of directShTargets) {
+    try {
+      const fd = fs.openSync(p, 'r'); const buf = Buffer.alloc(2);
+      const n = fs.readSync(fd, buf, 0, 2, 0); fs.closeSync(fd);
+      if (n < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) badShebang.push(path.basename(p)); // not "#!"
+    } catch {}
+  }
+  add('trigger scripts have valid shebang', badShebang.length === 0, badShebang.length ? `bad shebang (execve→ENOEXEC, no ledger entry): ${badShebang.join(', ')} — first two bytes must be "#!"` : `${directShTargets.size} direct cron scripts, all shebangs valid`);
+
+  // 8d2. cron-exec'd scripts have a RESOLVABLE interpreter. (8d) proves a file
+  // starts with "#!"; it does not prove the interpreter named there exists on
+  // cron's PATH. `#!/usr/bin/env node` is a perfectly VALID shebang that still
+  // dies with exit 127 under cron, because cron runs with a bare compiled-in
+  // PATH (/usr/bin:/bin — verified 2026-08-05: no PATH= line in the crontab,
+  // and the failure text was literally "env: node: No such file or directory")
+  // while Homebrew's node lives in /opt/homebrew/bin.
+  //
+  // Neither existing check catches this class:
+  //   - (8c) is ledger-based, so it only sees a job AFTER it has already failed,
+  //     and only for jobs run through `cron-run --label` — 31 of 123 entries
+  //     bypass cron-run entirely, and those never reach cron-runs.jsonl at all.
+  //   - (8d) only scans *.sh targets. Both real instances were EXTENSIONLESS
+  //     node scripts, so it never looked at them.
+  // calendar-attendee-audit failed silently every night until 2026-08-05, and
+  // hum-channel-audit carried the same shebang while firing once a year
+  // (0 8 23 6 *) with no --label — a 12-month-invisible breakage. Only a static
+  // scan closes this, which is why it is a sibling of (8d) rather than (8c).
+  //
+  // A shebang only matters when the script is exec'd DIRECTLY. Most Homebrew-node
+  // scripts under cron are safe precisely because their crontab line names
+  // /opt/homebrew/bin/node explicitly and the shebang is never consulted — so a
+  // token preceded by an interpreter (or by a redirect) is skipped, not flagged.
+  // Logic lives in lib/cron-interpreter-check.js so it is unit-testable
+  // (agent/test/cron-interpreter-check.test.mjs covers both real
+  // regressions plus the safe-by-explicit-interpreter case).
+  const { findUnresolvableInterpreters } = require(path.join(ROOT, 'lib/cron-interpreter-check.js'));
+  const { bad: unresolvable, scanned: execScanned } = findUnresolvableInterpreters(cronLines);
+  add("cron-exec'd scripts have a resolvable interpreter", unresolvable.length === 0,
+    unresolvable.length
+      // An `env node` script under cron-run stays red (the wrapper is deliberately
+      // not trusted) but is not said to exit 127 now: it runs while cron-run puts
+      // node on PATH (lib/cron-interpreter-check.js, BUT SAY WHICH).
+      ? `interpreter not on cron's bare PATH: ${unresolvable.map(b => `${b.file} (${b.shebang}${b.wrapperRescued ? '; runs only while cron-run puts node on PATH, exit 127 without it' : ' → exit 127'})`).join('; ')} — hardcode the absolute interpreter path (e.g. #!/opt/homebrew/bin/node)`
+      : `${execScanned.length} directly-exec'd cron scripts, all interpreters resolve`);
+
+  // 8d3. is every ACTIVE crontab entry still a well-formed schedule + command?
+  //
+  // Sibling of (8d2), and a static scan for the same reason: the failure never
+  // reaches the ledger, because a job that cannot run produces no row to fail.
+  //
+  // On 2026-09-05T04:05Z cron-tz-sync matched a DISABLED entry by its --label
+  // and rewrote it positionally, overwriting the `#HUMPAUSE#` marker with the
+  // minute and shifting every remaining field one place right:
+  //     #HUMPAUSE# 0 23 * * * /…/cron-run --label trigger-hum-daily -- …
+  //  →  0 23 23 * * *        /…/cron-run --label trigger-hum-daily -- …
+  // Six fields: cron reads `0 23 23 * *` as the schedule (23:00 on the 23rd)
+  // and the bare `*` as the command, which cannot run. The pause marker is
+  // gone too, so lifting the pause restores every OTHER lane and leaves this
+  // one dead. cron-tz-sync's own guards (added the same day) stop it happening
+  // again; they do not repair a line already damaged, and nothing else looked.
+  // (8c) is ledger-based and sees no failure; (8d)/(8d2) resolve the command's
+  // script and interpreter, and `*` is neither.
+  //
+  // The discriminator is that a schedule field is glyphs only while a command
+  // always contains a letter — zero false positives across all 238 lines of
+  // the live crontab. Logic lives in lib/cron-wellformed-check.js so it
+  // is unit-testable (agent/test/cron-wellformed-check.test.mjs covers
+  // the real regression plus the legal shapes that must stay green).
+  const { findMalformedCronEntries, describeMalformed } = require(path.join(ROOT, 'lib/cron-wellformed-check.js'));
+  const { bad: malformed, scanned: wellformedScanned } = findMalformedCronEntries(cronLines);
+  add('crontab entries are well-formed', malformed.length === 0,
+    malformed.length
+      ? `unrunnable cron entr${malformed.length === 1 ? 'y' : 'ies'} — ${describeMalformed(malformed)}. Repair the line by hand; a shifted schedule also means a pause marker was overwritten.`
+      : `${wellformedScanned} active cron entries, all schedule/command boundaries intact`);
+
+  // 8f. is the shared clone actually committable right now?
+  //
+  // `edva-commit` is the only sanctioned write path and it can be blocked by
+  // conditions that belong to nobody in particular: an unmerged path left by a
+  // stash pop makes its plain `git commit` refuse for EVERY caller, and a file
+  // another session left staged trips its foreign-file guard (exit 3). Both are
+  // invisible until something tries to commit — and the thing that tries is
+  // usually self-improve-approval-poll landing a card the user has already signed,
+  // which records status "applied" whether or not the commit half succeeded.
+  // Logic lives in lib/repo-committable-check.js so it is unit-testable.
+  try {
+    const { findCommitBlockers, describeBlockers } = require(path.join(ROOT, 'lib/repo-committable-check.js'));
+    const gitRun = (a) => execFileSync('git', a, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const { ok: committable, blockers } = findCommitBlockers(gitRun);
+    add('repo is committable', committable,
+      committable
+        ? 'no unmerged paths, no conflict markers, nothing left staged'
+        : describeBlockers(blockers));
+  } catch (e) {
+    // Deliberately FAILS rather than degrading to green. This check exists
+    // because a blocked commit already reports success everywhere else in the
+    // pipeline; a version of it that answered "fine" whenever it could not run
+    // would reproduce the exact bug class it was written to catch.
+    add('repo is committable', false, `could not determine — ${e.message.split('\n')[0]}`);
+  }
+
+  // 8e. sustained cron-run failures. (8c) only flags the 126/127 "could not execute"
+  // band because a single non-zero exit is ambiguous (edva-sync/skills-sync exit 1
+  // by design on divergence/dirty-tree; conditional reminders exit 1 until their
+  // condition is met). But a job whose newest run failed AND has failed every run for
+  // a sustained streak is unambiguously stuck — that's how skills-sync sat blocked 37×
+  // overnight 2026-06-24 while every other check stayed green. Flag a label whose
+  // newest run is non-zero with a consecutive-failure streak ≥ 3 (within 48h), excluding
+  // the 126/127 band (8c owns it) and ad-hoc one-shot reminders (UPPERCASE_…_<date>
+  // labels that exit 1 by design while polling for a condition).
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'data/cron-runs.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    const byLabel = new Map();
+    for (const line of raw) {
+      try {
+        const r = JSON.parse(line);
+        if (r.label && r.start && new Date(r.start).getTime() >= cutoff) {
+          if (!byLabel.has(r.label)) byLabel.set(r.label, []);
+          byLabel.get(r.label).push(r);
+        }
+      } catch {}
+    }
+    const adHoc = /^[A-Z][A-Z0-9_]*_\d{6,}$/;
+    const stuck = [];
+    for (const [label, runs] of byLabel) {
+      if (adHoc.test(label)) continue;
+      let streak = 0; // walk newest→oldest; count consecutive non-zero (non-exec-band) exits
+      for (let i = runs.length - 1; i >= 0; i--) {
+        const ex = runs[i].exit;
+        if (ex === 0 || ex === 126 || ex === 127) break;
+        streak++;
+      }
+      if (streak >= 3) stuck.push(`${label}(${streak}× fail, last exit ${runs[runs.length - 1].exit})`);
+    }
+    add('cron runs not stuck-failing', stuck.length === 0, stuck.length ? `sustained failures (≥3 in a row, last 48h): ${stuck.join('; ')}` : `no label failing ≥3× in a row`);
+  } catch (e) { if (e.code !== 'ENOENT') add('cron runs not stuck-failing', false, `cron-runs.jsonl read failed: ${e.message}`); }
+
+  // 9. process-manager running (check HTTP health endpoint — pgrep can't see cross-session processes on macOS)
+  const pmHealth = shSafe('curl -sf --max-time 3 http://127.0.0.1:9095/health');
+  add('process-manager running', !!pmHealth, pmHealth ? 'HTTP 200' : 'unreachable on :9095 — check launchd');
+
+  // 10. supervisor health endpoints reachable
+  const chatHealth = fetchJson('http://127.0.0.1:9094/health');
+  add('chat supervisor reachable', !!chatHealth, chatHealth ? 'HTTP 200' : 'unreachable on :9094');
+  const opsHealth = fetchJson('http://127.0.0.1:9093/health');
+  add('ops supervisor reachable', !!opsHealth, opsHealth ? 'HTTP 200' : 'unreachable on :9093');
+
+  // 10b. WhatsApp channel reachable + paired. Runs as the 5th process-manager
+  // child (Baileys gateway). If the process is up but unpaired, the host_jid
+  // field is null and we need to re-run the pair flow.
+  const waHealth = fetchJson('http://127.0.0.1:9100/health');
+  const waPaired = waHealth && waHealth.host_jid;
+  add('whatsapp-channel reachable + paired', !!waPaired,
+    waPaired
+      ? `paired as ${waHealth.host_jid} (${waHealth.host_name || 'unknown'})`
+      : waHealth
+        ? 'up but unpaired — wa-auth missing or session revoked; re-pair via `npm run pair -- --phone <E164>` in agent/whatsapp-channel'
+        : 'unreachable on :9100 — process-manager should be supervising it; check whatsapp-channel.log');
+
+  // 11. MCP configs are valid JSON
+  for (const name of ['chat-mcp-config.json', 'mcp-config.json']) {
+    const p = path.join(TOOLS, 'agent/supervisor', name);
+    let valid = false;
+    try { JSON.parse(fs.readFileSync(p, 'utf8')); valid = true; } catch {}
+    add(`${name} valid`, valid, valid ? 'valid JSON' : 'missing or invalid');
+  }
+
+  // 12. CLAUDE.md freshness — each agent's CLAUDE.md shouldn't be newer than
+  // its current session. The supervisor exposes sessionStartedAt (set on each
+  // startSession call including graceful restarts) — prefer that over the
+  // supervisor-process startedAt so graceful restarts clear the STALE state.
+  // Very recent edits (< CLAUDE_MD_GRACE_MIN) are treated as "pending restart"
+  // rather than STALE: they're an active-editing state, not a stale-config
+  // running-in-production state. True operational staleness means the file
+  // was changed long ago and the supervisor was never bounced to pick it up.
+  const CLAUDE_MD_GRACE_MIN = 10;
+  for (const [name, port, relPath] of [
+    ['chat', 9094, 'agent/chat-agent/CLAUDE.md'],
+    ['ops', 9093, 'agent/ops-agent/CLAUDE.md'],
+  ]) {
+    const cmdPath = path.join(TOOLS, relPath);
+    let ok = false;
+    let status = null;
+    try {
+      const health = fetchJson(`http://127.0.0.1:${port}/health`) || {};
+      const sessionTs = health.sessionStartedAt || health.startedAt;
+      const ref = sessionTs ? new Date(sessionTs).getTime() : 0;
+      const mtime = fs.statSync(cmdPath).mtimeMs;
+      const ageMin = (Date.now() - mtime) / 60000;
+      if (!ref) { ok = false; status = 'supervisor unreachable'; }
+      else if (mtime <= ref) { ok = true; status = 'fresh'; }
+      else if (ageMin < CLAUDE_MD_GRACE_MIN) {
+        ok = true;
+        status = `fresh (edited ${ageMin.toFixed(0)}min ago — within ${CLAUDE_MD_GRACE_MIN}min grace, pending restart)`;
+      } else {
+        ok = false;
+        status = `STALE — CLAUDE.md edited ${ageMin.toFixed(0)}min ago, session started ${new Date(ref).toISOString()}`;
+      }
+    } catch (err) { ok = false; status = `check failed: ${err.message}`; }
+    add(`${name} CLAUDE.md fresh`, ok, status);
+  }
+
+  // 13. hum liveness — hum fires 5x/day at 10:30, 12:30, 15:30, 17:30, 22:30 local.
+  // Longest natural gap inside waking hours is ~5h (17:30 → 22:30) + jitter, so 7h stale is broken.
+  // Check only inside 11:00-22:59 local to avoid false positives during overnight sleep window.
+  const humRunsPath = path.join(TOOLS, 'data/hum-runs.jsonl');
+  const hour = new Date().getHours();
+  const inWakingCheck = hour >= 11 && hour < 23;
+  if (!inWakingCheck) {
+    add('hum liveness', true, `skipped (outside 11:00–23:00 check window, now ${hour}:00)`);
+  } else {
+    let raw = null;
+    try { raw = fs.readFileSync(humRunsPath, 'utf8'); }
+    catch (e) { if (e.code !== 'ENOENT') add('hum liveness', false, `read failed: ${e.message}`); }
+    if (raw !== null) {
+      const lines = raw.split('\n').filter(Boolean);
+      let lastTs = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try { const r = JSON.parse(lines[i]); if (r.ts) { lastTs = r.ts; break; } } catch {}
+      }
+      if (!lastTs) {
+        add('hum liveness', true, 'no runs yet (fresh install)');
+      } else {
+        const ageH = (Date.now() - new Date(lastTs).getTime()) / 3600000;
+        const stale = ageH > 7;
+        add('hum liveness', !stale, stale
+          ? `STALE — last run ${ageH.toFixed(1)}h ago; expect a run every ~2h during waking hours`
+          : `last run ${ageH.toFixed(1)}h ago (${new Date(lastTs).toLocaleString()})`);
+      }
+    } else if (raw === null && !checks.some(c => c.name === 'hum liveness')) {
+      add('hum liveness', true, 'hum not installed (no hum-runs.jsonl)');
+    }
+  }
+
+  // 14. Chrome DevTools Protocol reachable (port 9222).
+  // The ops-agent's chrome-devtools MCP uses --autoConnect, which requires
+  // Chrome to be running with --remote-debugging-port enabled on a non-default
+  // user data directory. Without CDP reachable, any mcp__chrome-devtools__*
+  // tool call hangs until the supervisor's 10-min TURN WATCHDOG trips.
+  // Detecting this up-front in doctor surfaces the state anytime the user
+  // runs it; the chrome-cdp-watch cron owns transition-triggered alerting.
+  // Probe uses `localhost` (not 127.0.0.1): Chrome 147 silently binds an IPv4
+  // stub on :9222 from the user's interactive profile that 404s on every CDP
+  // path. `localhost` resolves to ::1 first on macOS and hits the LaunchAgent
+  // automation Chrome (com.edva.chrome-cdp) which binds IPv6 :9222.
+  const cdpProbe = shSafe('curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9222/json/version 2>/dev/null') || '000';
+  const cdpUp = cdpProbe === '200';
+  add('chrome CDP port reachable', cdpUp, cdpUp
+    ? 'HTTP 200 on :9222/json/version'
+    : `HTTP ${cdpProbe} on :9222 — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.edva.chrome-cdp. Browser-automation jobs will skip until this clears.`);
+
+  // 15. gog tasks CLI reachable. The 2026-04-29 review documented memories
+  // #914/#920 falsely flagging "gog CLI unavailable" because the symlink
+  // target was inspected instead of the actual binary. Probe by invoking a
+  // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
+  // (renamed binary, expired token bucket) without reading the symlink.
+  const gogProbe = shSafe(`/opt/homebrew/bin/gog tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
+  const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
+  add('gog tasks CLI reachable', !!gogOk, gogOk
+    ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
+    : `gog tasks list failed: ${(gogProbe || '<empty>').slice(0, 160)}. Re-auth via 'gog auth add ${OWNER_EMAIL || '<your-account>'} --services tasks' or fall back to service account.`);
+
+  // 16. CI keychain-lock fleet in sync. Every macOS-signing repo on this host
+  // mutates ONE global user keychain search list. When that goes wrong the
+  // symptom is not a build failure — it is login.keychain-db being evicted,
+  // which takes Edva's Max auth down with "Not logged in" and no API-key
+  // fallback. A defect like this gets copy-pasted across workflows and repos,
+  // so the expensive part is DISCOVERY, not the fix; this check re-runs that
+  // audit continuously. Skipped, not failed, when gh is missing or
+  // unauthenticated (exit 2) — doctor runs on hosts without gh, and a network
+  // hiccup must not read as fleet drift.
+  const kcAudit = installTools("bin/ci-keychain-lock-audit");
+  if (fs.existsSync(kcAudit)) {
+    const kcOut = shSafe(`${kcAudit} 2>&1; echo "EXIT:$?"`) || 'EXIT:2';
+    const kcCode = (kcOut.match(/EXIT:(\d+)\s*$/) || [, '2'])[1];
+    if (kcCode === '2') {
+      add('CI keychain-lock fleet in sync', true, 'skipped (gh unavailable/unauthenticated)');
+    } else if (kcCode === '0') {
+      add('CI keychain-lock fleet in sync', true, 'all signing repos byte-identical + sourcing the helper');
+    } else {
+      const bad = kcOut.split('\n').filter(l => /FAIL/.test(l))
+        .map(l => l.trim().replace(/\s+/g, ' ')).slice(0, 4).join('; ');
+      add('CI keychain-lock fleet in sync', false,
+        `${bad || 'drift detected'}. Run bin/ci-keychain-lock-audit for the full list; re-vendor with 'cp .github/scripts/ci-keychain-lock.sh <repo>/.github/scripts/'. A repo that stops sourcing the helper can evict login.keychain-db and take Max auth down.`);
+    }
+  }
+
+  // 17. one Claude Code on a job's PATH — WARN-level: a latent hazard once no call
+  // site runs a bare `claude`; red would sit in every pre-flight log. No spawn, no network.
+  // Logic: lib/claude-binaries.js (tests/claude-binaries.test.mjs).
+  try {
+    const { findClaudeBinaries, describeClaudeBinaries } = require(path.join(__dirname, '../lib/claude-binaries.js'));
+    const { warn, detail } = describeClaudeBinaries(findClaudeBinaries({ homedir: HOME }), { homedir: HOME });
+    add("one Claude Code on a job's PATH", true, detail, warn);
+  } catch (e) {
+    add("one Claude Code on a job's PATH", true, `could not determine — ${e.message.split('\n')[0]}`, true);
+  }
+
+  // 18 + 19. Landed but not live; code left uncommitted — WARN-level.
+  // A daemon runs the code it started with (one landed fix sat inert in hum-sense
+  // for a week), and an uncommitted edit lives only in the working tree, where a revert or a
+  // failed autostash undoes it (2026-10-10). Read-only: supervisor-code-reload --report.
+  const scr = shSafe(`"${process.execPath}" "${path.join(__dirname, 'supervisor-code-reload')}" --report`, { timeout: 60_000 });
+  let rep = null;
+  try { rep = scr ? JSON.parse(scr) : null; } catch {}
+  if (!rep || !rep.ok) {
+    add('running code matches what landed', true, 'could not determine — supervisor-code-reload --report gave no answer', true);
+  } else {
+    const hour = 3_600_000;
+    const sups = rep.supervisors.filter((s) => s.stale_since && Date.now() - Date.parse(s.stale_since) > hour);
+    const late = [
+      ...rep.late.map((l) => `${l.name} (pid ${l.pid}, up since ${l.started.slice(0, 16)}Z, missing code committed from ${l.since.slice(0, 16)}Z on, newest ${l.newest}; ${l.fix})`),
+      ...sups.map((s) => `${s.agent} supervisor (stale since ${s.stale_since.slice(0, 16)}Z${s.held ? `, reload held: ${s.held}` : ''}; edva restart session)`),
+    ];
+    add('running code matches what landed', true, late.length
+      ? `landed but not live: ${late.join('; ')}`
+      : `${rep.running} of ${rep.watched} watched daemons running, each on the code that landed; supervisors current (supervisor-code-reload)`, late.length > 0);
+    if (rep.uncommitted) {
+      const old = rep.uncommitted.code.filter((a) => a.hours > 24);
+      const dataOld = rep.uncommitted.data.filter((a) => a.hours > 24).length;
+      add('no code file uncommitted over 24h', true, (old.length
+        ? `${old.length} code file(s) modified but not committed for over a day; a revert or failed sync would silently undo them: ${old.map((a) => `${a.path} (since ${a.since.slice(0, 16)}Z)`).join(', ')}. Commit each with edva-commit -m "..." -- <path>.`
+        : `${rep.uncommitted.code.length} code file(s) modified, none known to be over a day.`)
+        + ` Runtime data (data/, not warned): ${rep.uncommitted.data.length} modified, ${dataOld} over a day.`, old.length > 0);
+    }
+  }
+
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(checks, null, 2)); process.exit(checks.every(c => c.ok) ? 0 : 1); }
+
+  // --repair: auto-fix repairable drift (schedule mismatches + orphan scripts in cron)
+  if (hasFlag(args, '--repair')) {
+    const mutableTasks = loadTasks();
+    let repaired = 0;
+
+    // Build cron map: triggerBasename -> [schedule strings]
+    const cronMapR = {};
+    for (const line of cronLines) {
+      const scriptMatch = line.match(/trigger-[\w-]+\.sh/);
+      if (!scriptMatch) continue;
+      const bname = scriptMatch[0];
+      const parts = line.trim().split(/\s+/);
+      const sched = parts.slice(0, 5).join(' ');
+      if (!cronMapR[bname]) cronMapR[bname] = [];
+      cronMapR[bname].push(sched);
+    }
+
+    // Fix schedule mismatches
+    for (const t of mutableTasks) {
+      if (!t.trigger_script || !t.schedule || t.schedule === 'on-demand') continue;
+      const bname = t.trigger_script.split('/').pop();
+      const actual = cronMapR[bname];
+      if (!actual) continue;
+      const taskParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).sort();
+      const actualParts = actual.slice().sort();
+      if (JSON.stringify(taskParts) !== JSON.stringify(actualParts)) {
+        const newSched = actual.length === 1 ? actual[0] : actual.join(' / ');
+        console.log(`  repair: ${t.name} schedule "${t.schedule}" → "${newSched}"`);
+        t.schedule = newSched;
+        repaired++;
+      }
+    }
+
+    // Register orphan scripts (in cron, not in tasks.json)
+    const taskScriptsR = new Set(mutableTasks.map(t => t.trigger_script && t.trigger_script.split('/').pop()).filter(Boolean));
+    for (const [bname, scheds] of Object.entries(cronMapR)) {
+      if (taskScriptsR.has(bname)) continue;
+      const scriptPath = path.join(TOOLS, 'agent/scripts', bname);
+      if (!fs.existsSync(scriptPath)) continue;
+      // Read the first comment line for a description
+      let desc = '';
+      try { const lines = fs.readFileSync(scriptPath, 'utf8').split('\n'); for (const l of lines) { const m = l.match(/^#\s*(.+)/); if (m && !m[1].startsWith('!')) { desc = m[1].trim(); break; } } } catch {}
+      const taskName = bname.replace(/^trigger-/, '').replace(/\.sh$/, '');
+      const newSched = scheds.length === 1 ? scheds[0] : scheds.join(' / ');
+      const entry = {
+        name: taskName,
+        schedule: newSched,
+        schedule_human: newSched,
+        trigger_script: `agent/scripts/${bname}`,
+        webhook_url: 'http://localhost:9092',
+        webhook_task: taskName.toUpperCase().replace(/-/g, ' '),
+        ops_playbook_section: null,
+        delivers_to: 'unknown',
+        phrases: [],
+        description: desc || `Auto-registered by doctor --repair on ${new Date().toISOString().slice(0,10)}.`,
+        job: taskName,
+      };
+      console.log(`  repair: registered orphan ${taskName} @ ${newSched}`);
+      mutableTasks.push(entry);
+      repaired++;
+    }
+
+    if (repaired > 0) {
+      writeTasks(mutableTasks);
+      console.log(c.green(`\n  ${repaired} repair(s) applied to agent/local/tasks.json. Run 'edva doctor' to verify.`));
+    } else {
+      console.log(c.dim('  nothing to repair'));
+    }
+    process.exit(0);
+  }
+
+  let failed = 0, warned = 0;
+  for (const ck of checks) {
+    const mark = !ck.ok ? c.red('✗') : ck.warn ? c.yellow('!') : c.green('✓');
+    console.log(`${mark} ${c.bold(ck.name)}`);
+    console.log(`  ${c.dim(ck.detail)}`);
+    if (!ck.ok) failed++;
+    else if (ck.warn) warned++;
+  }
+  console.log('');
+  const warnSuffix = warned ? c.yellow(` (${warned} warning${warned === 1 ? '' : 's'})`) : '';
+  if (failed === 0) console.log(c.green(`${checks.length}/${checks.length} checks passed`) + warnSuffix);
+  else { console.log(c.red(`${failed}/${checks.length} checks FAILED`) + warnSuffix); process.exit(1); }
+}
+
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// --- hum ---
+const HUM_STATE   = path.join(TOOLS, 'data/hum-state.json');
+const HUM_SEEN    = path.join(TOOLS, 'data/hum-seen.json');
+const HUM_FEEDBK  = path.join(TOOLS, 'data/hum-feedback.jsonl');
+const HUM_RUNS    = path.join(TOOLS, 'data/hum-runs.jsonl');
+const HUM_REACTION_ALIASES = {
+  '👍':'helpful', 'helpful':'helpful', 'good':'helpful', 'yes':'helpful',
+  '👎':'skip', 'skip':'skip', 'bad':'skip', 'no':'skip',
+  '💤':'snooze', 'snooze':'snooze',
+  'more':'more', 'more_of_these':'more', 'more of these':'more',
+  // iOS tapback tokens (phone-channel forwards these raw from
+  // edva_messages.reaction). Match the semantic intent the client exposes
+  // (Great / Useful / Not Useful) to the existing hum vocabulary.
+  '❤️':'more', 'heart':'more',
+  'thumbs_up':'helpful',
+  'thumbs_down':'skip',
+};
+
+function loadHumState() {
+  try { return JSON.parse(fs.readFileSync(HUM_STATE, 'utf8')); }
+  catch (e) {
+    if (e.code === 'ENOENT') die(`hum state not found at ${HUM_STATE}. Is hum installed?`);
+    throw e;
+  }
+}
+function saveHumState(s) {
+  const tmp = HUM_STATE + '.tmp.' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, HUM_STATE);
+}
+function parseHumDuration(s) {
+  if (!s) return null;
+  const now = Date.now();
+  const lc = s.toLowerCase().trim();
+  if (lc === 'today' || lc === 'end-of-day') {
+    const d = new Date(); d.setHours(23, 59, 59, 999);
+    return d.toISOString();
+  }
+  if (lc === 'until-morning' || lc === 'morning') {
+    const d = new Date();
+    if (d.getHours() >= 9) d.setDate(d.getDate() + 1);
+    d.setHours(9, 0, 0, 0);
+    return d.toISOString();
+  }
+  if (lc === 'weekend' || lc === 'until-monday') {
+    const d = new Date();
+    const day = d.getDay();
+    const daysToMonday = day === 1 ? 7 : (8 - day) % 7 || 7;
+    d.setDate(d.getDate() + daysToMonday);
+    d.setHours(9, 0, 0, 0);
+    return d.toISOString();
+  }
+  const m = lc.match(/^(\d+)\s*(m|min|h|hr|d|day|days)$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const unit = m[2];
+    const ms = unit.startsWith('m') && !unit.startsWith('min') ? n * 60 * 1000
+             : unit.startsWith('min') ? n * 60 * 1000
+             : unit.startsWith('h') ? n * 60 * 60 * 1000
+             : n * 24 * 60 * 60 * 1000;
+    return new Date(now + ms).toISOString();
+  }
+  const iso = new Date(s);
+  if (!isNaN(iso.getTime())) return iso.toISOString();
+  return null;
+}
+function formatHumTime(iso) {
+  if (!iso) return c.dim('—');
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const mins = Math.round((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return `${d.toLocaleString()} ${c.dim('(just now)')}`;
+  if (mins < 60) return `${d.toLocaleString()} ${c.dim(`(${mins}m ago)`)}`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${d.toLocaleString()} ${c.dim(`(${hrs}h ago)`)}`;
+  return `${d.toLocaleString()} ${c.dim(`(${Math.round(hrs/24)}d ago)`)}`;
+}
+
+function cmdHum(args) {
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help') return cmdHumHelp();
+  const subs = {
+    status: cmdHumStatus,
+    pause: cmdHumPause,
+    resume: cmdHumResume,
+    feedback: cmdHumFeedback,
+    runs: cmdHumRuns,
+    review: cmdHumReview,
+    test: cmdHumTest,
+    tune: cmdHumTune,
+    question: cmdHumQuestion,
+    learn: cmdHumLearn,
+    learnings: cmdHumLearnings,
+    situation: cmdHumSituation,
+    sense: cmdHumSense,
+    insight: cmdHumInsight,
+    audit: cmdHumAudit,
+    reactions: cmdHumReactions,
+    signal: cmdHumSignal,
+    intervention: cmdHumIntervention,
+    lane: cmdHumLane,
+  };
+  const fn = subs[sub];
+  if (!fn) die(`unknown: hum ${sub}. Try: edva hum help`);
+  fn(args.slice(1));
+}
+
+function cmdHumHelp() {
+  console.log(c.bold('edva hum') + ' — proactive check-in subsystem\n');
+  console.log('  status                       show next run, today\'s pings, cool-down, pause state, threshold');
+  console.log('  pause <duration>             "2h" | "30m" | "today" | "until-morning" | "weekend" | "<ISO>"');
+  console.log('  resume                       unpause');
+  console.log('  feedback <ping-id> <reaction>  record reaction: helpful | skip | snooze | more | 👍 | 👎');
+  console.log('    (use ping-id "last" to reference the most recent ping)');
+  console.log('  runs [--tail N]              tail hum-runs.jsonl (default 10)');
+  console.log('  review [--since Nd]          what was surfaced / reacted to (default 7d)');
+  console.log('  test                         fire a one-shot tick via webhook');
+  console.log('  tune                         show current config + feedback bias');
+  console.log('  question                     show current pending question (or null)');
+  console.log('  learn <id> <answer>          record a manual answer for the pending question');
+  console.log('  learnings [--tail N]         tail hum-learnings.jsonl (default 10)');
+  console.log('  situation [--json]           composite snapshot: where/env/time/now/next/working-on');
+  console.log('  sense [status|once|sensors|tail|emit ...]   situational trigger engine (default: status)');
+  console.log('  insight [--since Nd]         aggregate last N days of tick traces into metrics (default 7d)');
+  console.log('  reactions [--since Nd] [--json]  per-lane reaction-rate (surfaced/reacted/positive) from hum-feedback.jsonl');
+  console.log('  signal [--since Nd] [--lane <name>] [--json]  weighted signal dashboard (love=2x, up=1x; canonical: hum-improvement-loop.md)');
+  console.log('  intervention list | record | measure  hum-improvement-loop intervention attribution ledger');
+  console.log('  lane status | enable <name> [reason] | disable <name> [reason]  manual lever for auto-quiesce (2 consecutive expired-unanswered lane_diagnosis questions pauses a lane)');
+  console.log('  audit [--window 24h|7d] [--json]  drift check: outcome.sent count vs hum-feedback entries\n');
+  console.log(c.dim('State files:'));
+  console.log(c.dim(`  ${HUM_STATE}`));
+  console.log(c.dim(`  ${HUM_SEEN}`));
+  console.log(c.dim(`  ${HUM_FEEDBK}`));
+  console.log(c.dim(`  ${HUM_RUNS}`));
+}
+
+function cmdHumStatus(args) {
+  const s = loadHumState();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(s, null, 2)); return; }
+  console.log(c.bold('Hum Status') + '\n');
+  if (s.pause && s.pause.until && new Date(s.pause.until) > new Date()) {
+    console.log(`  ${c.yellow('PAUSED')} until ${new Date(s.pause.until).toLocaleString()}`);
+    if (s.pause.reason) console.log(`  reason:  ${s.pause.reason}`);
+  } else {
+    console.log(`  state:   ${c.green('active')}`);
+  }
+  const minIntMin = enforcedPingCaps().minIntervalMin; // the code-enforced budget (lib/ping-budget.mjs)
+  if (s.last_ping_at) {
+    const lastPingMs = Date.now() - new Date(s.last_ping_at).getTime();
+    const minMs = minIntMin * 60 * 1000;
+    if (lastPingMs < minMs) {
+      const m = Math.round((minMs - lastPingMs) / 60000);
+      console.log(`  min-interval: ${c.yellow(`${m}m remaining`)} (${minIntMin}m)`);
+    } else {
+      console.log(`  min-interval: ${c.green('clear')} (${minIntMin}m)`);
+    }
+  }
+  const today = s.today || {};
+  const cap = enforcedPingCaps().maxPerDay; // the code-enforced budget (lib/ping-budget.mjs)
+  const capColor = (today.pings || 0) >= cap ? c.red : c.green;
+  const runs = today.runs || 0;
+  const pings = today.pings || 0;
+  const questions = today.questions || 0;
+  const logOnly = today.log_only || 0;
+  console.log(`  today:    ${runs} ticks, ${capColor(`${pings}/${cap} pings`)}, ${questions} questions, ${logOnly} log-only`);
+  console.log(`  last run: ${formatHumTime(s.last_run_at)}`);
+  console.log(`  last ping: ${formatHumTime(s.last_ping_at)}`);
+
+  // Pending question, if any
+  try {
+    const raw = fs.readFileSync(HUM_PENDING_Q, 'utf8').trim();
+    if (raw && raw !== 'null') {
+      const q = JSON.parse(raw);
+      const exp = new Date(q.expires_at);
+      const remMin = Math.round((exp.getTime() - Date.now()) / 60000);
+      const status = remMin > 0 ? c.yellow(`${remMin}m left`) : c.red('EXPIRED');
+      console.log(`  pending question: ${c.bold(q.subject)} [${status}]`);
+    }
+  } catch {}
+
+  // Last outbound Edva message stamp
+  try {
+    const stamp = JSON.parse(fs.readFileSync(path.join(TOOLS, 'data/last-edva-message-at.json'), 'utf8'));
+    if (stamp.ts) console.log(`  last outbound msg: ${formatHumTime(stamp.ts)}`);
+  } catch {}
+}
+
+function cmdHumPause(args) {
+  const durStr = args[0];
+  if (!durStr) die('hum pause: duration required (e.g. "2h", "today", "until-morning", "weekend")');
+  const until = parseHumDuration(durStr);
+  if (!until) die(`hum pause: could not parse duration "${durStr}"`);
+  const s = loadHumState();
+  s.pause = { until, reason: args.slice(1).join(' ') || null, set_at: new Date().toISOString() };
+  saveHumState(s);
+  console.log(`${c.yellow('Paused')} until ${new Date(until).toLocaleString()}`);
+}
+
+function cmdHumResume(args) {
+  const s = loadHumState();
+  if (!s.pause) { console.log(c.dim('hum was not paused')); return; }
+  s.pause = null;
+  saveHumState(s);
+  console.log(c.green('Resumed'));
+}
+
+// Advisory lock around hum-feedback.jsonl. Must match the lockfile path used
+// by bin/hum-ping so reaction updates and ping appends serialize — a
+// naïve read-modify-write here would otherwise silently clobber a concurrent
+// append from a freshly-sent hum ping.
+const HUM_FEEDBK_LOCK = path.join(TOOLS, 'data/.hum-feedback.lock');
+function humFeedbackLockAcquire(timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try { fs.mkdirSync(HUM_FEEDBK_LOCK); return true; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try {
+        const age = Date.now() - fs.statSync(HUM_FEEDBK_LOCK).mtimeMs;
+        if (age > 30_000) { try { fs.rmdirSync(HUM_FEEDBK_LOCK); } catch {} continue; }
+      } catch {}
+      const until = Date.now() + 20 + Math.floor(Math.random() * 30);
+      while (Date.now() < until) { /* spin */ }
+    }
+  }
+  return false;
+}
+function humFeedbackLockRelease() { try { fs.rmdirSync(HUM_FEEDBK_LOCK); } catch {} }
+
+// Maps a normalized tapback token (see HUM_REACTION_ALIASES) to the
+// disposition/reaction_token vocabulary shared by suggestion-history.mjs and
+// hum-responses.mjs, so a one-word reaction scores the same as its
+// conversational equivalent ("more"/heart = love-strength, "helpful"/thumbs-up
+// = up-strength — matches the split suggestion-classify already uses).
+function humReactionToDisposition(norm) {
+  switch (norm) {
+    case 'helpful': return { disposition: 'positive', reaction_token: 'up' };
+    case 'more':    return { disposition: 'positive', reaction_token: 'love' };
+    case 'skip':    return { disposition: 'negative', reaction_token: 'down' };
+    case 'snooze':  return { disposition: 'snoozed', reaction_token: 'snooze' };
+    default:        return { disposition: null, reaction_token: null };
+  }
+}
+
+async function cmdHumFeedback(args) {
+  let pingId = args[0];
+  const reaction = args[1];
+  if (!pingId || !reaction) die('hum feedback <ping-id|last> <reaction>');
+  const norm = HUM_REACTION_ALIASES[reaction.toLowerCase()] || reaction;
+
+  if (!humFeedbackLockAcquire()) {
+    console.error(c.yellow('warn') + ': could not acquire hum-feedback lock after 5s; proceeding anyway');
+  }
+
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBK, 'utf8'); }
+  catch (e) {
+    humFeedbackLockRelease();
+    if (e.code === 'ENOENT') die('no hum feedback log yet');
+    throw e;
+  }
+  const lines = raw.split('\n');
+
+  if (pingId === 'last') {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      try {
+        const r = JSON.parse(lines[i]);
+        if (r.ping_id) { pingId = r.ping_id; break; }
+      } catch {}
+    }
+    if (pingId === 'last') die('no ping-id found in feedback log');
+  }
+
+  let found = false;
+  let matchedEntry = null;
+  const out = lines.map(line => {
+    if (!line.trim()) return line;
+    try {
+      const r = JSON.parse(line);
+      if (r.ping_id === pingId) {
+        r.reaction = norm;
+        r.reaction_at = new Date().toISOString();
+        found = true;
+        matchedEntry = r;
+        return JSON.stringify(r);
+      }
+      return line;
+    } catch { return line; }
+  });
+  if (!found) {
+    humFeedbackLockRelease();
+    die(`no ping found with id "${pingId}"`);
+  }
+
+  const tmp = HUM_FEEDBK + '.tmp.' + process.pid;
+  try {
+    fs.writeFileSync(tmp, out.join('\n'));
+    fs.renameSync(tmp, HUM_FEEDBK);
+  } finally {
+    humFeedbackLockRelease();
+  }
+  console.log(`${c.green('Recorded')} reaction "${norm}" for ${pingId}`);
+
+  // Dual-log write: a tapback/reaction-word reply ("helpful"/"skip"/"snooze"/
+  // "more") used to only flip `reaction` on the matching hum-feedback.jsonl
+  // row above. That left hum-responses.jsonl (overnight consolidation + same-
+  // day re-ask suppression) and suggestion-history.jsonl (the signal tracker
+  // hum-improvement-loop scores read) blind to every reaction-word reply —
+  // only free-text replies through suggestion-classify wrote those. Mirror
+  // that path here so both mechanisms see the same reply regardless of shape.
+  // (Fixed after hum's "ideas" lane reported 11 pings/0
+  // reactions when at least 4 had actually gotten a "helpful".)
+  const headline = (matchedEntry?.findings || [])[0] || null;
+  const subjectKey = headline?.subject_key || headline?.dedup_key || null;
+  const display = headline?.subject_display || headline?.signal?.slice(0, 80) || null;
+  const { disposition, reaction_token } = humReactionToDisposition(norm);
+  try {
+    const { appendResponse } = await import(path.join(TOOLS, 'lib/hum-responses.mjs'));
+    appendResponse({
+      ping_id: pingId,
+      lane: matchedEntry?.lane || null,
+      subject: display,
+      subject_key: subjectKey,
+      ping_text: display,
+      reply_text: reaction,
+      disposition,
+      source: 'tapback_edva_cli',
+    });
+  } catch (e) {
+    console.error(c.dim(`  (hum-responses capture warn: ${e.message})`));
+  }
+  if (subjectKey && disposition) {
+    try {
+      const { appendReaction } = await import(path.join(TOOLS, 'lib/suggestion-history.mjs'));
+      appendReaction({
+        subject_key: subjectKey,
+        disposition,
+        reaction_token,
+        reason: null,
+        reason_detail: null,
+        source: 'phone_tapback',
+        evidence: reaction,
+        message_id: null,
+      });
+    } catch (e) {
+      console.error(c.dim(`  (suggestion-history capture warn: ${e.message})`));
+    }
+  }
+
+  // Reinforcement loop: if the ping originated from an idea, append the
+  // reaction to hum-ideas.jsonl so the next ideation run can read it and
+  // bias generation. See system/hum-ideas-reservoir.md.
+  try {
+    const ideasFile = path.join(TOOLS, 'data/hum-ideas.jsonl');
+    const ideaRaw = fs.readFileSync(ideasFile, 'utf8');
+    const ideaLines = ideaRaw.split('\n').filter(Boolean);
+    let matchedIdeaId = null;
+    for (const line of ideaLines) {
+      try {
+        const r = JSON.parse(line);
+        if (r.ping_id === pingId && r.id) { matchedIdeaId = r.id; break; }
+      } catch {}
+    }
+    if (matchedIdeaId) {
+      const reactionRecord = {
+        id: matchedIdeaId,
+        reaction: norm,
+        reacted_at: new Date().toISOString(),
+        ping_id: pingId,
+      };
+      fs.appendFileSync(ideasFile, JSON.stringify(reactionRecord) + '\n');
+      console.log(c.dim(`  → linked to idea ${matchedIdeaId}`));
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(c.dim(`  (idea-link warn: ${e.message})`));
+  }
+}
+
+function cmdHumRuns(args) {
+  const tailStr = getFlag(args, '--tail', '10');
+  const tail = Math.max(1, parseInt(tailStr, 10) || 10);
+  let raw;
+  try { raw = fs.readFileSync(HUM_RUNS, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') { console.log(c.dim('(no runs yet)')); return; } throw e; }
+  const lines = raw.split('\n').filter(Boolean);
+  const recent = lines.slice(-tail);
+  if (!recent.length) { console.log(c.dim('(no runs yet)')); return; }
+  const rows = recent.map(line => {
+    try {
+      const r = JSON.parse(line);
+      const modeColor = r.mode === 'ping' ? c.green : (r.mode === 'error' ? c.red : c.dim);
+      return {
+        ts: String(r.ts || '').slice(0, 19),
+        mode: modeColor(r.mode || '?'),
+        // Current trace (hum.md Step 4) nests the ranker verdict under
+        // `sonnet.*`; the flat top_score/decision/deferral_reason fields are
+        // the pre-2026-07 shape, kept as a fallback for old rows.
+        lane: (r.sonnet && r.sonnet.based_on_topic) || r.lane_rotated || '—',
+        top: (() => { const s = r.sonnet && typeof r.sonnet.score === 'number' ? r.sonnet.score : r.top_score; return typeof s === 'number' ? s.toFixed(2) : '—'; })(),
+        decision: (r.sonnet && r.sonnet.decision) || r.decision || '—',
+        reason: (r.sonnet && r.sonnet.silent_root_cause) || (r.outcome && r.outcome.downgrade_reason) || r.deferral_reason || c.dim('—'),
+      };
+    } catch { return { ts: c.dim('(unparsable)'), mode: '', lane: '', top: '', decision: '', reason: '' }; }
+  });
+  console.log(table(rows, ['ts', 'mode', 'lane', 'top', 'decision', 'reason']));
+}
+
+function cmdHumReview(args) {
+  const sinceStr = getFlag(args, '--since', '7d');
+  const m = String(sinceStr).match(/^(\d+)([hd])$/);
+  const since = new Date();
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (m[2] === 'h') since.setHours(since.getHours() - n);
+    else since.setDate(since.getDate() - n);
+  } else { since.setDate(since.getDate() - 7); }
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBK, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') { console.log(c.dim('(no feedback log yet)')); return; } throw e; }
+  const lines = raw.split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+                       .filter(e => e.sent_at && new Date(e.sent_at) >= since);
+  console.log(c.bold(`Hum review — since ${since.toLocaleString()}`) + '\n');
+  console.log(`  total pings: ${entries.length}`);
+  const byLane = {}, byReact = { helpful: 0, skip: 0, snooze: 0, more: 0, silence: 0, none: 0 };
+  for (const e of entries) {
+    byLane[e.lane] = (byLane[e.lane] || 0) + 1;
+    const r = e.reaction || (e.reaction_at ? 'silence' : 'none');
+    byReact[r] = (byReact[r] || 0) + 1;
+  }
+  console.log('\n  ' + c.bold('By reaction:'));
+  for (const [k, v] of Object.entries(byReact)) console.log(`    ${k}: ${v}`);
+  console.log('\n  ' + c.bold('By lane:'));
+  for (const [k, v] of Object.entries(byLane)) console.log(`    ${k}: ${v}`);
+}
+
+function cmdHumTest(args) {
+  const lane = getFlag(args, '--lane', null);
+  const payload = lane ? JSON.stringify({ job: 'hum', force_lane: lane }) : JSON.stringify({ job: 'hum' });
+  console.log(c.dim(`Dispatching hum to http://localhost:9092 (bypasses jitter)...`));
+  const res = shSafe(`curl -sf --max-time 5 -X POST http://localhost:9092 -H "Content-Type: application/json" -d '${payload}'`);
+  if (res === null) die('dispatch failed — is the ops supervisor running? Check: edva status');
+  console.log(c.green('Dispatched.') + ' Tail progress: ' + c.dim('edva hum runs --tail 5'));
+}
+
+// Passthrough to the situational trigger engine — `edva hum sense status`
+// is the same thing as `hum-sense status`, and lives here so the whole hum
+// subsystem is discoverable from one place.
+function cmdHumSense(args) {
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(path.join(TOOLS, 'bin/hum-sense'), args.length ? args : ['status'], { stdio: 'inherit' });
+  process.exit(r.status ?? 0);
+}
+
+function cmdHumTune(args) {
+  const s = loadHumState();
+  console.log(c.bold('Hum tuning') + '\n');
+  console.log(`  min_ping_interval_minutes: ${enforcedPingCaps().minIntervalMin}`);
+  console.log(`  max_pings_per_day: ${enforcedPingCaps().maxPerDay}`);
+  console.log(`  schema_version: ${s.schema_version ?? 1}`);
+  console.log(c.dim('\nThe ping budget is enforced in code (lib/ping-budget.mjs; env HUM_MAX_PINGS_PER_DAY /'));
+  console.log(c.dim('HUM_MIN_PING_INTERVAL_MIN); the two fields in ' + HUM_STATE + ' are ignored.'));
+  console.log(c.dim('Weekly hum-review proposes tuning based on reactions + answer rates.'));
+}
+
+// --- cost ---
+function cmdCost(args) {
+  const data = shSafe('curl -sf --max-time 3 http://127.0.0.1:9093/cost');
+  if (!data) { die('supervisor not reachable on :9093. Is the ops-supervisor running?'); return; }
+  const j = JSON.parse(data);
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(j, null, 2)); return; }
+  console.log(c.bold('Ops Agent Cost') + '\n');
+  console.log(`  today:   $${j.todayUsd?.toFixed(4) || '0.0000'}`);
+  console.log(`  week:    $${j.weekUsd?.toFixed(4) || '0.0000'}`);
+  console.log(`  total:   $${j.totalUsd?.toFixed(4) || '0.0000'}`);
+  if (j.perModel && Object.keys(j.perModel).length) {
+    console.log(`\n  ${c.bold('Per model:')}`);
+    for (const [m, cost] of Object.entries(j.perModel)) {
+      console.log(`    ${m}: $${cost.toFixed(4)}`);
+    }
+  }
+  console.log(`  entries: ${j.entries || 0}`);
+}
+
+const HUM_PENDING_Q = installTools("data/hum-pending-question.json");
+const HUM_LEARNINGS = installTools("data/hum-learnings.jsonl");
+const HUM_ANSWER_BIN = installTools("bin/hum-answer");
+
+function cmdHumQuestion(args) {
+  try {
+    const raw = require('fs').readFileSync(HUM_PENDING_Q, 'utf8').trim();
+    if (!raw || raw === 'null') { console.log(c.dim('(no pending question)')); return; }
+    const q = JSON.parse(raw);
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(q, null, 2)); return; }
+    console.log(c.bold('Pending Question') + '\n');
+    console.log(`  id:           ${q.id}`);
+    console.log(`  asked_at:     ${q.asked_at}`);
+    console.log(`  expires_at:   ${q.expires_at}`);
+    console.log(`  subject:      ${q.subject}`);
+    console.log(`  memory_hook:  ${q.memory_hook}`);
+    console.log(`\n  ${q.question}`);
+  } catch (e) {
+    if (e.code === 'ENOENT') { console.log(c.dim('(no pending question)')); return; }
+    throw e;
+  }
+}
+
+function cmdHumLearn(args) {
+  const [id, ...rest] = args;
+  const answer = rest.join(' ').trim();
+  if (!id || !answer) die('hum learn <id> <answer>');
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(HUM_ANSWER_BIN, [id, answer], { encoding: 'utf8' });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status ?? 0);
+}
+
+function cmdHumLearnings(args) {
+  let n = 10;
+  for (let i = 0; i < args.length; i++) if (args[i] === '--tail' && args[i + 1]) n = parseInt(args[++i], 10);
+  try {
+    const lines = require('fs').readFileSync(HUM_LEARNINGS, 'utf8').trim().split('\n').filter(Boolean);
+    const tail = lines.slice(-n);
+    if (hasFlag(args, '--json')) { console.log(tail.join('\n')); return; }
+    console.log(c.bold(`Last ${tail.length} hum learnings`) + '\n');
+    for (const line of tail) {
+      const r = JSON.parse(line);
+      const d = new Date(r.answered_at).toLocaleString();
+      console.log(`${c.dim(d)}  ${c.bold(r.subject)}  [${r.memory_hook}]`);
+      console.log(`  Q: ${r.question.slice(0, 140)}`);
+      console.log(`  A: ${r.answer.slice(0, 200)}\n`);
+    }
+  } catch (e) {
+    if (e.code === 'ENOENT') { console.log(c.dim('(no learnings yet)')); return; }
+    throw e;
+  }
+}
+
+// Composite situation snapshot for hum. Gathers where/environment/time/
+// activity/next/working-on signals. Cached 2 min in TMPDIR so multiple
+// callers within a tick share one computation.
+const SITUATION_CACHE = path.join(process.env.TMPDIR || '/tmp', 'edva-situation.json');
+
+function readJsonSafe(p) {
+  try { return JSON.parse(require('fs').readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+function buildSituation() {
+  const fs = require('fs');
+  const tz = readJsonSafe(path.join(TOOLS, 'data/user-timezone.json'))?.timezone || instance().tz;
+  const cursor = readJsonSafe(path.join(TOOLS, 'data/phone-channel-cursor.json'));
+  const lastInboundMs = cursor?.lastSeenAt ? Date.now() - new Date(cursor.lastSeenAt).getTime() : null;
+  const inboundMinAgo = lastInboundMs !== null ? Math.round(lastInboundMs / 60000) : null;
+  const lastOut = readJsonSafe(path.join(TOOLS, 'data/last-edva-message-at.json'));
+  const outboundMinAgo = lastOut?.ts ? Math.round((Date.now() - new Date(lastOut.ts).getTime()) / 60000) : null;
+
+  const activity = inferActivityState();
+
+  // Phone context (audio + motion) — returns null if stale / absent
+  let phoneCtx = null;
+  try {
+    phoneCtx = JSON.parse(shSafe(
+      `node -e "require('${path.join(TOOLS, 'lib/phone-context.js')}').getLatest().then(r=>console.log(JSON.stringify(r)))"`
+    ) || 'null');
+  } catch {}
+
+  // Sleep/wake — actual wake time today + last-active yesterday, from the
+  // installation's own sleep signal (cliExt().sleepInfo) when it has one.
+  let sleepInfo = null;
+  try {
+    if (typeof cliExt().sleepInfo === 'function') sleepInfo = cliExt().sleepInfo({ TOOLS, shSafe }) || null;
+  } catch {}
+
+  // Current location via findme (single call; cached by findme itself)
+  let location = null;
+  try {
+    // `locate me` = the owner's own phone (findme treats it exactly like the owner's name).
+    const raw = shSafe(`"${path.join(TOOLS, 'bin/findme')}" locate me --json`);
+    location = JSON.parse(raw || 'null');
+  } catch {}
+
+  // Scheduled presence from the canonical travel timeline — the authoritative
+  // answer to "where is the user". findme is a live GPS/device signal and goes
+  // null whenever the phone is stale, which is exactly when hum most needs to
+  // know: once the situation snapshot carried where_place=null while
+  // `travel where` had the correct city, and hum shipped a ping asserting
+  // a different one. Always resolve it (cheap, one query) and expose it
+  // separately so consumers can tell the GPS reading from the itinerary.
+  let scheduled = null;
+  try {
+    const raw = shSafe(`"${path.join(TOOLS, 'bin/travel')}" where now --json 2>/dev/null`);
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && parsed.metro) scheduled = parsed;
+  } catch {}
+
+  // Today's git commits (topic extraction)
+  let todayCommits = [];
+  try {
+    const out = shSafe(`cd ${installRoot()} && git log --oneline --since="today 00:00" --no-color 2>/dev/null`);
+    todayCommits = (out || '').trim().split('\n').filter(Boolean).slice(0, 20);
+  } catch {}
+
+  // This-week commit topics — compact word-frequency of the last 7d commits'
+  // subject lines (minus prefixes like "feat:"/"fix:" and small words). Top 5.
+  let weekTopics = [];
+  try {
+    const raw = shSafe(`cd ${installRoot()} && git log --since="7 days ago" --pretty=%s --no-color 2>/dev/null`) || '';
+    const stop = new Set(['the','and','for','with','from','into','that','this','add','adds','added','fix','fixes','fixed','update','updates','updated','feat','chore','docs','test','tests','when','what','have','has','not','now','new','use','uses','used','one','two','all','any','via','per']);
+    const freq = {};
+    for (const line of raw.split('\n')) {
+      const cleaned = line.replace(/^[a-z]+(\([^)]+\))?:/i, '').toLowerCase();
+      for (const w of cleaned.split(/[^a-z0-9-]+/)) {
+        if (w.length < 4 || stop.has(w)) continue;
+        freq[w] = (freq[w] || 0) + 1;
+      }
+    }
+    weekTopics = Object.entries(freq).sort((a,b) => b[1]-a[1]).slice(0, 5).map(([w]) => w);
+  } catch {}
+
+  // Weather, cached via apple-weather — skip if binary missing
+  let weather = null;
+  try {
+    const w = shSafe(`"${path.join(TOOLS, 'bin/apple-weather')}" --findme --json 2>/dev/null`);
+    if (w) {
+      const parsed = JSON.parse(w);
+      const cur = parsed?.currentWeather || parsed?.current || null;
+      if (cur) weather = { temp_f: cur.temperature != null ? (cur.temperature * 9) / 5 + 32 : null, condition: cur.conditionCode, uv: cur.uvIndex };
+    }
+  } catch {}
+
+  // HID idle time — minutes since last keyboard/mouse/trackpad input on this
+  // Mac. Signals "at desk actively" vs "stepped away / on phone / in a
+  // meeting." `ioreg` returns nanoseconds.
+  let atDeskMin = null;
+  try {
+    const raw = shSafe(`ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/ {print $NF; exit}'`);
+    const ns = parseInt(raw, 10);
+    if (Number.isFinite(ns)) atDeskMin = Math.round(ns / 1e9 / 60);
+  } catch {}
+
+  // Next — what's coming up. Calendar events in [+0, +120min] plus today's
+  // tasks summary. Feeds Sonnet's relevance overlay ("meeting in 30 min"
+  // trumps most other candidates).
+  let upcomingEvents = [];
+  try {
+    const raw = shSafe(`/opt/homebrew/bin/gog calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
+    const data = JSON.parse(raw || '{}');
+    const events = data?.events || data?.items || [];
+    const now = Date.now();
+    const horizon = now + 2 * 3600 * 1000;
+    upcomingEvents = events
+      .map((e) => {
+        const start = new Date(e.start?.dateTime || e.start?.date || 0).getTime();
+        const end = new Date(e.end?.dateTime || e.end?.date || 0).getTime();
+        return { start, end, summary: e.summary || '(no title)', location: e.location || null };
+      })
+      .filter((e) => e.start && e.start >= now - 5 * 60000 && e.start <= horizon)
+      .slice(0, 3)
+      .map((e) => ({
+        in_min: Math.round((e.start - now) / 60000),
+        duration_min: Math.max(0, Math.round((e.end - e.start) / 60000)),
+        summary: e.summary,
+        location: e.location,
+      }));
+  } catch {}
+
+  // Due-today + overdue tasks — lightweight counts + top-3 titles
+  let dueToday = [], overdueCount = 0;
+  try {
+    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
+    const today = new Date().toISOString().slice(0, 10);
+    for (const line of plain.split('\n').filter(Boolean)) {
+      if (line.includes('completed')) continue;
+      const m = line.match(/(\d{4}-\d{2}-\d{2})/);
+      if (!m) continue;
+      if (m[1] < today) overdueCount++;
+      else if (m[1] === today) {
+        // gog --plain is TSV; title is field 2
+        const parts = line.split('\t');
+        dueToday.push((parts[1] || line).slice(0, 80));
+      }
+    }
+    dueToday = dueToday.slice(0, 3);
+  } catch {}
+
+  // `findme locate --json` emits a LIST of device records — `_print_devices`
+  // does `print(json.dumps(out))` over `matched` — and each record is keyed
+  // `lat`/`lon`, with the reverse-geocoded name under `place`.
+  //
+  // This block read `location.latitude` off the list. Two independent
+  // mismatches (array-vs-object, and latitude-vs-lat), so `where.lat` and
+  // `where.lon` were ALWAYS null on this path — not when the phone went quiet,
+  // always. Every location-aware lane reads those two fields, so `nearby` and
+  // `dining` path (a) could never fire: the 2026-08-04 debug trace shows
+  // "nearby lane itself found nothing" on every single tick, all day, while the
+  // app was posting a fresh fix every few minutes (183 rows into
+  // location_history in 12h, plus lat/lon on every chat message).
+  //
+  // The failure was invisible because `place` still populated — from
+  // `scheduled?.label`, the travel timeline — so the snapshot looked healthy
+  // ("<City>, <Country> — <lodging name>…") while carrying no coordinates at all. It
+  // even self-reported `place_source: "travel_timeline"`, which was the tell.
+  //
+  // findme itself was never the problem: `cmd_locate` already prefers the
+  // Edva app's live GPS over iCloud and returns without touching Find My.
+  // The consumer just never unwrapped what it handed back.
+  const device = Array.isArray(location) ? location[0] : location;
+  // Accept both spellings so this cannot break again if the emitter changes.
+  const devLat = device?.lat ?? device?.latitude ?? null;
+  const devLon = device?.lon ?? device?.longitude ?? null;
+  const devPlace = device?.place || device?.place_name || device?.placeName || null;
+
+  return {
+    where: {
+      lat: devLat,
+      lon: devLon,
+      // Live device reading first; fall back to the itinerary so `place` is
+      // never null just because the phone went quiet.
+      place: devPlace || scheduled?.label || scheduled?.metro || null,
+      place_source: devPlace ? 'device' : (scheduled ? 'travel_timeline' : null),
+      // Always present when the timeline knows: the AUTHORITATIVE city for
+      // today, independent of GPS freshness. Any candidate asserting the user is
+      // somewhere else is wrong — see lib/claim-facts.mjs.
+      scheduled_metro: scheduled?.metro || null,
+      scheduled_label: scheduled?.label || null,
+      companions: device?.companions || [],
+      activity: device?.activity || null,
+      // Reverse-geocoded country, straight from findme. Cheap to carry and it
+      // is what picks the right Wikipedia edition for local lore lookups — a
+      // local edition often has an article on a small street that en does not.
+      country: device?.country || null,
+      city: device?.city || null,
+    },
+    environment: {
+      weather,
+      audio_class: phoneCtx?.fresh ? phoneCtx.audio_class : null,
+      db_bucket: phoneCtx?.fresh ? phoneCtx.ambient_db_bucket : null,
+      motion_class: phoneCtx?.motion_class || null,
+      phone_context_age_min: phoneCtx?.age_min ?? null,
+    },
+    time: {
+      local_hour: activity.local_hour,
+      tz: activity.local_tz,
+      activity_state: activity.state,
+      inbound_min_ago: inboundMinAgo,
+      outbound_min_ago: outboundMinAgo,
+      wake_time_today: sleepInfo?.wake_time_today || null,
+      sleep_time_yesterday: sleepInfo?.sleep_time_yesterday || null,
+      asleep_now: sleepInfo?.asleep_now || false,
+    },
+    now_activity: {
+      at_desk_min: atDeskMin,
+    },
+    next: {
+      upcoming_events: upcomingEvents,
+      tasks_due_today: dueToday,
+      overdue_count: overdueCount,
+    },
+    working_on: {
+      today_commits: todayCommits,
+      week_commit_topics: weekTopics,
+    },
+  };
+}
+
+function cmdHumSituation(args) {
+  const fs = require('fs');
+  let snap = null;
+  try {
+    const stat = fs.statSync(SITUATION_CACHE);
+    if (Date.now() - stat.mtimeMs < 120 * 1000) {
+      snap = JSON.parse(fs.readFileSync(SITUATION_CACHE, 'utf8'));
+    }
+  } catch {}
+  if (!snap || hasFlag(args, '--fresh')) {
+    snap = buildSituation();
+    try { fs.writeFileSync(SITUATION_CACHE, JSON.stringify(snap)); } catch {}
+  }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(snap, null, 2)); return; }
+  console.log(c.bold('Situation') + '\n');
+  console.log(`  where:    ${snap.where.place || '—'}  (${snap.where.lat?.toFixed(3)}, ${snap.where.lon?.toFixed(3)})`);
+  if (snap.where.companions?.length) console.log(`  with:     ${snap.where.companions.join(', ')}`);
+  console.log(`  activity: ${snap.where.activity || '—'}`);
+  console.log(`  state:    ${snap.time.activity_state}  (${snap.time.local_hour}:00 ${snap.time.tz})`);
+  console.log(`  inbound:  ${snap.time.inbound_min_ago ?? '—'} min ago   outbound: ${snap.time.outbound_min_ago ?? '—'} min ago`);
+  if (snap.time.wake_time_today) {
+    console.log(`  woke:     ${snap.time.wake_time_today.hm}  (${snap.time.wake_time_today.source})`);
+  }
+  if (snap.time.sleep_time_yesterday) {
+    console.log(`  to bed:   ${snap.time.sleep_time_yesterday.hm} y'day  (${snap.time.sleep_time_yesterday.source})`);
+  }
+  if (snap.environment.weather) console.log(`  weather:  ${snap.environment.weather.temp_f}F ${snap.environment.weather.condition}`);
+  if (snap.environment.audio_class) console.log(`  audio:    ${snap.environment.audio_class}  (${snap.environment.db_bucket || '—'})`);
+  if (snap.environment.motion_class) console.log(`  motion:   ${snap.environment.motion_class}`);
+  if (snap.now_activity?.at_desk_min !== null && snap.now_activity?.at_desk_min !== undefined) {
+    const d = snap.now_activity.at_desk_min;
+    console.log(`  at desk:  ${d < 2 ? c.green('active now') : d + ' min idle'}`);
+  }
+  if (snap.next?.upcoming_events?.length) {
+    console.log('\n  ' + c.bold('Next:'));
+    for (const e of snap.next.upcoming_events) {
+      const when = e.in_min < 0 ? 'started' : `in ${e.in_min}m`;
+      console.log(`    ${when}  ${e.summary}${e.location ? ' @ ' + e.location : ''}`);
+    }
+  }
+  if (snap.next?.tasks_due_today?.length || snap.next?.overdue_count) {
+    console.log(`  tasks:    ${snap.next.overdue_count} overdue, ${snap.next.tasks_due_today?.length || 0} due today`);
+  }
+  if (snap.working_on.today_commits?.length) {
+    console.log(`  today commits: ${snap.working_on.today_commits.length}`);
+  }
+  if (snap.working_on.week_commit_topics?.length) {
+    console.log(`  week topics:   ${snap.working_on.week_commit_topics.join(', ')}`);
+  }
+}
+
+// Insight — aggregate the enriched tick trace into metrics mirroring the
+// intent file in data/hum-intent.md. Read-only; hum-review uses the
+// same computations against its own window.
+// Drift audit — compare outcome.sent=true in hum-runs.jsonl vs hum-feedback
+// entries in the same window. They should be 1:1. Non-zero delta means the
+// send+log plumbing is dropping rows (the 2026-04-11..15 regression this
+// whole subsystem was hardened to prevent).
+function cmdHumAudit(args) {
+  let windowHours = 24;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--window' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) windowHours = parseInt(m[1], 10) * (m[2] === 'd' ? 24 : 1);
+    }
+  }
+  const asJson = hasFlag(args, '--json');
+  const cutoff = Date.now() - windowHours * 3600 * 1000;
+
+  function parseJsonl(p) {
+    try {
+      return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+    } catch (e) {
+      if (e.code === 'ENOENT') return [];
+      throw e;
+    }
+  }
+
+  const runs = parseJsonl(HUM_RUNS);
+  const feedback = parseJsonl(HUM_FEEDBK);
+
+  // A run "sent" if outcome.sent === true (new schema) OR decision === 'PING'
+  // with a ping_id (legacy schema, pre-2026-04-15 rewrite). Accept `ts` or
+  // `ran_at` as the timestamp key, and normalize `decision` case — historical
+  // rows have varied in both dimensions.
+  const sentPings = runs.filter((r) => {
+    const ts = Date.parse(r.ts || r.ran_at || '');
+    if (!Number.isFinite(ts) || ts < cutoff) return false;
+    const newSchema = r.outcome?.sent === true && r.outcome.ping_id;
+    const legacy = String(r.decision || '').toUpperCase() === 'PING' && r.ping_id;
+    return newSchema || legacy;
+  }).map((r) => r.outcome?.ping_id || r.ping_id);
+
+  const feedbackPings = feedback.filter((r) => {
+    const ts = Date.parse(r.sent_at || '');
+    return Number.isFinite(ts) && ts >= cutoff;
+  }).map((r) => r.ping_id);
+
+  const sentSet = new Set(sentPings);
+  const feedbackSet = new Set(feedbackPings);
+  const missingFeedback = [...sentSet].filter((id) => !feedbackSet.has(id));
+  const orphanFeedback = [...feedbackSet].filter((id) => !sentSet.has(id));
+  const drift = missingFeedback.length + orphanFeedback.length;
+
+  const report = {
+    window_hours: windowHours,
+    cutoff_iso: new Date(cutoff).toISOString(),
+    pings_sent_in_runs: sentPings.length,
+    pings_logged_in_feedback: feedbackPings.length,
+    missing_feedback_for_sent: missingFeedback,
+    orphan_feedback_no_run: orphanFeedback,
+    drift_count: drift,
+    healthy: drift === 0,
+  };
+
+  if (asJson) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const mark = drift === 0 ? c.green('OK') : c.red('DRIFT');
+    console.log(`${c.bold('hum audit')} (last ${windowHours}h) — ${mark}`);
+    console.log(`  sent in runs:      ${report.pings_sent_in_runs}`);
+    console.log(`  logged in feedback: ${report.pings_logged_in_feedback}`);
+    if (missingFeedback.length) {
+      console.log(c.red(`  missing feedback (${missingFeedback.length}):`));
+      for (const id of missingFeedback) console.log(`    ${id}`);
+    }
+    if (orphanFeedback.length) {
+      console.log(c.yellow(`  orphan feedback (${orphanFeedback.length}):`));
+      for (const id of orphanFeedback) console.log(`    ${id}`);
+    }
+  }
+
+  process.exit(drift === 0 ? 0 : 1);
+}
+
+function cmdHumInsight(args) {
+  const fs = require('fs');
+  let sinceDays = 7;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) sinceDays = parseInt(m[1], 10) * (m[2] === 'h' ? 1 / 24 : 1);
+    }
+  }
+  const cutoff = Date.now() - sinceDays * 24 * 3600 * 1000;
+
+  let runs = [], feedback = [], learnings = [];
+  try {
+    runs = fs.readFileSync(HUM_RUNS, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.ts).getTime() >= cutoff);
+  } catch {}
+  try {
+    feedback = fs.readFileSync(HUM_FEEDBK, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.sent_at || r.ts || 0).getTime() >= cutoff);
+  } catch {}
+  try {
+    learnings = fs.readFileSync(HUM_LEARNINGS, 'utf8').trim().split('\n').filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean).filter((r) => new Date(r.answered_at || 0).getTime() >= cutoff);
+  } catch {}
+
+  const total = runs.length;
+  if (total === 0) {
+    console.log(c.dim(`No tick traces in the last ${sinceDays}d.`));
+    return;
+  }
+  const bucket = { silent: 0, info: 0, question: 0, error: 0 };
+  const perTopicCandidates = {}, perTopicWins = {}, perTopicErrors = {};
+  const scoreDist = [];
+  let sent = 0, downgrades = 0, bashGated = 0; // bashGated approximated by "no candidates AND no sonnet call"
+  let meetingSuppressed = 0;
+
+  for (const r of runs) {
+    const d = r.sonnet?.decision || 'error';
+    bucket[d] = (bucket[d] || 0) + 1;
+    if (r.outcome?.sent) sent++;
+    if (r.outcome?.downgrade_reason) downgrades++;
+    // harvest.candidates/errors are normally arrays, but a schema variant has
+    // written `candidates` as an int (a count) — `|| []` doesn't guard a truthy
+    // non-array, so `for...of` on an int throws. Guard with Array.isArray.
+    const cands = Array.isArray(r.harvest?.candidates) ? r.harvest.candidates : [];
+    for (const c of cands) {
+      const t = c && typeof c === 'object' ? c.topic : null;
+      if (t) perTopicCandidates[t] = (perTopicCandidates[t] || 0) + 1;
+    }
+    const errs = Array.isArray(r.harvest?.errors) ? r.harvest.errors : [];
+    for (const e of errs) {
+      const t = e && typeof e === 'object' ? e.topic : null;
+      if (t) perTopicErrors[t] = (perTopicErrors[t] || 0) + 1;
+    }
+    if (r.sonnet?.based_on_topic) {
+      perTopicWins[r.sonnet.based_on_topic] = (perTopicWins[r.sonnet.based_on_topic] || 0) + 1;
+    }
+    if (typeof r.sonnet?.score === 'number') scoreDist.push(r.sonnet.score);
+  }
+
+  const silentRate = bucket.silent / total;
+  const reactedCount = feedback.filter((f) => f.reaction).length;
+  const positive = feedback.filter((f) => ['helpful', 'more', '👍'].includes(f.reaction)).length;
+  const negative = feedback.filter((f) => ['skip', 'snooze', '👎', '💤'].includes(f.reaction)).length;
+  const responseRate = feedback.length ? reactedCount / feedback.length : 0;
+  const positiveRate = (positive + negative) ? positive / (positive + negative) : 0;
+  const answerRate = bucket.question ? learnings.length / bucket.question : 0;
+
+  // hum-review Step 3 criteria table, computed here (2026-10-04) so the review
+  // turn quotes PASS/FAIL instead of re-deriving arithmetic by hand. Rows that
+  // need a judgement or a source this CLI does not read (attention hit-rate,
+  // LLM-invocation efficiency, the wiki half of memory growth) come back as
+  // status "MODEL" with a note — the review fills those in.
+  const answerMins = learnings
+    .map((l) => (Date.parse(l.answered_at || '') - Date.parse(l.asked_at || '')) / 60000)
+    .filter((m) => Number.isFinite(m) && m >= 0)
+    .sort((a, b) => a - b);
+  const medianAnswerMin = answerMins.length ? answerMins[Math.floor(answerMins.length / 2)] : null;
+  const subjectTicks = {};
+  for (const r of runs) {
+    const subj = r.sonnet?.subject;
+    if (subj && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
+  }
+  const dupSubjects = Object.entries(subjectTicks).filter(([, n]) => n > 1).map(([k, n]) => ({ subject: k, ticks: n }));
+  const perTopicAttempts = {};
+  for (const r of runs) {
+    for (const t of Array.isArray(r.harvest?.attempted) ? r.harvest.attempted : []) perTopicAttempts[t] = (perTopicAttempts[t] || 0) + 1;
+  }
+  const errRates = Object.keys(perTopicErrors).map((t) => ({
+    topic: t, errors: perTopicErrors[t], attempts: perTopicAttempts[t] || (perTopicCandidates[t] || 0) + perTopicErrors[t],
+  })).map((x) => ({ ...x, rate: x.attempts ? x.errors / x.attempts : 1 }));
+  const worstErr = errRates.sort((a, b) => b.rate - a.rate)[0] || null;
+  const grade = (value, ok) => (value == null ? 'N/A' : ok ? 'PASS' : 'FAIL');
+  const criteria = [
+    { criterion: 'Silent rate', value: silentRate, target: '>= 0.85', status: grade(silentRate, silentRate >= 0.85) },
+    { criterion: 'Info positive rate', value: (positive + negative) ? positiveRate : null, target: '>= 0.60', status: grade((positive + negative) ? positiveRate : null, positiveRate >= 0.60) },
+    { criterion: 'Info response rate', value: feedback.length ? responseRate : null, target: '>= 0.30', status: grade(feedback.length ? responseRate : null, responseRate >= 0.30) },
+    { criterion: 'Question answer rate', value: bucket.question ? answerRate : null, target: '>= 0.40', status: grade(bucket.question ? answerRate : null, answerRate >= 0.40) },
+    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: '<= 30', status: grade(medianAnswerMin, medianAnswerMin <= 30) },
+    { criterion: 'Subject dedup', value: dupSubjects.length, detail: dupSubjects, target: '= 0', status: grade(dupSubjects.length, dupSubjects.length === 0) },
+    { criterion: 'Harvester error rate (worst topic)', value: worstErr ? worstErr.rate : 0, detail: errRates, target: '<= 0.10', status: grade(0, !worstErr || worstErr.rate <= 0.10) },
+    { criterion: 'Memory growth', value: learnings.length, target: '>= 3 per week', status: 'MODEL', note: `hum-learnings rows only (${learnings.length}); add wiki pages updated in-window` },
+    { criterion: 'Attention hit-rate', value: null, target: '>= 0.70', status: 'MODEL', note: 'needs week_commit_topics / upcoming events / 👍-history judgement' },
+    { criterion: 'LLM-invocation efficiency', value: null, target: '>= 0.40', status: 'MODEL', note: 'bash-gated skips live in watchdog.log' },
+  ];
+
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({
+      window_days: sinceDays,
+      total, silent_rate: silentRate, bucket,
+      info_sent: sent, downgrades,
+      info_response_rate: responseRate, info_positive_rate: positiveRate,
+      questions_asked: bucket.question, questions_answered: learnings.length, answer_rate: answerRate,
+      median_time_to_answer_min: medianAnswerMin,
+      per_topic_candidates: perTopicCandidates, per_topic_wins: perTopicWins, per_topic_errors: perTopicErrors,
+      criteria,
+    }, null, 2));
+    return;
+  }
+
+  console.log(c.bold(`Hum insight — last ${sinceDays}d`) + '\n');
+  console.log(`  ticks:           ${total}`);
+  console.log(`  silent:          ${bucket.silent}  (${(silentRate * 100).toFixed(1)}%)  ${silentRate >= 0.85 ? c.green('✓ intent') : c.yellow('below 0.85')}`);
+  console.log(`  info:            ${bucket.info} (sent ${sent}, downgraded ${downgrades})`);
+  console.log(`  question:        ${bucket.question}  (answered ${learnings.length}, rate ${(answerRate * 100).toFixed(0)}%)  ${answerRate >= 0.4 ? c.green('✓ intent') : c.yellow('below 0.40')}`);
+  if (bucket.error) console.log(`  ${c.red('error:          ' + bucket.error)}`);
+
+  console.log('\n  ' + c.bold('Info reactions'));
+  console.log(`    response rate:  ${(responseRate * 100).toFixed(0)}%  ${responseRate >= 0.30 ? c.green('✓') : c.yellow('below 0.30')}`);
+  console.log(`    positive rate:  ${(positiveRate * 100).toFixed(0)}%  (${positive}👍 / ${negative}👎)  ${positiveRate >= 0.60 ? c.green('✓') : c.yellow('below 0.60')}`);
+
+  console.log('\n  ' + c.bold('Per-topic hit rate (wins ÷ candidates)'));
+  const topics = Object.keys(perTopicCandidates).sort();
+  for (const t of topics) {
+    const cand = perTopicCandidates[t] || 0;
+    const wins = perTopicWins[t] || 0;
+    const errs = perTopicErrors[t] || 0;
+    const attempts = cand + errs;
+    const hit = cand ? (wins / cand * 100).toFixed(0) + '%' : '—';
+    const errRate = attempts ? (errs / attempts * 100).toFixed(0) + '%' : '0%';
+    const errColor = errs / (attempts || 1) > 0.1 ? c.yellow : c.dim;
+    console.log(`    ${t.padEnd(18)} cand=${String(cand).padStart(3)}  wins=${String(wins).padStart(3)} (${hit})  ${errColor('err=' + errs + ' (' + errRate + ')')}`);
+  }
+
+  if (scoreDist.length) {
+    scoreDist.sort((a, b) => a - b);
+    const med = scoreDist[Math.floor(scoreDist.length / 2)];
+    const p90 = scoreDist[Math.floor(scoreDist.length * 0.9)];
+    console.log('\n  ' + c.bold('Sonnet score distribution') + `  median=${med.toFixed(2)}  p90=${p90.toFixed(2)}  (threshold 0.55)`);
+  }
+
+  console.log('\n  ' + c.bold('Intent criteria (hum-review Step 3)'));
+  for (const k of criteria) {
+    const v = k.value == null ? '—' : (typeof k.value === 'number' && !Number.isInteger(k.value) ? k.value.toFixed(2) : String(k.value));
+    const col = k.status === 'PASS' ? c.green : k.status === 'FAIL' ? c.red : c.dim;
+    console.log(`    ${k.criterion.padEnd(36)} ${v.padStart(6)}  ${k.target.padEnd(14)} ${col(k.status)}`);
+  }
+}
+
+// edva hum reactions — per-lane reaction-rate detection (backloop
+// variant). Hum surfaces a finding through TWO channels, and a lane
+// can live in either, so this reads two ledgers:
+//
+//   1. INFO pings — data/hum-feedback.jsonl, the per-ping ledger every
+//      hum info-send appends to (one row per ping: {ping_id, sent_at, lane,
+//      reaction, reaction_at, ...}) — the same file `edva hum insight`
+//      already reads. Engagement = a non-null `reaction` (a tapback token).
+//   2. QUESTIONS — data/hum-runs.jsonl rows whose `sonnet.decision` is
+//      "question". These never get a hum-feedback.jsonl row at all; their
+//      answers land in data/hum-learnings.jsonl (written by
+//      bin/hum-answer), keyed by the run's `outcome.question_id`.
+//      Engagement = that id appearing in hum-learnings.jsonl.
+//
+// For each lane in the window:
+//   surfaced  = info_surfaced + question_surfaced
+//   reacted   = info_reacted  + question_answered
+//   positive  = reaction ∈ {helpful, more, 👍}   (same vocabulary as insight)
+//   negative  = reaction ∈ {skip, snooze, 👎, 💤}
+//   other     = engaged without valence — includes every answered question
+//
+// response_rate = reacted / surfaced (how often the user engages with the lane)
+// positive_rate = positive / (positive + negative) (how often engagement is positive)
+//
+// Flags a lane as DECAYING when surfaced >= 3 AND response_rate < 0.10
+// (lots of pings, no engagement) or when info_surfaced >= 5 AND
+// positive_rate < 0.40 (the user reacts but mostly negatively). hum-review
+// reads --json output to surface decay candidates per topic.
+//
+// Previously sourced from data/suggestion-history.jsonl's `kind:"surfaced"`
+// rows keyed by subject_key — but nothing in the current codebase writes that
+// kind (appendSurfaced in lib/suggestion-history.mjs has no callers), so
+// `surfaced` there was frozen near zero while `hum insight` (sourced from
+// hum-runs.jsonl + hum-feedback.jsonl) kept counting normally. That produced
+// the >30x disagreement flagged in the 2026-07-26 hum-review (Proposal 5).
+// hum-feedback.jsonl is populated on every real send and already carries
+// `lane` directly (no subject_key-prefix guessing needed), so it's both the
+// more complete and the simpler source.
+//
+// Questions were folded in on 2026-07-30, closing the successor to that same
+// gap: hum-feedback.jsonl only ever gets a row for an *info* decision, so a
+// lane that mostly asks questions was invisible here. In the 14d to 2026-07-30
+// there were 44 question ticks contributing nothing — `ideas` alone was short
+// 17 real surfacings (8 counted vs 25 actual), and `location_context` had 8
+// sent-and-unanswered questions that the tool could not see at all. A lane
+// the user answers fine through the question channel could therefore be flagged
+// `low_engagement` on the strength of its info pings alone. Three deliberate
+// choices in that fold:
+//   · Only questions with `outcome.sent === true` AND an `outcome.question_id`
+//     count as surfaced. 11 of those 44 were never actually sent (downgraded
+//     by `pending_question_active`, `precheck_suppressed`, `wiki_settled`,
+//     a killed hung send, ...). Counting an unsent question as surfaced would
+//     depress response_rate and manufacture the very false decay signal this
+//     fold exists to remove.
+//   · An answered question counts toward `reacted`/`other`, never
+//     `positive`/`negative`. hum-answer records free text, which carries no
+//     thumbs-up/down valence to read; inventing one would be a fabricated
+//     sentiment score.
+//   · `mostly_negative` therefore still gates on `info_surfaced >= 5`, NOT on
+//     the combined total — preserving its pre-2026-07-30 behavior exactly.
+//     Questions add no valence, so letting them inflate that gate would let a
+//     3-reaction sample trip a valence verdict it is far too small to support.
+function cmdHumReactions(args) {
+  const fsLocal = require('fs');
+  let sinceDays = 7;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) sinceDays = parseInt(m[1], 10) * (m[2] === 'h' ? 1 / 24 : 1);
+    }
+  }
+  const cutoffMs = Date.now() - sinceDays * 24 * 3600 * 1000;
+  const readJsonl = (p) => {
+    try {
+      return fsLocal.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter(Boolean);
+    } catch { return null; }
+  };
+  const feedbackAll = readJsonl(HUM_FEEDBK);
+  const runsAll = readJsonl(HUM_RUNS);
+  if (feedbackAll === null && runsAll === null) {
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify({ window_days: sinceDays, lanes: {}, total_surfaced: 0, total_reacted: 0 }, null, 2)); return; }
+    console.log(c.dim(`hum-feedback.jsonl / hum-runs.jsonl not readable; no reactions to summarize.`));
+    return;
+  }
+  const rows = (feedbackAll || []).filter((r) => new Date(r.sent_at || r.ts || 0).getTime() >= cutoffMs);
+  const runs = (runsAll || []).filter((r) => new Date(r.ts || 0).getTime() >= cutoffMs);
+  // Answered-question ids. Deliberately NOT windowed: a question surfaced
+  // inside the window can only have been answered at or after it was asked, so
+  // windowing this set can only produce false negatives (an edge-of-window
+  // question whose answer parses oddly), never false positives. Rows without
+  // an `id` are not question answers at all — hum-learnings.jsonl also carries
+  // canary-feedback/chat rule rows, which carry no id and must not count.
+  const answeredIds = new Set((readJsonl(HUM_LEARNINGS) || []).map((r) => r.id).filter(Boolean));
+
+  // Same reaction-token vocabulary `cmdHumInsight` uses, so the two commands
+  // never disagree on what counts as positive vs. negative.
+  const POSITIVE_TOKENS = ['helpful', 'more', '👍'];
+  const NEGATIVE_TOKENS = ['skip', 'snooze', '👎', '💤'];
+
+  // One row per real send — no subject-centric dedup needed (unlike the old
+  // suggestion-history path, a ping_id here is never double-counted).
+  const lanes = {};
+  const touch = (lane) => {
+    if (!lanes[lane]) lanes[lane] = { info_surfaced: 0, question_surfaced: 0, surfaced: 0, reacted: 0, positive: 0, negative: 0, other: 0 };
+    return lanes[lane];
+  };
+  for (const r of rows) {
+    const lane = r.lane || 'unknown';
+    const slot = touch(lane);
+    slot.info_surfaced += 1;
+    slot.surfaced += 1;
+    if (r.reaction) {
+      slot.reacted += 1;
+      if (POSITIVE_TOKENS.includes(r.reaction)) slot.positive++;
+      else if (NEGATIVE_TOKENS.includes(r.reaction)) slot.negative++;
+      else slot.other++;
+    }
+  }
+  // Question surfacings. Only ones that actually reached the user AND carry an
+  // id we can match an answer against — see the header comment for why an
+  // unsent question must never count as surfaced.
+  for (const r of runs) {
+    if (r.sonnet?.decision !== 'question') continue;
+    const out = r.outcome || {};
+    if (out.sent !== true || !out.question_id) continue;
+    const slot = touch(r.sonnet.based_on_topic || 'unknown');
+    slot.question_surfaced += 1;
+    slot.surfaced += 1;
+    if (answeredIds.has(out.question_id)) {
+      slot.reacted += 1;
+      slot.other += 1; // engaged, but a free-text answer carries no valence
+    }
+  }
+  const totalSurfaced = Object.values(lanes).reduce((a, b) => a + b.surfaced, 0);
+  const totalReacted = Object.values(lanes).reduce((a, b) => a + b.reacted, 0);
+  // Per-lane derived metrics + decay flag.
+  const perLane = {};
+  for (const [lane, s] of Object.entries(lanes)) {
+    const responseRate = s.surfaced ? s.reacted / s.surfaced : 0;
+    const known = s.positive + s.negative;
+    const positiveRate = known ? s.positive / known : null;
+    let decay = null;
+    // `mostly_negative` gates on info_surfaced (the valence-bearing
+    // population), not the combined total — questions contribute no
+    // positive/negative signal, so they must not inflate this gate.
+    if (s.info_surfaced >= 5 && positiveRate !== null && positiveRate < 0.40) decay = 'mostly_negative';
+    else if (s.surfaced >= 3 && responseRate < 0.10) decay = 'low_engagement';
+    perLane[lane] = { ...s, response_rate: responseRate, positive_rate: positiveRate, decay };
+  }
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ window_days: sinceDays, total_surfaced: totalSurfaced, total_reacted: totalReacted, lanes: perLane }, null, 2));
+    return;
+  }
+  console.log(c.bold(`Hum reactions — last ${sinceDays}d`) + '\n');
+  console.log(`  total surfaced: ${totalSurfaced}    total reacted: ${totalReacted}    overall response: ${totalSurfaced ? ((totalReacted / totalSurfaced) * 100).toFixed(0) : 0}%\n`);
+  const laneNames = Object.keys(perLane).sort();
+  if (laneNames.length === 0) { console.log(c.dim('  (no surfaced/reaction rows in window)')); return; }
+  console.log('  LANE             SURF  INFO    Q  RXN  POS  NEG  RESPONSE  POSITIVE  DECAY');
+  for (const lane of laneNames) {
+    const s = perLane[lane];
+    const rr = (s.response_rate * 100).toFixed(0).padStart(3) + '%';
+    const pr = s.positive_rate === null ? ' n/a' : (s.positive_rate * 100).toFixed(0).padStart(3) + '%';
+    const decayCol = s.decay ? c.yellow(s.decay) : '';
+    console.log(`  ${lane.padEnd(16)} ${String(s.surfaced).padStart(4)}  ${String(s.info_surfaced).padStart(4)}  ${String(s.question_surfaced).padStart(3)}  ${String(s.reacted).padStart(3)}  ${String(s.positive).padStart(3)}  ${String(s.negative).padStart(3)}  ${rr.padStart(8)}  ${pr.padStart(8)}  ${decayCol}`);
+  }
+}
+
+// edva hum signal — the hum-improvement-loop dashboard. Reads the daily
+// time series in data/hum-metrics-state.json (canonical schema in
+// data/hum-improvement-loop.md). Shows today vs 7d rolling vs 30d
+// baseline + per-lane breakdown + open decay events.
+function cmdHumSignal(args) {
+  const fsLocal = require('fs');
+  const STATE = path.join(TOOLS, 'data/hum-metrics-state.json');
+  let sinceDays = 14;
+  let laneFilter = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)d?$/); if (m) sinceDays = parseInt(m[1], 10);
+    } else if (args[i] === '--lane' && args[i + 1]) {
+      laneFilter = args[++i];
+    }
+  }
+  let state;
+  try { state = JSON.parse(fsLocal.readFileSync(STATE, 'utf8')); }
+  catch {
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify({ daily: [], decay_events: [] })); return; }
+    console.log(c.dim('hum-metrics-state.json not present yet — run `hum-metrics-collect` first.'));
+    return;
+  }
+  const daily = (state.daily || []).slice(-sinceDays);
+  const decayEvents = (state.decay_events || []).slice(-20);
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ daily, decay_events: decayEvents, lane: laneFilter }, null, 2));
+    return;
+  }
+  if (daily.length === 0) { console.log(c.dim('(no daily rows yet)')); return; }
+  const last = daily[daily.length - 1];
+  console.log(c.bold(`Hum signal — last ${sinceDays}d (latest: ${last.date})`) + '\n');
+  // Headline (latest row).
+  const fmt = (n, d = 3) => n === null || n === undefined ? c.dim('n/a') : Number(n).toFixed(d);
+  console.log(c.bold('  Latest day'));
+  console.log(`    surfaced:           ${last.surfaced}`);
+  console.log(`    signal_score_raw:   ${fmt(last.signal_score_raw, 2)}`);
+  console.log(`    signal_per_surfaced:${' '}${fmt(last.signal_per_surfaced)}`);
+  console.log(`    surface_rate:       ${fmt(last.surface_rate)}`);
+  console.log(`    silent_rate:        ${fmt(last.silent_rate)}`);
+  const r7 = last.rolling_7d;
+  const r30 = last.rolling_30d_baseline;
+  if (r7) {
+    console.log(c.bold('\n  Rolling 7d'));
+    console.log(`    signal_per_surfaced:${' '}${fmt(r7.signal_per_surfaced)}    surface_rate: ${fmt(r7.surface_rate)}`);
+  }
+  if (r30) {
+    console.log(c.bold('\n  Rolling 30d baseline'));
+    console.log(`    signal_per_surfaced:${' '}${fmt(r30.signal_per_surfaced)}    surface_rate: ${fmt(r30.surface_rate)}`);
+  }
+  // Per-lane (latest day; or filtered).
+  const lanes = last.lane_yield || {};
+  const laneKeys = Object.keys(lanes).filter(k => !laneFilter || k === laneFilter).sort();
+  if (laneKeys.length) {
+    console.log(c.bold('\n  Per-lane (latest day)'));
+    console.log('    LANE             CAND  SURF  LOVE  UP   DOWN  SNOOZ  SIG/SURF');
+    for (const lane of laneKeys) {
+      const ly = lanes[lane];
+      const rx = ly.reactions || {};
+      const cell = (n) => String(n || 0).padStart(4);
+      const sps = fmt(ly.signal_per_surfaced);
+      console.log(`    ${lane.padEnd(16)} ${cell(ly.candidates)}  ${cell(ly.surfaced)}  ${cell(rx.love)}  ${cell(rx.up)}  ${cell(rx.down)}  ${cell(rx.snooze)}   ${sps.padStart(6)}`);
+    }
+  }
+  // Decay events.
+  if (decayEvents.length) {
+    console.log(c.bold('\n  Recent decay events'));
+    for (const ev of decayEvents) {
+      const ts = (ev.ts || '').slice(0, 19);
+      const lane = ev.lane ? `[${ev.lane}]` : '[global]';
+      const extra = ev.type === 'lane_decay_silent' ? `surfaced=${ev.surfaced_in_window} silent_days=${ev.days_silent}`
+                  : ev.type === 'global_decay_drop' ? `Δ=${ev.delta_pct} today=${ev.today_3d} base=${ev.baseline_7d}`
+                  : ev.type.includes('surface_rate') ? `rolling_3d=${ev.rolling_3d}`
+                  : '';
+      console.log(`    ${c.yellow(ev.type.padEnd(24))} ${lane.padEnd(10)} ${extra}    ${c.dim(ts)}`);
+    }
+  }
+  // Sparkline (signal_per_surfaced over window).
+  const series = daily.map(r => r.signal_per_surfaced).filter(v => v !== null);
+  if (series.length >= 3) {
+    const min = Math.min(...series), max = Math.max(...series);
+    const bars = '▁▂▃▄▅▆▇█';
+    const scale = (max - min) || 1;
+    const spark = daily.map(r => {
+      const v = r.signal_per_surfaced;
+      if (v === null) return c.dim('·');
+      const idx = Math.min(7, Math.floor(((v - min) / scale) * 7));
+      return bars[idx];
+    }).join('');
+    console.log(c.bold('\n  Signal/surfaced trend ') + c.dim(`(min=${fmt(min)}, max=${fmt(max)})`));
+    console.log(`    ${spark}`);
+  }
+}
+
+// edva hum intervention — attribution ledger for the hum-improvement-loop.
+// Subcommands:
+//   list                     — open + measured interventions
+//   record <id> <hypothesis> — manually add an entry (auto-impl flow does this too)
+//   measure                  — re-run attribution (also runs in hum-metrics-collect --measure)
+function cmdHumIntervention(args) {
+  const fsLocal = require('fs');
+  const LEDGER = path.join(TOOLS, 'data/hum-interventions.jsonl');
+  const sub = args[0];
+  if (!sub || sub === 'list' || sub === 'help' || sub === '--help') {
+    let rows = [];
+    try { rows = fsLocal.readFileSync(LEDGER, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)); }
+    catch { rows = []; }
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(rows, null, 2)); return; }
+    if (rows.length === 0) { console.log(c.dim('(no interventions logged yet)')); return; }
+    console.log(c.bold(`Hum interventions (${rows.length})`) + '\n');
+    for (const r of rows) {
+      const m = r.measurement;
+      const verdict = m ? `${m.verdict} (Δ=${m.delta_signal_per_surfaced})` : c.yellow('pending');
+      console.log(`  ${c.bold(r.id)}  ${r.lane || 'global'}  ${verdict}`);
+      console.log(`    applied: ${r.applied_at}  commit: ${(r.commit || '').slice(0,7)}`);
+      console.log(`    ${r.hypothesis || ''}\n`);
+    }
+    return;
+  }
+  if (sub === 'record') {
+    const id = args[1]; const hypothesis = args.slice(2).join(' ');
+    if (!id || !hypothesis) die('hum intervention record <id> <hypothesis>');
+    const row = {
+      id, applied_at: new Date().toISOString(),
+      commit: (require('child_process').execSync('git rev-parse --short HEAD').toString().trim()),
+      lane: null, hypothesis, predicted_effect: {},
+      baseline_window: null,
+      measure_at: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
+    };
+    fsLocal.appendFileSync(LEDGER, JSON.stringify(row) + '\n');
+    console.log(`recorded ${id}`);
+    return;
+  }
+  if (sub === 'measure') {
+    const { spawnSync } = require('child_process');
+    const collect = path.join(TOOLS, 'bin/hum-metrics-collect');
+    if (!fs.existsSync(collect)) die('hum intervention measure: this installation has no bin/hum-metrics-collect');
+    const r = spawnSync(collect,
+      ['--measure', '--dry-run'], { encoding: 'utf8' });
+    if (r.stdout) process.stdout.write(r.stdout);
+    if (r.stderr) process.stderr.write(r.stderr);
+    return;
+  }
+  die(`unknown: hum intervention ${sub}. Try: list | record | measure`);
+}
+
+// edva hum lane — manual lever for the auto-quiesce mechanism
+// (lib/hum-lane-quiesce.mjs). hum-sense's own housekeeping already
+// auto-quiesces a lane after 2 consecutive expired-unanswered lane_diagnosis
+// questions and auto-re-enables it on a positive reaction; this is the
+// explicit path for "bring back <lane>" or a manual pause, same shared
+// library so both mechanisms log to the same state + intervention ledger.
+async function cmdHumLane(args) {
+  const { quiesceLane, reenableLane, laneQuiesceStatus } =
+    await import(path.join(TOOLS, 'lib/hum-lane-quiesce.mjs'));
+  const sub = args[0];
+  if (!sub || sub === 'status' || sub === 'help' || sub === '--help') {
+    const rows = laneQuiesceStatus();
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(rows, null, 2)); return; }
+    console.log(c.bold('Hum lanes') + '\n');
+    for (const r of rows) {
+      const state = r.enabled ? c.green('enabled') : c.yellow('disabled');
+      const streak = r.consecutive_expired ? c.dim(`  (unanswered streak: ${r.consecutive_expired})`) : '';
+      console.log(`  ${r.lane.padEnd(18)} ${state}${streak}`);
+      if (!r.enabled && r.quiesced_reason) console.log(c.dim(`    ${r.quiesced_reason}`));
+    }
+    return;
+  }
+  const lane = args[1];
+  if (!lane) die(`hum lane ${sub}: lane name required. Try: edva hum lane status | enable <name> [reason] | disable <name> [reason]`);
+  const reason = args.slice(2).join(' ') || null;
+  if (sub === 'enable') {
+    const result = reenableLane(lane, reason);
+    if (!result) { console.log(c.red(`unknown lane: ${lane}`)); return; }
+    console.log(result.changed ? c.green(`${lane} re-enabled.`) : c.dim(`${lane} was already enabled.`));
+    return;
+  }
+  if (sub === 'disable') {
+    const result = quiesceLane(lane, reason);
+    if (!result) { console.log(c.red(`unknown lane: ${lane}`)); return; }
+    console.log(result.changed ? c.yellow(`${lane} disabled.`) : c.dim(`${lane} was already disabled.`));
+    return;
+  }
+  die(`unknown: hum lane ${sub}. Try: status | enable <name> [reason] | disable <name> [reason]`);
+}
+
+// Infer the user's current activity state from existing signals. Reads
+// phone-channel-cursor.json (last inbound) + user-timezone.json (local TZ),
+// classifies as active / winding_down / sleeping / waking. Used by
+// trigger-hum.sh as a soft gate and exposed here for ad-hoc inspection.
+function inferActivityState() {
+  const fs = require('fs');
+  const dataDir = path.join(TOOLS, 'data');
+  const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+  const cursor = readJson(`${dataDir}/phone-channel-cursor.json`);
+  const tzdata = readJson(`${dataDir}/user-timezone.json`);
+  const tz = (tzdata && tzdata.timezone) || instance().tz;
+  const lastSeenAt = cursor && cursor.lastSeenAt ? new Date(cursor.lastSeenAt) : null;
+  const ageMin = lastSeenAt ? Math.round((Date.now() - lastSeenAt.getTime()) / 60000) : null;
+  const localHour = parseInt(
+    new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', hour12: false }).format(new Date()),
+    10
+  );
+  let state = 'active';
+  let reason = `${localHour}:00 local, inbound ${ageMin ?? '?'}m ago`;
+
+  // A device signal the installation has (cliExt().activityOverride: the phone
+  // locked since bed hours → sleeping, whatever the clock says) beats the clock
+  // rules below; no signal, or a stale one, falls through to them.
+  let override = null;
+  try {
+    if (typeof cliExt().activityOverride === 'function') override = cliExt().activityOverride({ tz, localHour, ageMin, dataDir, readJson });
+  } catch {}
+  if (override && override.state) {
+    return { state: override.state, last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz, reason: override.reason };
+  }
+
+  if (localHour >= 1 && localHour < 7) {
+    state = 'sleeping';
+    reason = `sleep window ${localHour}:00 local`;
+  } else if ((localHour >= 22 || localHour < 1) && (ageMin === null || ageMin >= 30)) {
+    state = 'winding_down';
+    reason = `late (${localHour}:00) + no phone activity ${ageMin ?? '?'}m`;
+  } else if (localHour >= 7 && localHour < 9 && ageMin !== null && ageMin < 30) {
+    state = 'waking';
+    reason = `morning + fresh phone activity ${ageMin}m ago`;
+  }
+  return { state, last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz, reason };
+}
+
+function cmdContext(args) {
+  const ctxBuilder = require(path.join(TOOLS, 'lib/edva-context.js'));
+  const skipCache = hasFlag(args, '--fresh');
+  const ctx = ctxBuilder.build({ skipCache });
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(ctx, null, 2)); return; }
+  console.log(c.bold('Edva Context') + '\n');
+  console.log(`  built_at: ${ctx.built_at}`);
+  console.log(`\n  ${c.bold('Profile')}      ${Object.keys(ctx.profile).join(', ')}`);
+  console.log(`  ${c.bold('Tastes')}       ${Object.keys(ctx.tastes).join(', ')}`);
+  console.log(`  ${c.bold('Projects')}     ${Object.keys(ctx.projects).join(', ')}`);
+  console.log(`\n  ${c.bold('Knowledge sources')} (${Object.keys(ctx.knowledge).length})`);
+  for (const [k, v] of Object.entries(ctx.knowledge)) {
+    console.log(`    ${k.padEnd(15)} ${c.dim(v.via)}`);
+  }
+  console.log(`\n  ${c.bold('Recent')}`);
+  console.log(`    today commits:    ${ctx.recent.today_commits.length}`);
+  console.log(`    today triage:     P1=${ctx.recent.today_triage.p1 || 0} P2=${ctx.recent.today_triage.p2 || 0} P3=${ctx.recent.today_triage.p3 || 0}`);
+  console.log(`    hum runs 7d:      ${ctx.recent.counts.hum_runs_7d}`);
+  console.log(`    hum feedback 14d: ${ctx.recent.counts.hum_feedback_14d}`);
+  console.log(`    hum learnings 30d:${ctx.recent.counts.hum_learnings_30d}`);
+  console.log(`    watchlist notify: ${ctx.recent.counts.watchlist_notify} shows`);
+}
+
+function cmdActivity(args) {
+  const out = inferActivityState();
+  if (hasFlag(args, '--state-only')) { console.log(out.state); return; }
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(out)); return; }
+  console.log(c.bold('Activity State') + '\n');
+  console.log(`  state:     ${out.state}`);
+  console.log(`  inbound:   ${out.last_inbound_min_ago ?? '—'} min ago`);
+  console.log(`  local:     ${out.local_hour}:00 ${out.local_tz}`);
+  console.log(`  reason:    ${out.reason}`);
+}
+
+// ========================================================================
+// MAIN DISPATCH
+// ========================================================================
+const [, , cmd, ...args] = process.argv;
+
+// edva watchdog — summarize watchdog-incidents/.
+// Each file in the incident dir is a per-incident probe state:
+//   <key>             — consecutive-failure counter (integer)
+//   <key>.green_streak — consecutive-recovery counter (integer)
+//   <key>.alerted     — touched when an alert was sent (mtime is alert time)
+//   <key>.alert_count — alerts within the current max_window
+//   <key>.alert_first — mtime is first alert in the window
+// Read shape from agent/scripts/watchdog.sh incident_seen / incident_should_alert.
+function cmdWatchdog(args) {
+  const sub = args[0];
+  if (sub && !sub.startsWith('--') && sub !== 'status') {
+    console.error(c.red(`unknown edva watchdog subcommand: ${sub}`));
+    console.error('Usage: edva watchdog [status] [--json]');
+    process.exit(1);
+  }
+  const incidentDir = installTools("data/watchdog-incidents");
+  let entries;
+  try { entries = fs.readdirSync(incidentDir); } catch { entries = []; }
+  // Group by base key.
+  const byKey = {};
+  for (const f of entries) {
+    let key = f, kind = 'failures';
+    if (f.endsWith('.green_streak')) { key = f.slice(0, -'.green_streak'.length); kind = 'green_streak'; }
+    else if (f.endsWith('.alerted')) { key = f.slice(0, -'.alerted'.length); kind = 'alerted_mtime'; }
+    else if (f.endsWith('.alert_count')) { key = f.slice(0, -'.alert_count'.length); kind = 'alert_count'; }
+    else if (f.endsWith('.alert_first')) { key = f.slice(0, -'.alert_first'.length); kind = 'alert_first_mtime'; }
+    if (!byKey[key]) byKey[key] = {};
+    const full = path.join(incidentDir, f);
+    try {
+      if (kind === 'failures' || kind === 'green_streak' || kind === 'alert_count') {
+        byKey[key][kind] = parseInt(fs.readFileSync(full, 'utf8').trim(), 10) || 0;
+      } else {
+        byKey[key][kind] = new Date(fs.statSync(full).mtimeMs).toISOString();
+      }
+    } catch {}
+  }
+  const rows = Object.entries(byKey).map(([key, v]) => ({ key, ...v })).sort((a, b) => a.key.localeCompare(b.key));
+  if (args.includes('--json')) {
+    console.log(JSON.stringify({ incidents: rows, count: rows.length }, null, 2));
+    return;
+  }
+  if (rows.length === 0) { console.log(c.dim('no watchdog incidents on disk — all probes clean')); return; }
+  console.log(c.bold(`Watchdog incidents (${rows.length})\n`));
+  console.log('KEY                              FAILS  GREEN  ALERTS  LAST_ALERT');
+  for (const r of rows) {
+    const fails = r.failures ?? 0;
+    const green = r.green_streak ?? 0;
+    const alerts = r.alert_count ?? 0;
+    const last = r.alerted_mtime ?? '-';
+    const failsStr = fails > 0 ? c.yellow(String(fails).padEnd(5)) : String(fails).padEnd(5);
+    console.log(`${r.key.padEnd(32)} ${failsStr}  ${String(green).padEnd(5)}  ${String(alerts).padEnd(6)}  ${last}`);
+  }
+}
+
+// --- whereami / host identity ---
+// Which physical machine is this? Sessions used to guess from a cwd path
+// string and get it backwards ("laptop, nothing running" while on the
+// production host with everything healthy). Resolves deterministically via
+// lib/host-identity.js (hostname/alias → hardware-UUID fallback) against
+// system/hosts.json.
+function cmdWhereami(args) {
+  const { resolveHost, hostBanner } = require(path.join(TOOLS, 'lib/host-identity.js'));
+  const h = resolveHost();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(h, null, 2)); return; }
+  if (hasFlag(args, '--banner')) { console.log(hostBanner(h)); return; }
+  if (hasFlag(args, '--role')) { console.log(h.role); process.exit(h.known ? 0 : 1); }
+  const roleColor = h.isProduction ? c.green : (h.known ? c.cyan : c.yellow);
+  console.log(roleColor(c.bold(h.known ? h.role.toUpperCase() : 'UNKNOWN')) + c.dim(` (${h.label})`));
+  console.log(c.dim('hostname: ') + h.hostname);
+  console.log(c.dim('uuid:     ') + (h.uuid || 'n/a'));
+  if (h.notes) console.log(c.dim('notes:    ') + h.notes);
+  if (!h.known) {
+    console.log(c.yellow('\nUnregistered host — not the production Edva host. Add it to system/hosts.json (hostname + uuid + role) so sessions self-identify.'));
+  }
+  console.log(c.dim('\n⚠ The default Bash-tool sandbox masks localhost + process lists (pgrep/launchctl/curl); run unsandboxed to verify Edva service health.'));
+}
+
+const dispatch = {
+  tasks: cmdTasks,
+  whereami: cmdWhereami,
+  host: cmdWhereami,
+  status: cmdStatus,
+  services: cmdServices,
+  logs: cmdLogs,
+  cron: cmdCron,
+  git: cmdGit,
+  ci: cmdCi,
+  triage: cmdTriage,
+  hum: cmdHum,
+  restart: cmdRestart,
+  arch: cmdArch,
+  where: cmdWhere,
+  doctor: cmdDoctor,
+  cost: cmdCost,
+  activity: cmdActivity,
+  context: cmdContext,
+  watchdog: cmdWatchdog,
+};
+
+// --- CLI extensions (cli.d/) ---
+// An installation adds its own subcommands without editing this file: each
+// bin/cli.d/<name>.mjs (next to this CLI) default-exports
+//   { name?: "<subcommand>" (default: the file name), summary: "<one line>",
+//     usage?: "<name> <args>", async run(args, ctx) }
+// ctx = { ROOT, TOOLS, HOME, OWNER, c, table, hasFlag, getFlag, die }.
+// The built-in subcommands win on a name; a module that fails to load is
+// reported and skipped. `edva help` lists them under EXTENSIONS. Contract
+// and examples: bin/cli.d/README.md.
+const CLI_D = path.join(__dirname, 'cli.d');
+function cliExtensionFiles() {
+  try { return fs.readdirSync(CLI_D).filter((f) => f.endsWith('.mjs') && !f.startsWith('_')).sort(); }
+  catch { return []; }
+}
+async function loadCliExtensions() {
+  const { pathToFileURL } = require('url');
+  const out = [];
+  for (const f of cliExtensionFiles()) {
+    try {
+      const mod = await import(pathToFileURL(path.join(CLI_D, f)).href);
+      const ext = mod.default || mod;
+      const name = ext.name || f.replace(/\.mjs$/, '');
+      if (typeof ext.run !== 'function') { console.error(c.yellow(`cli.d/${f}: no run(args, ctx) — skipped`)); continue; }
+      if (dispatch[name] || name === 'help' || out.some((e) => e.name === name)) { console.error(c.yellow(`cli.d/${f}: '${name}' is already a subcommand — skipped`)); continue; }
+      out.push({ name, summary: ext.summary || '', usage: ext.usage || name, run: ext.run });
+    } catch (e) {
+      console.error(c.yellow(`cli.d/${f}: failed to load: ${e.message}`));
+    }
+  }
+  return out;
+}
+const cliCtx = { ROOT, TOOLS, HOME, OWNER, c, table, hasFlag, getFlag, die };
+
+if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+  if (!cliExtensionFiles().length) { cmdHelp(); process.exit(0); }
+  loadCliExtensions().then((ext) => { cmdHelp(ext); process.exit(0); });
+} else if (dispatch[cmd]) {
+  dispatch[cmd](args);
+} else {
+  loadCliExtensions().then(async (ext) => {
+    const e = ext.find((x) => x.name === cmd);
+    if (!e) { console.error(c.red(`unknown subcommand: ${cmd}`) + '\n'); cmdHelp(ext); process.exit(1); }
+    try { await e.run(args, cliCtx); }
+    catch (err) { die(`${cmd}: ${err && err.message ? err.message : err}`); }
+  });
+}

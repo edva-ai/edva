@@ -1,11 +1,11 @@
 # Contributing
 
-Merlin is the open-source extraction of a working personal-agent setup. Contributions are welcome with the caveat that the project has strong opinions; not all PRs will land. Read on for what's encouraged + what isn't.
+Edva is the open-source extraction of a working personal-agent setup. Contributions are welcome with the caveat that the project has strong opinions; not all PRs will land. Read on for what's encouraged + what isn't.
 
 ## How this repo is put together
 
 - **The kernel** — every file listed in [`.kernel-sync.json`](.kernel-sync.json) — is generated: the maintainer runs the same kernel in a private installation and a sync tool copies it here mechanically (path and brand rewrites only), behind a guard that refuses personal data. PRs against kernel files are welcome; they land by being applied upstream and arriving with the next sync, so keep them small and self-contained. Don't hand-edit a kernel file in a PR that also does other things.
-- **Merlin's own files** — this README and the docs, `examples/`, `apps/`, `bin/cli.d/*.mjs` (Merlin's own `merlin` subcommands), `.github/`, `.tools/`, the root `package.json`, `.gitignore`, the MCP configs (`agent/supervisor/chat-mcp-config.json`, `agent/ops-*-agent/.mcp.json`) and the `_ext/.gitkeep` contract files Merlin adds. These are edited here directly.
+- **Edva's own files** — this README and the docs, `examples/`, `apps/`, `bin/cli.d/*.mjs` (Edva's own `edva` subcommands), `.github/`, `.tools/`, the root `package.json`, `.gitignore`, the MCP configs (`agent/supervisor/chat-mcp-config.json`, `agent/ops-*-agent/.mcp.json`) and the `_ext/.gitkeep` contract files Edva adds. These are edited here directly.
 - **An installation's own files** — `agent/local/` and everything in an `_ext/` dir — are gitignored and never belong in a PR. See [`docs/architecture-public-private.md`](docs/architecture-public-private.md).
 
 ## What we'd love help with
@@ -21,21 +21,21 @@ Merlin is the open-source extraction of a working personal-agent setup. Contribu
 ## What we probably won't accept
 
 - **Reverting to per-tool permission prompts.** The supervisors run in `bypassPermissions` mode by design. The layered safety lives in `CLAUDE.md` rules + the outbound precheck, not in per-action prompts. If you have a security concern, please file it per `SECURITY.md` first.
-- **Adding a new top-level abstraction without an existing problem it solves.** "What if Merlin supported X" PRs that don't trace to a real workflow get politely declined.
+- **Adding a new top-level abstraction without an existing problem it solves.** "What if Edva supported X" PRs that don't trace to a real workflow get politely declined.
 - **Tighter coupling to a specific commercial API.** Where possible, integrations should be opt-in plugins with a clear contract — not directly imported into the kernel.
 - **Reintroducing personal-specific tools.** This repo deliberately ships a minimal set of working backends; PRs that hardcode someone's home-automation or fitness tracker won't merge. Build it behind a hook in your own `_ext/` dir or `agent/local/config/`, document the pattern in `docs/integrations/`, and link it from the README.
 - **Bumping the bypass — disabling outbound precheck, financial limits, prompt-injection rules — on the rationale that they're slow or annoying.** They're load-bearing. Speed them up, sure. Bypass them, no.
 
 ## Development setup
 
-The README quickstart is the development setup. There's no separate dev environment — the same `./scripts/bootstrap.sh && ./bin/merlin init && ./bin/merlin up` flow gets you a working agent.
+The README quickstart is the development setup. There's no separate dev environment — the same `./scripts/bootstrap.sh && ./bin/edva init && ./bin/edva up` flow gets you a working agent.
 
 For changes you want to test without going through the supervisor:
 
 ```bash
 # Direct CLI invocations
-node bin/merlin status
-node bin/merlin doctor
+node bin/edva status
+node bin/edva doctor
 
 # Direct supervisor invocation
 node agent/supervisor/index.mjs --agent ops
@@ -45,15 +45,15 @@ node --test tests/*.test.mjs agent/test/*.test.mjs
 
 # Public/private boundary checks
 python3 .tools/sanitize-guard.py --all
-node bin/merlin audit
+node bin/edva audit
 ```
 
-A few tests need macOS, launchd or a live supervisor and fail in a Linux container (for example `fork-cost-ledger`, `hum-scheduled-senders-launchd`, `launchd-kick-self-install`, `merlin-logs-window`, `system-issue-writeback`, `watchdog-disk-free`); `resource-leak` is timing-sensitive.
+A few tests need macOS, launchd or a live supervisor and fail in a Linux container (for example `fork-cost-ledger`, `hum-scheduled-senders-launchd`, `launchd-kick-self-install`, `edva-logs-window`, `system-issue-writeback`, `watchdog-disk-free`); `resource-leak` is timing-sensitive.
 
 ## Pull-request checklist
 
 - [ ] `node --check` on every modified `.js` / `.mjs` file passes.
-- [ ] If you changed agent behavior or added a job, the corresponding doc (`agent/CLAUDE.md`, `agent/ops-agent/CLAUDE.md`, `agent/ops-agent/jobs/<job>.md`, `system/architecture.md`) is updated **in the same PR**. (Self-awareness Rule #1 — Merlin learns its state from the repo, not from `git log`.)
+- [ ] If you changed agent behavior or added a job, the corresponding doc (`agent/CLAUDE.md`, `agent/ops-agent/CLAUDE.md`, `agent/ops-agent/jobs/<job>.md`, `system/architecture.md`) is updated **in the same PR**. (Self-awareness Rule #1 — Edva learns its state from the repo, not from `git log`.)
 - [ ] No new hardcoded paths — use `lib/root.cjs` (`installRoot()`, `installTools()`, `toolsPath()`) in Node and `agent/scripts/lib/root.sh` in shell.
 - [ ] No identity or per-installation values in kernel code — read them through `lib/instance.cjs` (`instance()`, `localConfig(name, defaults)`) with generic defaults.
 - [ ] No personal identifiers in commit messages or content — assume your PR will be read by strangers indefinitely. `python3 .tools/sanitize-guard.py` passes (the pre-commit hook runs it; see `docs/architecture-public-private.md` for the private pattern list).

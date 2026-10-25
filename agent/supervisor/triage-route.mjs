@@ -12,14 +12,14 @@
 // What moves. Only the per-message triage items gmail-source hands to
 // `_dispatchTriage` (source `gmail:<messageId>`). Everything else gmail-source
 // dispatches — batch catch-up, history-expired recovery, storm consolidation,
-// periodic catch-up — and any mail addressed to Merlin itself (the command
+// periodic catch-up — and any mail addressed to Edva itself (the command
 // channel, which may need Chrome or a long multi-step turn) stays on ops.
 //
 // Idempotency and counters are unchanged: gmail-source records the dispatch
 // attempt (lib/dispatch-attempts.mjs) BEFORE calling us, and the
 // RECLASSIFY flap counter lives in the shared reclassify-tracking.json that
 // every tier's dispatcher reads. The ops-light ledger attributes cost under the
-// same `gmail:<id>` source, and merlin-cost-report unions both ledgers.
+// same `gmail:<id>` source, and edva-cost-report unions both ledgers.
 //
 // Fails toward delivery: if ops-light is unhealthy, or the POST fails, the item
 // goes to the local (ops) dispatcher exactly as before. Never drop an email.

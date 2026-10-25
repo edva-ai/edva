@@ -262,10 +262,10 @@ describe("PriorityDispatcher", () => {
   // ── Coalescing (Claude-Code "type several lines, one turn") ─────────
 
   it("merges the contiguous same-source same-priority run into one turn", () => {
-    dispatcher.dispatch("running", "merlin", { priority: "high" }); // in-flight
-    dispatcher.dispatch("msg1", "merlin", { priority: "high" });
-    dispatcher.dispatch("msg2", "merlin", { priority: "high" });
-    dispatcher.dispatch("msg3", "merlin", { priority: "high" });
+    dispatcher.dispatch("running", "edva", { priority: "high" }); // in-flight
+    dispatcher.dispatch("msg1", "edva", { priority: "high" });
+    dispatcher.dispatch("msg2", "edva", { priority: "high" });
+    dispatcher.dispatch("msg3", "edva", { priority: "high" });
 
     session.completeCurrentTurn(); // running done → drain merges msg1..3
     assert.equal(session.sent.length, 2, "one merged turn, not three");
@@ -275,20 +275,20 @@ describe("PriorityDispatcher", () => {
   });
 
   it("does NOT merge across different sources", () => {
-    dispatcher.dispatch("running", "merlin", { priority: "high" });
-    dispatcher.dispatch("a", "merlin", { priority: "high" });
+    dispatcher.dispatch("running", "edva", { priority: "high" });
+    dispatcher.dispatch("a", "edva", { priority: "high" });
     dispatcher.dispatch("b", "triage", { priority: "high" }); // different source
 
     session.completeCurrentTurn();
-    assert.equal(session.sent[1], "a", "only the merlin item dispatches");
+    assert.equal(session.sent[1], "a", "only the edva item dispatches");
     assert.equal(dispatcher.queue.length, 1);
     assert.equal(dispatcher.queue[0].content, "b", "triage stays its own turn");
   });
 
   it("does NOT merge across different priorities", () => {
-    dispatcher.dispatch("running", "merlin", { priority: "normal" });
-    dispatcher.dispatch("h", "merlin", { priority: "high" });
-    dispatcher.dispatch("n", "merlin", { priority: "normal" });
+    dispatcher.dispatch("running", "edva", { priority: "normal" });
+    dispatcher.dispatch("h", "edva", { priority: "high" });
+    dispatcher.dispatch("n", "edva", { priority: "normal" });
 
     session.completeCurrentTurn(); // head=h(high); next is normal → no merge
     assert.equal(session.sent[1], "h");
@@ -337,12 +337,12 @@ describe("PriorityDispatcher", () => {
   it("emits a coalesced event with the merge count", () => {
     const events = [];
     dispatcher.on("coalesced", (e) => events.push(e));
-    dispatcher.dispatch("running", "merlin", { priority: "high" });
-    dispatcher.dispatch("m1", "merlin", { priority: "high" });
-    dispatcher.dispatch("m2", "merlin", { priority: "high" });
+    dispatcher.dispatch("running", "edva", { priority: "high" });
+    dispatcher.dispatch("m1", "edva", { priority: "high" });
+    dispatcher.dispatch("m2", "edva", { priority: "high" });
     session.completeCurrentTurn();
     assert.equal(events.length, 1);
     assert.equal(events[0].mergedCount, 1);
-    assert.equal(events[0].source, "merlin");
+    assert.equal(events[0].source, "edva");
   });
 });

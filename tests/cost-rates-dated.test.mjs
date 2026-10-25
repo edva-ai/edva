@@ -20,11 +20,11 @@ import { fileURLToPath } from "node:url";
 import { REPO_ROOT as ROOT } from "../lib/root.cjs";
 const near = (got, want, what) => assert.ok(Math.abs(got - want) < 0.005, `${what}: ${got} vs ${want}`);
 
-// A throwaway $HOME whose Dev/merlin points at this checkout's code but has its
+// A throwaway $HOME whose Dev/edva points at this checkout's code but has its
 // own logs and transcripts, so nothing here reads a real ledger or session.
 function fakeHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cost-rates-"));
-  const g = path.join(home, "Dev/merlin");
+  const g = path.join(home, "Dev/edva");
   fs.mkdirSync(path.join(g, "agent/logs"), { recursive: true });
   fs.mkdirSync(path.join(g, "agent/ops-agent"), { recursive: true });
   fs.mkdirSync(path.join(g, "data"), { recursive: true });
@@ -46,13 +46,13 @@ const ROWS = [
 ].map((r, i) => ({ dispatch_id: `d${i}`, short_id: `s${i}`, session_id: `sess-${i}`, duration_ms: 1000, num_turns: 3,
   total_cost_usd: 1, session_cumulative_cost_usd: 1, web_search_requests: 0, terminal_reason: "completed", ...r }));
 
-test("merlin-cost-report: Sonnet 5.5 cache reads are $0.10 from 2026-10-07, Haiku 5.5 has its own rate", () => {
+test("edva-cost-report: Sonnet 5.5 cache reads are $0.10 from 2026-10-07, Haiku 5.5 has its own rate", () => {
   const { home, g } = fakeHome();
   try {
     const dir = path.join(g, "agent/logs/supervisor-ops-light");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "job-costs.ndjson"), ROWS.map((r) => JSON.stringify(r)).join("\n") + "\n");
-    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/merlin-cost-report"), "--since", "2026-10-01", "--json"],
+    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/edva-cost-report"), "--since", "2026-10-01", "--json"],
       { env: { ...process.env, HOME: home }, encoding: "utf8" }));
     const job = (s) => out.jobs.find((j) => j.source === s).weighted_cost_usd;
     // $2 in / $10 out / $2.50 5m write either side; only the cache read moved.
@@ -80,10 +80,10 @@ const SONNET_AFTER = (1000 * 2 + 10_000 * 10 + 100_000 * 2.5 + 10_000_000 * 0.10
 const HAIKU_SHORT = (1000 * 0.10 + 1_000_000 * 0.50 + 60_000 * 0.01 + 20_000 * 0.125) / 1e6;
 const HAIKU_LONG = (1000 * 0.50 + 100_000 * 2.50 + 5_000_000 * 0.05 + 200_000 * 0.625) / 1e6;
 
-test("merlin-allowance-coverage prices each transcript request at its own date and prompt length", () => {
+test("edva-allowance-coverage prices each transcript request at its own date and prompt length", () => {
   const { home } = fakeHome();
   try {
-    const proj = path.join(home, ".claude/projects/-Users-operator-Dev-merlin");
+    const proj = path.join(home, ".claude/projects/-Users-operator-Dev-edva");
     fs.mkdirSync(proj, { recursive: true });
     fs.writeFileSync(path.join(proj, "a.jsonl"), [
       userLine("hello"),
@@ -92,7 +92,7 @@ test("merlin-allowance-coverage prices each transcript request at its own date a
       line("m3", "claude-haiku-5-5", "2026-10-08T12:00:00.000Z", U(1000, 1_000_000, 60_000, 20_000)),
       line("m4", "claude-haiku-5-5", "2026-10-08T12:00:00.000Z", U(1000, 100_000, 5_000_000, 200_000)),
     ].join("\n") + "\n");
-    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/merlin-allowance-coverage"), "--since", "2026-10-01T00:00:00Z", "--json"],
+    const out = JSON.parse(execFileSync("node", [path.join(ROOT, "bin/edva-allowance-coverage"), "--since", "2026-10-01T00:00:00Z", "--json"],
       { env: { ...process.env, HOME: home }, encoding: "utf8" }));
     near(out.account_usd_list, SONNET_BEFORE + SONNET_AFTER + HAIKU_SHORT + HAIKU_LONG, "account list USD");
     // The Haiku 5.5 tokens are counted, not skipped as an unknown id.

@@ -1,4 +1,4 @@
-// _telemetry.mjs — Merlin's anonymous first-run install ping.
+// _telemetry.mjs — Edva's anonymous first-run install ping.
 //
 // One POST per (host, context) to the telemetry endpoint (apps/telemetry/,
 // a small open-source function; its README documents the payload and the
@@ -7,10 +7,10 @@
 // git short SHA and the context label ("fresh-install", ...).
 //
 // Off switches, checked on every call:
-//   MERLIN_NO_TELEMETRY=1        in the environment: never ping
-//   MERLIN_TELEMETRY=off         in .env (the `merlin init` answer, or
-//                                `merlin telemetry off`): never ping
-// MERLIN_TELEMETRY_URL points the ping at a fork's own deployment.
+//   EDVA_NO_TELEMETRY=1        in the environment: never ping
+//   EDVA_TELEMETRY=off         in .env (the `edva init` answer, or
+//                                `edva telemetry off`): never ping
+// EDVA_TELEMETRY_URL points the ping at a fork's own deployment.
 // A touchfile data/.install-pinged-<ctx> makes each context fire at most once.
 
 import fs from "node:fs";
@@ -20,19 +20,19 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readDotEnv } from "./_common.mjs";
 
-export const DEFAULT_TELEMETRY_URL = "https://merlin-telemetry.vercel.app/install";
+export const DEFAULT_TELEMETRY_URL = "https://edva-telemetry.vercel.app/install";
 
 export function telemetryUrl() {
-  return process.env.MERLIN_TELEMETRY_URL || DEFAULT_TELEMETRY_URL;
+  return process.env.EDVA_TELEMETRY_URL || DEFAULT_TELEMETRY_URL;
 }
 
 // → { enabled, reason }
 export function telemetryState(base) {
-  if (process.env.MERLIN_NO_TELEMETRY === "1") return { enabled: false, reason: "MERLIN_NO_TELEMETRY=1 in the environment" };
+  if (process.env.EDVA_NO_TELEMETRY === "1") return { enabled: false, reason: "EDVA_NO_TELEMETRY=1 in the environment" };
   const env = readDotEnv(path.join(base, ".env"));
-  if (String(env.MERLIN_TELEMETRY || "").toLowerCase() === "off") return { enabled: false, reason: "MERLIN_TELEMETRY=off in .env" };
-  if (env.MERLIN_NO_TELEMETRY === "1") return { enabled: false, reason: "MERLIN_NO_TELEMETRY=1 in .env" };
-  return { enabled: true, reason: env.MERLIN_TELEMETRY ? `MERLIN_TELEMETRY=${env.MERLIN_TELEMETRY} in .env` : "default (no opt-out set)" };
+  if (String(env.EDVA_TELEMETRY || "").toLowerCase() === "off") return { enabled: false, reason: "EDVA_TELEMETRY=off in .env" };
+  if (env.EDVA_NO_TELEMETRY === "1") return { enabled: false, reason: "EDVA_NO_TELEMETRY=1 in .env" };
+  return { enabled: true, reason: env.EDVA_TELEMETRY ? `EDVA_TELEMETRY=${env.EDVA_TELEMETRY} in .env` : "default (no opt-out set)" };
 }
 
 export function pingTouchfile(base, ctx) {
@@ -65,7 +65,7 @@ export async function sendInstallPing(base, ctx, { force = false } = {}) {
     const ver = JSON.parse(payload).ver || "dev";
     await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json", "user-agent": `merlin-cli/${ver} (${process.platform}; ${process.arch})` },
+      headers: { "content-type": "application/json", "user-agent": `edva-cli/${ver} (${process.platform}; ${process.arch})` },
       body: payload,
       signal: ctrl.signal,
     }).catch(() => {});

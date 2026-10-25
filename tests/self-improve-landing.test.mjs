@@ -24,7 +24,7 @@ const K = KERNEL_SUBDIR ? `${KERNEL_SUBDIR}\\/` : "";
 fs.writeFileSync(path.join(LOCAL, "config", "self-improve-landing.json"), JSON.stringify({
   force_high: [`^${K}bin\\/vault-[^/]*$`, `^${K}agent\\/local\\/jobs\\/high-risk-[^/]*\\.md$`],
 }));
-process.env.MERLIN_LOCAL_DIR = LOCAL;
+process.env.EDVA_LOCAL_DIR = LOCAL;
 test.after(() => fs.rmSync(LOCAL, { recursive: true, force: true }));
 const { changedLines, composeCard, decideLanding: decide, installationRefusals, railsFor, MAX_CHANGED_LINES, MAX_FILES } = await import("../lib/self-improve-landing.mjs");
 // Judged as a fresh install: no _ext/self-improve-landing.mjs hook. The hook
@@ -47,8 +47,8 @@ test("moderate risk still lands on its own — only high blast radius asks", () 
 
 for (const path of [
   "bin/email-send",
-  "bin/merlin-send-curl",
-  "bin/merlin-calendar",
+  "bin/edva-send-curl",
+  "bin/edva-calendar",
   "bin/vault-sync",
   "agent/supervisor/index.mjs",
   "agent/config/agents.json",

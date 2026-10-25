@@ -2,7 +2,7 @@
 // needs a signed owner approval" substrate primitive.
 //
 // Conway can gate an action behind a client prompt only while a client is
-// attached. Merlin is always-on with real financial/browser/home rails, so it
+// attached. Edva is always-on with real financial/browser/home rails, so it
 // needs the gate as a DURABLE substrate primitive: wrapping a tool with
 // `gate()` turns its execution into a two-step handshake —
 //
@@ -19,7 +19,7 @@
 // normal registry tool).
 //
 // SAFETY POSTURE — this gate FAILS CLOSED. Unlike recall/snip-semantic (which
-// fail OPEN so a down dependency never silences Merlin), a high-stakes gate
+// fail OPEN so a down dependency never silences Edva), a high-stakes gate
 // that cannot persist its pending record MUST refuse to execute — never run a
 // financial/destructive action we can't record or later prove was approved.
 //

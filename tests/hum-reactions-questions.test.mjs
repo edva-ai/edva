@@ -1,4 +1,4 @@
-// Tests for `merlin hum reactions` counting the QUESTION channel, not just
+// Tests for `edva hum reactions` counting the QUESTION channel, not just
 // info pings.
 //
 // hum surfaces a finding either as an info ping (a row in hum-feedback.jsonl,
@@ -11,7 +11,7 @@
 // window sampled 2026-07-30), including the downgrade_reason values that mark
 // a question the pipeline decided against actually sending.
 //
-// The command is a subcommand of the `merlin` CLI rather than an exported
+// The command is a subcommand of the `edva` CLI rather than an exported
 // helper, and it resolves its data paths from os.homedir(). Node's
 // os.homedir() honours $HOME on POSIX, so these drive the real binary with
 // HOME pointed at a temp fixture tree — an end-to-end test of the shipped
@@ -25,7 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MERLIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "merlin");
+const EDVA = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "edva");
 
 const hoursAgo = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
 
@@ -49,14 +49,14 @@ const answer = (id) => ({ id, asked_at: hoursAgo(6), answered_at: hoursAgo(5), s
 
 function run({ feedback = [], runs = [], learnings = [] }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "hum-rxn-"));
-  const data = path.join(home, "Dev/merlin/data");
+  const data = path.join(home, "Dev/edva/data");
   fs.mkdirSync(data, { recursive: true });
   const write = (f, rows) => fs.writeFileSync(path.join(data, f), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
   write("hum-feedback.jsonl", feedback);
   write("hum-runs.jsonl", runs);
   write("hum-learnings.jsonl", learnings);
   try {
-    const out = execFileSync("node", [MERLIN, "hum", "reactions", "--since", "14d", "--json"], {
+    const out = execFileSync("node", [EDVA, "hum", "reactions", "--since", "14d", "--json"], {
       env: { ...process.env, HOME: home },
       encoding: "utf8",
     });
@@ -184,9 +184,9 @@ test("mostly_negative still fires when the info population itself is negative", 
 
 test("missing ledgers degrade to an empty report rather than throwing", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "hum-rxn-empty-"));
-  fs.mkdirSync(path.join(home, "Dev/merlin/data"), { recursive: true });
+  fs.mkdirSync(path.join(home, "Dev/edva/data"), { recursive: true });
   try {
-    const out = execFileSync("node", [MERLIN, "hum", "reactions", "--since", "14d", "--json"], {
+    const out = execFileSync("node", [EDVA, "hum", "reactions", "--since", "14d", "--json"], {
       env: { ...process.env, HOME: home },
       encoding: "utf8",
     });

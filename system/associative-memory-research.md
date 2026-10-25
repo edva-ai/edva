@@ -1,6 +1,6 @@
-# Associative memory — research survey and plan for Merlin (2026-10-24)
+# Associative memory — research survey and plan for Edva (2026-10-24)
 
-The question: *interconnected, human-like memory, where concepts are stored interconnected and recalling one brings up all the memories associated with it.* This doc compares the field (existing systems and research papers, through Oct 2026) with what Merlin already has (`system/wiki-architecture.md`). It then names the changes most likely to help, measurably.
+The question: *interconnected, human-like memory, where concepts are stored interconnected and recalling one brings up all the memories associated with it.* This doc compares the field (existing systems and research papers, through Oct 2026) with what Edva already has (`system/wiki-architecture.md`). It then names the changes most likely to help, measurably.
 
 **How the sources were read.** The research sandbox could not reach arxiv.org, OpenReview, the ACL Anthology or most vendor sites. Paper details come from search-engine extracts of those pages. GitHub source, PyPI and npm were read directly. Every benchmark number is the authors' or vendor's own claim unless marked otherwise. Treat single numbers as directional; §3 explains why.
 
@@ -22,7 +22,7 @@ One correction to § 5.1 found while building it: the association list's RRF wei
 
 ## 1. Bottom line
 
-1. **Merlin already has most of the structure the field uses.** It has a page graph (`page_links`), Memora-style cue anchors, hybrid BM25+KNN fused with RRF, nightly consolidation (the dream, the deep dream, link-weave), and episodic pages. What it lacks is a *retriever that uses the graph the way association works*, and an *eval that can see association at all*.
+1. **Edva already has most of the structure the field uses.** It has a page graph (`page_links`), Memora-style cue anchors, hybrid BM25+KNN fused with RRF, nightly consolidation (the dream, the deep dream, link-weave), and episodic pages. What it lacks is a *retriever that uses the graph the way association works*, and an *eval that can see association at all*.
 2. **The 1-hop expansion's zero gain was close to guaranteed by its design and its measurement.** It was not evidence against association (§2).
 3. **Across the literature, association gains are real but modest.** They show up almost only on multi-hop and indirect-cue questions: roughly +1 to +3 points overall, larger on the multi-hop slice. Systems that keep the gains also keep dense and lexical retrieval dominant in the fusion.
 4. **The biggest failure in 2026 benchmarks is the missing cue, not the missing hop.** Example: "planning dinner Friday" should bring up a guest's dietary restriction. Graph traversal at query time can't fix this. Cues written when the memory is saved can (T-Mem, Memora).
@@ -65,7 +65,7 @@ The architecture doc's caveat holds: what was missing is a query set built aroun
   - Zep has been scored anywhere from 58 to 95 on LoCoMo, depending on who ran it, the judge model, and whether the 446 adversarial Category-5 questions were dropped.
   - MemDelta (2026) shows that swapping only the embedding model moves accuracy about 6 points and can flip rankings.
   - MemPalace's 96.6% was plain ChromaDB.
-  - The consequence: only an eval on Merlin's own corpus decides anything.
+  - The consequence: only an eval on Edva's own corpus decides anything.
 
 ---
 
@@ -73,18 +73,18 @@ The architecture doc's caveat holds: what was missing is a query set built aroun
 
 ### 4a. Existing systems (status checked on PyPI / npm / GitHub, 2026-10-24)
 
-| System | Data model: what an edge means | How recall pulls in associated memories | LLM per write | Status | Take for Merlin |
+| System | Data model: what an edge means | How recall pulls in associated memories | LLM per write | Status | Take for Edva |
 |---|---|---|---|---|---|
 | **Zep / Graphiti** | Episodes → entities. An edge is a **fact sentence + embedding + bi-temporal validity** (`valid_at`/`invalid_at`, `created_at`/`expired_at`). Superseded facts are invalidated, not deleted. | Cosine + BM25 + BFS from hits. Reranked by RRF, graph distance, mention count, MMR or a cross-encoder. | Several (extract, resolve, dedup, invalidate) | 0.31.2, Apache-2.0, Python. Neo4j / FalkorDB only. Zep CE deprecated. | The fact-edge schema. |
 | **Mem0** (v3 OSS) | Memories + entity collection. **Graph removed from OSS in 2026.** | Semantic candidates reranked by BM25 + entity-overlap boost. The boost **reorders; it never adds candidates.** | 1 (ADD-only) | py 2.2.1 / npm 3.3.1, Apache-2.0 | Entity boost as a reranker. |
-| **Letta** (MemGPT) | Markdown memory files in git (MemFS). No graph. | The agent's own grep/search loop. A "sleep-time" agent consolidates in the background. | Background agent | 0.34.12; `letta-code` is TS | The closest in spirit to Merlin. Validates the dream approach. |
+| **Letta** (MemGPT) | Markdown memory files in git (MemFS). No graph. | The agent's own grep/search loop. A "sleep-time" agent consolidates in the background. | Background agent | 0.34.12; `letta-code` is TS | The closest in spirit to Edva. Validates the dream approach. |
 | **Hindsight** (Vectorize) | Facts, experiences, observations, mental models. Entity, temporal, semantic and causal links. | **Four parallel channels: semantic, BM25, graph and temporal** (a date window parsed from the query). RRF, then cross-encoder, then recency multipliers. Graph score = `tanh(0.5·shared_entities)` + link weights. | ≥1 + consolidation | 1.1.0, MIT, Python server + Node client | **Best documented blueprint** for what's asked here. |
 | **Cognee** | Entity / relation triplets. Edges carry `feedback_weight`. | Vector-seeded triplet traversal. Every edge rendered as text and embedded. `improve()` strengthens what was used. | Per chunk | 1.6.5, Apache-2.0. SQLite + Kuzu (Kuzu archived by Apple; fork is LadybugDB) | Triplet embeddings; feedback weights. |
 | **HippoRAG 2** | Phrase nodes (OpenIE triples) + passage nodes + synonym edges | Query→triple match → LLM filter → **Personalized PageRank** seeded with phrases + dense-scored passages, weighted by node specificity | NER + OpenIE per passage | 2.0.0a5, MIT, low activity. Built for static corpora. | PPR in JS: a few ms on this corpus. |
 | **Supermemory** | Memory→memory edges: **updates** (`isLatest`), **extends**, **derives** | Hybrid, latest version wins | Per add | MIT, TS, self-hostable | A cheap typed-edge vocabulary. |
 | **Basic Memory** | Markdown + SQLite. `- [category] fact` observations, `- rel_type [[Target]]` **typed relations** | Hybrid FTS + vector; `build_context` walks relations | 0 | 0.24.1, **AGPL** | Nearest twin. Typed relations written in markdown. |
 | **MemOS local plugin** | Traces / policies / world model / skills | FTS5 + vector + keyword, RRF + MMR | Several | `@memtensor/memos-local-plugin` 2.0.20, **Node + better-sqlite3**, MIT | Best Node+SQLite code to read; task-oriented. |
-| **Memora** (MSR) | Primary abstraction + many-to-many cue anchors | **Iterative, LLM-steered anchor expansion with a stop decision** | Several | MIT, Python | Merlin has the anchors; the iterative policy is the unborrowed part. |
+| **Memora** (MSR) | Primary abstraction + many-to-many cue anchors | **Iterative, LLM-steered anchor expansion with a stop decision** | Several | MIT, Python | Edva has the anchors; the iterative policy is the unborrowed part. |
 | **A-MEM** | Zettelkasten notes; LLM-chosen links; "memory evolution" rewrites neighbours | kNN + linked notes | 2–3 | MIT, research code | Weak in third-party reruns (J≈48). |
 | **LightRAG / GraphRAG** | Entities + relation descriptions; Leiden communities | Local / global / mix; map-reduce over communities | Per chunk + reports | MIT; GraphRAG in maintenance | Poor fit. Week/month pages already play the role of community summaries. |
 | **MCP server-memory, Memento, rag-memory-mcp** | Entities / observations / typed relations | Substring or vector + attached relations | 0 | Node | Toys, but clean schemas. |
@@ -100,12 +100,12 @@ The architecture doc's caveat holds: what was missing is a query set built aroun
 | **Context reinstatement + temporal contiguity** | TCM/CMR (Howard & Kahana), EM-LLM (ICLR '25), RaMem (2606.22844), TIDER, Zep bi-temporal | Retrieved episode → its time, people and places become new cues; D±1 neighbours pulled in | RaMem +10% F1, LoCoMo R@1 .366 → .418 | ~1 ms |
 | **Base-level activation / forgetting** | ACT-R `B = ln Σ t^−d` (d≈0.5), Generative Agents, MemoryBank, FadeMem | Recency × frequency prior | No clean 2025–26 benchmark against vectors | Nightly SQL |
 | **Reconsolidation** | Nader 2000; Retrieval-Driven Reconsolidation (2609.16053); MSR human-inspired arch (2605.08538) | A retrieved and contradicted page is marked for rewrite | Architectural; little measured | Nightly LLM, targeted |
-| **CLS / sleep consolidation** | Auto-Dreamer, MemDream, HEMA, Letta sleep-time | Offline episodic → semantic distillation | Merlin's dream already does this | — |
+| **CLS / sleep consolidation** | Auto-Dreamer, MemDream, HEMA, Letta sleep-time | Offline episodic → semantic distillation | Edva's dream already does this | — |
 | **LLM-in-the-loop traversal; RL memory managers** | Memora policy, MRAgent, Mnemis System-2, MIRIX, Mem-α | An agent walks and prunes paths | Best headline numbers | Multiple LLM calls; doesn't fit 600 ms |
 
 ---
 
-## 5. Plan for Merlin, in order
+## 5. Plan for Edva, in order
 
 Every step below is additive, behind a flag, and judged on the eval from step 0. That is how cues and expansion were already handled here.
 
@@ -129,7 +129,7 @@ The current 27-case set has one gold page each. Extend `wiki-recall-eval` with a
 - **Three splits, reported separately:**
   - Wikilink paths.
   - **Text co-mention without a link.** This guards against circularity, since wikilink-generated questions favour wikilink expansion.
-  - About 50 hand-labelled real questions from `merlin_messages`, as the v2 set already does.
+  - About 50 hand-labelled real questions from `edva_messages`, as the v2 set already does.
 - **Metrics:**
   - **recall_all@k**: every gold page in the top k. This is LongMemEval's official definition.
   - recall_any@k, nDCG@10, and **final-hop recall**: the gold page BM25 can't reach.
@@ -173,7 +173,7 @@ This is the only fix with evidence for the missing-cue case.
 - Run it on the Sonnet rung for preference, person and project pages first, from the dream or a one-off batch. The doc's estimate for the corpus is about $2–3; incremental runs after that are small.
 - The existing validator (rejects meta-questions) still applies. Add a grounding check: each cue must cite a span of the page.
 
-### 4. Co-retrieval (Hebbian) weights, from logs Merlin already writes
+### 4. Co-retrieval (Hebbian) weights, from logs Edva already writes
 
 - **The signal already exists.** `data/auto-recall-judge.jsonl` records, for every judged message, which candidates the Sonnet judge **kept**. That is a labelled "used together" signal.
   - Pairs kept together → `coactivation(a, b, w, last_ts)`, updated nightly as `w = w·λ^Δdays + η` (HeLa-Mem: η≈0.02, λ≈0.995).

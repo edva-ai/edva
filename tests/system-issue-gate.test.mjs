@@ -21,7 +21,7 @@ const MAXAUTH = (d) => ({
   role: "assistant",
   created_at: d,
   content:
-    "🔴 Max auth is DOWN — a supervisor is logging 'Not logged in' and the keychain self-heal did not clear it. The whole Merlin backend (email triage, hum, watchers) is offline until it clears.",
+    "🔴 Max auth is DOWN — a supervisor is logging 'Not logged in' and the keychain self-heal did not clear it. The whole Edva backend (email triage, hum, watchers) is offline until it clears.",
 });
 const EPISODE = (d, day) => ({
   role: "assistant",

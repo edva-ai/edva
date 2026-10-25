@@ -21,12 +21,12 @@ const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "hum-answer-"));
 // hum-learnings.jsonl, and (via hum-responses.mjs, which uses os.homedir() →
 // honors $HOME) hum-responses.jsonl. Mirror the layout under a fake HOME.
 const fakeHome = path.join(fixtureDir, "home");
-const fakeData = path.join(fakeHome, "Dev/merlin/data");
+const fakeData = path.join(fakeHome, "Dev/edva/data");
 fs.mkdirSync(fakeData, { recursive: true });
 // The memory dir hum-answer used to write into — assert it stays empty. Same
 // derivation as lib/instance.cjs claudeMemoryDir(), under the fake HOME.
 const { claudeProjectSlug } = createRequire(import.meta.url)("../lib/instance.cjs");
-const fakeMemoryDir = path.join(fakeHome, ".claude/projects", claudeProjectSlug(path.join(fakeHome, "Dev", "merlin")), "memory");
+const fakeMemoryDir = path.join(fakeHome, ".claude/projects", claudeProjectSlug(path.join(fakeHome, "Dev", "edva")), "memory");
 fs.mkdirSync(fakeMemoryDir, { recursive: true });
 
 function writePending(obj) {

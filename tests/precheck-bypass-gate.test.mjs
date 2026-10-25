@@ -1,6 +1,6 @@
 // precheck-bypass-gate.test.mjs — --skip-precheck is an allowlist, not a flag.
 //
-// The precheck is the one universal chokepoint on everything Merlin says to
+// The precheck is the one universal chokepoint on everything Edva says to
 // the user, and its bypass flag was unenforced: CLAUDE.md § Outbound Precheck
 // named four permitted caller classes and anything could pass it anyway. The
 // ping review traced its worst findings to gates being BYPASSED
@@ -21,15 +21,15 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SEND = path.join(ROOT, "bin/merlin-send-curl");
+const SEND = path.join(ROOT, "bin/edva-send-curl");
 
 // A throwaway HOME so nothing here can reach the real Supabase or logs. The
 // gate runs long before any network call, so a fake key is enough.
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "precheck-gate-"));
-fs.mkdirSync(path.join(HOME, "Dev/merlin/tools"), { recursive: true });
-fs.writeFileSync(path.join(HOME, "Dev/merlin/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
+fs.mkdirSync(path.join(HOME, "Dev/edva/tools"), { recursive: true });
+fs.writeFileSync(path.join(HOME, "Dev/edva/.env"), "SUPABASE_SERVICE_ROLE_KEY=fake\n");
 // A synthetic installation that adds its own brokerage intents to the kernel's
-// merlin-model-only list (agent/local/config/send-intents.json).
+// edva-model-only list (agent/local/config/send-intents.json).
 const LOCAL = path.join(HOME, "local");
 fs.mkdirSync(path.join(LOCAL, "config"), { recursive: true });
 fs.writeFileSync(path.join(LOCAL, "config", "send-intents.json"), JSON.stringify({ extend_private_data_intents: ["brokerco", "brokerco-*"] }));
@@ -79,13 +79,13 @@ test("the improvements channel is exempt — approval cards fix a broken prechec
 
 test("the allowlisted chat intents still pass", () => {
   for (const intent of ["hum-debug", "resilience-test", "health-alert", "brokerco-status"]) {
-    const { err } = send(["--skip-precheck", "--intent", intent, "--no-push", "x"], { MERLIN_LOCAL_DIR: LOCAL });
+    const { err } = send(["--skip-precheck", "--intent", intent, "--no-push", "x"], { EDVA_LOCAL_DIR: LOCAL });
     assert.doesNotMatch(err, REFUSED, `intent "${intent}" should be exempt`);
   }
 });
 
-test("MERLIN_PRECHECK_BYPASS=1 is the escape hatch for out-of-sandbox probers", () => {
-  const { err } = send(["--skip-precheck", "--no-push", "x"], { MERLIN_PRECHECK_BYPASS: "1" });
+test("EDVA_PRECHECK_BYPASS=1 is the escape hatch for out-of-sandbox probers", () => {
+  const { err } = send(["--skip-precheck", "--no-push", "x"], { EDVA_PRECHECK_BYPASS: "1" });
   assert.doesNotMatch(err, REFUSED);
 });
 
@@ -98,7 +98,7 @@ test("a normal chat send is untouched — the gate only fires on the bypass flag
 
 test("refusals are logged, so drift is visible instead of silent", () => {
   send(["--skip-precheck", "--intent", "some-new-job", "--no-push", "x"]);
-  const log = path.join(HOME, "Dev/merlin/data/logs/precheck-bypass-blocked.log");
+  const log = path.join(HOME, "Dev/edva/data/logs/precheck-bypass-blocked.log");
   assert.ok(fs.existsSync(log), "expected a blocked-bypass log");
   assert.match(fs.readFileSync(log, "utf8"), /some-new-job/);
 });

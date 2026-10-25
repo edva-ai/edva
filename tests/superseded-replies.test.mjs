@@ -9,7 +9,7 @@ import path from "node:path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "superseded-"));
 const FILE = path.join(tmp, "superseded-replies.jsonl");
-process.env.MERLIN_SUPERSEDED_REPLIES = FILE;
+process.env.EDVA_SUPERSEDED_REPLIES = FILE;
 const { recordSuperseded, readSuperseded } = await import("../lib/superseded-replies.mjs");
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 beforeEach(() => fs.rmSync(FILE, { force: true }));

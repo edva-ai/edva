@@ -25,8 +25,8 @@
 
 set -euo pipefail
 
-DB_PATH="${MEMORY_INDEX_DB:-$HOME/Dev/merlin/data/memory-index.db}"
-DEST_DIR="$HOME/Dev/merlin/data/memory-db-snapshots"
+DB_PATH="${MEMORY_INDEX_DB:-$HOME/Dev/edva/data/memory-index.db}"
+DEST_DIR="$HOME/Dev/edva/data/memory-db-snapshots"
 KEEP=4
 QUIET=0
 

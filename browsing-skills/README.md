@@ -1,6 +1,6 @@
-# Merlin — Browsing Skills
+# Edva — Browsing Skills
 
-Central registry of browser actions used by Merlin's cron jobs, hum, and ad-hoc agent work. Pattern lifted from the upstream public [browsing-skills/browsing-skills](https://github.com/browsing-skills/browsing-skills) project: one file per action, structured JSON output, validated and benchmark-able.
+Central registry of browser actions used by Edva's cron jobs, hum, and ad-hoc agent work. Pattern lifted from the upstream public [browsing-skills/browsing-skills](https://github.com/browsing-skills/browsing-skills) project: one file per action, structured JSON output, validated and benchmark-able.
 
 ## Why
 
@@ -14,7 +14,7 @@ Each action now lives in **exactly one file**. When a selector breaks, you updat
 browsing-skills/
 ├── SKILL.md            # umbrella — lists supported sites + routes agents
 ├── README.md           # this file
-├── skills/             # merlin-private skills (site-specific actions)
+├── skills/             # edva-private skills (site-specific actions)
 ├── external/           # auto-synced from the configured fork of browsing-skills
 ├── fixtures/           # saved HTML + expected JSON for snapshot tests
 └── tools/
@@ -29,8 +29,8 @@ browsing-skills/
 The runtime sync is automatic. The host's crontab runs:
 
 ```cron
-0 10 * * * $HOME/Dev/merlin/bin/browsing-skills-sync >> $HOME/Dev/merlin/data/logs/browsing-skills-sync.log 2>&1
-0 23 * * * $HOME/Dev/merlin/browsing-skills/tools/skill-health.js >> $HOME/Dev/merlin/data/logs/skill-health.log 2>&1
+0 10 * * * $HOME/Dev/edva/bin/browsing-skills-sync >> $HOME/Dev/edva/data/logs/browsing-skills-sync.log 2>&1
+0 23 * * * $HOME/Dev/edva/browsing-skills/tools/skill-health.js >> $HOME/Dev/edva/data/logs/skill-health.log 2>&1
 ```
 
 - `browsing-skills-sync` pulls fresh upstream + fork content into `external/` (10am local).

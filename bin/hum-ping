@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // hum-ping — atomically send a hum message AND record its feedback entry.
 //
-// Replaces the two-step dance in jobs/hum.md (send via merlin-send-curl,
+// Replaces the two-step dance in jobs/hum.md (send via edva-send-curl,
 // then separately append to hum-feedback.jsonl). That dance was LLM-driven,
 // which meant step 2 got skipped on a nontrivial fraction of runs — so
 // hum-daily/hum-review reported zero reactions on pings that had been sent.
@@ -9,7 +9,7 @@
 // This binary makes the send+log atomic: one exec, one code path, no way to
 // land a ping in the phone without its feedback row. It also holds a
 // mkdir-based advisory lock around the JSONL write so concurrent
-// `merlin hum feedback` calls can't clobber the new row via read-modify-
+// `edva hum feedback` calls can't clobber the new row via read-modify-
 // write on the same file.
 //
 // Usage:
@@ -53,8 +53,8 @@
 //      had been switched off in hum-state.json and nothing in this path read it
 //      (nine pings in a day, three inside 22 minutes).
 //
-//  12  not sent: resolved first — merlin-send-curl's resolve-first gate found
-//      that Merlin's own records already answer what this ping asks or leaves
+//  12  not sent: resolved first — edva-send-curl's resolve-first gate found
+//      that Edva's own records already answer what this ping asks or leaves
 //      open, and the answer added nothing worth sending (bin/
 //      hum-resolve-first). No row. The answer is kept so it is not re-asked; a
 //      reservoir idea behind it is retired and a queued location ask dropped.
@@ -115,7 +115,7 @@ const noPush = flag("--no-push", false);
 const pushBody = flag("--push-body");
 let message = flag("--message");
 const fromStdin = flag("--message-from-stdin", false);
-// Intent label forwarded to merlin-send-curl so the outbound-precheck
+// Intent label forwarded to edva-send-curl so the outbound-precheck
 // reasoner has caller context (e.g. "hum:<lane>:<branch>"). Added after
 // diagnosing systematic suppression of protected-lane pings — precheck
 // couldn't tell a playbook-protected nudge from a generic dedup-candidate
@@ -219,10 +219,10 @@ if (isLocalHistoryPing) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Send the ping via merlin-send-curl --capture-id.
+// 1. Send the ping via edva-send-curl --capture-id.
 // ---------------------------------------------------------------------------
 const HOME = os.homedir();
-const SEND_BIN = installTools("bin/merlin-send-curl");
+const SEND_BIN = installTools("bin/edva-send-curl");
 const FEEDBACK_PATH = installTools("data/hum-feedback.jsonl");
 // An installation's own CLI for a lane hum-ping closes out (a retrospective
 // location ask): bin/_ext/<name> or bin/<name> when present, else skipped.
@@ -273,7 +273,7 @@ if (findings && findings.length > 0) {
 //
 //     A "were you at X?" / "did you actually stop?" question is a different
 //     animal from everything else hum sends: the user was physically there, so
-//     the information gap is Merlin's, not the user's, and the interrupt buys us
+//     the information gap is Edva's, not the user's, and the interrupt buys us
 //     data rather than buying the user anything.
 //
 //     In one week dozens of them reached the user (up to ten a day), roughly
@@ -378,7 +378,7 @@ if (suppressHook) sendArgs.push("--suppress-hook");
 if (noPush) sendArgs.push("--no-push");
 if (pushBody) sendArgs.push("--push-body", pushBody);
 // The forwarded intent ALWAYS starts with `hum:` — it is what routes the ping
-// through merlin-send-curl's resolve-first gate and tells the
+// through edva-send-curl's resolve-first gate and tells the
 // precheck it is a hum lane. A caller's own `hum:<lane>:<branch>` passes as
 // is; a missing one becomes `hum:<lane>`, and a non-hum label is nested under
 // the lane rather than dropped. (Previously an unknown lane sent no
@@ -491,7 +491,7 @@ if (evidenceStamp) sendArgs.push("--evidence-as-of", evidenceStamp);
 // attach a picture and a map — `supporting_data.media.{image_url,map_url}`,
 // both already-public URLs it composed itself.
 //
-// Forwarded rather than appended here, because `merlin-send-curl` is the only
+// Forwarded rather than appended here, because `edva-send-curl` is the only
 // place downstream of BOTH rewriting gates (outbound-precheck's `modify` and
 // claim-freshness's vintage rewrite). Appending at this level would put the
 // URLs inside the text those gates are free to replace wholesale.
@@ -532,7 +532,7 @@ let resolvedFirst = false;
 let suppressReason = "";
 try {
   const captureRaw = fs.readFileSync(captureFile, "utf8").trim();
-  // merlin-send-curl writes a JSON sentinel here when the outbound precheck
+  // edva-send-curl writes a JSON sentinel here when the outbound precheck
   // suppressed the send (no DB row, no APNs push). In that case the harvester
   // should NOT record a `surfaced` feedback row, suggestion-history row, or
   // dedup key — nothing actually landed on the phone. See system/
@@ -643,7 +643,7 @@ if (noveltyMaxSim !== null) {
 
 // ---------------------------------------------------------------------------
 // 2. Append the feedback row under an advisory lock. The lock defends the
-//    file against a concurrent `merlin hum feedback` read-modify-write, and
+//    file against a concurrent `edva hum feedback` read-modify-write, and
 //    against a second hum-ping running at the same moment. POSIX mkdir is
 //    atomic, so we use that as the lock primitive instead of shelling out to
 //    flock (which isn't installed on macOS).

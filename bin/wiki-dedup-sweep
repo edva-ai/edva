@@ -38,8 +38,8 @@ import { runOneShot } from "../agent/core/one-shot.mjs";
 import { installRoot } from "../lib/root.cjs";
 
 const HOME = os.homedir();
-const MERLIN = installRoot();
-const LOG = path.join(MERLIN, "data/logs/wiki-dedup-sweep.log");
+const EDVA = installRoot();
+const LOG = path.join(EDVA, "data/logs/wiki-dedup-sweep.log");
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] || "run";
@@ -197,7 +197,7 @@ if (has("email") && actionable.length > 0 && !allFailed) {
   const dupes = actionable.filter((c) => c.verdict.verdict === "duplicate").length;
   const overlaps = actionable.length - dupes;
   const subject = `Wiki sweep: ${dupes} duplicate${dupes === 1 ? "" : "s"}, ${overlaps} overlap${overlaps === 1 ? "" : "s"} across ${stats.pages} pages`;
-  const r = spawnSync(path.join(MERLIN, "bin/email-send"), [
+  const r = spawnSync(path.join(EDVA, "bin/email-send"), [
     "--to", createRequire(import.meta.url)("../lib/instance.cjs").instanceValue("owner_email"), "--subject", subject, "--body-file", bodyFile, "--html",
   ], { encoding: "utf8" });
   if (r.status !== 0) log(`WARN email-send failed: ${r.stderr || r.stdout}`);

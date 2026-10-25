@@ -3,7 +3,7 @@
 #
 # Kills the tmux session, waits for launchd to restart it, verifies the agent
 # reaches a running state (past all prompts), and logs the result.
-# Sends a Merlin notification on each run with pass/fail status.
+# Sends a Edva notification on each run with pass/fail status.
 #
 # Usage: runs via launchd on a schedule, auto-removes itself after 2 days.
 
@@ -11,10 +11,10 @@ set -euo pipefail
 
 TMUX=/opt/homebrew/bin/tmux
 SESSION=claude
-LOGDIR="$HOME/Dev/merlin/agent/logs"
+LOGDIR="$HOME/Dev/edva/agent/logs"
 LOG="$LOGDIR/resilience-test.log"
 PLIST="$HOME/Library/LaunchAgents/ai.claude.resilience-test.plist"
-MERLIN="$HOME/Dev/merlin/bin/merlin-send-curl"
+EDVA="$HOME/Dev/edva/bin/edva-send-curl"
 
 # Auto-expire: remove ourselves after 2 days from first run
 CREATED_FILE="$LOGDIR/.resilience-test-created"
@@ -38,7 +38,7 @@ notify() {
   local msg="$1"
   # --skip-precheck: diagnostic notification, must not be modified/suppressed
   # by recent chat context — we're verifying the channel itself.
-  "$MERLIN" --skip-precheck --intent resilience-test "$msg" 2>/dev/null || log "Merlin notification failed, result logged only"
+  "$EDVA" --skip-precheck --intent resilience-test "$msg" 2>/dev/null || log "Edva notification failed, result logged only"
 }
 
 log "=== Resilience test starting ==="

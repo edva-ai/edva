@@ -65,7 +65,7 @@ describe("fork pure helpers (WP3)", () => {
     // cannot apply CLAUDE.md's injection rule correctly.
     const d = forkDirective("fork-y", "look up the boiling point of ethanol");
     assert.match(d, /authorized/i, "must assert the task is authorized");
-    assert.match(d, /Merlin/, "must name who the task came from");
+    assert.match(d, /Edva/, "must name who the task came from");
     assert.match(d, /INHERITED BACKGROUND|inherited background/i, "must label the inherited context as context");
     assert.match(d, /UNTRUSTED/i, "must label fetched web content untrusted");
     assert.match(d, /look up the boiling point of ethanol/, "and still carry the task");

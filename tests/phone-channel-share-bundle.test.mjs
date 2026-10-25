@@ -1,4 +1,4 @@
-// A share-sheet send is several merlin_messages rows (one per photo, then the
+// A share-sheet send is several edva_messages rows (one per photo, then the
 // user's note); phone-channel used to dispatch each on its own, so one share got
 // two or three answers. Replays that shape with realistic timing, and pins the
 // wiring in phone-channel/index.mjs.
@@ -11,7 +11,7 @@ import test from "node:test";
 import { ShareBundler, SHARE_BUNDLE_GAP_MS as GAP, SHARE_CONSUMED_TTL_MS, isShareRow, laterTimestamp } from "../agent/phone-channel/share-bundle.mjs";
 
 const META = { source: "share", timezone: "UTC", utc_offset: "0" };
-const URL0 = "https://project.supabase.invalid/storage/v1/object/public/merlin-attachments";
+const URL0 = "https://project.supabase.invalid/storage/v1/object/public/edva-attachments";
 const row = (id, created_at, content, metadata = META) => ({ id, created_at, role: "user", channel: "chat", metadata, content });
 // Photo row, then the note row, ~0.5 s apart (one share).
 const SHARE_A = [

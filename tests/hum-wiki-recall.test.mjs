@@ -7,7 +7,7 @@
 //
 //   1. The query prepended the candidate's `topic` ("dining Casa Verde …").
 //      Under FTS5's implicit AND that was one more token every page had to
-//      contain; under semantic search it drags the query toward Merlin's own
+//      contain; under semantic search it drags the query toward Edva's own
 //      hum-machinery pages. Subject only.
 //
 //   2. FTS5 ANDs its terms, so a sentence-shaped query demanded every token on

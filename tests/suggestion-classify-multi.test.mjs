@@ -20,7 +20,7 @@ const BIN = path.join(HERE, "../bin/suggestion-classify");
 
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "classify-multi-"));
 after(() => fs.rmSync(fixture, { recursive: true, force: true }));
-fs.mkdirSync(path.join(fixture, "Dev/merlin/data"), { recursive: true });
+fs.mkdirSync(path.join(fixture, "Dev/edva/data"), { recursive: true });
 
 const hoursAgo = (h) => new Date(Date.now() - h * 3600e3).toISOString();
 const MSG_MUSEUM = "f0000000-0000-0000-0000-00000000000a";
@@ -28,7 +28,7 @@ const MSG_FIRE = "f0000000-0000-0000-0000-00000000000b";
 
 // Field shapes as live pings carry them: signal present on one,
 // absent on the other (only the dedup-key slug describes it).
-fs.writeFileSync(path.join(fixture, "Dev/merlin/data/hum-feedback.jsonl"), [
+fs.writeFileSync(path.join(fixture, "Dev/edva/data/hum-feedback.jsonl"), [
   JSON.stringify({ ping_id: "p-museum", sent_at: hoursAgo(6), lane: "ideas", reaction: null,
     message_id: MSG_MUSEUM,
     findings: [{ dedup_key: "ideas:0a0b0c0d", subject_key: "ideas:0a0b0c0d",

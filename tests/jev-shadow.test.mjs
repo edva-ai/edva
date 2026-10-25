@@ -74,16 +74,16 @@ test("disagreement is recorded when Jev acted", async () => {
 
 // A "🔀 Jev disagreement" page in the System tab was not actionable, and that
 // channel is only for things the operator can or should act on. A disagreement goes to its log and
-// nowhere else. Run in a child whose HOME holds a stub merlin-send-curl
+// nowhere else. Run in a child whose HOME holds a stub edva-send-curl
 // (jev-shadow resolves the sender from os.homedir()), with JEV_NO_ALERT unset
 // so the old page path would have fired into the stub, never a real channel.
 test("a disagreement is logged, never posted to a channel", async () => {
   const { spawnSync } = await import("node:child_process");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jev-shadow-home-"));
-  const bin = path.join(home, "Dev/merlin/bin");
+  const bin = path.join(home, "Dev/edva/bin");
   fs.mkdirSync(bin, { recursive: true });
   const sends = path.join(home, "sends.log");
-  fs.writeFileSync(path.join(bin, "merlin-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "edva-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
   const shadowDir = path.join(home, "shadow");
   const lib = new URL("../lib/jev-shadow.mjs", import.meta.url).href;
   const script = `
@@ -99,7 +99,7 @@ test("a disagreement is logged, never posted to a channel", async () => {
   assert.equal(d.length, 1);
   assert.equal(d[0].id, "late-1");
   assert.ok(d[0].did);
-  assert.equal(fs.existsSync(sends), false, "no merlin-send-curl call for a disagreement");
+  assert.equal(fs.existsSync(sends), false, "no edva-send-curl call for a disagreement");
   fs.rmSync(home, { recursive: true, force: true });
 });
 

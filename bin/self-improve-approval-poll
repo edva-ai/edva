@@ -82,7 +82,7 @@ function safeExt(name) {
   const p = path.resolve(EXT, name);
   return p.startsWith(EXT + path.sep) ? p : null;
 }
-// Commits go through merlin-commit, the wrapper every agent/job in this repo
+// Commits go through edva-commit, the wrapper every agent/job in this repo
 // must use: it declares the manifest itself, so it satisfies
 // githooks/pre-commit by construction. A raw `git add` + `git commit`
 // in the shared clone is exactly what the hook refuses, and when this used to
@@ -91,35 +91,35 @@ function safeExt(name) {
 // effect).
 async function gitCommit(paths, msg) {
   try {
-    await exec(path.join(ROOT, "bin/merlin-commit"), ["-m", msg, "--", ...paths], { cwd: ROOT });
+    await exec(path.join(ROOT, "bin/edva-commit"), ["-m", msg, "--", ...paths], { cwd: ROOT });
   } catch (e) {
     return { error: (e.stderr || e.message || "").toString().trim() };
   }
   // A commit that only exists on this host is one `git checkout` from gone
   // and invisible to every other clone. The 15-minute sync cron used to be
   // the only thing that pushed, and it refused whenever another clone had
-  // pushed first, so approved fixes sat unpushed. merlin-sync now rebases
+  // pushed first, so approved fixes sat unpushed. edva-sync now rebases
   // and pushes on its own; run
   // it here too so an approved fix reaches origin in seconds, not at the next
   // tick. Best-effort: a sync failure is the cron's problem to report, not a
   // reason to call the apply failed.
   try {
-    await exec(path.join(ROOT, "bin/merlin-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
+    await exec(path.join(ROOT, "bin/edva-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
   } catch (e) {
-    process.stderr.write(`[self-improve-approval-poll] committed but merlin-sync did not push: ${(e.stderr || e.message || "").toString().trim().slice(0, 300)}\n`);
+    process.stderr.write(`[self-improve-approval-poll] committed but edva-sync did not push: ${(e.stderr || e.message || "").toString().trim().slice(0, 300)}\n`);
   }
   return true;
 }
 
 // ---- pending-commit recovery ------------------------------------------------
-// The merlin-commit fix above made a failed commit VISIBLE. It never made it
+// The edva-commit fix above made a failed commit VISIBLE. It never made it
 // RECOVERABLE. Detection fires one ping into the Improvements channel, the row
 // keeps `status:"applied"` and `result.ok:true`, and nothing retries or
 // re-raises it. Every downstream reader — cost-efficiency-review's state,
 // nightly-review's roundup, system-issue-review's writeback — then reads the
 // change as landed.
 //
-// That gap bit when two owner-signed cards were refused by merlin-commit
+// That gap bit when two owner-signed cards were refused by edva-commit
 // because a CONCURRENT session had left unrelated files staged in the shared
 // clone's index. The hook was right to refuse and those files were not ours to
 // sweep — but the condition is transient by construction, and any later retry
@@ -351,7 +351,7 @@ async function applyItem(row) {
 
 // confirm to the user in the Improvements channel
 async function confirm(text) {
-  try { await exec(path.join(ROOT, "bin/merlin-send-curl"), ["--channel", "improvements", "--skip-precheck", text], { timeout: 15000 }); } catch {}
+  try { await exec(path.join(ROOT, "bin/edva-send-curl"), ["--channel", "improvements", "--skip-precheck", text], { timeout: 15000 }); } catch {}
 }
 
 const u = createUnifiedApproval({ store, deviceKeys, postSuggestion: null, applyItem });

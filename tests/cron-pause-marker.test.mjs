@@ -19,12 +19,12 @@ const { findPaused, unpause, labelOf } = require(path.join(HERE, "../lib/cron-pa
 
 // A synthetic crontab in the shapes cron-run and the pause families write.
 const CRON = [
-  "*/20 * * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-hum -- /Users/operator/Dev/merlin/agent/scripts/trigger-hum.sh",
-  "#HUMPAUSE# 0 23 * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-hum-daily -- /Users/operator/Dev/merlin/agent/scripts/trigger-hum-daily.sh",
-  "# merlin: hum-example-collect — daily example collector",
-  "#HUMPAUSE# 29 6 * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-hum-example-collect -- /Users/operator/Dev/merlin/agent/scripts/trigger-hum-example-collect.sh",
-  "#DIGESTPAUSE# 15 9 * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-example-digest -- bash -c 'x'",
-  "0 8 1 1 * /Users/operator/Dev/merlin/bin/example-audit --days 3 # ONE-SHOT-AUDIT",
+  "*/20 * * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-hum -- /Users/operator/Dev/edva/agent/scripts/trigger-hum.sh",
+  "#HUMPAUSE# 0 23 * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-hum-daily -- /Users/operator/Dev/edva/agent/scripts/trigger-hum-daily.sh",
+  "# edva: hum-example-collect — daily example collector",
+  "#HUMPAUSE# 29 6 * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-hum-example-collect -- /Users/operator/Dev/edva/agent/scripts/trigger-hum-example-collect.sh",
+  "#DIGESTPAUSE# 15 9 * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-example-digest -- bash -c 'x'",
+  "0 8 1 1 * /Users/operator/Dev/edva/bin/example-audit --days 3 # ONE-SHOT-AUDIT",
   "",
 ];
 
@@ -37,8 +37,8 @@ test("finds only the lines carrying the requested marker", () => {
 test("restoring strips exactly the marker and nothing else", () => {
   const { lines, restored } = unpause(CRON, "HUMPAUSE");
   assert.equal(restored.length, 2);
-  assert.equal(lines[1], "0 23 * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-hum-daily -- /Users/operator/Dev/merlin/agent/scripts/trigger-hum-daily.sh");
-  assert.equal(lines[3], "29 6 * * * /Users/operator/Dev/merlin/bin/cron-run --label trigger-hum-example-collect -- /Users/operator/Dev/merlin/agent/scripts/trigger-hum-example-collect.sh");
+  assert.equal(lines[1], "0 23 * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-hum-daily -- /Users/operator/Dev/edva/agent/scripts/trigger-hum-daily.sh");
+  assert.equal(lines[3], "29 6 * * * /Users/operator/Dev/edva/bin/cron-run --label trigger-hum-example-collect -- /Users/operator/Dev/edva/agent/scripts/trigger-hum-example-collect.sh");
 });
 
 test("the line count never changes and every other line is byte-identical", () => {
@@ -65,7 +65,7 @@ test("a trailing marker-shaped comment is not a paused line", () => {
   // comment line is not a job. Neither may be resurrected as a cron entry.
   const { restored } = unpause(CRON, "ONE-SHOT-AUDIT");
   assert.equal(restored.length, 0);
-  assert.equal(unpause(CRON, "merlin").restored.length, 0);
+  assert.equal(unpause(CRON, "edva").restored.length, 0);
 });
 
 test("an ordinary commented-out job is not touched", () => {

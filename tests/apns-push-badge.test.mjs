@@ -2,7 +2,7 @@
 // reflect pending Face-ID approvals, not chat-unread alone.
 //
 // Root cause: sendApnsPush() computed aps.badge from unread
-// merlin_messages(channel=chat) only, for every non-system channel — so a
+// edva_messages(channel=chat) only, for every non-system channel — so a
 // push announcing a brand-new high-risk self-improve card carried whatever
 // chat-unread happened to be (often 0), with no signal a card was waiting.
 // The in-app hamburger badge already knew about pending approvals

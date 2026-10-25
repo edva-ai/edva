@@ -20,7 +20,7 @@
 //   hum-ideas-resolve <ping_id> --resolution "<the user's words>" [--topic "<phrase>"] [--dry-run]
 //   (--keywords k1 k2 ... is still accepted and joined into the topic phrase)
 // Prints JSON {ping_id, idea_id, swept:[ids], review}. Exit: 0 ok · 2 usage · 3 ping/idea not found.
-// Env (tests): MERLIN_DATA_DIR.
+// Env (tests): EDVA_DATA_DIR.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 
 import { installTools } from "../lib/root.cjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const DIR = process.env.EDVA_DATA_DIR || installTools("data");
 const SUPPRESS_MS = 48 * 3600 * 1000;
 
 function die(msg, code) { process.stderr.write(`hum-ideas-resolve: ${msg}\n`); process.exit(code); }

@@ -56,7 +56,7 @@ function safeHostBanner() {
   catch { return ""; }
 }
 
-const CACHE_PATH = path.join(os.tmpdir(), "merlin-wiki-session-context.json");
+const CACHE_PATH = path.join(os.tmpdir(), "edva-wiki-session-context.json");
 
 // Hash of THIS script's own source, folded into the cache key.
 //
@@ -181,7 +181,7 @@ function buildMemoryMap(byType, total) {
     `- \`wiki_search(query, mode:"hybrid")\` — paraphrase-tolerant search for what ${OWNER_NAME} IS or PREFERS or DECIDED (profile, feedback rules, projects, references). \`type:\` to scope. Reach for \`episode_search\` instead for anything that happened on a day.`,
     "- `wiki_read <id>` — full body of any page (ids appear in the pinned menu and in search hits), plus its typed facts.",
     "- `wiki_associate(ids:[...])` — everything tied to a page or several (people ↔ the days they appear in, a day ↔ the day before/after, pages often recalled together), each result saying how it was reached. For \"what else happened when…\" and the bridge between two things.",
-    "- `recall_events(query)` — search Merlin's own activity stream (what it actually did/decided), not just curated pages.",
+    "- `recall_events(query)` — search Edva's own activity stream (what it actually did/decided), not just curated pages.",
   ];
   return lines.join("\n") + "\n";
 }

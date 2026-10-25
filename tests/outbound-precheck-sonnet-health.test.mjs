@@ -14,7 +14,7 @@ import fs from "node:fs";
 import { makeFixture, choice } from "./jev-gate-harness.mjs";
 
 const BIN = path.resolve("bin/outbound-precheck.mjs");
-const SEND_CURL = path.resolve("bin/merlin-send-curl");
+const SEND_CURL = path.resolve("bin/edva-send-curl");
 const f = makeFixture("outbound-precheck");
 const LOG = () => path.join(f.tmp, "precheck.jsonl");
 const HEALTH = () => path.join(f.tmp, "precheck-health.json");
@@ -123,23 +123,23 @@ test("crossing 25% tells the system channel once, silently, outside the precheck
   const first = sends();
   assert.equal(first.length, 1, `one report: ${JSON.stringify(first)}`);
   assert.match(first[0], /^--channel system --skip-precheck --intent precheck-health /);
-  const msg = first[0].replace(/^--channel system --skip-precheck --intent precheck-health /, ""); // lang-regex-ok: the alert text Merlin composed, not anything the user wrote
-  assert.match(msg, /^⚠️ Relevance check partly blind: .*6 of the last 21 messages \(29%; no_json 6\)/); // lang-regex-ok: the alert text Merlin composed, not anything the user wrote
+  const msg = first[0].replace(/^--channel system --skip-precheck --intent precheck-health /, ""); // lang-regex-ok: the alert text Edva composed, not anything the user wrote
+  assert.match(msg, /^⚠️ Relevance check partly blind: .*6 of the last 21 messages \(29%; no_json 6\)/); // lang-regex-ok: the alert text Edva composed, not anything the user wrote
   assert.ok(health().alerted_at);
 
-  // The words must get through merlin-send-curl's system-channel gates as a
+  // The words must get through edva-send-curl's system-channel gates as a
   // plain, silent row: not a claimed outage (exit 3), not an unattested error
   // mechanism (exit 6), not a P1-sweep alert (exit 7), not 🔴/🚨 (which push).
   const src = fs.readFileSync(SEND_CURL, "utf8");
   for (const name of ["INFRA_CLAIM_RE", "MECHANISM_CLAIM_RE", "P1_SWEEP_SUBJECT_RE"]) {
     const m = src.match(new RegExp(`^${name}='(.+)'$`, "m"));
-    assert.ok(m, `${name} not found in merlin-send-curl`);
+    assert.ok(m, `${name} not found in edva-send-curl`);
     for (const k of ["no_json", "unavailable", "error"]) {
       const variant = msg.replace("no_json 6", `${k} 6`);
       assert.doesNotMatch(variant, new RegExp(m[1], "i"), `${name} would block: ${variant}`);
     }
   }
-  assert.ok(!/^(🔴|🚨)/.test(msg), "a degraded check is not a critical page"); // lang-regex-ok: the alert text Merlin composed, not anything the user wrote
+  assert.ok(!/^(🔴|🚨)/.test(msg), "a degraded check is not a critical page"); // lang-regex-ok: the alert text Edva composed, not anything the user wrote
 
   await run({ sonnet: "still no json" });   // still over the line, same episode
   await sleep(1000);   // long enough that a wrong second report would have landed

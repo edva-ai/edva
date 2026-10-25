@@ -1,4 +1,4 @@
-// The chat agent's context windows read merlin_messages, which holds several
+// The chat agent's context windows read edva_messages, which holds several
 // channels: chat, system (infra alerts) and improvements (approval cards).
 // Each window must read only the channel the inbound message came from, or
 // alerts the user never saw in Chat show up in the agent's idea of the
@@ -25,7 +25,7 @@ const CHANNEL_SCOPE = '.eq("channel", row.channel || "chat")';
 
 test("Recent conversation reads only the inbound message's channel", () => {
   const q = queryFor("historyP");
-  assert.ok(q.includes('.from("merlin_messages")'), "historyP reads merlin_messages");
+  assert.ok(q.includes('.from("edva_messages")'), "historyP reads edva_messages");
   assert.ok(q.includes(CHANNEL_SCOPE), "historyP is channel-scoped");
 });
 

@@ -12,8 +12,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/root.sh"   # MERLIN_ROOT, MERLIN_TOOLS
-LOG_DIR="$MERLIN_TOOLS/agent/logs"
+source "$SCRIPT_DIR/lib/root.sh"   # EDVA_ROOT, EDVA_TOOLS
+LOG_DIR="$EDVA_TOOLS/agent/logs"
 LOG_FILE="$LOG_DIR/memory-snapshot.log"
 
 mkdir -p "$LOG_DIR"
@@ -24,7 +24,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 TS="$(date '+%Y-%m-%d %H:%M:%S')"
 {
   echo "=== $TS ==="
-  "$MERLIN_TOOLS/bin/memory-snapshot" --quiet 2>&1 || {
+  "$EDVA_TOOLS/bin/memory-snapshot" --quiet 2>&1 || {
     rc=$?
     echo "memory-snapshot FAILED with exit $rc"
     exit "$rc"

@@ -132,7 +132,7 @@ function sendBody(res, cb, status, chunks) {
   res.emit("end");
 }
 
-const TEST_URL = "https://supabase-rest-test.invalid/rest/v1/merlin_messages?select=*";
+const TEST_URL = "https://supabase-rest-test.invalid/rest/v1/edva_messages?select=*";
 
 test("fetchJson returns the uncorrupted row when the emoji straddles a chunk boundary", async () => {
   fakeRequest((res, _req, cb) => sendBody(res, cb, 200, splitAt(PAYLOAD_BYTES, hostileOffsets())));

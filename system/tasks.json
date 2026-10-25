@@ -1,6 +1,6 @@
 {
   "$schema": "./tasks.schema.json",
-  "_comment": "Registry of the kernel's automated tasks. Single source of truth for chat-agent delegation + cron reference. This installation's own tasks (and any field it overrides on a kernel task) live in agent/local/tasks.json, same shape; every reader sees the two merged by lib/registry.cjs (`node lib/registry.cjs tasks`). Edit, then run 'merlin doctor' to verify cron + playbook alignment.",
+  "_comment": "Registry of the kernel's automated tasks. Single source of truth for chat-agent delegation + cron reference. This installation's own tasks (and any field it overrides on a kernel task) live in agent/local/tasks.json, same shape; every reader sees the two merged by lib/registry.cjs (`node lib/registry.cjs tasks`). Edit, then run 'edva doctor' to verify cron + playbook alignment.",
   "tasks": [
     {
       "name": "morning-digest",
@@ -10,7 +10,7 @@
       "webhook_url": null,
       "webhook_task": null,
       "ops_playbook_section": "Morning Digest",
-      "delivers_to": "merlin",
+      "delivers_to": "edva",
       "phrases": [
         "morning brief",
         "morning briefing",
@@ -19,7 +19,7 @@
         "daily digest",
         "morning digest"
       ],
-      "description": "Compile calendar, tasks, news headlines, and weather; send to Merlin.",
+      "description": "Compile calendar, tasks, news headlines, and weather; send to Edva.",
       "job": "morning-digest"
     },
     {
@@ -66,7 +66,7 @@
       "webhook_url": "http://localhost:9092",
       "webhook_task": "HUM",
       "ops_playbook_section": "Hum",
-      "delivers_to": "merlin",
+      "delivers_to": "edva",
       "phrases": [
         "hum",
         "hum status",
@@ -86,7 +86,7 @@
       "webhook_url": "http://localhost:9092",
       "webhook_task": "HUM REVIEW",
       "ops_playbook_section": "Hum Review",
-      "delivers_to": "email+merlin",
+      "delivers_to": "email+edva",
       "phrases": [
         "hum review",
         "hum weekly review",
@@ -162,7 +162,7 @@
       "webhook_url": "http://localhost:9092",
       "webhook_task": "NIGHTLY REVIEW",
       "ops_playbook_section": "nightly-review",
-      "delivers_to": "merlin",
+      "delivers_to": "edva",
       "phrases": [
         "self improvement review",
         "weekly review",
@@ -242,7 +242,7 @@
       "ops_playbook_section": null,
       "delivers_to": "none",
       "phrases": [],
-      "description": "Off-box copy of the wiki. Reconciles Supabase wiki_pages / wiki_page_links / wiki_page_revisions (merlin project) to data/memory-index.db via `bin/wiki-cloud-sync push` — stateless row-hash diff for pages+links, rowid cursor for revisions (data/wiki-cloud-sync.json). Pages 3 failures in a row via merlin-notify --channel system. Restore = `wiki-cloud-sync restore --db <new-file>` then swap in + re-run wiki-embed. Check = `wiki-cloud-sync verify`. Direct script — no webhook, no Anthropic API.",
+      "description": "Off-box copy of the wiki. Reconciles Supabase wiki_pages / wiki_page_links / wiki_page_revisions (edva project) to data/memory-index.db via `bin/wiki-cloud-sync push` — stateless row-hash diff for pages+links, rowid cursor for revisions (data/wiki-cloud-sync.json). Pages 3 failures in a row via edva-notify --channel system. Restore = `wiki-cloud-sync restore --db <new-file>` then swap in + re-run wiki-embed. Check = `wiki-cloud-sync verify`. Direct script — no webhook, no Anthropic API.",
       "job": null
     },
     {
@@ -253,7 +253,7 @@
       "webhook_url": null,
       "webhook_task": null,
       "ops_playbook_section": null,
-      "delivers_to": "merlin",
+      "delivers_to": "edva",
       "phrases": [],
       "description": "Probe Chrome DevTools Protocol on port 9222 and notify the user once per UP→DOWN transition so they can investigate a lost TCC grant / closed Chrome / chrome-devtools-mcp re-sign. Silent on recovery. Quiet hours 00:00–09:00 local defer the ping to the 09:00-tick. State in data/chrome-cdp-state.json. Direct script — no webhook, no Anthropic API.",
       "job": null
@@ -266,7 +266,7 @@
       "webhook_url": null,
       "webhook_task": null,
       "ops_playbook_section": "hum-explore",
-      "delivers_to": "merlin",
+      "delivers_to": "edva",
       "phrases": [
         "borderline pick",
         "hum explore",
@@ -290,7 +290,7 @@
         "cost push",
         "push cost report"
       ],
-      "description": "Push per-day model-weighted Claude usage/cost rollups (from merlin-cost-report --push, unioning the ops/-light/-haiku ledgers) to the hosted /usage telemetry endpoint for central, durable monitoring across hosts. Sends the real metered weighted cost, not the SDK phantom estimate. Runs after midnight over a 2-day window; idempotent per (host, day). Requires MERLIN_USAGE_TOKEN (or STATS_TOKEN) in .env. Direct script — no webhook, no Anthropic API. Non-fatal when there are no cost rows. NOTE: confirm the cron slot via merlin-cron-slots on the host.",
+      "description": "Push per-day model-weighted Claude usage/cost rollups (from edva-cost-report --push, unioning the ops/-light/-haiku ledgers) to the hosted /usage telemetry endpoint for central, durable monitoring across hosts. Sends the real metered weighted cost, not the SDK phantom estimate. Runs after midnight over a 2-day window; idempotent per (host, day). Requires EDVA_USAGE_TOKEN (or STATS_TOKEN) in .env. Direct script — no webhook, no Anthropic API. Non-fatal when there are no cost rows. NOTE: confirm the cron slot via edva-cron-slots on the host.",
       "job": null
     },
     {
@@ -355,7 +355,7 @@
         "why does that alert keep firing",
         "fix the recurring errors"
       ],
-      "description": "Nightly root-cause pass over Merlin's own system channel. Clusters the last 14 days of alerts into distinct issues (by condition, not wording), correlates recovery messages, closes out verified fixes, then works two lanes: up to 3 fix attempts and up to 3 cheaper review-only passes. Every issue is reviewed even if it healed itself (2026-07-25) -- a recovery closes the incident, never the issue, and nothing reaches a terminal status without a recorded root cause. Low/moderate fixes are implemented + critic-reviewed + committed autonomously and shown as a green-check card in the Improvements channel; high-risk fixes are staged as one Face-ID card per night. A review concluding no code change is warranted is recorded silently (status reviewed / resolution reviewed-no-fix) and surfaces in the weekly nightly-review roundup.",
+      "description": "Nightly root-cause pass over Edva's own system channel. Clusters the last 14 days of alerts into distinct issues (by condition, not wording), correlates recovery messages, closes out verified fixes, then works two lanes: up to 3 fix attempts and up to 3 cheaper review-only passes. Every issue is reviewed even if it healed itself (2026-07-25) -- a recovery closes the incident, never the issue, and nothing reaches a terminal status without a recorded root cause. Low/moderate fixes are implemented + critic-reviewed + committed autonomously and shown as a green-check card in the Improvements channel; high-risk fixes are staged as one Face-ID card per night. A review concluding no code change is warranted is recorded silently (status reviewed / resolution reviewed-no-fix) and surfaces in the weekly nightly-review roundup.",
       "job": "system-issue-review"
     },
     {
@@ -380,7 +380,7 @@
     {
       "name": "cost-efficiency-review",
       "schedule": "37 2 * * *",
-      "schedule_human": "Daily at 2:37 AM local (launchd agent ai.claude.cost-efficiency-review, NOT cron — cron can't reach the in-session Max keychain; runs on ephemeral Opus 5 like the rest of the improvement family). Slot reserved via merlin-cron-slots.",
+      "schedule_human": "Daily at 2:37 AM local (launchd agent ai.claude.cost-efficiency-review, NOT cron — cron can't reach the in-session Max keychain; runs on ephemeral Opus 5 like the rest of the improvement family). Slot reserved via edva-cron-slots.",
       "scheduler": "launchd",
       "trigger_script": "agent/scripts/trigger-cost-efficiency-review.sh",
       "webhook_task": "COST EFFICIENCY REVIEW",
@@ -388,15 +388,15 @@
       "delivers_to": "improvements",
       "phrases": [
         "cost efficiency review",
-        "what is merlin spending",
+        "what is edva spending",
         "where is my budget going",
-        "why is merlin using so much budget",
+        "why is edva using so much budget",
         "context floor",
         "cost overhead",
         "what's eating the budget",
-        "how much did merlin cost today"
+        "how much did edva cost today"
       ],
-      "description": "Daily review of WHERE the Max budget actually went in the last 24h — not which job spent the most, but whether the spend bought WORK or bought CONTEXT. Reads a pre-fetched `merlin-cost-report --efficiency --json` (the trigger fetches it un-sandboxed) and compares against the 2026-08-06 baseline: cost split by token type, the measured context FLOOR per supervisor, the working window above it, and the compact/rotate churn that follows when that window closes. Flags a regression when overhead rises >5 points, a floor grows >5k, a working window drops under 40k, or 24h spend exceeds 1.4x the 7d median — then attributes it to a specific change (a new always-loaded CLAUDE.md section, an added MCP server, a gate that stopped gating, a job that got heavier) and files cuts through the unified self-improvement pipeline: low/moderate auto-apply with a green-check card, high risk (model tier, output quality, capability removal) as a Face-ID card it can never self-approve. Silent when nothing regressed. Exists because a single day can burn a large share of the weekly cap, most of it cache traffic, and nightly-review's weekly job-shaped cost lens could not see it.",
+      "description": "Daily review of WHERE the Max budget actually went in the last 24h — not which job spent the most, but whether the spend bought WORK or bought CONTEXT. Reads a pre-fetched `edva-cost-report --efficiency --json` (the trigger fetches it un-sandboxed) and compares against the 2026-08-06 baseline: cost split by token type, the measured context FLOOR per supervisor, the working window above it, and the compact/rotate churn that follows when that window closes. Flags a regression when overhead rises >5 points, a floor grows >5k, a working window drops under 40k, or 24h spend exceeds 1.4x the 7d median — then attributes it to a specific change (a new always-loaded CLAUDE.md section, an added MCP server, a gate that stopped gating, a job that got heavier) and files cuts through the unified self-improvement pipeline: low/moderate auto-apply with a green-check card, high risk (model tier, output quality, capability removal) as a Face-ID card it can never self-approve. Silent when nothing regressed. Exists because a single day can burn a large share of the weekly cap, most of it cache traffic, and nightly-review's weekly job-shaped cost lens could not see it.",
       "job": "cost-efficiency-review"
     },
     {

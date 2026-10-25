@@ -233,7 +233,7 @@ test("capture artifacts: a drop writes the tagged sentinel + sidecar, a rewrite 
 
   const cap2 = path.join(tmp(), "cap");
   writeCaptureArtifacts(cap2, { action: "rewrite", decision_id: "hr-2", verdict: "partial", still_question: true, text: "gap?" });
-  assert.equal(fs.existsSync(cap2), false, "the id is merlin-send-curl's to write");
+  assert.equal(fs.existsSync(cap2), false, "the id is edva-send-curl's to write");
   assert.deepEqual(readSidecar(cap2), { by: "hum-resolve-first", decision_id: "hr-2", action: "rewrite", verdict: "partial", still_question: true, text: "gap?" });
 
   fs.writeFileSync(sidecarPath(cap2), JSON.stringify({ by: "hum-resolve-first", action: "drop" }));
@@ -290,7 +290,7 @@ test("CLI: a drop writes the sentinel, the log row and the memory; exit 0", () =
   assert.ok(fs.readFileSync(path.join(r.dir, "store.jsonl"), "utf8").includes("idea-jordan"));
 });
 
-test("CLI: a rewrite returns the text and choices flag for merlin-send-curl", () => {
+test("CLI: a rewrite returns the text and choices flag for edva-send-curl", () => {
   const r = cli([], JSON.stringify(input), { __answer: { ...RESOLVED, verdict: "partial", remaining_gap: "x", gap_text: "Only this?", choices_still_fit: false } });
   assert.equal(r.out.action, "rewrite");
   assert.equal(r.out.text, "Only this?");

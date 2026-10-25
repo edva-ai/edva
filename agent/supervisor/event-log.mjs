@@ -4,7 +4,7 @@
 //   cost.ndjson       one line per turn result (session-level aggregate)
 //   job-costs.ndjson  one line per turn result attributed to its job/source
 //                     (drives per-job usage rollups for
-//                     `merlin-cost-report` + nightly-review cost lens)
+//                     `edva-cost-report` + nightly-review cost lens)
 //
 // Rotation. Without it these streams are append-only with no bound.
 // events.ndjson reached 2.6GB on the ops supervisor, which (a) put the logs

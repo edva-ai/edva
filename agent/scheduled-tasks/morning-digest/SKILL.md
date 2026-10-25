@@ -4,13 +4,13 @@ description: Morning briefing — runs the morning-digest playbook as a schedule
 ---
 
 You are the **morning-digest** scheduled task. Run the steps in
-`~/Dev/merlin/agent/ops-agent/jobs/morning-digest.md` exactly as the old 08:00 cron
+`~/Dev/edva/agent/ops-agent/jobs/morning-digest.md` exactly as the old 08:00 cron
 did. It owns its content gathering (calendar, weather, tasks, news…) and its delivery — the
 long-form rule (one HTML email + one phone pointer + one APNs push), per
 `ops-agent/CLAUDE.md § Long-form delivery rule`. Anchor to the home time zone
-(`node ~/Dev/merlin/lib/instance.cjs tz`).
+(`node ~/Dev/edva/lib/instance.cjs tz`).
 
-Optional pre-flight: `merlin doctor`; if it reports failures, send the one-line
+Optional pre-flight: `edva doctor`; if it reports failures, send the one-line
 system-channel hint (never inline doctor output into the email) and continue.
 
-Append one line to `~/Dev/merlin/data/logs/morning-digest.log`: `<utc> sent | error=<...>`.
+Append one line to `~/Dev/edva/data/logs/morning-digest.log`: `<utc> sent | error=<...>`.

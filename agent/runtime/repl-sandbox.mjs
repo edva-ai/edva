@@ -9,7 +9,7 @@
 // ends: deferred tools are invoked via executeTool() in code, so ~30K of schemas
 // never enters context.
 //
-// MERLIN ADAPTATION — Max-only auth: Conway's sample() calls the Messages API
+// EDVA ADAPTATION — Max-only auth: Conway's sample() calls the Messages API
 // directly. Here sample() routes through an injected `sampler` that defaults to a
 // Max-compliant `claude -p --model <tier>` fork (ANTHROPIC_API_KEY stripped), the
 // same fork pattern the hum harvesters use — never the SDK. Tests inject a mock sampler.
@@ -21,7 +21,7 @@
 //   - injected globals are frozen (non-writable) so user code can't clobber the
 //     bridge; oversized results spill to disk instead of blowing context.
 // The caller is responsible for only ever constructing this behind the same
-// owner-approval / allow-list gates as Merlin's other privileged tools.
+// owner-approval / allow-list gates as Edva's other privileged tools.
 
 import vm from "node:vm";
 import fs from "node:fs";

@@ -1,6 +1,6 @@
-// browser.mjs — CAP A4. Drive Merlin's ALREADY-logged-in Chrome (real cookies,
+// browser.mjs — CAP A4. Drive Edva's ALREADY-logged-in Chrome (real cookies,
 // real sessions) through the existing CDP driver (bin/cdp.py on port
-// 9222). Conway drives a headless Chromium; Merlin's authenticated profile is
+// 9222). Conway drives a headless Chromium; Edva's authenticated profile is
 // strictly better, so we wrap it rather than borrow the headless approach.
 //
 // Discipline (Conway + OpenCLAW): `read` returns a SIMPLIFIED DOM — visible

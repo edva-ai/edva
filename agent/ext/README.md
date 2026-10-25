@@ -1,6 +1,6 @@
 # ext/ — owner-approved, agent-authored capability modules (WP11)
 
-Modules here were **written by Merlin** and **explicitly approved by the user** before
+Modules here were **written by Edva** and **explicitly approved by the user** before
 they were allowed to load (see `system/wp11-self-improvement-gate-design.md`).
 Each is a WP5 plugin (`<name>/manifest.json` + optional `index.mjs`). They are served
 as real `mcp__tools__*` tools + skills by `tools-mcp`.

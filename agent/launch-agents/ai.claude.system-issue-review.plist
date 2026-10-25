@@ -25,19 +25,19 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>__MERLIN_TOOLS__/agent/scripts/trigger-system-issue-review.sh</string>
+        <string>__EDVA_TOOLS__/agent/scripts/trigger-system-issue-review.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>__HOME__</string>
         <key>PATH</key>
-        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__EDVA_TOOLS__/bin</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
     </dict>
     <key>WorkingDirectory</key>
-    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <string>__EDVA_TOOLS__/agent/ops-agent</string>
     <key>RunAtLoad</key>
     <false/>
     <key>KeepAlive</key>
@@ -50,8 +50,8 @@
         <integer>27</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+    <string>__EDVA_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+    <string>__EDVA_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
 </dict>
 </plist>

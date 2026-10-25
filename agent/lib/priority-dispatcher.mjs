@@ -22,10 +22,10 @@ export class PriorityDispatcher extends EventEmitter {
   // `coalesce` (default on): when draining, merge the contiguous run of queued
   // items that share the head's (source, priority) into ONE turn — the
   // Claude-Code "type several lines while it's working, they all land in the
-  // next turn" behavior. Before this, N rapid Merlin messages ran as N separate
+  // next turn" behavior. Before this, N rapid Edva messages ran as N separate
   // turns (full startup latency each, and the agent never saw them together);
   // now they're one turn the agent answers holistically. Merging is deliberately
-  // conservative — SAME source AND SAME priority only — so a Merlin message is
+  // conservative — SAME source AND SAME priority only — so a Edva message is
   // never fused with a background triage/cron task (different source, usually
   // different priority), which must stay a distinct turn. `maxCoalesce` caps a
   // single merged turn so a flood can't build one enormous prompt.

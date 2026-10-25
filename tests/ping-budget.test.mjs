@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 
 // Sandbox HOME before any lib is imported: every ledger path is HOME-relative.
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ping-budget-"));
-const DATA = path.join(tmp, "Dev/merlin/data");
+const DATA = path.join(tmp, "Dev/edva/data");
 fs.mkdirSync(DATA, { recursive: true });
 process.env.HOME = tmp;
 delete process.env.HUM_MAX_PINGS_PER_DAY;
@@ -31,7 +31,7 @@ delete process.env.HUM_DEDUP_WINDOW_H;
 // A synthetic installation whose Rule #1 lane is "practice" (hum-lanes.json protected_lanes).
 fs.mkdirSync(path.join(tmp, "local/config"), { recursive: true });
 fs.writeFileSync(path.join(tmp, "local/config/hum-lanes.json"), JSON.stringify({ protected_lanes: ["practice"] }));
-process.env.MERLIN_LOCAL_DIR = path.join(tmp, "local");
+process.env.EDVA_LOCAL_DIR = path.join(tmp, "local");
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 import { REPO_ROOT as REPO } from "../lib/root.cjs";

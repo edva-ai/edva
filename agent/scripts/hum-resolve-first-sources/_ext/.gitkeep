@@ -1,6 +1,6 @@
 # Per-instance resolve-first evidence sources (overlay drop).
 #
-# lib/hum-resolve-first.mjs reads a bundle of Merlin's own records before
+# lib/hum-resolve-first.mjs reads a bundle of Edva's own records before
 # any hum question or comment is sent, so it never asks something the records
 # already answer. The kernel bundle is generic (calendar, tasks, recent chat,
 # memory recall, email memory, this gate's earlier conclusions). Modules placed

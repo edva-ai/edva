@@ -6,8 +6,8 @@
 // 5 min" — distinct from cron/launchd recurring jobs, and the sanctioned
 // alternative to a foreground sleep (which would block the loop).
 //
-// MERLIN SURPASSES CONWAY HERE: Conway's checkLater lives in a managed runtime
-// and dies on container cycle. Merlin PERSISTS the wake to memory-index.db, so
+// EDVA SURPASSES CONWAY HERE: Conway's checkLater lives in a managed runtime
+// and dies on container cycle. Edva PERSISTS the wake to memory-index.db, so
 // a scheduled wake survives a full supervisor bounce or reboot — the always-on
 // box + persistence makes this strictly better than Conway's in-memory timer
 // (WP7 surpass-lens).
@@ -24,7 +24,7 @@ import os from "node:os";
 
 import { installTools } from "../../lib/root.cjs";
 // Conway caps this at 300s (its wake is an in-memory timer that dies on
-// container cycle). Merlin PERSISTS the wake to memory-index.db and survives a
+// container cycle). Edva PERSISTS the wake to memory-index.db and survives a
 // bounce, so the cap can be a useful in-conversation ceiling (1h) without
 // competing with cron/calendar for genuine long-term reminders. Overridable via
 // CHECK_LATER_MAX_SECONDS.

@@ -36,7 +36,7 @@ describe("watchdogMsFor", () => {
   it("returns the per-source override, else the default", () => {
     const thresholds = { "daily-summary": 20 * 60_000 };
     assert.equal(watchdogMsFor("daily-summary", { thresholds }), 20 * 60_000);
-    assert.equal(watchdogMsFor("merlin", { thresholds }), TURN_WATCHDOG_MS_DEFAULT);
+    assert.equal(watchdogMsFor("edva", { thresholds }), TURN_WATCHDOG_MS_DEFAULT);
   });
 
   // Regression guard for the "⚠️ Ops turn from <job> hung for 10min with no
@@ -51,7 +51,7 @@ describe("watchdogMsFor", () => {
   });
 
   it("keeps the short leash for sources a human is waiting on", () => {
-    assert.equal(watchdogMsFor("merlin", {}), TURN_WATCHDOG_MS_DEFAULT);
+    assert.equal(watchdogMsFor("edva", {}), TURN_WATCHDOG_MS_DEFAULT);
     assert.equal(watchdogMsFor("gmail:fake-msg-a01", {}), TURN_WATCHDOG_MS_DEFAULT);
     // A missing source is a bug, not a job — short leash so it cannot quietly
     // hold the queue for the longer window.
@@ -60,9 +60,9 @@ describe("watchdogMsFor", () => {
   });
 
   it("an explicit override still wins over both defaults", () => {
-    const thresholds = { "nightly-review": 55 * 60_000, "merlin": 3 * 60_000 };
+    const thresholds = { "nightly-review": 55 * 60_000, "edva": 3 * 60_000 };
     assert.equal(watchdogMsFor("nightly-review", { thresholds }), 55 * 60_000);
-    assert.equal(watchdogMsFor("merlin", { thresholds }), 3 * 60_000);
+    assert.equal(watchdogMsFor("edva", { thresholds }), 3 * 60_000);
   });
 
   it("isInteractiveSource classifies the documented set", () => {
@@ -85,7 +85,7 @@ describe("TurnWatchdog", () => {
     const wd = new TurnWatchdog({ onFire: (item, ms) => fired.push([item.id, ms]), setTimer: clock.setTimer, clearTimer: clock.clearTimer, now: clock.now });
     const handle = [...clock.pending][0]; // none yet
     assert.equal(handle, undefined);
-    wd.arm({ id: "t1", source: "merlin" });
+    wd.arm({ id: "t1", source: "edva" });
     assert.equal(wd.armed, true);
     clock.fire([...clock.pending][0]);
     assert.deepEqual(fired, [["t1", TURN_WATCHDOG_MS_DEFAULT]]);
@@ -96,7 +96,7 @@ describe("TurnWatchdog", () => {
     const clock = fakeClock();
     let fired = 0;
     const wd = new TurnWatchdog({ onFire: () => fired++, setTimer: clock.setTimer, clearTimer: clock.clearTimer, now: clock.now });
-    wd.arm({ id: "t1", source: "merlin" });
+    wd.arm({ id: "t1", source: "edva" });
     wd.clear();
     assert.equal(wd.armed, false);
     assert.equal(clock.pending.size, 0, "timer removed");
@@ -107,8 +107,8 @@ describe("TurnWatchdog", () => {
     const clock = fakeClock();
     const fired = [];
     const wd = new TurnWatchdog({ onFire: (item) => fired.push(item.id), setTimer: clock.setTimer, clearTimer: clock.clearTimer, now: clock.now });
-    wd.arm({ id: "t1", source: "merlin" });
-    wd.arm({ id: "t2", source: "merlin" });
+    wd.arm({ id: "t1", source: "edva" });
+    wd.arm({ id: "t2", source: "edva" });
     assert.equal(clock.pending.size, 1, "only one live timer after re-arm");
     clock.fire([...clock.pending][0]);
     assert.deepEqual(fired, ["t2"], "only the latest turn fires");
@@ -125,13 +125,13 @@ describe("TurnWatchdog", () => {
     const clock = fakeClock();
     const wd = new TurnWatchdog({ setTimer: clock.setTimer, clearTimer: clock.clearTimer, now: clock.now });
     assert.equal(wd.arm({ id: "t1", source: "release-watcher" }), TURN_WATCHDOG_MS_JOB_DEFAULT);
-    assert.equal(wd.arm({ id: "t2", source: "merlin" }), TURN_WATCHDOG_MS_DEFAULT);
+    assert.equal(wd.arm({ id: "t2", source: "edva" }), TURN_WATCHDOG_MS_DEFAULT);
   });
 
   it("a caller may still pin both windows explicitly", () => {
     const clock = fakeClock();
     const wd = new TurnWatchdog({ defaultMs: 60_000, jobDefaultMs: 90_000, setTimer: clock.setTimer, clearTimer: clock.clearTimer, now: clock.now });
-    assert.equal(wd.arm({ id: "t1", source: "merlin" }), 60_000);
+    assert.equal(wd.arm({ id: "t1", source: "edva" }), 60_000);
     assert.equal(wd.arm({ id: "t2", source: "cron-whatever" }), 90_000);
   });
 

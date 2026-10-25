@@ -68,7 +68,7 @@ const signal = [
   "That is how things looked THEN. Never present it or its numbers as current (\"lately\", \"these days\"): say when it was seen, or ask without it.",
   `The change: ${String(i.proposed_change || i.title).slice(0, 360)}`,
   predicted ? `What it should do: ${predicted.slice(0, 220)}` : null,
-  `Once they have answered, Merlin builds it the way they described${i.risk === "high" ? " and files it as one Improvements card to sign (it is high-risk)" : " and applies it on its own"}.`,
+  `Once they have answered, Edva builds it the way they described${i.risk === "high" ? " and files it as one Improvements card to sign (it is high-risk)" : " and applies it on its own"}.`,
 ].filter(Boolean).join("\n");
 
 stampRun("hum_asks", true);

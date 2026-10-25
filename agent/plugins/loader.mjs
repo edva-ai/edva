@@ -1,6 +1,6 @@
 // loader.mjs — WP5: plugin / extension architecture (playbooks become plugins).
 //
-// Turns Merlin capabilities into hot-reloadable modules with a manifest and
+// Turns Edva capabilities into hot-reloadable modules with a manifest and
 // typed contribution kinds, so adding a capability never means editing the
 // supervisor. A plugin is a directory:
 //

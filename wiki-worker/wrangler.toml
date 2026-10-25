@@ -17,10 +17,10 @@
 # Deploy:  cd wiki-worker && wrangler deploy --config ../agent/local/wiki-worker/wrangler.toml
 #          (set both secrets FIRST — without them every viewer gets 403)
 # Secrets (wrangler secret put):
-#   SUPABASE_SERVICE_ROLE_KEY — merlin project service role (.env)
+#   SUPABASE_SERVICE_ROLE_KEY — edva project service role (.env)
 #   CF_ACCESS_AUD             — the wiki hostname's Access application's AUD tag (.env)
 
-name = "merlin-wiki"
+name = "edva-wiki"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 workers_dev = false

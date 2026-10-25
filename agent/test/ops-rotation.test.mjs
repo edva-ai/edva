@@ -123,7 +123,7 @@ function startSupervisor({ basePort, configPath, stateDir, claudeArgs = [], resu
 // the file is absent — checkAuth() in http-server.mjs).
 function authHeaders() {
   try {
-    const t = fs.readFileSync(path.join(os.homedir(), "Dev/merlin/secrets/webhook-token"), "utf8").trim();
+    const t = fs.readFileSync(path.join(os.homedir(), "Dev/edva/secrets/webhook-token"), "utf8").trim();
     return t ? { authorization: `Bearer ${t}` } : {};
   } catch { return {}; }
 }

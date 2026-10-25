@@ -3,7 +3,7 @@
 //
 // The supervisor tees every event into events_fts live (EventLog.append), so
 // under normal operation no indexing step is needed. This CLI is for:
-//   - search : ad-hoc "what did Merlin do about X?" from the terminal (the
+//   - search : ad-hoc "what did Edva do about X?" from the terminal (the
 //              same primitive the agent gets via the recall_events MCP tool)
 //   - recent : newest N events (what the handoff digest reads)
 //   - rebuild: drop + re-ingest from the JSONL source of truth (after a schema

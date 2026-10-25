@@ -7,8 +7,8 @@
 //
 //   import { LOCAL_DIR, SYNTHETIC, writeLocalConfig } from "./synthetic-instance.mjs";
 //
-// It points MERLIN_LOCAL_DIR (lib/instance.cjs) at a fresh temp dir
-// holding SYNTHETIC as instance.json, and clears the MERLIN_* identity
+// It points EDVA_LOCAL_DIR (lib/instance.cjs) at a fresh temp dir
+// holding SYNTHETIC as instance.json, and clears the EDVA_* identity
 // overrides, so the test sees the same identity in every checkout (a private
 // installation with its own agent/local/, or a fresh one without) and
 // child processes inherit it. writeLocalConfig(name, obj) adds a
@@ -34,7 +34,7 @@ export const LOCAL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "synthetic-instan
 fs.mkdirSync(path.join(LOCAL_DIR, "config"), { recursive: true });
 fs.writeFileSync(path.join(LOCAL_DIR, "instance.json"), JSON.stringify(SYNTHETIC, null, 1));
 
-process.env.MERLIN_LOCAL_DIR = LOCAL_DIR;
+process.env.EDVA_LOCAL_DIR = LOCAL_DIR;
 for (const env of Object.values(createRequire(import.meta.url)("../lib/instance.cjs").INSTANCE_KEYS)) delete process.env[env];
 
 export function writeLocalConfig(name, obj) {
