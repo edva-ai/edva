@@ -2,9 +2,8 @@
 //
 // The dispatcher's queue + inFlight live in memory. The in-process restart()
 // flow transfers them between dispatcher instances correctly, but a whole-
-// process restart (launchd respawn, OOM, panic, cron-killed) drops them. On
-// 2026-05-18 a queued `mkt-aso-baseline` was lost this way when the process
-// started fresh at 08:01:57Z right after the 08:00 cron burst.
+// process restart (launchd respawn, OOM, panic, cron-killed) drops them (e.g.
+// a job queued by a cron burst, lost when the process restarts a minute later).
 //
 // This module saves queue+inFlight to disk atomically on every mutation so
 // the next process can replay them.

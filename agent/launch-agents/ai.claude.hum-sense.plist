@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hum-sense — the situational trigger engine behind hum.
+
+  Long-running, KeepAlive. Runs the sensor registry on their intervals, drains
+  events pushed in by phone-channel and anything else, and asks the gate
+  whether the moment justifies waking the hum agent. Most ticks do nothing and
+  cost nothing; a busy hour costs a couple of subprocesses a minute.
+
+  This is a plain launchd agent, NOT a process-manager child: it holds no Max
+  credential and spawns no `claude -p`, so it has none of the keychain or auth
+  coupling that forces the agent supervisors under the session launchagent. If
+  it dies, `trigger-hum.sh` notices the stale heartbeat within 20 minutes and
+  falls back to a cron tick, so hum degrades rather than going silent.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.hum-sense
+    (renders __MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__, then launchctl bootstrap)
+  Restart after a code change:
+    launchctl kickstart -k gui/$(id -u)/ai.claude.hum-sense
+  Inspect:
+    hum-sense status
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.hum-sense</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>__MERLIN_TOOLS__/bin/hum-sense</string>
+        <string>daemon</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_HOME__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/hum-sense-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/hum-sense-launchd.log</string>
+</dict>
+</plist>

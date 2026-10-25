@@ -1,0 +1,12 @@
+{
+  "_comment": "Identity patterns for .tools/sanitize-guard.py — the list that names YOU, so it never goes in the public tree. Copy to agent/local/sanitize-patterns.json (gitignored), or keep it elsewhere and point MERLIN_SANITIZE_PATTERNS at it; in CI, store the JSON in the MERLIN_SANITIZE_PATTERNS_JSON repo secret. Keys are pattern names and are PUBLIC: accepted hits in .tools/sanitize-guard-baseline.json are keyed by them and every reported hit prints its name. So a name describes the kind of identifier (owner_handle, project_homepage, companion_app_name, address_1, org_1) and never spells the brand, domain, handle, person or place it matches. Values are the private part: Python regexes, matched case-insensitively per line. Keys starting with _ are ignored.",
+  "owner_name": "\\balex\\s+example\\b",
+  "owner_handle": "\\balex-example\\b",
+  "owner_email": "alex@example\\.com",
+  "home_address": "123\\s+Sample\\s+(?:St|Street)",
+  "project_ref": "abcdefghijklmnopqrst",
+  "host_name": "\\bmy-server\\b",
+  "home_path": "/Users/alex\\b",
+  "project_homepage": "\\bexample\\.org\\b",
+  "org_1": "\\bacme\\s+widgets\\b"
+}

@@ -6,9 +6,7 @@
 # Exit 0 = all green. Exit 1 = a test failed.
 
 set -u
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
-
-G="${MERLIN_HOME}/bin/merlin"
+G="$HOME/Dev/merlin/bin/merlin"
 PASS=0
 FAIL=0
 FAILURES=()
@@ -46,14 +44,14 @@ echo
 echo "[tasks]"
 run "tasks list" "$G" tasks
 run "tasks list --json" "$G" tasks --json
-assert_json "tasks.json has 6 entries" '. | length' '6' "$G" tasks
+assert_json "tasks --json lists the merged registry" '(. | length) > 0' 'true' "$G" tasks
 run "tasks show morning-digest" "$G" tasks show morning-digest
 EXPECT_CODE=1 run "tasks show unknown exits 1" "$G" tasks show nonexistent
 
 # Matching
 assert_json "match 'morning briefing' → morning-digest" '.matches[0].name' 'morning-digest' "$G" tasks match "morning briefing"
-assert_json "match 'weekend activity list' → weekend-events" '.matches[0].name' 'weekend-events' "$G" tasks match "weekend activity list"
-assert_json "match 'send the newsletters' → newsletter-digest" '.matches[0].name' 'newsletter-digest' "$G" tasks match "send the newsletters"
+assert_json "match 'refill ideas reservoir' → hum-ideation" '.matches[0].name' 'hum-ideation' "$G" tasks match "refill ideas reservoir"
+assert_json "match 'rebalance pins' → wiki-audit" '.matches[0].name' 'wiki-audit' "$G" tasks match "rebalance pins"
 assert_json "match confidence is high when 1 match" '.confidence' 'high' "$G" tasks match "morning brief"
 assert_json "match gibberish → none" '.confidence' 'none' "$G" tasks match "bla bla bla bla"
 run "tasks match exit 0 for high-confidence" "$G" tasks match "morning brief"
@@ -108,7 +106,7 @@ run "triage rules" "$G" triage rules
 run "triage playbook" "$G" triage playbook
 
 # pause/resume roundtrip
-PAUSE_FLAG="${MERLIN_HOME}/data/.triage-paused"
+PAUSE_FLAG="$HOME/Dev/merlin/data/.triage-paused"
 echo "  (pause/resume roundtrip — will dispatch a CATCH UP task on resume)"
 "$G" triage pause > /dev/null
 [ -f "$PAUSE_FLAG" ] && pass "pause creates flag" || fail "pause creates flag"
@@ -123,7 +121,7 @@ run "arch" "$G" arch
 # --- where ---
 echo
 echo "[where]"
-run "where example" "$G" where example
+run "where hum" "$G" where hum
 EXPECT_CODE=1 run "where nothing-matches exits 1" "$G" where xyz-no-such-thing
 
 # --- doctor ---
@@ -134,11 +132,11 @@ run "doctor --json" "$G" doctor --json
 
 # doctor drift injection
 echo "  (drift injection test)"
-cp ${MERLIN_HOME}/system/tasks.json /tmp/_tasks_backup.json
-sed -i '' 's/"Morning Digest"/"Drift-Injected"/' ${MERLIN_HOME}/system/tasks.json
+cp ~/Dev/merlin/system/tasks.json /tmp/_tasks_backup.json
+sed -i '' 's/"Morning Digest"/"Drift-Injected"/' ~/Dev/merlin/system/tasks.json
 if "$G" doctor > /dev/null 2>&1; then fail "drift detection catches bad playbook section"
 else pass "drift detection catches bad playbook section"; fi
-cp /tmp/_tasks_backup.json ${MERLIN_HOME}/system/tasks.json
+cp /tmp/_tasks_backup.json ~/Dev/merlin/system/tasks.json
 rm /tmp/_tasks_backup.json
 
 # --- summary ---

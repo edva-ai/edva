@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev question for lib/claim-freshness.mjs Stage 3 — is what the message asserts still TRUE at release time? Jev acts alone on pass and drop; 'rewrite' (and 'drop' on a solicited reply) takes Sonnet's text. See docs/jev.md. Kernel definition; an installation's own data/jev-questions/claim-freshness.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "A message is about to be sent to the user. Decide whether its claims are still TRUE now, using the memory_rows (mail, chat, the user's own dated replies, wiki, activity log) found for each claim. A memory row from source `replies` is the user's own dated word and is the strongest authority on their own plans; when one says they have since decided otherwise about something this message asserts, that assertion is stale. The claim order and the count of confirmed claims carry no meaning. Match on MEANING, not shared words: 'hasn't enrolled' is settled by a notice that they 'set up' or 'registered'. Matching on meaning cuts both ways: a row can share the claim's subject and vocabulary and still settle a DIFFERENT question. When the claim is that something has NOT happened yet, a row recording an EARLIER STEP of the same process (an invitation sent, a lease sent for signature, a package shipped) settles nothing; where the obligation recurs, a previous completed cycle never settles the current one. Silence in memory is NOT confirmation — but an UNDATED message is not an old message: drop only when memory affirmatively shows the situation resolved. Where the user IS right now is a live observation that an older chat line about travel plans cannot overturn. Resolve relative time words inside a row against THAT ROW'S date. If solicited is 'yes', never choose drop. On a proactive message, a status a THIRD PARTY controls that memory is silent about and that is more than about a day old should be dropped rather than hedged — but the user's OWN doing (an item they haven't got round to, a date read off their own calendar or timeline) is pass. A message asking the user to VERIFY something the assistant could read for itself (its own queue, whether its job ran) is drop. A report of what the assistant just did or found, a change it just made and read back, or a statement of what it is about to do, is pass.",
+      "criteria": {
+        "pass": "the claims are not actually stale, or memory confirms they still hold — including a report about a run that finished moments ago, a change the assistant just made, or a statement of what it is about to do",
+        "rewrite": "still worth sending but must stop asserting something: memory shows the state moved (say the new facts), or — for a solicited message only — memory is silent and the claim needs its vintage attributed",
+        "drop": "memory shows the situation resolved (the FINISHED state, not an earlier step and not a previous cycle) and the message is now wrong or pointless (proactive messages only)"
+      }
+    }
+  }
+}

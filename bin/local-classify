@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+// local-classify — CLI wrapper around lib/local-triage.mjs (rules-first email triage
+// on the local model). See that lib + docs/cost-rearchitecture-june2026.md.
+//
+// Usage:
+//   echo '{"from":"...","subject":"...","body":"..."}' | local-classify email
+//   local-classify email --from "<addr>" --subject "<s>" --body "<text>" [--no-mem] [--explain]
+//
+// Output: one JSON verdict on stdout. source = rule:<id> | model | error. Exit 2 on failure
+// (caller MUST treat exit!=0 / escalate=true as "route to the remote agent").
+
+import { classifyEmail } from "../lib/local-triage.mjs";
+
+const args = process.argv.slice(2);
+const type = args[0];
+const has = (n) => args.includes(n);
+const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
+
+function readStdin() {
+  return new Promise((res) => {
+    if (process.stdin.isTTY) return res("");
+    let s = ""; process.stdin.on("data", (d) => (s += d)); process.stdin.on("end", () => res(s));
+  });
+}
+
+(async () => {
+  if (type !== "email") { console.error("usage: local-classify email [--from --subject --body | JSON stdin]"); process.exit(2); }
+  let input = {};
+  const stdin = (await readStdin()).trim();
+  if (stdin) { try { input = JSON.parse(stdin); } catch { input.body = stdin; } }
+  input.from = flag("--from") ?? input.from ?? "";
+  input.subject = flag("--subject") ?? input.subject ?? "";
+  input.body = flag("--body") ?? input.body ?? "";
+
+  const verdict = await classifyEmail(input, { noMem: has("--no-mem") });
+  if (!has("--explain")) delete verdict.usedMemory;
+  process.stdout.write(JSON.stringify(verdict) + "\n");
+  if (verdict.source === "error") process.exit(2);
+})();

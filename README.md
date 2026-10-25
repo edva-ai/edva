@@ -6,7 +6,7 @@ Most assistants wait. You type, they reply, the moment passes. Merlin stays on. 
 
 > Runs on the Claude subscription you already have. No API keys. No per-token bills.
 
-→ Read the full story: **[silo.co/merlin](https://silo.co/merlin)**
+→ Get started: **[docs/quickstart.md](docs/quickstart.md)**
 
 ---
 
@@ -20,7 +20,7 @@ Merlin works the other way around. It runs through Anthropic's official Claude e
 - **No new account.** Same Claude, just always on.
 - **Flat monthly cost** — built for an assistant that runs continuously.
 
-If you'd rather pay by usage, Merlin will use an API key too. But the subscription path is the one it was designed for.
+The agents run only on that subscription (a Claude Max login): Merlin never quietly falls back to per-token billing, and if the subscription is unavailable it stops and tells you. An API key is optional, for a few developer tools such as `merlin review-pr`.
 
 ---
 
@@ -32,7 +32,7 @@ If you'd rather pay by usage, Merlin will use an API key too. But the subscripti
 - **Brings you the morning.** A quiet brief with today's calendar, your tasks, the weather, and the headlines you'd care about — waiting for you before you're out of bed.
 - **Knows your taste.** Recommends restaurants by what you actually like and where you are, not what's popular this week.
 - **Watches the world for you.** A flight you've been pricing drops. Tickets to a show you'd want. A friend's birthday is in a week. The follow-up call you meant to schedule. You'll hear about it at the right moment, from the right direction.
-- **Helps with the rest.** "Write that no for me." "Summarize this." "Plan a long weekend in Lisbon under two thousand." Describe what you need; Merlin does the work.
+- **Helps with the rest.** "Write that no for me." "Summarize this." "Plan a long weekend away under two thousand." Describe what you need; Merlin does the work.
 - **Stays close.** A companion iOS/macOS app keeps the conversation going. Reply with 👍 to confirm, or "skip" to teach Merlin what not to bring up again.
 
 ## What makes Merlin different
@@ -56,16 +56,19 @@ Five things most AI assistants miss.
 For the technically inclined:
 
 ```bash
-git clone https://github.com/mraccah2/merlin.git ~/Dev/merlin
+# Clone this repository — copy its URL from the green "Code" button on GitHub
+git clone <this repository's URL> ~/Dev/merlin
 cd ~/Dev/merlin
 
 # 1. Install deps, set up runtime dirs, check Ollama
 ./scripts/bootstrap.sh
 
-# 2. Interactive setup — writes .env, generates a webhook token, seeds example configs
+# 2. Interactive setup — writes .env and agent/local/instance.json,
+#    generates a webhook token, seeds starter config from examples/
 ./bin/merlin init
 
-# 3. Start everything in the foreground (Ctrl-C to stop)
+# 3. Check the install, then start everything in the foreground (Ctrl-C to stop)
+./bin/merlin doctor
 ./bin/merlin up
 
 # In another terminal — fire a test job
@@ -75,23 +78,24 @@ cd ~/Dev/merlin
 ./bin/merlin tail ops
 ```
 
-For 24/7 deployment, install the launchd or systemd service per [`docs/installer.md`](docs/installer.md).
+Cloned somewhere other than `~/Dev/merlin`? Export `MERLIN_HOME=<path>` (and keep it in `.env`) — the CLI, scripts and MCP configs resolve the install from it. For 24/7 deployment see [`docs/installer.md`](docs/installer.md).
 
 ## What ships out of the box
 
 | | |
 |---|---|
 | Kernel | process-manager, supervisors, channel framework, MCP shell bridge, kernel test suite |
-| CLIs | 22 tools — `merlin`, `wiki`, `memory`, `email-*`, `context-*`, `hum-*`, `suggestion-*` |
-| Libraries | `wiki-store`, `memory-store`, `local-llm`, `apns-push`, `supabase-rest`, `merlin-context` |
-| Apps | Two SwiftUI companion apps — chat (`apps/companion/`) and fitness tracker (`apps/spotter/`) |
-| Reference jobs | `morning-digest`, hum + 5 hum-* playbooks, wiki-audit, memory-snapshot, chrome-cdp-watch, context-sync |
-| CI | iOS + macOS TestFlight workflows, secret-scan |
+| CLIs | ~90 tools — `merlin` (with Merlin's own `init`, `overlay`, `up`, `dispatch`, `tail`, `audit`, `review-pr`, `telemetry` in `bin/cli.d/`), `wiki`, `memory`, `email-*`, `context-*`, `hum-*`, `job-*`, `cron-*`, `self-improve-*` |
+| Libraries | `instance` (per-install identity + config), `registry`, `wiki-store`, `local-llm`, `apns-push`, `supabase-rest`, `merlin-context`, the outbound/claim gates |
+| Apps | Two SwiftUI companion apps — chat (`apps/companion/`) and fitness tracker (`apps/trainer/`) |
+| Reference jobs | `morning-digest`, the hum family (`hum`, `hum-review`, `hum-ideation`, `hum-daily`, `hum-consolidate`, `hum-explore`), the weekly self-improvement loop (`nightly-review`, `improvement-plan`, `system-issue-review`, `skill-repair`, `cost-efficiency-review`), wiki upkeep, `context-sync` |
+| CI | iOS + macOS TestFlight workflows, secret-scan, sanitize-guard, narrative review |
 
 ## What you'll build yourself
 
 Merlin is deliberately a small, opinionated kernel — not a turnkey product. The integrations are sparse because *your* assistant should know about *your* life.
 
+- **Make it yours without forking the kernel.** Your identity, rules and values go in `agent/local/` (`instance.json`, `shared.md`, `config/*.json`), your own code in the `_ext/` hook dirs. Both are gitignored; keep them in a private repo and link it with `merlin overlay add`. See [`docs/architecture-public-private.md`](docs/architecture-public-private.md).
 - **Populate Hum's awareness loop.** Empty on day 1. See [`docs/hum.md`](docs/hum.md).
 - **Populate your memory corpus.** Empty on day 1. See [`docs/memory.md`](docs/memory.md).
 - **Wire up integrations** — Gmail ([guide](docs/integrations/gmail.md)), Supabase ([guide](docs/integrations/supabase.md)), SMTP ([guide](docs/integrations/smtp.md)), or your own.
@@ -106,8 +110,8 @@ Minimum:
 
 - **macOS** (Apple Silicon preferred) or **Linux**
 - **Node.js 22.5+** (built-in `node:sqlite`)
-- **[Ollama](https://ollama.com)** with `gemma3:4b` and `nomic-embed-text` pulled
-- A **Claude Max subscription** (recommended) OR a **Claude API key**
+- **[Ollama](https://ollama.com)** with `gemma3:1b` and `nomic-embed-text` pulled
+- A **Claude Max subscription**, with the Claude Code CLI logged in on the host (`claude`)
 
 Full dependency matrix, per-feature requirements, and platform notes in [`docs/dependencies.md`](docs/dependencies.md). The bootstrap script probes for what's installed and warns about gaps.
 
@@ -118,8 +122,6 @@ For the curious. Merlin is built on Claude Code with persistent `claude -p` supe
 ## License + contributing
 
 Apache 2.0 — see [`LICENSE`](LICENSE). Contributions welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md). Security disclosures via [`SECURITY.md`](SECURITY.md).
-
-→ Read more: **[silo.co/merlin](https://silo.co/merlin)**
 
 <!--
   Anonymous view-counter pixel — no PII, no raw IP retention. The

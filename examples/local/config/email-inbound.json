@@ -1,0 +1,5 @@
+{
+  "_comment": "Who may email the agent's own address directly (lib/email-inbound-gate.mjs). Copy to agent/local/config/email-inbound.json. `allowlist` is the full ordered list — put your own address (instance.json owner_email) first, since this replaces the default. Mail from anyone else is held and you are asked in chat. `held_example` is a name the held-mail notice offers as an example.",
+  "allowlist": ["alex@example.com", "partner@example.com"],
+  "held_example": "my accountant"
+}

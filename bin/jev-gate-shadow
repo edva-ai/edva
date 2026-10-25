@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+// jev-gate-shadow — the DETACHED, side-effect-free legacy judgment for a job
+// gate whose turn Jev skipped (Jev shadow week; docs/jev.md).
+//
+//   jev-gate-shadow hum-ping-gate <dispatchId>   → would hum's Sonnet turn have pinged?
+//   jev-gate-shadow p1-resolution <batchId>      → which ids would the unstar-scan downgrade?
+//
+// Tool-less `claude -p` (no --allowedTools, Max session — never the API key),
+// over exactly the state Jev saw, with the job's own decision criteria. It
+// cannot act: it prints a verdict and records ONE late comparison.
+// APPROXIMATION, by design: the real turns can harvest (hum) or open the thread
+// (p1); the shadow sees only the gate state. Spawned by lib/jev-hum-gate.mjs
+// and lib/jev-p1-gate.mjs; resolved once via lib/jev-pending.mjs.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { installRoot, installTools } from "../lib/root.cjs";
+// Who the assistant serves (agent/local/instance.json owner_name).
+const OWNER = createRequire(import.meta.url)("../lib/instance.cjs").instance().owner_name;
+const { withFileLock } = createRequire(import.meta.url)("../lib/file-lock.js");
+
+const [site, id] = process.argv.slice(2);
+const ROOT = installRoot();
+const CLAUDE = process.env.CLAUDE_BIN || path.join(os.homedir(), ".local/bin/claude");
+
+const { findPending, markResolved } = await import("../lib/jev-pending.mjs");
+const { runToolless, parseModelJson: firstJson } = await import("../lib/jev-claude.mjs");
+const { recordLateComparison } = await import("../lib/jev-shadow.mjs");
+
+function section(file, startHeading, maxChars) {
+  try {
+    const s = fs.readFileSync(path.join(ROOT, file), "utf8");
+    const i = startHeading ? s.indexOf(startHeading) : 0;
+    return s.slice(i < 0 ? 0 : i, (i < 0 ? 0 : i) + maxChars);
+  } catch { return ""; }
+}
+
+// Tool-less, Max-only, off the merlin tree's settings (lib/jev-claude.mjs).
+// `--allowedTools ""` alone left built-ins + MCP + allow rules live, and the p1
+// prompt quotes the playbook section that explains p1-downgrade.
+async function runClaude(model, prompt) {
+  if (process.env.JEV_GATE_SHADOW_STUB) return process.env.JEV_GATE_SHADOW_STUB; // tests
+  return runToolless({ bin: CLAUDE, model, prompt, timeoutMs: 180000 });
+}
+
+export function humPrompt(state) {
+  return `You are running in SHADOW mode for an evaluation. Do NOT take any action and do not call any tools.
+Hum is ${OWNER}'s proactive assistant. Its playbook (excerpt below) runs a harvest of the listed lanes, ranks candidates, and sends ONE ping (info or a question) only when the best one clears its bar; otherwise it stays silent. ${OWNER} wants MORE flow, not less — silence is right only for genuinely low-signal moments.
+Given ONLY the moment below, would hum's turn most likely send ${OWNER} a ping?
+Output ONLY a JSON object: {"ping": true|false, "why": "<= 20 words"}
+
+===== HUM PLAYBOOK (excerpt) =====
+${section("agent/ops-agent/jobs/hum.md", "", 2500)}
+${section("agent/ops-agent/jobs/hum.md", "### Decision logic", 3500)}
+===== MOMENT =====
+${JSON.stringify(state, null, 2)}`;
+}
+
+export function p1Prompt(state, ids) {
+  return `You are running in SHADOW mode for an evaluation. Do NOT take any action and do not call any tools.
+These messages are labelled P1 in ${OWNER}'s Gmail but are NOT starred. Apply the unstar-scan rules below: downgrade a genuine unstar; leave untouched a recent third-party reply on an active/important thread, or anything ambiguous.
+Message n corresponds to id ids[n]. ids = ${JSON.stringify(ids)}
+Output ONLY a JSON object: {"downgrade": ["<id>", ...]}  (empty array = leave them all)
+
+===== RULES =====
+${section("agent/ops-agent/jobs/p1-resolve.md", "## Unstar scan", 1800)}
+${section("agent/ops-agent/jobs/p1-resolve.md", "- **Not every unstarred-p1 is a user-unstar", 1600)}
+===== MESSAGES =====
+${JSON.stringify(state, null, 2)}`;
+}
+
+const p = site && id ? findPending(site, id) : null;
+if (!p || p.kind !== "skipped") { process.stdout.write("null\n"); process.exit(0); }
+
+let legacyValue = null, agree = null;
+if (site === "hum-ping-gate") {
+  const v = firstJson(await runClaude("claude-sonnet-5-5", humPrompt(p.state)));
+  if (v && typeof v.ping === "boolean") { legacyValue = { ping: v.ping, why: String(v.why || "").slice(0, 200), via: "sonnet-shadow" }; agree = v.ping === false; }
+} else if (site === "p1-resolution") {
+  const v = firstJson(await runClaude("haiku", p1Prompt(p.state, p.ids)));
+  if (v && Array.isArray(v.downgrade)) {
+    const d = v.downgrade.filter((x) => p.ids.includes(x));
+    legacyValue = { downgrade: d, via: "haiku-shadow" }; agree = d.length === 0;
+  }
+}
+
+if (legacyValue && markResolved(site, id, "shadow")) {
+  recordLateComparison({
+    site, id,
+    jevRow: { used: "jev", input: p.state, jev: { value: p.jev, confidence: p.jev?.confidence } },
+    legacyValue, agree,
+  });
+}
+// Self-heal for a wrong P1 skip (review 2026-09-23): the gate marked these ids
+// seen, so without this a P1 that should have been downgraded would never be
+// re-scanned. Un-see exactly the ids the shadow would downgrade; the next tick's
+// change-gate then dispatches the REAL scan (legacy decides and acts).
+if (site === "p1-resolution" && legacyValue && agree === false && legacyValue.downgrade.length) {
+  try {
+    const SEEN = process.env.P1_SCAN_SEEN || installTools("data/p1-scan-seen.json");
+    const drop = new Set(legacyValue.downgrade);
+    // Force list FIRST: p1-scan-gate treats forced ids as fresh even if they are
+    // (re-)seen, so this alone guarantees the re-dispatch. Un-seeing below is
+    // belt-and-braces, done under the lock p1-scan-gate also takes.
+    // kernel-closure-ok: inside this try — an installation without the P1 gate skips the force list
+    const { P1_FORCE_FILE } = await import("../lib/jev-p1-gate.mjs");
+    let f = []; try { f = JSON.parse(fs.readFileSync(P1_FORCE_FILE, "utf8")).ids || []; } catch {}
+    fs.writeFileSync(P1_FORCE_FILE, JSON.stringify({ ids: [...new Set([...f, ...drop])] }));
+    withFileLock(SEEN, () => {
+      const st = JSON.parse(fs.readFileSync(SEEN, "utf8"));
+      st.ids = (st.ids || []).filter((x) => !drop.has(x));
+      st.updatedAt = new Date().toISOString();
+      fs.writeFileSync(SEEN + ".tmp", JSON.stringify(st, null, 2));
+      fs.renameSync(SEEN + ".tmp", SEEN);
+    });
+  } catch {}
+}
+process.stdout.write(JSON.stringify(legacyValue) + "\n");

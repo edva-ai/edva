@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # memory-restore — restore auto-memory files from the backup repo.
 #
-# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its
-# own git repo (private ${MERLIN_BACKUP_REPO}) snapshotted every 30 min.
+# The memory dir at ~/.claude/projects/<project-slug>/memory/ is its
+# own git repo (the private personal-memory repo) snapshotted every 30 min.
 # This script is how you walk that history back to a known-good state.
 #
 # Usage:
@@ -24,8 +24,13 @@
 
 set -euo pipefail
 
-MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}"
-TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$HOME/Dev/merlin/data/memory-snapshots}"
+# Claude Code's project slug: the session start path (~/Dev/merlin) with every
+# non-alphanumeric character turned into "-" (lib/instance.cjs claudeMemoryDir).
+PROJECT_SLUG="$(printf '%s' "${MERLIN_PROJECT_DIR:-$HOME/Dev/merlin}" | tr -c 'A-Za-z0-9' '-')"
+MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/$PROJECT_SLUG/memory}"
+# The installation's kernel tree (MERLIN_INSTALL_TOOLS), from root.sh.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
+TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$MERLIN_INSTALL_TOOLS/data/memory-snapshots}"
 
 if [[ ! -d "$MEMORY_DIR/.git" ]]; then
   echo "memory-restore: $MEMORY_DIR is not a git repo" >&2

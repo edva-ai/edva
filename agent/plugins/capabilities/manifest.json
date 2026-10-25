@@ -1,0 +1,5 @@
+{
+  "name": "capabilities",
+  "version": "1.0.0",
+  "description": "CAP (Appendix A): web_search, view_image, create_image (gated), browser — capability tools registered into the WP1 deferred-tool registry."
+}

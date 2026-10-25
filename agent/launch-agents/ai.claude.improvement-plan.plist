@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Self Improvement Plan — SAFETY NET slot (Tuesdays 10:30 local).
+
+  The review starts at 05:00, can run 90 minutes, and the chained plan up to
+  180, so an earlier slot could find a chained plan still working without having
+  written its last_run yet, and the trigger's "already planned" guard would let a
+  second Opus plan start beside it. 10:30 is past the worst case
+  (05:00 + 90 + 180 = 09:30).
+
+  The normal path is the chain: trigger-nightly-review.sh launches this the
+  moment the review exits clean, which guarantees the plan reads a fresh report.
+  This slot exists for the case where the review died or the chain never fired.
+  Double-running is harmless by construction — the job's Step 1 staleness guard
+  exits without planning when the review's state file is >24h old, and its Step 2
+  exclusion set means a second run over the same report has nothing new to file.
+
+  launchd USER agent, not crontab (keychain / Max auth — see the review plist).
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.improvement-plan
+    (renders __MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__, then launchctl bootstrap)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.improvement-plan</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__MERLIN_TOOLS__/agent/scripts/trigger-improvement-plan.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>2</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/improvement-plan-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/improvement-plan-launchd.log</string>
+</dict>
+</plist>

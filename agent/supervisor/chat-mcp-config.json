@@ -1,14 +1,20 @@
 {
-  "_comment": "MCP servers for chat agent under supervisor. phone-channel provides reply/get_location tools; message delivery handled by supervisor HTTP dispatch instead of MCP notifications.",
+  "_comment": "MCP servers for the chat agent under the chat supervisor (agent/supervisor/chat-supervisor.mjs passes this file as --mcp-config). phone-channel provides the reply/get_location tools (MERLIN_PHONE_PRIMARY marks it as the one Supabase subscriber); tools is agent/tools-mcp scoped to the chat agent. No secrets here: ${VAR} placeholders are expanded from the environment, which process-manager.mjs loads from .env (MERLIN_HOME is written there by `merlin init` and exported by `merlin up`). Add your own servers in a copy outside the repo only if they name accounts or machine paths.",
   "mcpServers": {
     "phone-channel": {
       "command": "node",
-      "args": ["${MERLIN_HOME_USER}/dev/merlin/agent/phone-channel/index.mjs"],
+      "args": ["${MERLIN_HOME}/agent/phone-channel/index.mjs"],
+      "env": {
+        "MERLIN_PHONE_PRIMARY": "1"
+      },
       "alwaysLoad": true
     },
     "tools": {
       "command": "node",
-      "args": ["${MERLIN_HOME_USER}/dev/merlin/agent/tools-mcp/index.mjs"],
+      "args": ["${MERLIN_HOME}/agent/tools-mcp/index.mjs"],
+      "env": {
+        "MERLIN_AGENT_ID": "chat"
+      },
       "alwaysLoad": true
     },
     "supabase-merlin": {
@@ -20,8 +26,7 @@
       ],
       "env": {
         "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
-      },
-      "alwaysLoad": true
+      }
     }
   }
 }

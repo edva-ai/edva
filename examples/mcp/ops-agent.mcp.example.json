@@ -1,0 +1,28 @@
+{
+  "_comment": "Project-scope MCP servers for the ops tier. Copy to agent/ops-agent/.mcp.json (gitignored, so your copy never conflicts with an update) and add the servers your own jobs need. The ops tier is the only one that loads chrome-devtools (the automation Chrome on :9222); ops-light and ops-haiku ship their own Chrome-less .mcp.json. No secrets here: ${VAR} placeholders are expanded from the environment, which process-manager.mjs loads from .env.",
+  "mcpServers": {
+    "tools": {
+      "command": "node",
+      "args": ["${MERLIN_HOME}/agent/tools-mcp/index.mjs"],
+      "env": {
+        "MERLIN_AGENT_ID": "ops"
+      },
+      "alwaysLoad": true
+    },
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@0.21.0", "--browserUrl", "http://localhost:9222"]
+    },
+    "supabase-merlin": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@supabase/mcp-server-supabase@latest",
+        "--project-ref=${MERLIN_SUPABASE_PROJECT}"
+      ],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

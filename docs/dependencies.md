@@ -8,15 +8,15 @@ The README's prereqs list is the minimum. This is the complete map: required vs 
 |---|---|---|---|
 | **Node.js 22.5+** | Built-in `node:sqlite` requires 22.5+; all kernel code is JS/TS | [nodejs.org](https://nodejs.org) | `node --version` |
 | **npm** | Dependency install across subpackages | ships with Node | `npm --version` |
-| **A Claude account** | Either an API key (pay-per-token) or Max subscription | [console.anthropic.com](https://console.anthropic.com) | — |
+| **Claude Max + Claude Code CLI** | Every agent runs as `claude -p` on a Max login; the supervisors hide `ANTHROPIC_API_KEY` from it ([`agent-auth-model.md`](agent-auth-model.md)) | `npm install -g @anthropic-ai/claude-code`, then `claude` once | `claude auth status` |
+| **macOS** (primary target) | launchd jobs, Keychain-held Claude credentials, AppleScript tools, `ioreg`; the kernel also assumes Node at `/opt/homebrew/bin/node` and the install at `~/Dev/merlin` (or `MERLIN_HOME`) — see [`installer.md`](installer.md) | — | — |
 | **A POSIX shell** | bash 4+ (macOS users: `brew install bash` for 5.x; the default `/bin/bash` is 3.2 from 2007 and may misbehave) | — | `bash --version` |
 
 ## Tier 2 — strongly recommended
 
 | Dep | Purpose | Without it |
 |---|---|---|
-| **Ollama** + `gemma3:4b` + `nomic-embed-text` | Phone-channel ack layer + memory embeddings | Phone-channel falls back to canned "thinking…" messages. Memory search loses the semantic component (FTS-only still works). |
-| **Claude Code CLI** (`@anthropic-ai/claude-code`) | The supervisor spawns `claude -p` children to run the agents | Agents won't start. This is the kernel binary. |
+| **Ollama** + `gemma3:1b` + `nomic-embed-text` | Local classification (`lib/local-llm.mjs`) + memory embeddings | Local classifiers fail open to a normal dispatch; memory search loses the semantic component (FTS still works). |
 | **jq** | Used by trigger scripts + watchdog for JSON parsing | A few scripts will warn and skip. |
 | **curl** | Used by webhook trigger scripts | Trigger scripts won't dispatch. (cron-driven jobs broken.) |
 
@@ -26,7 +26,7 @@ The README's prereqs list is the minimum. This is the complete map: required vs 
 
 - Google Cloud project + Gmail + Pub/Sub APIs enabled
 - OAuth client (Desktop type)
-- A tunnel: **Hookdeck CLI** (`brew install hookdeck/hookdeck/hookdeck-cli`) or ngrok or your own reverse proxy
+- A public HTTPS hostname tunnelled to the host's port 9090 (the kernel's watchdog knows a Cloudflare Tunnel; any reverse proxy works)
 - See [`docs/integrations/gmail.md`](integrations/gmail.md)
 
 ### Outbound mail (`bin/email-send`)
@@ -42,13 +42,13 @@ The README's prereqs list is the minimum. This is the complete map: required vs 
 
 ### Google Calendar / Tasks / Contacts inside agent tools
 
-The `agent/tools-mcp/index.mjs` exposes tools like `contacts_search` that shell out to a `gog` CLI. **This CLI doesn't ship with Merlin.** It's a contract — the upstream gandalf source provided a personal `gog` binary; the public Merlin tree expects you to bring your own.
+Several kernel tools and harvesters shell out to the `gog` Google CLI (`gog calendar …`, `gog tasks …`). **It doesn't ship with Merlin** — install it yourself (it needs `GOG_KEYRING_PASSWORD` in `.env` with a file keyring), or replace those calls.
 
 Three paths:
 
-1. **Use the official Google MCP servers** (`@modelcontextprotocol/server-google-*` or similar). Wire them into `agent/supervisor/mcp-config.json` instead of relying on `gog`. Cleanest path for new adopters.
-2. **Write a minimal `gog` shim** that matches the call shape the playbooks use: `gog calendar list [--results-only] [--from ISO] [--to ISO]`, `gog tasks list @default`, `gog contacts search <query>`. Drop it in `bin/`. The contract is whatever the playbooks happen to call; see grep `\bgog\b` for the exact invocations.
-3. **Disable the affected playbooks.** The reference jobs that lean on `gog` are `morning-digest` and several hum harvesters. Replace or remove them; the rest of the kernel works without `gog`.
+1. **Install `gog`** and authorize it for Calendar and Tasks (`gog auth add <account> --services calendar,tasks`). `merlin doctor` checks that it answers.
+2. **Write a minimal `gog` shim** matching the call shapes the code uses (`grep -rn '\bgog\b' agent bin lib`) and put it on the agents' `PATH`.
+3. **Use Google MCP servers** instead, wired into your MCP configs, and adapt the playbooks that call `gog` (`morning-digest`, the calendar/tasks harvesters and sensors).
 
 If you go path #1, please consider opening a PR documenting which official MCP server you used + how you wired it — it would help everyone after you.
 
@@ -57,7 +57,7 @@ If you go path #1, please consider opening a PR documenting which official MCP s
 - **macOS host with Xcode 16+** (Apple Silicon strongly recommended for build speed)
 - **Apple Developer Program** account ($99/year) for code signing
 - **Ruby** + the `fastlane` gem (`gem install fastlane`) — for `bundle exec fastlane` workflows
-- For Spotter: **xcodegen** (`brew install xcodegen`) — generates `Spotter.xcodeproj` from `project.yml`
+- For Trainer: **xcodegen** (`brew install xcodegen`) — generates `Trainer.xcodeproj` from `project.yml`
 - See [`apps/companion/CODE-SIGNING.md`](../apps/companion/CODE-SIGNING.md)
 
 ### GitHub Actions CI (iOS + macOS TestFlight builds)
@@ -84,7 +84,9 @@ The shipped workflows (`.github/workflows/ios-testflight.yml`, `.github/workflow
 | `MAC_NOTIFSERVICE_PROFILE` | Base64-encoded notification-service `.provisionprofile` |
 | `ASC_KEY_ID` | App Store Connect API key ID |
 | `ASC_ISSUER_ID` | ASC API key issuer ID |
-| `ASC_KEY_P8` | ASC API key contents (the `.p8` file, base64 or raw) |
+| `ASC_PRIVATE_KEY` | ASC API key contents (the `.p8` file) |
+
+Plus the repo **variable** `MAC_INSTALLER_IDENTITY` — the full name of the "3rd Party Mac Developer Installer: … (TEAMID)" identity in the runner's keychain, used to sign the macOS package.
 
 See [Apple's docs](https://developer.apple.com/documentation/appstoreconnectapi/creating_api_keys_for_app_store_connect_api) for generating the ASC API key.
 
@@ -101,17 +103,17 @@ If you're putting Merlin on a dedicated machine (Mac mini, Intel NUC, Raspberry 
 | Dep | What it adds |
 |---|---|
 | `gh` | Some Merlin scripts use `gh` to inspect runs/issues; without it those features short-circuit silently. |
-| `op` (1Password CLI) | Lets you reference secrets via `op://Vault/Item/field` instead of plaintext in `.env`. See [`docs/hardening.md`](hardening.md). |
-| Chrome + chrome-devtools-mcp | If you want agent-driven browser automation (the gandalf source used this for Tripit scraping, lottery entries, etc.). Not wired into any shipping job. |
-| Python 3 | Spotter's `ci/distribute_external.py` uses Python. Not needed if you're not building the iOS apps. |
+| `op` (1Password CLI) | Resolve secrets from a vault at start-up instead of keeping them in `.env`. See [`docs/hardening.md`](hardening.md). |
+| Chrome + chrome-devtools-mcp | Agent-driven browser automation on the `ops` tier (automation Chrome on :9222; `examples/mcp/ops-agent.mcp.example.json`, `browsing-skills/`). Jobs that need it are listed in `agent/config/chrome-jobs.json`. |
+| Python 3 | Trainer's `ci/distribute_external.py` uses Python. Not needed if you're not building the iOS apps. |
 
 ## Hardware notes
 
 Merlin will run on:
 
 - **Mac mini / iMac / MacBook**, M1 or newer recommended for fastlane build speed. Intel works for everything except the iOS-build CI runner (slower).
-- **Linux server / VPS**, any 64-bit. We've tested on Ubuntu 22.04 and Debian 12. Memory: 4 GB is enough for the supervisors + Ollama with a small model; 8 GB is comfortable.
-- **Raspberry Pi 4/5** — should work for the supervisor-only deployment (no iOS app builds). Ollama is the limiting factor — small models only, or use the API-key auth mode and skip Ollama.
+- **Linux server / VPS**, any 64-bit — possible but secondary: the macOS-only pieces stay off and the Node-path convention needs a symlink ([`installer.md`](installer.md)). Memory: 8 GB is comfortable for the supervisors + a small Ollama model.
+- **Raspberry Pi 4/5** — untested; the macOS assumptions above apply, and Ollama limits you to small models.
 
 What you cannot do:
 
@@ -120,7 +122,7 @@ What you cannot do:
 
 ## Network notes
 
-The supervisor binds to localhost on ports **9090** (gmail-pubsub), **9092** (webhook), **9093** (ops health), **9094** (chat health), and **9096** (wiki UI). If you have services running on those ports already, change them in `agent/config/agents.json` and the corresponding wiki-server / Hookdeck config. The bootstrap script doesn't probe for conflicts — `merlin up` will fail loudly on `EADDRINUSE`.
+The supervisors bind to `127.0.0.1`: ops **9090** (Gmail push, the only port meant to be reachable through your tunnel), **9091** (control), **9092** (webhook), **9093** (health); ops-light **9081–9083**; ops-haiku **9071–9073**; chat health **9094**; the process manager **9095**; the wiki UI **9096**; the WhatsApp channel **9100**. Ports are set in `agent/config/agents.json` (kernel file — override per host only if you must). `merlin up` fails loudly on `EADDRINUSE`.
 
 Outbound connections you'll see:
 
@@ -128,8 +130,8 @@ Outbound connections you'll see:
 - `127.0.0.1:11434` — Ollama (local, no egress)
 - `*.supabase.co` — if Supabase wired
 - `googleapis.com` — if Gmail Pub/Sub wired
-- `hkdk.events` — if Hookdeck wired
 - `api.smtp2go.com` — if outbound mail wired
 - `api.appstoreconnect.apple.com` — only during iOS CI
+- `merlin-telemetry.vercel.app` — the one anonymous install ping `merlin init` asks about (off with `MERLIN_TELEMETRY=off` or `MERLIN_NO_TELEMETRY=1`), and the private `/usage` push only if you set `MERLIN_USAGE_TOKEN`
 
-No telemetry, no analytics, no "phone home" anywhere in the kernel.
+Nothing else phones home.

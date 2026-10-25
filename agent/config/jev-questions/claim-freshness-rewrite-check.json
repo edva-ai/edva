@@ -1,0 +1,14 @@
+{
+  "_doc": "Jev question for lib/claim-freshness.mjs Stage 3b — did the gate's rewrite stay inside its limits? Reject or no answer sends the original. Chat replies (solicited) never reach Jev. Kernel definition; an installation's own data/jev-questions/claim-freshness-rewrite-check.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "The release gate decided a message (`original`) could not go out exactly as written and produced `rewrite`, giving `why_rewritten`. `claims` and `memory_rows` are the evidence it used; each memory row carries its own date, and `evidence_observed_at` says when the original's evidence was observed (UNKNOWN means undated, not old). `travel_timeline`, when present, is the live source of record for trips; its times are UTC. Decide only whether the rewrite stayed inside its limits, not whether the original was right. A rewrite may: say when or where a claim was observed; remove or soften a claim; replace a value in a claim (a date, time, count, status, list items, or how sure it is) with what the travel timeline shows or what a DATED memory row shows (after the evidence when the evidence is dated), as long as no later reply of the user's says otherwise; or drop/settle a question when a dated reply of the user's answered or dismissed THAT question. Anything else is a reject: an added fact, warning or question; an open question presented as answered without the user's own answer to it; a value from an undated row or one older than dated evidence; overriding something the user said; any change to who did what or what happens next. When in doubt, reject.",
+      "criteria": {
+        "accept": "every difference is a dating, a removal or softening, a value replaced from the timeline or a dated memory row no later user reply contradicts, or a question dropped because the user's own dated reply answered it",
+        "reject": "adds a claim, warning or question, closes a question the user did not answer, takes a value from an undated or older row, overrides the user, or otherwise changes what the message means"
+      }
+    }
+  }
+}

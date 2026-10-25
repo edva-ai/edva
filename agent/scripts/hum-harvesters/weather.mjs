@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+import os from "node:os";
+import path from "node:path";
 import { execSync } from "node:child_process";
 import { readStdinJson, readCache, writeCache, emit, emitNull, stampRun } from "./_common.mjs";
 
+import { installTools } from "../../../lib/root.cjs";
 const { situation: sit, context } = await readStdinJson();
 
 // Use cached weather if fresh (60m TTL); otherwise fetch
@@ -10,14 +13,14 @@ let cur = readCache("weather");
 let prev = cur; // for delta detection
 if (!cur || cur._age_min >= TTL_MIN) {
   try {
-    const out = execSync("${MERLIN_HOME_USER}/dev/merlin/bin/apple-weather --findme --json 2>/dev/null", {
+    const out = execSync(`${installTools("bin/apple-weather")} --findme --json 2>/dev/null`, {
       encoding: "utf8", timeout: 10000,
     });
     const w = JSON.parse(out);
     const c = w?.currentWeather || w?.current || null;
     if (!c) { emitNull("no current weather in payload"); process.exit(0); }
     cur = {
-      temp_f: c.temperature,
+      temp_f: c.temperature != null ? (c.temperature * 9) / 5 + 32 : null,
       condition: c.conditionCode,
       precip_chance: c.precipitationChance || 0,
       uv: c.uvIndex || 0,
@@ -45,12 +48,7 @@ if (prev && prev._cached_at) {
 // Proactive "heading out with weather concern" trigger — only relevant if outside
 // or about to go outside. Hum's Sonnet ranker can use the supporting data.
 const rainSoon = (cur.precip_chance || 0) >= 0.5;
-// C-as-F mislabel guard: when the upstream feed reports a Celsius value (~0–10C
-// for cool/cold conditions) but the units field still says F, we'd fire
-// extreme=true on a perfectly ordinary 11F-but-actually-11C "Cloudy" day.
-// 22 false hits in one day per the 2026-04-29 hum review.
-const mislabeledCold = cur.temp_f < 32 && ["Cloudy", "PartlyCloudy", "MostlyCloudy"].includes(cur.condition);
-const extreme = !mislabeledCold && (cur.temp_f < 25 || cur.temp_f > 90);
+const extreme = cur.temp_f < 25 || cur.temp_f > 90;
 
 if (findings.length === 0 && !rainSoon && !extreme) {
   stampRun("weather", false);

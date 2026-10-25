@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+// wiki-assoc — CLI over associative memory: the graph retriever, and the three
+// nightly writers that feed it. Design: system/wiki-architecture.md
+// § Associative recall; research: system/associative-memory-research.md.
+//
+//   wiki-assoc associate <id> [<id>...] [--query "q"] [--type T] [--after D] [--before D] [--ppr] [-k N] [--json]
+//       "recall this and bring up what's tied to it" — same as the wiki_associate MCP tool
+//
+//   wiki-assoc hebbian update [--dry-run]        fold new auto-recall judge rows into page_coactivation
+//   wiki-assoc hebbian candidates [--min 0.3] [--write]   strong co-used pairs with NO link (for wiki-link-weave)
+//   wiki-assoc hebbian partners <id>             pages most often used together with <id>
+//   wiki-assoc hebbian stats
+//
+//   wiki-assoc activation update                 rebuild ACT-R base-level activation from the use logs
+//   wiki-assoc activation top [-k N]
+//
+//   wiki-assoc facts extract [--limit N] [--types user,project] [--no-sonnet] [--dry-run]
+//   wiki-assoc facts list <id> [--all]           current facts touching <id> (--all: expired too)
+//   wiki-assoc facts embed                       vectors for facts still missing one
+//   wiki-assoc facts stats
+//
+//   wiki-assoc nightly            no-model writers: hebbian update, link candidates file, activation update
+//   wiki-assoc nightly --llm      the model writers: facts extract, then trigger cues (needs the Max
+//                                 login — run from the launchd agent ai.claude.wiki-assoc-nightly)
+//     [--api-fallback]            while Max is unavailable, send the Sonnet step to the API under
+//                                 its monthly cap (lib/api-fallback.mjs). Only the launchd
+//                                 runner passes it, so a hand run can never bill the API.
+//
+// Output is JSON for every write command (it lands in the job log).
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { associatePages, embedPendingPages } from "../lib/wiki-embed.mjs";
+import { updateCoactivation, linkCandidates, partnersOf, hebbianStats } from "../lib/wiki-hebbian.mjs";
+import { updateActivation, topActivation } from "../lib/wiki-activation.mjs";
+import { extractPendingFacts, embedPendingFacts, factsForPage, factStats, DEFAULT_FACT_TYPES } from "../lib/wiki-facts.mjs";
+import { localLlmEmbed } from "../lib/local-llm.mjs";
+import { localRung, sonnetRung } from "../lib/model-ladder.mjs";
+import { isIsoDate } from "../lib/wiki-assoc.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const CANDIDATES_FILE =
+  process.env.WIKI_LINK_CANDIDATES_FILE ||
+  installTools("data/wiki-link-candidates.json");
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") out.json = true;
+    else if (a === "--ppr") out.ppr = true;
+    else if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--write") out.write = true;
+    else if (a === "--all") out.all = true;
+    else if (a === "--llm") out.llm = true;
+    else if (a === "--no-sonnet") out.noSonnet = true;
+    else if (a === "--api-fallback") out.apiFallback = true;
+    else if (a === "-k" || a === "--limit") out.k = Number(argv[++i]);
+    else if (a === "--min") out.min = Number(argv[++i]);
+    else if (a === "--type") out.type = argv[++i];
+    else if (a === "--types") out.types = argv[++i];
+    else if (a === "--query") out.query = argv[++i];
+    else if (a === "--after") out.after = argv[++i];
+    else if (a === "--before") out.before = argv[++i];
+    else out._.push(a);
+  }
+  return out;
+}
+
+const print = (o) => console.log(JSON.stringify(o, null, 2));
+const [cmd, sub, ...rest] = process.argv.slice(2);
+
+function writeCandidates(min = 0.3) {
+  const pairs = linkCandidates({ min });
+  const doc = { generated_at: new Date().toISOString(), min_weight: min, pairs };
+  fs.mkdirSync(path.dirname(CANDIDATES_FILE), { recursive: true });
+  fs.writeFileSync(CANDIDATES_FILE, JSON.stringify(doc, null, 2) + "\n");
+  return { file: CANDIDATES_FILE, pairs: pairs.length };
+}
+
+// `api`: only the nightly launchd pass (run-wiki-assoc-llm.sh, --api-fallback)
+// may fall back to the API while Max is unavailable. A hand run (often over
+// SSH, where the fork always reads as signed out) stays Max-only, so it can
+// never bill the API while Max is in fact fine.
+async function factsExtract(flags, { api = false } = {}) {
+  const rungs = [localRung({ maxTokens: 1200, timeoutMs: 60000 })];
+  if (!flags.noSonnet) rungs.push(sonnetRung({ timeoutMs: 150000, ...(api ? { apiCaller: "wiki-facts" } : {}) }));
+  return extractPendingFacts({
+    rungs,
+    embedFn: (t) => localLlmEmbed(t),
+    types: flags.types ? flags.types.split(",").map((s) => s.trim()).filter(Boolean) : DEFAULT_FACT_TYPES,
+    limit: flags.k || Number(process.env.WIKI_FACTS_PER_RUN || 40),
+    sonnetBudget: Number(process.env.WIKI_FACTS_SONNET_BUDGET || 30),
+    dryRun: !!flags.dryRun,
+  });
+}
+
+async function main() {
+  if (cmd === "associate") {
+    const flags = parseFlags([sub, ...rest].filter((x) => x !== undefined));
+    if (!flags._.length && !flags.query) {
+      console.error('usage: wiki-assoc associate <id> [<id>...] [--query "q"] [--type T] [--after D] [--before D] [--ppr] [-k N]');
+      process.exit(1);
+    }
+    const out = await associatePages({
+      ids: flags._,
+      query: flags.query || null,
+      limit: flags.k || 15,
+      type: flags.type || null,
+      after: isIsoDate(flags.after) ? flags.after : null,
+      before: isIsoDate(flags.before) ? flags.before : null,
+      method: flags.ppr ? "ppr" : "sa",
+      embedQuery: flags.query ? (t) => localLlmEmbed(t) : null,
+    });
+    if (flags.json) return print(out);
+    if (!out.seeds.length) return console.log("(no such seed pages)");
+    console.log(`seeds: ${out.seeds.join(", ")}\n`);
+    for (const r of out.results) {
+      const how = `${r.via || "?"}${r.hops > 1 ? `, ${r.hops} hops` : ""}${r.from ? ` from ${r.from}` : ""}`;
+      console.log(`${r.activation.toFixed(4)}  ${r.id} — ${r.title || ""}   (${how})`);
+    }
+    return;
+  }
+
+  const flags = parseFlags(rest);
+  if (cmd === "hebbian") {
+    if (sub === "update") return print(updateCoactivation({ dryRun: !!flags.dryRun }));
+    if (sub === "candidates") {
+      if (flags.write) return print(writeCandidates(flags.min ?? 0.3));
+      return print(linkCandidates({ min: flags.min ?? 0.3, limit: flags.k || 40 }));
+    }
+    if (sub === "partners") return print(partnersOf(flags._[0], { limit: flags.k || 15 }));
+    if (sub === "stats") return print(hebbianStats());
+  } else if (cmd === "activation") {
+    if (sub === "update") return print(updateActivation());
+    if (sub === "top") return print(topActivation({ limit: flags.k || 20 }));
+  } else if (cmd === "facts") {
+    if (sub === "extract") return print(await factsExtract(flags));
+    if (sub === "list") return print(factsForPage(flags._[0], { includeExpired: !!flags.all }));
+    if (sub === "embed") return print(await embedPendingFacts({ embedFn: (t) => localLlmEmbed(t) }));
+    if (sub === "stats") return print(factStats());
+  } else if (cmd === "nightly") {
+    const nightly = parseFlags([sub, ...rest].filter((x) => x !== undefined));
+    if (!nightly.llm) {
+      return print({
+        hebbian: updateCoactivation(),
+        candidates: writeCandidates(),
+        activation: updateActivation(),
+      });
+    }
+    const api = !!nightly.apiFallback;
+    const facts = await factsExtract(nightly, { api });
+    const triggers = await embedPendingPages({
+      embedFn: (t) => localLlmEmbed(t),
+      limit: Number(process.env.WIKI_TRIGGER_PAGES_PER_RUN || 60),
+      triggers: true,
+      triggerChatFn: localRung({ maxTokens: 500, timeoutMs: 45000 }),
+      triggerEscalateFn: nightly.noSonnet ? null : sonnetRung({ timeoutMs: 120000, ...(api ? { apiCaller: "wiki-triggers" } : {}) }),
+    });
+    return print({ facts, triggers: { ...triggers, errors: (triggers.errors || []).slice(0, 10) } });
+  }
+  console.error("usage: wiki-assoc <associate|hebbian|activation|facts|nightly> ... (see the header of bin/wiki-assoc)");
+  process.exit(1);
+}
+
+main().catch((e) => {
+  console.error(`wiki-assoc: ${e?.stack || e}`);
+  process.exit(1);
+});

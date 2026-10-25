@@ -57,9 +57,9 @@ ok "npm $(npm --version)"
 if command -v ollama >/dev/null 2>&1; then
   ok "Ollama $(ollama --version 2>&1 | head -1)"
   # Models — non-fatal if missing
-  if ! ollama list 2>/dev/null | grep -q "gemma3:4b"; then
-    warn "Ollama model 'gemma3:4b' not pulled. The ack layer needs it:"
-    warn "    ollama pull gemma3:4b"
+  if ! ollama list 2>/dev/null | grep -q "gemma3:1b"; then
+    warn "Ollama model 'gemma3:1b' not pulled. Local classification needs it:"
+    warn "    ollama pull gemma3:1b"
   fi
   if ! ollama list 2>/dev/null | grep -q "nomic-embed-text"; then
     warn "Ollama model 'nomic-embed-text' not pulled. Memory embeddings need it:"
@@ -88,10 +88,10 @@ done
 # ── data directories ──────────────────────────────────────────────────────
 hr
 info "Creating runtime directories"
-for d in data data/hum-cache logs agent/logs agent/logs/supervisor-ops agent/logs/supervisor-chat agent/supervisor/state/ops agent/supervisor/state/chat secrets credentials; do
+for d in data data/hum-cache data/logs data/watchdog-incidents logs agent/logs agent/logs/supervisor-ops agent/logs/supervisor-chat agent/logs/supervisor-ops-light agent/logs/supervisor-ops-haiku agent/supervisor/state/ops agent/supervisor/state/chat agent/local agent/local/config secrets credentials; do
   mkdir -p "$d"
 done
-ok "data/, logs/, agent/logs/, supervisor state/, secrets/, credentials/"
+ok "data/, logs/, agent/logs/, supervisor state/, agent/local/, secrets/, credentials/"
 
 # ── npm dependencies (per package) ────────────────────────────────────────
 hr
@@ -104,7 +104,7 @@ if [[ -f package.json ]]; then
 fi
 
 # Each agent subpackage has its own package.json
-for d in agent agent/supervisor agent/tools-mcp agent/webhook-channel agent/gmail-channel agent/phone-channel agent/dispatch-bridge bin; do
+for d in agent agent/supervisor agent/tools-mcp agent/webhook-channel agent/phone-channel agent/whatsapp-channel agent/dispatch-bridge browsing-skills bin; do
   if [[ -f "$d/package.json" ]]; then
     (cd "$d" && npm install --silent --no-audit --no-fund --no-progress)
     ok "$d/"
@@ -119,6 +119,7 @@ chmod +x agent/bin/*.sh agent/bin/*.py agent/bin/*.mjs 2>/dev/null || true
 chmod +x agent/scripts/*.sh agent/scripts/*.mjs 2>/dev/null || true
 chmod +x agent/scripts/hum-harvesters/*.mjs 2>/dev/null || true
 chmod +x agent/scripts/lib/*.sh 2>/dev/null || true
+chmod +x agent/launch-agents/*.sh 2>/dev/null || true
 chmod +x scripts/*.sh 2>/dev/null || true
 chmod +x system/test-merlin.sh 2>/dev/null || true
 ok "executable bits set"
@@ -144,6 +145,11 @@ Next steps:
   1. ./bin/merlin init          # interactive config wizard
   2. ./bin/merlin up            # start everything in the foreground
   3. ./bin/merlin tail ops      # watch the agent work
+
+Your own rules, config and code go in agent/local/ and the _ext/ dirs
+(gitignored); keep them in a private repo and link it with
+  ./bin/merlin overlay add <path>
+See docs/architecture-public-private.md.
 
 For deeper docs: ./system/architecture.md
 EOF

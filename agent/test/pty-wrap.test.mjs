@@ -2,7 +2,7 @@
 //
 // IMPORTANT: These tests require PTY device access, which is blocked by
 // sandbox environments. They will skip gracefully when PTY is unavailable.
-// Run on the Mac Mini directly for full coverage.
+// Run on the production host directly for full coverage.
 //
 // Run: node --test agent/test/pty-wrap.test.mjs
 
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK = path.join(__dirname, "mock-service.mjs");
 const PTY_WRAP = path.join(__dirname, "..", "bin", "pty-wrap.py");
-const PYTHON = "python3";
+const PYTHON = "/opt/homebrew/bin/python3";
 const NODE = process.execPath;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

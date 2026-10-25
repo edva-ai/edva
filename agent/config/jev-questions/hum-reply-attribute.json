@@ -1,0 +1,5 @@
+{
+  "_doc": "lib/hum-reply-segments.mjs modelPick — which ONE open hum item does each segment of a catch-up reply answer? Questions are built per call (one `choice` per segment over i0..iN + none); this file only carries the site's threshold. There is deliberately NO keyword fallback. Kernel definition; an installation's own data/jev-questions/hum-reply-attribute.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.8,
+  "questions": {}
+}

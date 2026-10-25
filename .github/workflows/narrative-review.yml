@@ -10,7 +10,8 @@ name: Narrative review (Claude)
 # the canonical blocker is the human review enforced by branch protection +
 # sanitize-guard CI. To make it blocking, remove `|| true` from the run step.
 #
-# Cost: ~$0.005-$0.02 per PR with claude-haiku-4-5 (the default).
+# Cost: ~$0.005-$0.02 per PR with claude-haiku-4-5 (the default; see
+# bin/cli.d/review-pr.mjs).
 #
 # Requires repo secret: ANTHROPIC_API_KEY. Skip the run cleanly if not set so
 # forks without a key don't see red CI.
@@ -34,8 +35,8 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install SDK
-        run: npm install --no-audit --no-fund @anthropic-ai/sdk
+      - name: Install root dependencies (@anthropic-ai/sdk)
+        run: npm ci --no-audit --no-fund
 
       - name: Run merlin review-pr
         id: review

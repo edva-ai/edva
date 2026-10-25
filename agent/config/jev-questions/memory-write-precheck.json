@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev contradiction gate for wiki writes (bin/memory-write-precheck.mjs). true = conflict. A confident 'conflict' is still detailed/confirmed by Sonnet, so a false positive costs one Sonnet call, not a blocked write. Kernel definition; an installation's own data/jev-questions/memory-write-precheck.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.85,
+  "notes": "Every write through `wiki save`/`wiki edit` replaces the whole page, so the new version contradicting the old version is usually the point (a correction), not a conflict.",
+  "questions": {
+    "contradiction": {
+      "type": "boolean",
+      "instructions": "The user's personal AI agent is about to save `new_content` to its long-term memory. `new_content` REPLACES `current_page` in full, so `current_page` is the PRIOR version of the same page: correcting, re-dating or superseding a fact it asserted is the POINT of the write and is NOT a contradiction. `related_memory` is OTHER pages found by search — those survive the write, and an incompatible fact there is what this gate exists to catch (e.g. another page says the user is away all week and the new content says they are home on Wednesday). Answer true when BOTH: (a) `related_memory` asserts something factual, AND (b) `new_content` asserts the opposite or an incompatible fact. Also true when `new_content` silently reverses or drops a fact `current_page` asserted with nothing marking it as deliberate (no date, no 'superseded'/'corrected' framing) — an overwrite with a stale copy. An addition, refinement or new detail is NOT a contradiction. Memory that is silent is NOT a contradiction. If in doubt, false.",
+      "criteria": {
+        "true": "a page that survives this write asserts an incompatible fact, or the new page silently reverses what the prior version said",
+        "false": "consistent, additive, a refinement, a dated correction or supersession, or memory is silent"
+      }
+    }
+  }
+}

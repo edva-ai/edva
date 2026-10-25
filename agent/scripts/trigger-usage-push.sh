@@ -2,33 +2,35 @@
 # trigger-usage-push.sh — push per-day Claude usage/cost rollups to the hosted
 # /usage telemetry endpoint for central, durable monitoring across hosts.
 #
-# Direct script — no webhook, no Anthropic API. It just runs
-# `merlin-cost-report --push`, which reads agent/logs/supervisor-ops/job-costs.ndjson,
-# rolls it up per (day, job), and POSTs each day to apps/telemetry's /usage.
-# Idempotent server-side per (host, day): a 2-day window is safe to re-run.
+# Direct script — no webhook, no Anthropic API. Wraps `merlin-cost-report --push`,
+# which unions the per-agent ledgers (supervisor-ops/-light/-haiku job-costs.ndjson),
+# rolls them up per (day, job), and POSTs each day to the hosted /usage endpoint.
+# Sends the model-WEIGHTED real cost (not the SDK phantom estimate). Idempotent
+# server-side per (host, day): a 2-day window is safe to re-run.
 #
 # Requires MERLIN_USAGE_TOKEN (or STATS_TOKEN) in .env — merlin-cost-report
-# loads .env itself and refuses to push unauthenticated. Non-fatal when there
-# are no cost rows yet (logs and moves on).
+# loads it and refuses to push unauthenticated. Non-fatal when there are no cost
+# rows yet (logs and exits 0).
 #
-# Install via crontab (nightly, after midnight so the prior day is complete):
-#   15 4 * * * ${MERLIN_HOME}/agent/scripts/trigger-usage-push.sh >> ${MERLIN_HOME}/agent/logs/usage-push.log 2>&1
-#
-# Registered in system/tasks.json as "usage-push".
+# Runs nightly from tasks.json. All output → agent/logs/usage-push.log.
 
 set -uo pipefail
-# Derive MERLIN_HOME from this script's location (agent/scripts/) so casing or a
-# relocated checkout doesn't break it; honor an explicit MERLIN_HOME if set.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-: "${MERLIN_HOME:=$(cd "$SCRIPT_DIR/../.." && pwd)}"
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-LOG="${MERLIN_HOME}/agent/logs/usage-push.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/root.sh"   # MERLIN_ROOT, MERLIN_TOOLS
+LOG_DIR="$MERLIN_TOOLS/agent/logs"
+LOG_FILE="$LOG_DIR/usage-push.log"
+
+mkdir -p "$LOG_DIR"
+
+# PATH for cron context (Homebrew node, git, gh).
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
 TS="$(date '+%Y-%m-%d %H:%M:%S')"
 
 # Push the last 2 days: yesterday (complete) + today (partial). The /usage
 # endpoint overwrites each (host, day) snapshot, so re-pushing never
-# double-counts. `|| true` keeps a non-zero exit (e.g. no cost rows yet, or
-# missing token) from aborting the cron run — we always record the outcome.
-OUT="$("${MERLIN_HOME}/bin/merlin-cost-report" --since 2d --push 2>&1)" || true
-echo "${TS} [usage-push] ${OUT}" >> "$LOG"
+# double-counts. `|| true` keeps a non-zero exit (no cost rows yet, or missing
+# token) from aborting the cron run — we always record the outcome.
+OUT="$("$MERLIN_TOOLS/bin/merlin-cost-report" --since 2d --push 2>&1)" || true
+echo "$TS [usage-push] $OUT" >>"$LOG_FILE"

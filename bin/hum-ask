@@ -1,0 +1,193 @@
+#!/usr/bin/env node
+// hum-ask — send a hum QUESTION and hold the pending-question slot, in one step.
+//
+// The question-side twin of hum-ping. A hum question used to go out
+// as a bare `merlin-send-curl --capture-id` from the playbook (jobs/hum.md
+// § question) and from hum-tick, and the caller then wrote
+// hum-pending-question.json itself. Two things were wrong with that:
+//   - nothing guaranteed a `hum:` intent, so a question could miss the
+//     resolve-first gate — and the case that created the gate WAS a question
+//     whose answer was already in the user's own records;
+//   - a precheck suppression still wrote the slot, with the suppression
+//     sentinel JSON stored as `delivered_msg_id`.
+//
+// Now the send always carries `hum:<lane>:question` (so merlin-send-curl runs
+// bin/hum-resolve-first on it), and the slot is written only for what
+// actually landed AS A QUESTION:
+//   - sent unchanged, or rewritten by the gate to ask only the remaining gap
+//     → slot written with the text the user actually saw, exit 0;
+//   - the gate found the answer and sent a short FYI instead → no slot (there
+//     is nothing for the user to answer), exit 13;
+//   - the gate found the answer and sent nothing → exit 12;
+//   - the precheck suppressed it → no slot, exit 14.
+//
+// Usage:
+//   hum-ask --id <q-id> --lane <lane> [--subject S] [--memory-hook H]
+//           [--rationale R] [--ttl-min 15] [--intent hum:<lane>:question]
+//           [--findings <json array>] [--relevant-until <iso>]
+//           (--message <text> | --message-from-stdin)
+//
+// Open-questions ledger: every question that lands is recorded in
+// data/open-questions.jsonl (lib/open-questions.mjs) and stays open until
+// answered, so the `open_questions` lane can re-ask it. A re-ask passes the
+// ORIGINAL --id. The chat row is tagged metadata.question_id (+ question_until
+// for a time-bound one) so the app colours it while it is open. A re-ask the
+// resolve-first gate settles from the records (12 / 13) retires the question.
+// --relevant-until defaults from the lane (location lanes: end of the local day).
+//
+// Prints one JSON line: {status, question_id, message_id, text_sent, decision_id}
+//
+// Exit codes:
+//   0  asked — the pending-question slot now holds it
+//   12 not sent: resolved first, nothing worth saying (no slot)
+//   13 resolved first: an FYI went out instead of the question (no slot)
+//   14 not sent: suppressed by the outbound precheck (no slot)
+//   3  send failed (no slot)
+//   2  usage error
+//
+// Does NOT check whether another question is pending (jobs/hum.md § question
+// step 1 / hum-tick's post-rules do) and does NOT touch hum-state.json counters
+// (the caller stamps last_question_at only on exit 0).
+//
+// Test seams (env): HOME (fixture root), HUM_SEND_BIN (fake sender).
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { readSidecar } from "../lib/hum-resolve-first.mjs";
+import { recordAsked, recordRetired, getQuestion, relevantUntilFor, stampRows } from "../lib/open-questions.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const HOME = os.homedir();
+const PENDING = installTools("data/hum-pending-question.json");
+const SEND = process.env.HUM_SEND_BIN || installTools("bin/merlin-send-curl");
+
+const args = process.argv.slice(2);
+function flag(name, hasValue = true) {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  if (!hasValue) { args.splice(i, 1); return true; }
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+function die(msg) { console.error(`hum-ask: ${msg}`); process.exit(2); }
+
+const id = flag("--id");
+const lane = flag("--lane") || "unknown";
+const subject = flag("--subject") ?? null;
+const memoryHook = flag("--memory-hook") ?? null;
+const rationale = flag("--rationale") ?? null;
+const ttlMin = Number(flag("--ttl-min") ?? 15);
+const intentArg = flag("--intent");
+const findingsRaw = flag("--findings");
+const relevantUntilArg = flag("--relevant-until") ?? null;
+let message = flag("--message");
+const fromStdin = flag("--message-from-stdin", false);
+if (args.length) die(`unrecognized args: ${args.join(" ")}`);
+if (!id) die("--id is required");
+if (!Number.isFinite(ttlMin) || ttlMin <= 0) die("--ttl-min must be a positive number");
+if (fromStdin) {
+  if (message) die("--message and --message-from-stdin are mutually exclusive");
+  message = fs.readFileSync(0, "utf8");
+}
+if (!message || !message.trim()) die("question text required (--message or --message-from-stdin)");
+let findings = null;
+if (findingsRaw) {
+  try { findings = JSON.parse(findingsRaw); } catch (e) { die(`--findings must be JSON (${e.message})`); }
+  if (!Array.isArray(findings)) die("--findings must be a JSON array");
+}
+
+// Always a `hum:` intent ending in `:question` — the gate's routing key and its
+// hint that this is a question.
+const intent = intentArg && intentArg.startsWith("hum:") ? intentArg : `hum:${lane}:question`;
+
+const stamp = `${process.pid}.${Date.now()}`;
+const captureFile = path.join(os.tmpdir(), `hum-ask-capture.${stamp}`);
+const contextFile = path.join(os.tmpdir(), `hum-ask-context.${stamp}.json`);
+const prior = getQuestion(id);
+const relevantUntil = relevantUntilArg || prior?.relevant_until || relevantUntilFor(lane, new Date().toISOString());
+const rowMeta = { question_id: id, ...(relevantUntil ? { question_until: relevantUntil } : {}) };
+const sendArgs = ["--suppress-hook", "--capture-id", captureFile, "--intent", intent, "--metadata-json", JSON.stringify(rowMeta)];
+try {
+  fs.writeFileSync(contextFile, JSON.stringify({
+    kind: "question", lane, question_id: id, subject,
+    dedup_key: (findings && findings[0] && findings[0].dedup_key) || (subject ? `question:${subject}` : null),
+    finding: (findings && findings[0]) || null,
+  }));
+  sendArgs.push("--hum-context", contextFile);
+} catch { /* the gate runs without it */ }
+sendArgs.push(message.trim());
+
+const res = spawnSync(SEND, sendArgs, { encoding: "utf8" });
+try { fs.unlinkSync(contextFile); } catch {}
+const side = readSidecar(captureFile);
+let capture = "";
+try { capture = fs.readFileSync(captureFile, "utf8").trim(); } catch {}
+try { fs.unlinkSync(captureFile); } catch {}
+
+async function done(code, status, extra = {}) {
+  // Settled by the records (12 / 13): a reservoir idea behind the question has
+  // nothing left to ask, so it is retired rather than left to win another tick.
+  const key = String((findings && findings[0] && findings[0].dedup_key) || "");
+  if ((code === 12 || code === 13) && key.startsWith("idea-")) {
+    spawnSync(installTools("bin/hum-reservoir-prune"),
+      ["--expire", key, "--reason", `resolved before asking (${side?.decision_id || "hum-resolve-first"})`], { encoding: "utf8" });
+  }
+  // A re-ask of an open question that the records now answer: settled, not asked again.
+  if ((code === 12 || code === 13) && prior?.status === "open") {
+    const q = recordRetired(id, `answered by the user's records before the re-ask (${side?.decision_id || "hum-resolve-first"})`);
+    if (q) await stampRows(q.msg_ids, "closed");
+  }
+  process.stdout.write(JSON.stringify({ status, question_id: id, decision_id: side?.decision_id || null, ...extra }) + "\n");
+  process.exit(code);
+}
+
+if (res.status !== 0) {
+  if (res.stderr) process.stderr.write(res.stderr);
+  await done(3, "send_failed", { exit: res.status });
+}
+
+// merlin-send-curl writes a JSON sentinel instead of an id when a gate held the message.
+if (capture.startsWith("{")) {
+  let sentinel = {};
+  try { sentinel = JSON.parse(capture); } catch {}
+  if (sentinel.by === "hum-resolve-first") await done(12, "resolved_first");
+  await done(14, "precheck_suppressed", { reason: String(sentinel.reason || "").slice(0, 200) });
+}
+const messageId = capture || null;
+
+if (side && side.action === "rewrite" && !side.still_question) {
+  // The answer went out instead of the question. Nothing to wait for.
+  await done(13, "resolved_fyi_sent", { message_id: messageId, text_sent: side.text });
+}
+
+const textSent = side && side.action === "rewrite" && side.text ? side.text : message.trim();
+const now = new Date();
+const pending = {
+  id,
+  asked_at: now.toISOString(),
+  question: textSent,
+  subject,
+  memory_hook: memoryHook,
+  rationale,
+  lane,
+  delivered_msg_id: messageId,
+  expires_at: new Date(now.getTime() + ttlMin * 60_000).toISOString(),
+};
+if (side && side.action === "rewrite") pending.resolve = { decision_id: side.decision_id, narrowed_to_gap: true };
+try {
+  fs.mkdirSync(path.dirname(PENDING), { recursive: true });
+  const tmp = `${PENDING}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(pending, null, 2) + "\n");
+  fs.renameSync(tmp, PENDING);
+} catch (e) {
+  console.error(`hum-ask: sent, but the pending-question slot could not be written (${e.message})`);
+}
+try {
+  recordAsked({ id, question: textSent, subject, lane, memory_hook: memoryHook, rationale, msg_id: messageId, relevant_until: relevantUntil, at: now.toISOString() });
+} catch (e) {
+  console.error(`hum-ask: sent, but the open-questions ledger could not be written (${e.message})`);
+}
+await done(0, "asked", { message_id: messageId, text_sent: textSent, reask: Boolean(prior), asks: (prior?.asks || 0) + 1 });

@@ -1,0 +1,296 @@
+#!/usr/bin/env node
+// wiki-cloud-sync — mirror the wiki (pages, links, revisions) to Supabase.
+//
+// The production host's memory-index.db stays the working store: every wiki read and
+// write Merlin does is local and synchronous. This tool keeps an off-box
+// copy in the merlin Supabase project (wiki_pages / wiki_page_links /
+// wiki_page_revisions — migration 20261004_wiki_cloud.sql), which is
+//   * the disaster-recovery source (`restore` rebuilds the wiki tables), and
+//   * what the wiki site reads.
+//
+// Usage:
+//   wiki-cloud-sync push [--dry-run] [--quiet]   reconcile Supabase to local
+//   wiki-cloud-sync verify [--json]              compare local vs cloud, exit 1 on drift
+//   wiki-cloud-sync restore --db <path>          pull the cloud copy into a NEW sqlite file
+//
+// push is a stateless diff, so a missed or failed run heals on the next one:
+//   pages      — row_hash (every mirrored column + the page's outgoing links)
+//                compared against the cloud; changed rows upserted, rows gone
+//                locally deleted, and the page's links replaced.
+//   revisions  — append-only; everything past the rowid cursor in
+//                data/wiki-cloud-sync.json is inserted (duplicates
+//                ignored). `verify` catches any gap by count.
+//
+// Safety: push refuses to delete when the local DB has fewer than half the
+// cloud's pages — an empty or half-built local DB must never wipe the
+// off-box copy it would be restored from.
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const sb = require("../lib/supabase-rest.js");
+
+const args = process.argv.slice(2);
+const cmd = args[0];
+const has = (f) => args.includes(`--${f}`);
+const opt = (f) => {
+  const i = args.indexOf(`--${f}`);
+  return i === -1 ? undefined : args[i + 1];
+};
+const QUIET = has("quiet");
+const log = (...a) => { if (!QUIET) console.log(...a); };
+
+const STATE_PATH = path.join(__dirname, "../data/wiki-cloud-sync.json");
+
+const PAGE_COLS = [
+  "id", "basename", "type", "title", "description", "status", "pinned",
+  "pinned_at", "pin_locked", "scope_json", "confidence", "last_verified_at",
+  "expires_at", "raw_md", "body_md", "frontmatter_json", "body_hash",
+  "source_mtime", "created_at", "updated_at",
+];
+const LINK_COLS = ["src_id", "dst_id", "link_type", "display", "section"];
+
+function readState() {
+  try { return JSON.parse(fs.readFileSync(STATE_PATH, "utf8")); } catch { return {}; }
+}
+function writeState(s) {
+  fs.writeFileSync(STATE_PATH, JSON.stringify(s, null, 2) + "\n");
+}
+
+function linksBySrc(d) {
+  const m = new Map();
+  for (const l of d.prepare(
+    "SELECT src_id, dst_id, link_type, display, section FROM page_links ORDER BY src_id, dst_id, link_type, section",
+  ).all()) {
+    if (!m.has(l.src_id)) m.set(l.src_id, []);
+    m.get(l.src_id).push(l);
+  }
+  return m;
+}
+
+function rowHash(page, links) {
+  const h = crypto.createHash("sha256");
+  h.update(JSON.stringify(PAGE_COLS.map((c) => page[c] ?? null)));
+  h.update(JSON.stringify((links || []).map((l) => LINK_COLS.map((c) => l[c] ?? null))));
+  return h.digest("hex");
+}
+
+function localSnapshot() {
+  const ws = require("../lib/wiki-store.js");
+  const d = ws.db();
+  const links = linksBySrc(d);
+  const pages = d.prepare(`SELECT ${PAGE_COLS.join(", ")} FROM pages`).all().map((p) => {
+    const out = {};
+    for (const c of PAGE_COLS) out[c] = p[c] ?? null;
+    out.row_hash = rowHash(out, links.get(out.id));
+    return out;
+  });
+  return { d, pages, links };
+}
+
+const chunk = (arr, n) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+};
+// PostgREST in.() list; ids are basenames (no commas/parens) but quote anyway.
+const inList = (ids) => `in.(${ids.map((i) => `"${String(i).replace(/"/g, '\\"')}"`).join(",")})`;
+
+async function remotePageHashes() {
+  const rows = await sb.requestAll("/rest/v1/wiki_pages?select=id,row_hash&order=id");
+  return new Map(rows.map((r) => [r.id, r.row_hash]));
+}
+
+// Config the Worker reads from wiki_config, each pushed only when the file's
+// content differs from the cloud's copy:
+//   share_scopes — the wiki site's per-person scopes (repo file)
+//   portal       — the curated topics for the home portal (bin/wiki-portal
+//                  writes it on the production host; absent until the first curation, and
+//                  then the Worker falls back to grouping by page type)
+const SCOPES_PATH = path.join(__dirname, "../data/wiki-share-scopes.json");
+const PORTAL_PATH = process.env.WIKI_PORTAL_FILE || path.join(__dirname, "../data/wiki-portal.json");
+async function pushConfig(key, file) {
+  if (!fs.existsSync(file)) return false;
+  const local = JSON.parse(fs.readFileSync(file, "utf8"));
+  const rows = await sb.request(`/rest/v1/wiki_config?key=eq.${key}&select=value`);
+  const canon = (v) => JSON.stringify(v, Object.keys(flatKeys(v)).sort());
+  if (rows && rows[0] && canon(rows[0].value) === canon(local)) return false;
+  await sb.request("/rest/v1/wiki_config?on_conflict=key", {
+    method: "POST",
+    body: [{ key, value: local, updated_at: new Date().toISOString() }],
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+  return true;
+}
+const pushShareScopes = () => pushConfig("share_scopes", SCOPES_PATH);
+const pushPortal = () => pushConfig("portal", PORTAL_PATH);
+// Every key at any depth, so canon() is order-insensitive (jsonb reorders keys).
+function flatKeys(v, acc = {}) {
+  if (v && typeof v === "object") {
+    for (const [k, x] of Object.entries(v)) { acc[k] = 1; flatKeys(x, acc); }
+  }
+  return acc;
+}
+
+async function push({ dryRun }) {
+  const { d, pages, links } = localSnapshot();
+  const remote = await remotePageHashes();
+  const localIds = new Set(pages.map((p) => p.id));
+
+  const changed = pages.filter((p) => remote.get(p.id) !== p.row_hash);
+  const gone = [...remote.keys()].filter((id) => !localIds.has(id));
+
+  if (gone.length && pages.length < remote.size / 2) {
+    throw new Error(
+      `refusing to delete ${gone.length} cloud pages: local has ${pages.length}, cloud has ${remote.size} (local DB looks incomplete)`,
+    );
+  }
+
+  const state = readState();
+  const cursor = Number(state.revisionRowid || 0);
+  const revs = d.prepare(
+    "SELECT rowid AS _rowid, page_id, rev, raw_md, edited_by, edited_at FROM page_revisions WHERE rowid > ? ORDER BY rowid",
+  ).all(cursor);
+
+  log(`pages: ${pages.length} local, ${remote.size} cloud — ${changed.length} to upsert, ${gone.length} to delete; revisions: ${revs.length} new`);
+  if (dryRun) return { changed: changed.length, gone: gone.length, revisions: revs.length };
+
+  for (const batch of chunk(changed, 100)) {
+    await sb.request("/rest/v1/wiki_pages?on_conflict=id", {
+      method: "POST",
+      body: batch.map((p) => ({ ...p, synced_at: new Date().toISOString() })),
+      prefer: "resolution=merge-duplicates,return=minimal",
+      timeoutMs: 60000,
+    });
+  }
+
+  // Links for every touched page are replaced wholesale (delete, then insert).
+  const touched = [...changed.map((p) => p.id), ...gone];
+  for (const ids of chunk(touched, 100)) {
+    await sb.request(`/rest/v1/wiki_page_links?src_id=${encodeURIComponent(inList(ids))}`, {
+      method: "DELETE", prefer: "return=minimal", timeoutMs: 60000,
+    });
+  }
+  const newLinks = changed.flatMap((p) => links.get(p.id) || []);
+  for (const batch of chunk(newLinks, 1000)) {
+    await sb.request("/rest/v1/wiki_page_links", {
+      method: "POST", body: batch, prefer: "resolution=ignore-duplicates,return=minimal", timeoutMs: 60000,
+    });
+  }
+
+  for (const ids of chunk(gone, 100)) {
+    await sb.request(`/rest/v1/wiki_pages?id=${encodeURIComponent(inList(ids))}`, {
+      method: "DELETE", prefer: "return=minimal", timeoutMs: 60000,
+    });
+  }
+
+  let maxRowid = cursor;
+  for (const batch of chunk(revs, 200)) {
+    await sb.request("/rest/v1/wiki_page_revisions?on_conflict=page_id,rev", {
+      method: "POST",
+      body: batch.map(({ _rowid, ...r }) => r),
+      prefer: "resolution=ignore-duplicates,return=minimal",
+      timeoutMs: 60000,
+    });
+    maxRowid = batch[batch.length - 1]._rowid;
+    writeState({ ...state, revisionRowid: maxRowid, lastPushAt: new Date().toISOString() });
+  }
+  writeState({ ...readState(), revisionRowid: maxRowid, lastPushAt: new Date().toISOString() });
+
+  const scopesPushed = await pushShareScopes();
+  const portalPushed = await pushPortal().catch((e) => { log(`portal push failed: ${e.message}`); return false; });
+
+  if (changed.length || gone.length || revs.length || scopesPushed || portalPushed) {
+    log(`pushed: ${changed.length} pages, ${newLinks.length} links, ${gone.length} deletions, ${revs.length} revisions${scopesPushed ? ", share scopes" : ""}${portalPushed ? ", portal topics" : ""}`);
+  }
+  return { changed: changed.length, gone: gone.length, revisions: revs.length };
+}
+
+async function countRemote(table) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const res = await fetch(`${sb.SUPABASE_URL}/rest/v1/${table}?select=*&limit=1`, {
+    method: "HEAD",
+    headers: { apikey: key, Authorization: `Bearer ${key}`, Prefer: "count=exact" },
+  });
+  if (!res.ok) throw new Error(`count ${table}: HTTP ${res.status}`);
+  return Number((res.headers.get("content-range") || "").split("/")[1]);
+}
+
+async function verify({ json }) {
+  const { d, pages } = localSnapshot();
+  const remote = await remotePageHashes();
+  const mismatched = pages.filter((p) => remote.get(p.id) !== p.row_hash).map((p) => p.id);
+  const extra = [...remote.keys()].filter((id) => !pages.some((p) => p.id === id));
+  const localLinks = d.prepare("SELECT count(*) AS n FROM page_links WHERE src_id IN (SELECT id FROM pages)").get().n;
+  const localRevs = d.prepare("SELECT count(*) AS n FROM page_revisions").get().n;
+  const [cloudLinks, cloudRevs] = await Promise.all([
+    countRemote("wiki_page_links"), countRemote("wiki_page_revisions"),
+  ]);
+  const report = {
+    pages: { local: pages.length, cloud: remote.size, mismatched: mismatched.length, cloudOnly: extra.length },
+    links: { local: localLinks, cloud: cloudLinks },
+    revisions: { local: localRevs, cloud: cloudRevs },
+    lastPushAt: readState().lastPushAt || null,
+  };
+  report.ok = !mismatched.length && !extra.length && localLinks === cloudLinks && localRevs === cloudRevs;
+  if (json) console.log(JSON.stringify(report, null, 2));
+  else {
+    console.log(`pages      local ${report.pages.local}  cloud ${report.pages.cloud}  mismatched ${mismatched.length}  cloud-only ${extra.length}`);
+    console.log(`links      local ${localLinks}  cloud ${cloudLinks}`);
+    console.log(`revisions  local ${localRevs}  cloud ${cloudRevs}`);
+    console.log(`last push  ${report.lastPushAt || "never"}`);
+    console.log(report.ok ? "OK — cloud matches local" : "DRIFT — run `wiki-cloud-sync push`");
+    if (mismatched.length) console.log(`  mismatched: ${mismatched.slice(0, 10).join(", ")}${mismatched.length > 10 ? " …" : ""}`);
+  }
+  return report.ok;
+}
+
+async function restore({ dbPath }) {
+  if (!dbPath) throw new Error("restore needs --db <path> (a NEW file; the live DB is never overwritten)");
+  const abs = path.resolve(dbPath);
+  if (fs.existsSync(abs)) throw new Error(`${abs} already exists — restore only writes a fresh file`);
+  process.env.MEMORY_INDEX_DB = abs;
+  const ws = require("../lib/wiki-store.js");
+  const d = ws.db();
+
+  const pages = await sb.requestAll("/rest/v1/wiki_pages?select=" + PAGE_COLS.join(",") + "&order=id", { timeoutMs: 60000 });
+  const links = await sb.requestAll("/rest/v1/wiki_page_links?select=" + LINK_COLS.join(",") + "&order=src_id,dst_id,link_type,section", { timeoutMs: 60000 });
+  const revs = await sb.requestAll("/rest/v1/wiki_page_revisions?select=page_id,rev,raw_md,edited_by,edited_at&order=page_id,rev", { timeoutMs: 60000, pageSize: 500, maxRows: 1e7 });
+
+  const insPage = d.prepare(`INSERT INTO pages (${PAGE_COLS.join(", ")}) VALUES (${PAGE_COLS.map((c) => "@" + c).join(", ")})`);
+  const insLink = d.prepare(`INSERT INTO page_links (${LINK_COLS.join(", ")}) VALUES (?, ?, ?, ?, ?)`);
+  const insRev = d.prepare("INSERT INTO page_revisions (page_id, rev, raw_md, edited_by, edited_at) VALUES (?, ?, ?, ?, ?)");
+  const insFts = d.prepare("INSERT INTO pages_fts(page_id, title, description, body_md) VALUES (?, ?, ?, ?)");
+  d.exec("BEGIN IMMEDIATE");
+  try {
+    for (const p of pages) {
+      insPage.run(p);
+      insFts.run(p.id, p.title || "", p.description || "", p.body_md || "");
+    }
+    for (const l of links) insLink.run(l.src_id, l.dst_id, l.link_type, l.display, l.section);
+    for (const r of revs) insRev.run(r.page_id, r.rev, r.raw_md, r.edited_by, r.edited_at);
+    d.exec("COMMIT");
+  } catch (err) {
+    d.exec("ROLLBACK");
+    throw err;
+  }
+  console.log(`restored ${pages.length} pages, ${links.length} links, ${revs.length} revisions → ${abs}`);
+  console.log("Embeddings/cues are not in the cloud copy; rebuild with wiki-embed after swapping the file in.");
+}
+
+(async () => {
+  try {
+    if (cmd === "push") await push({ dryRun: has("dry-run") });
+    else if (cmd === "verify") process.exit((await verify({ json: has("json") })) ? 0 : 1);
+    else if (cmd === "restore") await restore({ dbPath: opt("db") });
+    else {
+      console.log("usage: wiki-cloud-sync push [--dry-run] [--quiet] | verify [--json] | restore --db <new-path>");
+      process.exit(cmd ? 2 : 0);
+    }
+  } catch (err) {
+    console.error(`wiki-cloud-sync: ${err.message}`);
+    process.exit(1);
+  }
+})();

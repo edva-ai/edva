@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+// hum-daily-run — the nightly hum chronicle, in code (no agent turn).
+//
+// Reads the trailing 24h of hum-runs (via hum-run-log, never a tolerant
+// parser), hum-feedback, hum-learnings, the pending question and the
+// `merlin hum audit` drift check; aggregates with lib/hum-daily-report.mjs
+// and APPENDS one record per day to data/hum-daily.jsonl.
+//
+// No email, no phone pointer, no push (the user's call: track the information
+// and feed it into improvements, but send no daily email). The record is an input to
+// hum-improvement-ideation (jobs/hum-improvement-ideation.md), whose ideas
+// reach the user through the Improvements channel. The HTML view is still
+// available on demand with --dry-run.
+//
+// Usage:
+//   hum-daily-run              aggregate + record (idempotent per date)
+//   hum-daily-run --dry-run    write the HTML to stdout, record nothing
+//
+// Env (tests): HUM_RUNS_FILE, HUM_DAILY_DATA_DIR, HUM_DAILY_NOW (ISO).
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { aggregate, renderHtml, MIN_TICKS } from "../lib/hum-daily-report.mjs";
+import { createRequire } from "node:module";
+// The installation's home time zone (agent/local/instance.json tz; the host zone when unset).
+const instanceTz = () => createRequire(import.meta.url)("../lib/instance.cjs").instance().tz;
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DATA = process.env.HUM_DAILY_DATA_DIR || path.resolve(HERE, "../data");
+const BIN = (n) => path.join(HERE, n);
+
+function jsonl(p) {
+  try {
+    return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch (e) { if (e.code === "ENOENT") return []; throw e; }
+}
+function json(p) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } }
+
+function readRuns(startMs) {
+  const out = execFileSync(process.execPath, [BIN("hum-run-log"), "read", "--since", new Date(startMs).toISOString(), "--json"], {
+    encoding: "utf8", env: process.env, maxBuffer: 256 * 1024 * 1024,
+  });
+  return JSON.parse(out);
+}
+
+function audit() {
+  const r = spawnSync(BIN("merlin"), ["hum", "audit", "--window", "24h", "--json"], { encoding: "utf8" });
+  try { return JSON.parse(r.stdout); } catch { return null; }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const bad = args.filter((a) => a !== "--dry-run");
+  if (bad.length) { process.stderr.write("usage: hum-daily-run [--dry-run]\n"); process.exit(2); }
+  const dry = args.includes("--dry-run");
+
+  const endMs = process.env.HUM_DAILY_NOW ? Date.parse(process.env.HUM_DAILY_NOW) : Date.now();
+  const startMs = endMs - 24 * 3600 * 1000;
+  const dateLabel = new Intl.DateTimeFormat("en-CA", { timeZone: instanceTz() }).format(new Date(endMs));
+
+  const { records, skipped } = readRuns(startMs);
+  const a = aggregate({
+    runs: records,
+    feedback: jsonl(path.join(DATA, "hum-feedback.jsonl")),
+    learnings: jsonl(path.join(DATA, "hum-learnings.jsonl")),
+    pending: json(path.join(DATA, "hum-pending-question.json")),
+    audit: dry ? null : audit(),
+    startMs, endMs,
+  });
+
+  if (dry) {
+    let html = a.ticks < MIN_TICKS
+      ? `<p>Hum daily, only ${a.ticks} ticks in the last 24h; the supervisor or hum-sense may have been down.</p>`
+      : renderHtml(a, { dateLabel, startMs, endMs });
+    if (skipped) html += `<p style="color:#a00">hum-run-log skipped ${skipped} unparseable trace line(s) in this window.</p>`;
+    process.stdout.write(html + "\n");
+    return;
+  }
+
+  // One row per local date; a re-run the same day replaces that day's row.
+  const out = process.env.HUM_DAILY_OUT || path.join(DATA, "hum-daily.jsonl");
+  const row = { date: dateLabel, recorded_at: new Date().toISOString(), window: { start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() }, low_ticks: a.ticks < MIN_TICKS, skipped_trace_lines: skipped || 0, ...a };
+  const kept = jsonl(out).filter((r) => r.date !== dateLabel);
+  fs.writeFileSync(out, [...kept, row].map((r) => JSON.stringify(r)).join("\n") + "\n");
+  process.stdout.write(`hum-daily-run: recorded ${dateLabel} (${a.ticks} ticks, ${a.pings.length} pings, ${a.questions.length} questions) -> ${path.basename(out)}\n`);
+}
+
+main().catch((e) => { process.stderr.write(`hum-daily-run: ${e.message}\n`); process.exit(1); });

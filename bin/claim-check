@@ -1,0 +1,431 @@
+#!/usr/bin/env node
+// claim-check — the single gate every proposed suggestion, idea, or question
+// must pass before the user sees it.
+//
+// Replaces the per-incident validator treadmill (premiseValid, flightDateValid,
+// dowValid, travelPremiseValid, keyword dedup, thread-id dedup — each one a
+// regex written after a specific ping went wrong, each one blind to the next
+// phrasing) with two stages that generalize:
+//
+//   Stage 1 — AUTHORITIES (deterministic, free, always runs).
+//     lib/claim-facts.mjs extracts the entities the candidate mentions
+//     (places, dates) and asks each entity's authority what is actually true.
+//     Triggered by an ENTITY appearing, not by a sentence shape — so
+//     "you're in <city>", "your <city> stretch", and "while you're away in
+//     <city>" all get checked identically. A hard contradiction drops the
+//     candidate here, with no LLM call.
+//
+//   Stage 1.5 — FRESHNESS (lib/claim-freshness.mjs). Stage 1 answers
+//     "is this WHERE the user is?"; Stage 1.5 answers "is this STILL so?" — the
+//     stateful claims (has X enrolled / paid / replied / signed) that carry no
+//     place and no date for the authorities to probe, and that decay silently
+//     between authoring and release. Gated on evidence age, so a candidate
+//     written this tick costs nothing. Added after a two-day-old status claim
+//     shipped as fact.
+//
+//   Stage 2 — MEMORY (one LLM call, only when there is something to judge).
+//     Has the user already settled or contradicted this? The adjudicator sees the user's
+//     own dated words (lib/utterance-store.mjs — every reply to a ping,
+//     permanently searchable) fused with chat + wiki via `recall`, and answers
+//     ONE narrow question. That is a far easier call than the hum ranker's
+//     current side-task of noticing a contradiction while scoring 12 candidates
+//     on a weighted formula — which is how a "you're in <city>" ping shipped
+//     with the correct answer sitting one CLI call away.
+//
+// Stage 2 runs only when Stage 1 found a soft contradiction, or memory recall
+// surfaced something relevant, or --force. Ticks where nothing looks
+// contradictory cost zero tokens, so this can gate every candidate on every
+// 20-minute tick without a bill.
+//
+// Usage:
+//   echo '{"text":"...","supporting_data":{...},"subject":"..."}' | claim-check [--json] [--no-llm] [--force]
+//
+// Stdin:  {text, supporting_data?, subject?, lane?, reference_iso?}
+// Stdout: {verdict, reasons[], facts[], contradictions[], evidence[], correction?}
+//   verdict: "pass"    — nothing contradicts it, ship it
+//            "rewrite" — a premise is stale; `correction` says what is true
+//            "drop"    — already settled or flatly contradicted
+//
+// FAIL-OPEN, always. Every error path emits {verdict:"pass"} — same rule as
+// outbound-precheck: better an occasional dumb ping than an
+// entire silent agent. A gate that can silence hum by breaking is worse than
+// the bug it fixes.
+//
+// CALLER CONSTRAINT — Stage 2 needs an authenticated parent. It forks
+// `claude -p`, which resolves Max credentials from the login keychain, and the
+// keychain is only reachable from inside the GUI session (§ Auth Model in
+// agent/CLAUDE.md; the same constraint that moved the ephemeral Opus jobs
+// off cron). So:
+//   - Invoke this CLI from INSIDE an agent turn (ops / ops-light / a job
+//     playbook step). The fork inherits the session's keychain access, exactly
+//     like outbound-precheck and the hum harvesters already do.
+//   - Do NOT wire it straight into a crontab or an SSH one-liner. There,
+//     `claude -p` returns "Not logged in", Stage 2 fails open, and you get a
+//     gate that silently only ever runs Stage 1 — which looks like it's
+//     working.
+//   - Callers that only want the free deterministic half should import
+//     lib/claim-facts.mjs directly (what hum-harvest-all does) or pass
+//     --no-llm, rather than relying on the failure.
+//
+
+import { spawnSync } from "node:child_process";
+import { runToolless, parseModelJson } from "../lib/jev-claude.mjs";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { createRequire } from "node:module";
+import { loadTimeline, checkClaims } from "../lib/claim-facts.mjs";
+import { checkFreshness } from "../lib/claim-freshness.mjs";
+import { searchUtterances } from "../lib/utterance-store.mjs";
+import { decideGate, privateIntent, fitState } from "../lib/jev-gates.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const HOME = os.homedir();
+// Who the candidate is for (agent/local/instance.json owner_name).
+const { owner_name: OWNER, owner_id: OWNER_ID } = createRequire(import.meta.url)("../lib/instance.cjs").instance();
+const OWNER_UP = OWNER.toUpperCase();
+// The Jev state key for the owner's own dated words: `<owner_id>_said`
+// (user_said by default). The site's question text in
+// data/jev-questions/claim-check.json names it, so it follows owner_id.
+const SAID_KEY = `${OWNER_ID}_said`;
+// CLAIM_CHECK_* overrides are test seams (tests/jev-claim-check.test.mjs).
+const CLAUDE_BIN = process.env.CLAIM_CHECK_CLAUDE_BIN || path.join(HOME, ".local/bin/claude");
+const RECALL_BIN = process.env.CLAIM_CHECK_RECALL_BIN || installTools("bin/recall");
+const LOG_FILE = process.env.CLAIM_CHECK_LOG || installTools("data/claim-check-log.jsonl");
+
+const argv = process.argv.slice(2);
+const NO_LLM = argv.includes("--no-llm");
+const FORCE = argv.includes("--force");
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+  try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    fs.appendFileSync(LOG_FILE, JSON.stringify({ ts: new Date().toISOString(), ...obj }) + "\n");
+  } catch {}
+  process.exit(0);
+}
+
+let input;
+try { input = JSON.parse(fs.readFileSync(0, "utf8")); } catch { emit({ verdict: "pass", reasons: ["invalid_input"] }); }
+if (!input || typeof input.text !== "string" || !input.text.trim()) {
+  emit({ verdict: "pass", reasons: ["empty_input"] });
+}
+
+const text = input.text.trim();
+const supportingData = input.supporting_data || null;
+const subject = (input.subject || "").toString();
+
+// ─── Stage 1: authorities ─────────────────────────────────────────────────
+
+let facts = [], contradictions = [], checked = { places: [], dates: [] };
+try {
+  const timeline = await loadTimeline();
+  ({ facts, contradictions, checked } = checkClaims(
+    { text, supporting_data: supportingData, reference_iso: input.reference_iso || null },
+    timeline,
+  ));
+} catch (e) {
+  facts = []; contradictions = [];
+}
+
+const hard = contradictions.filter((c) => c.severity === "hard");
+if (hard.length) {
+  const c = hard[0];
+  emit({
+    verdict: "drop",
+    reasons: [`authority_contradiction: ${c.why}`],
+    facts, contradictions, evidence: [],
+    correction: c.kind === "presence"
+      ? { field: "location", stated: c.place, actual: c.actual_label, on: c.on }
+      : null,
+  });
+}
+
+// ─── Stage 1.5: freshness — is the premise STILL true? ────────────────────
+//
+// Runs before the memory stage on purpose. A claim the mailbox has already
+// resolved is not worth adjudicating for relevance — it is simply false, and
+// dropping it costs one fewer LLM call than discovering that downstream.
+//
+// A rewrite does NOT short-circuit: the corrected text becomes the working text
+// and still faces Stage 2, because "true now" and "worth saying" are different
+// questions and a message has to survive both.
+let workingText = text;
+let freshnessCorrection = null;
+let freshnessReasons = [];
+try {
+  const fresh = await checkFreshness({
+    text,
+    subject,
+    supporting_data: supportingData,
+    created_at: input.created_at || null,
+    evidence_as_of: input.evidence_as_of || null,
+    solicited: input.solicited === true,
+    // Forwarded so claim-freshness's Jev exclusion sees the hum lane / intent
+    // (a health-lane candidate must not reach Jev at stage 1.5 either).
+    intent: input.intent || null,
+    lane: input.lane || null,
+  }, { noLlm: NO_LLM });
+  freshnessReasons = fresh.reasons || [];
+  if (fresh.verdict === "drop") {
+    emit({
+      verdict: "drop",
+      reasons: [`stale_premise: ${fresh.reasons?.[0] || "resolved since authoring"}`],
+      facts, contradictions, evidence: [],
+      freshness: fresh,
+    });
+  }
+  if (fresh.verdict === "rewrite" && fresh.corrected_text) {
+    workingText = fresh.corrected_text;
+    freshnessCorrection = fresh;
+  }
+} catch {}
+
+// ─── Stage 2 gate: is there anything worth an LLM call? ───────────────────
+//
+// Ordering here is deliberate and load-bearing for cost. The cheap local
+// signal decides whether to spend anything at all:
+//
+//   searchUtterances  local, no network, no tokens — runs always
+//   recall            a subprocess + embedding + Supabase — runs ONLY if gated
+//   adjudicator       one Sonnet call — runs ONLY if gated
+//
+// The gate cannot be "recall returned something": `recall` returns its top-k
+// by rank with no relevance floor, so it answers for nearly any query and
+// would fire Stage 2 on essentially every candidate — ~12 per tick × 72 ticks
+// plus 8–15 ideas × 4 ideation runs a day. This job is supposed to be free on
+// quiet ticks, so the trigger is a REAL signal: a soft contradiction from the
+// authorities, or a reply of the user's with substantial token overlap.
+//
+// STRONG_UTTERANCE_SCORE is on searchUtterances' scale: overlap-fraction of
+// query tokens + a ≤0.15 recency term. 0.34 ≈ "a third of the query's
+// content words appear in something the user said" — enough to be about the same
+// subject, not a single shared common word.
+const STRONG_UTTERANCE_SCORE = 0.34;
+
+const query = [subject, workingText].filter(Boolean).join(" ").slice(0, 400);
+let utterances = [];
+try { utterances = searchUtterances(query, { k: 6 }); } catch { utterances = []; }
+
+const soft = contradictions.filter((c) => c.severity === "soft");
+const strongUtterance = utterances.some((u) => (u.score ?? 0) >= STRONG_UTTERANCE_SCORE);
+const worthJudging = FORCE || soft.length > 0 || strongUtterance;
+
+let recallHits = [];
+if (worthJudging && !NO_LLM) {
+  try {
+    const r = spawnSync(RECALL_BIN,
+      [query, "-k", "6", "--json"],
+      { encoding: "utf8", timeout: 20000, maxBuffer: 1024 * 1024 });
+    if (r.status === 0 && r.stdout) {
+      const parsed = JSON.parse(r.stdout);
+      recallHits = Array.isArray(parsed?.results) ? parsed.results : [];
+    }
+  } catch { recallHits = []; }
+}
+
+if (NO_LLM || !worthJudging) {
+  // A freshness rewrite outranks "nothing to judge" — the memory stage found no
+  // reason to speak, but the truth stage already replaced the text.
+  if (freshnessCorrection && !soft.length) {
+    emit({
+      verdict: "rewrite",
+      reasons: [`stale_premise: ${freshnessReasons[0] || "attributed to its evidence date"}`],
+      facts, contradictions,
+      evidence: utterances.map((u) => ({ date: u.date, quote: u.text, source: u.source })),
+      corrected_text: workingText,
+      freshness: freshnessCorrection,
+    });
+  }
+  emit({
+    verdict: soft.length ? "rewrite" : "pass",
+    reasons: soft.length
+      ? [`stale_premise (deterministic): ${soft[0].why}`]
+      : ["no_contradiction_found"],
+    facts, contradictions,
+    corrected_text: freshnessCorrection ? workingText : undefined,
+    evidence: utterances.map((u) => ({ date: u.date, quote: u.text, source: u.source })),
+    correction: soft.length && soft[0].kind === "presence"
+      ? { field: "location", stated: soft[0].place, actual: soft[0].actual_label, on: soft[0].on }
+      : null,
+  });
+}
+
+// ─── Stage 2: one focused adjudication ────────────────────────────────────
+
+// Lead with the CANONICAL METRO, not the segment's display label — the same
+// defect fixed in outbound-precheck.mjs, and this copy sits one rung UPSTREAM
+// of it: a drop here removes a hum candidate before the precheck ever sees it,
+// and leaves no row in outbound-precheck-log.jsonl to notice it by.
+//
+// `f.in` is `res.metro === wantMetro` (claim-facts.mjs) and is correct. But
+// `actual_label` is free text off the segment and is routinely not the city
+// (a stay can be labelled with its arrival airport). Rendering the label alone
+// can make a same-metro line read as a flat self-contradiction ("<user> is in
+// <label> … mentions "<neighbourhood>" — match: YES") and talk the adjudicator
+// out of its own correct verdict.
+const factLines = facts.length
+  ? facts.map((f) => {
+      const metro = f.actual_metro || f.actual_label;
+      const where = (f.actual_label && f.actual_label !== f.actual_metro)
+        ? `${metro} (segment label: "${f.actual_label}" — display text, not the comparison key)`
+        : `${metro}`;
+      return `  - On ${f.on}, ${OWNER} is in metro ${where} (authority: ${f.authority}). The candidate mentions "${f.place}" — SAME METRO: ${f.in ? "YES" : "NO"}.`;
+    }).join("\n")
+  : "  (no place/date claims in this candidate)";
+
+// Jev's copy of the same facts (from a disagreement review). The Sonnet
+// prompt above leaves two things to the reader that claim-facts already knows:
+// whether the candidate PLACES the user somewhere or only mentions a place (a
+// home while the user is away, an airport they connect through, where something is
+// for), and that dates are read from the whole text, so an asserted place that
+// holds on one of them makes a NO on another date most likely a different
+// fact's date. Jev cannot read past that the way Sonnet does: every place x date
+// pair arrived as an authoritative "SAME METRO: NO", and it leaned drop on true
+// hum ideas (two true ideas leaned drop at ~0.5). With this rendering plus the NO clause in
+// data/jev-questions/claim-check.json both lean pass, and a message that
+// needs the user somewhere they will not be still drops. factLines (Sonnet) is unchanged.
+const assertedHoldsOn = {};
+for (const f of facts) if (f.asserted && f.in) (assertedHoldsOn[f.place] ||= []).push(f.on);
+const jevFactLines = facts.length
+  ? facts.map((f) => {
+      const metro = f.actual_metro || f.actual_label;
+      const where = (f.actual_label && f.actual_label !== f.actual_metro)
+        ? `${metro} (segment label: "${f.actual_label}" — display text, not the comparison key)`
+        : `${metro}`;
+      const head = `  - On ${f.on}, ${OWNER} is in metro ${where} (authority: ${f.authority}).`;
+      if (f.in) return `${head} ${f.asserted ? `The candidate places ${OWNER} in "${f.place}"` : `The candidate mentions "${f.place}"`} — SAME METRO: YES.`;
+      if (!f.asserted) return `${head} "${f.place}" is MENTIONED, not stated as where ${OWNER} is — SAME METRO: NO, which matters only if the message needs ${OWNER} to be there in person on ${f.on}.`;
+      const holds = assertedHoldsOn[f.place];
+      if (holds) return `${head} The candidate places ${OWNER} in "${f.place}" — SAME METRO: NO on this date, but YES on ${holds.join(", ")}. Dates are read from the whole message, so this date may belong to a different fact in it: a contradiction only if the message itself puts ${OWNER} in "${f.place}" on ${f.on}.`;
+      return `${head} The candidate places ${OWNER} in "${f.place}" — SAME METRO: NO.`;
+    }).join("\n")
+  : "  (no place/date claims in this candidate)";
+
+const utteranceLines = utterances.length
+  ? utterances.map((u) => `  - ${u.rendered}`).join("\n")
+  : "  (nothing in the reply log matches this subject)";
+
+const recallLines = recallHits.length
+  ? recallHits.map((r) => `  - [${r.source}${r.created_at ? " " + String(r.created_at).slice(0, 10) : ""}] ${r.title ? r.title + " — " : ""}${(r.snippet || "").slice(0, 200)}`).join("\n")
+  : "  (no memory hits)";
+
+const prompt = `You are Merlin's claim-check adjudicator. A candidate message is about to be sent to ${OWNER}. Decide whether it should be sent as-is, rewritten, or dropped — based ONLY on whether it contradicts known facts or something ${OWNER} already told us.
+
+CANDIDATE (what would be sent):
+${workingText.slice(0, 1200)}
+
+AUTHORITATIVE FACTS (from Merlin's own live data — these are GROUND TRUTH, they outrank the candidate's wording).
+Each line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT drop or rewrite a candidate for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:
+${factLines}
+
+WHAT ${OWNER_UP} SAID (dated, verbatim, from the reply log):
+${utteranceLines}
+
+OTHER MEMORY (recall across chat + wiki):
+${recallLines}
+
+Answer this ONE question: does the candidate assert something the facts contradict, or ask/raise something ${OWNER} has already settled?
+
+- "drop"    — ${OWNER} already answered this, already handled it, or explicitly said not to raise it again; OR the candidate's core premise is false per the facts. Re-asking a settled thing is the single worst failure mode; when their own words settle it, drop.
+- "rewrite" — the candidate is still worth sending but one premise is stale (e.g. it names the wrong city or a passed date). Give the corrected text.
+- "pass"    — nothing contradicts it. This is the default; do NOT drop merely because a topic is vaguely related to something in memory. It must actually be SETTLED or CONTRADICTED.
+
+A hit in memory that is merely on the same subject is NOT grounds to drop — only an actual answer, decision, or contradiction is.
+
+Reply with ONE LINE of compact JSON, no prose, no markdown fence:
+{"verdict":"pass"|"rewrite"|"drop","reason":"<=140 chars, cite the date + quote or the fact that drove it>","corrected_text":"<only if verdict=rewrite, <=400 chars>"}`;
+
+// ─── The adjudication: Jev primary, Sonnet shadow + fallback ─────────────
+//
+// Jev (docs/jev.md) answers ONE choice — pass / rewrite /
+// drop — over the same facts, replies and memory. It acts alone on pass and
+// drop; a Jev "rewrite" takes Sonnet's corrected text (Jev cannot write). During
+// the shadow week a Sonnet "drop" beats a Jev "pass" (lib/jev-gates.mjs).
+// Health/finance lanes never reach Jev; everything else passes the fail-closed
+// on-device screen. Jev unavailable / unsure → exactly the old Sonnet path.
+//
+// Sonnet is ASYNC so the shadow turn and the Jev request overlap.
+// It resolves the parsed verdict or THROWS the old fail-open reason.
+// Tool-less, Max-only — lib/jev-claude.mjs.
+async function sonnetAdjudicate() {
+  const out = await runToolless({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
+  if (!out) throw new Error("adjudicator_unavailable");
+  const p = parseModelJson(out);
+  if (!p || !["pass", "rewrite", "drop"].includes(p.verdict)) throw new Error("adjudicator_bad_json");
+  return p;
+}
+
+const evidence = utterances.map((u) => ({ date: u.date, quote: u.text, source: u.source }));
+
+let parsed = null;
+let failReason = null;
+try {
+  const gate = await decideGate({
+    site: "claim-check",
+    id: createHash("sha1").update(workingText).digest("hex").slice(0, 12),
+    state: fitState({
+      candidate: workingText.slice(0, 1200),
+      subject: subject || "(none)",
+      authoritative_facts: jevFactLines,
+      [SAID_KEY]: utterances.map((u) => u.rendered),
+      other_memory: recallHits.map((r) => `[${r.source}${r.created_at ? " " + String(r.created_at).slice(0, 10) : ""}] ${r.title ? r.title + " — " : ""}${(r.snippet || "").slice(0, 200)}`),
+    }),
+    logInput: { subject, lane: input.lane || null, text: workingText.slice(0, 300) },
+    legacy: sonnetAdjudicate,
+    verdictOf: (p) => p.verdict,
+    classes: ["pass", "rewrite", "drop"],
+    textClasses: ["rewrite"],
+    conservative: ["drop"],
+    skipJev: privateIntent(input.intent || subject, input.lane),
+  });
+  if (gate.source === "jev") {
+    parsed = { verdict: gate.verdict, reason: gate.verdict === "drop" ? "jev: already settled or contradicted" : "jev: nothing contradicts it" };
+  } else {
+    parsed = gate.result;
+    if (parsed && gate.source === "legacy-conservative") parsed = { ...parsed, reason: `sonnet shadow drop over jev pass: ${parsed.reason || ""}` };
+    if (!parsed) failReason = "adjudicator_unavailable";
+  }
+} catch (err) {
+  failReason = /bad_json/.test(String(err?.message)) ? "adjudicator_bad_json" : "adjudicator_unavailable"; // lang-regex-ok: our own error code, not language
+}
+
+if (failReason === "adjudicator_unavailable") {
+  emit({
+    verdict: soft.length || freshnessCorrection ? "rewrite" : "pass",
+    reasons: ["adjudicator_unavailable"],
+    facts, contradictions, evidence,
+    corrected_text: freshnessCorrection ? workingText : undefined,
+    correction: soft.length && soft[0].kind === "presence"
+      ? { field: "location", stated: soft[0].place, actual: soft[0].actual_label, on: soft[0].on }
+      : null,
+  });
+}
+if (failReason) {
+  emit({
+    verdict: freshnessCorrection ? "rewrite" : "pass",
+    reasons: ["adjudicator_bad_json"],
+    facts, contradictions, evidence,
+    corrected_text: freshnessCorrection ? workingText : undefined,
+  });
+}
+
+// The memory stage judged the FRESHNESS-CORRECTED text, so a "pass" from it
+// means "the corrected text is worth sending" — not "send the original".
+const memoryVerdict = parsed.verdict;
+const finalVerdict = memoryVerdict === "pass" && freshnessCorrection ? "rewrite" : memoryVerdict;
+const finalText = memoryVerdict === "rewrite"
+  ? String(parsed.corrected_text || "").slice(0, 600)
+  : workingText;
+
+emit({
+  verdict: finalVerdict,
+  reasons: [String(parsed.reason || "adjudicated").slice(0, 200)],
+  facts, contradictions, evidence,
+  corrected_text: finalVerdict === "rewrite" ? finalText : undefined,
+  correction: soft.length && soft[0].kind === "presence"
+    ? { field: "location", stated: soft[0].place, actual: soft[0].actual_label, on: soft[0].on }
+    : null,
+});

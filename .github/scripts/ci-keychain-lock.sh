@@ -4,18 +4,16 @@
 # signing workflows: `source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"`.
 #
 # ┌────────────────────────────────────────────────────────────────────────────┐
-# │ CANONICAL SOURCE: the gandalf repo, .github/scripts/ci-keychain-lock.sh     │
+# │ SHARED FILE: every macOS-signing repo on a shared self-hosted runner host  │
+# │ should vendor an IDENTICAL copy of this file. Edit one canonical copy,     │
+# │ bump KC_LOCK_LIB_VERSION, and re-vendor everywhere.                        │
+# │ `bin/ci-keychain-lock-audit` compares the copies by sha256 and fails on    │
+# │ drift, so divergence is caught, not discovered.                            │
 # │                                                                            │
-# │ Every macOS-signing repo on the shared self-hosted mini vendors a BYTE-     │
-# │ IDENTICAL copy of this file. Do NOT edit a vendored copy — edit the         │
-# │ canonical one, bump KC_LOCK_LIB_VERSION, and re-vendor everywhere.          │
-# │ `tools/bin/ci-keychain-lock-audit` (in gandalf) compares every downstream   │
-# │ copy by sha256 and fails on drift, so divergence is caught, not discovered. │
-# │                                                                            │
-# │ The lock path is deliberately HOST-WIDE and identical in every repo: these  │
-# │ repos all sign on the same mini, so they must contend for the SAME lock or  │
-# │ the serialization is worthless. The "gandalf-" prefix is historical, not    │
-# │ ownership.                                                                  │
+# │ The lock path is deliberately HOST-WIDE and identical in every repo: these │
+# │ repos all sign on the same host, so they must contend for the SAME lock or │
+# │ the serialization is worthless. Its file name is historical, not           │
+# │ ownership; override it with KC_LOCK in every repo at once, or not at all.  │
 # └────────────────────────────────────────────────────────────────────────────┘
 KC_LOCK_LIB_VERSION="1"
 #
@@ -24,9 +22,9 @@ KC_LOCK_LIB_VERSION="1"
 # append, so every caller must read-modify-write. That list is global state
 # shared by every self-hosted runner on this host. Two concurrent signing jobs
 # racing it lose each other's entry, and a list written from a stale read can
-# drop login.keychain-db entirely — which takes Gandalf's Max auth down, because
-# the OAuth token lives in the login keychain and there is no API-key fallback
-# by design. See tools/system/architecture.md 2026-07-28.
+# drop login.keychain-db entirely — which takes an agent on the same host
+# auth-down, because its OAuth token lives in the login keychain and there is
+# no API-key fallback by design (docs/agent-auth-model.md).
 #
 # WHY CRASH-SAFE
 # The original lock was a bare `mkdir` with no owner and no expiry. A job
@@ -95,9 +93,9 @@ kc_lock_release() {
 # real contention, three concurrent signing jobs hammering `security` on one
 # host — then $current is empty, $filtered is empty, and this would write a
 # ONE-ENTRY list containing only the temp keychain, evicting login.keychain-db
-# and taking Gandalf's Max auth down. That is exactly the outage this helper
-# exists to prevent, reintroduced by the helper itself; caught 2026-07-28 by a
-# five-repo concurrent build (login gone 15:02:08–15:02:12).
+# and taking the agent's auth down. That is exactly the outage this helper
+# exists to prevent, reintroduced by the helper itself; it was caught by a
+# multi-repo concurrent build that briefly left login off the list.
 #
 # kc_remove always had this guarantee; kc_prepend did not. Both write the list,
 # so both need it — a write path without the guarantee is a write path that can
@@ -116,7 +114,7 @@ kc_prepend() {
 
 # Remove $1 from the user search list. NEVER emits an empty list: `security
 # list-keychains -d user -s` with no arguments SETS AN EMPTY LIST rather than
-# doing nothing, which evicts login.keychain-db and takes Gandalf auth down.
+# doing nothing, which evicts login.keychain-db and takes the agent's auth down.
 # login is therefore re-added explicitly whenever it is absent.
 kc_remove() {
   local drop="$1" remaining

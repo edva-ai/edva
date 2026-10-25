@@ -312,7 +312,7 @@ async function recordUsage(
   if (!redis) return { status: 503, error: "kv not configured" };
   const rawDay = String(body.day ?? "");
   const day = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : daySalt();
-  // host_fp is the merlin/gandalf SHA-256 prefix — always lowercase hex. Reject
+  // host_fp is the host fingerprint (SHA-256 prefix) — always lowercase hex. Reject
   // anything else so the hosts HLL and day-hash fields can't be polluted.
   const host = clip(String(body.host_fp ?? ""), 64);
   if (!/^[0-9a-f]{8,64}$/.test(host)) {

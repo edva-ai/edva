@@ -1,0 +1,10 @@
+# external/ is auto-synced from the configured browsing-skills fork by bin/browsing-skills-sync.
+# Edits here are destroyed on the next sync. Always edit the fork, not these copies.
+external/skills/
+external/SKILL.md
+external/README.md
+external/.sync-meta.json
+
+# Local test artifacts
+*.test.actual.json
+.cache/

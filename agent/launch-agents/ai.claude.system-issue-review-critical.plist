@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System Issue Review — hourly same-day escalation lane (:52 every hour).
+  Exits immediately unless a genuinely NEW critical (red) system-channel
+  condition landed; see the sibling ai.claude.system-issue-review.plist header.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.system-issue-review-critical</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__MERLIN_TOOLS__/agent/scripts/trigger-system-issue-review.sh</string>
+        <string>--critical-only</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>52</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+</dict>
+</plist>

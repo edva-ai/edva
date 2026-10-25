@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
-import { readStdinJson, emit, emitNull, stampRun } from "./_common.mjs";
+import { readStdinJson, emit, emitNull, stampRun, GOG_ACCOUNT } from "./_common.mjs";
 
 const { situation: sit, context } = await readStdinJson(); void sit; void context;
 
 try {
-  const plain = execSync("gog tasks list @default --plain", {
+  const plain = execSync(`/opt/homebrew/bin/gog tasks list @default --plain${GOG_ACCOUNT ? ` -a ${GOG_ACCOUNT}` : ""}`, {
     encoding: "utf8", timeout: 10000,
   });
   // gog plain output is TSV; find overdue + due-today lines

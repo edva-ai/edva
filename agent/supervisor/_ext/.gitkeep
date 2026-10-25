@@ -1,0 +1,25 @@
+# Per-instance supervisor hooks. Each is optional; a plain install has none.
+#
+# gmail-intake.mjs — Gmail intake step (supervisor/gmail-source.mjs).
+#   export async function intake({ messageId, from, subject, gmailAction, ctx })
+#   Runs after the spam check and before the P1 stampers, on the live push
+#   path and the catchups. Return { handled: true, kind, detail, log } when you
+#   fully filed the message in code (no agent dispatch); anything else falls
+#   through to the normal cascade. gmailAction(...args) runs bin/gmail-action
+#   and returns true on exit 0; ctx = { GMAIL_ACTION_BIN, GA_OPTS,
+#   extractEmailAddr }. Fail-open: a hook that fails to load or throws is
+#   logged and skipped. Use it for sender-specific handling, e.g. accepting one
+#   sender's invitations or routing a particular service's notices to a job.
+#
+# routes.mjs — extra HTTP routes (supervisor/http-server.mjs).
+#   export function register(api)
+#     api.post(pathname, async (req, res, url) => …)   a POST path on the Gmail
+#       push port, matched before the email-inbound and push branches; the
+#       handler authenticates its caller and writes the response.
+#     api.emailInbound(async (email) => true|false)    claim an authenticated
+#       inbound email (before the DKIM/DMARC alignment gate — check email.auth
+#       yourself if it matters); true answers 200 and nothing else runs.
+#     api.json / api.readBody / api.readBodyRaw / api.readSecret
+#   Loaded once at import; a hook that fails to load stops the supervisor.
+#
+# Modules here belong to this installation, not to the kernel.

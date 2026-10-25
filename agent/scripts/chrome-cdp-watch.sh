@@ -8,25 +8,41 @@
 # browser-automation jobs. This script probes the CDP port and fires exactly
 # one Merlin ping on each UP→DOWN transition; DOWN→UP is silent (self-heal).
 #
-# Install via crontab: */15 * * * * ${MERLIN_HOME_USER}/dev/merlin/agent/scripts/chrome-cdp-watch.sh
+# Install via crontab: */15 * * * * $HOME/Dev/merlin/agent/scripts/chrome-cdp-watch.sh
 #
 # State: data/chrome-cdp-state.json {state, since, last_notified}
 # Log:   agent/logs/watchdog.log  (single source of truth for ops alerts)
 
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
-
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-STATE_FILE="${MERLIN_HOME}/data/chrome-cdp-state.json"
-LOG="${MERLIN_HOME}/agent/logs/watchdog.log"
+STATE_FILE="$HOME/Dev/merlin/data/chrome-cdp-state.json"
+LOG="$HOME/Dev/merlin/agent/logs/watchdog.log"
 NOW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-# Quiet hours: skip notification during the configured sleep window (00:00–09:00 local time).
-# The probe still runs so state transitions are recorded; only the ping is
-# suppressed. If CDP is still down at 09:00, the 09:00–09:15 tick notifies.
-HOUR_ET=$(TZ=America/New_York date +%H)
+# chrome-cdp LaunchAgent + Chrome details (mirror com.merlin.chrome-cdp.plist).
+PLIST="$HOME/Library/LaunchAgents/com.merlin.chrome-cdp.plist"
+CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_PROFILE="$HOME/.cache/chrome-devtools-mcp/chrome-profile"
+
+# Quiet hours: skip notification during the user's sleep window (00:00–09:00
+# LOCAL). Resolve the user's current tz (phone-reported → user-timezone.json, home
+# timezone fallback) so quiet-hours follow the user when traveling. The probe still runs so
+# state transitions are recorded; only the ping is suppressed. If CDP is still
+# down at 09:00 local, the next post-09:00 tick notifies. Base-10 normalize to
+# avoid octal parse of "08"/"09".
+USER_TZ_FILE="$HOME/Dev/merlin/data/user-timezone.json"
+# Fallback: the home timezone (lib/instance.cjs tz, as MERLIN_TZ).
+source "$(dirname "$0")/lib/instance.sh"
+USER_TZ="${MERLIN_TZ:-UTC}"
+if [ -f "$USER_TZ_FILE" ]; then
+  PARSED_TZ=$(jq -r '.timezone // empty' "$USER_TZ_FILE" 2>/dev/null)
+  if [ -n "$PARSED_TZ" ] && TZ="$PARSED_TZ" date +%H >/dev/null 2>&1; then
+    USER_TZ="$PARSED_TZ"
+  fi
+fi
+HOUR_LOCAL=$((10#$(TZ="$USER_TZ" date +%H)))
 IN_QUIET_HOURS=0
-if [ "$HOUR_ET" -lt 9 ]; then IN_QUIET_HOURS=1; fi
+if [ "$HOUR_LOCAL" -lt 9 ]; then IN_QUIET_HOURS=1; fi
 
 # Probe: HTTP 200 on /json/version = CDP healthy. Any other response =
 # "down" (connection refused, timeout, 4xx/5xx). Kernel-enforced 5s cutoff.
@@ -39,6 +55,52 @@ if [ "$HTTP_CODE" = "200" ]; then
   CURR="up"
 else
   CURR="down"
+fi
+
+# --- Tab hygiene: reap leaked page tabs (two-strike, ≥1 tick ≈15min age) ---
+# Chrome-automation jobs (event watchers, outreach jobs, …)
+# open http(s) page tabs but don't reliably close them. They pile up — dozens of
+# pages / well over a hundred targets — and each leaked page keeps a swarm of
+# ad/tracker iframes+workers alive, bloating memory and crashing renderers
+# (chrome-cdp.err.log: ~700k ERROR + ~13k crash lines). Confirmed live that
+# closing the page tabs reaps the whole subtree (28 pages → 1, 169 → 10 targets).
+# To avoid yanking a tab a job is actively using, close ONLY tabs that were also
+# open on the previous tick (survived ≥1 interval ≈15 min — far longer than any
+# single chrome job's per-tab step). A freshly-opened tab always gets at least a
+# full interval of grace; a leaked tab is reaped on the next tick. about:blank is
+# always kept so the window (and the CDP port) stays alive.
+if [ "$CURR" = "up" ]; then
+  TAB_SNAP="$HOME/Dev/merlin/data/chrome-tab-snapshot.json"
+  CLOSE_IDS=$(curl -s --max-time 5 "http://localhost:9222/json/list" | TAB_SNAP="$TAB_SNAP" python3 -c '
+import json, os, sys
+try:
+    tabs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+cur = sorted({t["id"] for t in tabs
+              if t.get("type") == "page" and t.get("url", "").startswith("http")})
+snap = os.environ["TAB_SNAP"]
+try:
+    prev = set(json.load(open(snap)))
+except Exception:
+    prev = set()
+# Persist the current set for the next tick before closing anything.
+try:
+    json.dump(cur, open(snap, "w"))
+except Exception:
+    pass
+# Close only tabs open across two consecutive ticks (leaked, not in active use).
+for tid in sorted(set(cur) & prev):
+    print(tid)
+' 2>/dev/null)
+  if [ -n "$CLOSE_IDS" ]; then
+    HYG_N=0
+    while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      curl -sf --max-time 5 "http://localhost:9222/json/close/$id" >/dev/null 2>&1 && HYG_N=$((HYG_N+1))
+    done <<< "$CLOSE_IDS"
+    [ "$HYG_N" -gt 0 ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] tab-hygiene: reaped $HYG_N leaked page tab(s)" >> "$LOG"
+  fi
 fi
 
 # Read previous state (default: "unknown" on first ever run).
@@ -75,12 +137,39 @@ write_state() {
     > "$STATE_FILE"
 }
 
-# Try to recover Chrome CDP via the LaunchAgent. macOS launchctl kickstart
-# tears down the existing instance (-k) and spawns a fresh one. Returns 0
-# on launchctl success regardless of whether Chrome actually came back up
-# — the next watchdog tick re-probes :9222 and notifies if still down.
+# Try to recover Chrome CDP, escalating through three repair tiers. The next
+# watchdog tick re-probes :9222 and notifies if still down regardless.
+#
+# Tier 1 — kickstart: if the LaunchAgent is registered, tear down + respawn (-k).
+# Tier 2 — bootstrap: if the agent is NOT registered (a seen failure mode,
+#          where the job got unloaded and kickstart silently no-ops
+#          with "Could not find service"), clear any stale Chrome holding the
+#          profile/port and re-register the agent so KeepAlive resumes.
+# Tier 3 — direct launch: if bootstrap still fails, launch Chrome directly so
+#          browser-automation jobs can run; not KeepAlive-managed until a later
+#          bootstrap succeeds, but better than staying dark.
 self_heal_chrome_cdp() {
-  launchctl kickstart -k "gui/$UID/com.merlin.chrome-cdp" >> "$LOG" 2>&1
+  local svc="gui/$UID/com.merlin.chrome-cdp"
+  if launchctl print "$svc" >/dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier1: kickstart $svc" >> "$LOG"
+    launchctl kickstart -k "$svc" >> "$LOG" 2>&1
+    return 0
+  fi
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier2: agent not registered — clearing stale chrome + bootstrapping" >> "$LOG"
+  pkill -f "user-data-dir=$CHROME_PROFILE" 2>/dev/null; sleep 2
+  pkill -9 -f "user-data-dir=$CHROME_PROFILE" 2>/dev/null; sleep 1
+  rm -f "$CHROME_PROFILE/SingletonLock" "$CHROME_PROFILE/SingletonSocket" \
+        "$CHROME_PROFILE/SingletonCookie" "$CHROME_PROFILE/DevToolsActivePort" 2>/dev/null
+  launchctl enable "$svc" >> "$LOG" 2>&1
+  if launchctl bootstrap "gui/$UID" "$PLIST" >> "$LOG" 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier2: bootstrap ok" >> "$LOG"
+    return 0
+  fi
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier3: bootstrap failed — direct-launching chrome" >> "$LOG"
+  nohup "$CHROME_BIN" --remote-debugging-port=9222 --user-data-dir="$CHROME_PROFILE" \
+    --no-first-run --no-default-browser-check --disable-features=ChromeWhatsNewUI about:blank \
+    >> "$LOG" 2>&1 &
+  return 0
 }
 
 # First-ever run: bootstrap state silently. No ping — the user just deployed the
@@ -119,14 +208,16 @@ fi
 # already notified for this incident.
 if [ "$PREV" = "down" ] && [ "$CURR" = "down" ] && [ -z "$PREV_NOTIFIED" ]; then
   if [ "$IN_QUIET_HOURS" = "1" ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] still down after kickstart (HTTP $HTTP_CODE) — ping deferred to post-09:00 ET" >> "$LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] still down after kickstart (HTTP $HTTP_CODE) — ping deferred to post-09:00 local" >> "$LOG"
     write_state "down" "" "keep"
   else
     echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] still down after kickstart (HTTP $HTTP_CODE) — notifying" >> "$LOG"
     # --skip-precheck: chrome-cdp liveness alert is infrastructure-critical;
     # bypass the Sonnet-gated outbound precheck for the same reasons as
     # watchdog.sh (see system/architecture.md § Outbound Precheck).
-    "${MERLIN_HOME}/bin/merlin-send-curl" --suppress-hook --skip-precheck --intent chrome-cdp-down --channel system \
+    # MERLIN_INFRA_PROBE=1 — cron-run, un-sandboxed HTTP probe of :9222, so
+    # it may make a machine-health claim (see merlin-send-curl's gate).
+    MERLIN_INFRA_PROBE=1 "$HOME/Dev/merlin/bin/merlin-send-curl" --suppress-hook --skip-precheck --intent chrome-cdp-down --channel system \
       "🔌 Chrome DevTools port 9222 unreachable (HTTP $HTTP_CODE) — auto-restart of com.merlin.chrome-cdp didn't recover it. Likely TCC permission prompt (Screen Recording / Accessibility / Automation) or chrome-devtools-mcp re-signed. Browser-automation jobs will skip until this clears. Manual intervention needed." \
       > /dev/null 2>&1
     write_state "down" "$NOW_ISO" "keep"

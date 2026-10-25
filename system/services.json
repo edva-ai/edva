@@ -1,31 +1,17 @@
 {
-  "_comment": "LaunchAgents and long-running processes that make up the Merlin always-on server.",
+  "_comment": "LaunchAgents and long-running processes that make up the Merlin always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs.",
   "services": [
     {
       "name": "claude-session",
       "type": "launchagent",
       "label": "ai.claude.session",
       "plist": "~/Library/LaunchAgents/ai.claude.session.plist",
-      "description": "Launches process-manager which supervises chat-supervisor, ops-supervisor, and hookdeck. KeepAlive=true.",
+      "description": "Launches process-manager which supervises chat-supervisor, ops-supervisor, wiki-server, and whatsapp-channel. KeepAlive=true. (Gmail-push ingress is a separate Cloudflare Tunnel under com.cloudflare.cloudflared.)",
       "script": "agent/bin/process-manager.mjs",
       "logs": {
         "stdout": "agent/logs/claude-launchagent.log",
         "stderr": "agent/logs/claude-launchagent.err.log"
       },
-      "expected_running": true
-    },
-    {
-      "name": "claude-heartbeat",
-      "type": "launchagent",
-      "label": "com.example.merlin-heartbeat",
-      "plist": "~/Library/LaunchAgents/com.example.merlin-heartbeat.plist",
-      "description": "Posts system health to Firebase RTDB every 120s.",
-      "script": "agent/scripts/heartbeat-sender.sh",
-      "logs": {
-        "stdout": "logs/heartbeat.log",
-        "stderr": "logs/heartbeat.err.log"
-      },
-      "interval_seconds": 120,
       "expected_running": true
     },
     {
@@ -42,14 +28,15 @@
       "expected_running": false
     },
     {
-      "name": "actions-runner",
+      "name": "hum-sense",
       "type": "launchagent",
-      "label": "actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin",
-      "plist": "~/Library/LaunchAgents/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin.plist",
-      "description": "GitHub Actions self-hosted runner for ${MERLIN_OWNER}/merlin (iOS/macOS TestFlight builds).",
+      "label": "ai.claude.hum-sense",
+      "plist": "~/Library/LaunchAgents/ai.claude.hum-sense.plist",
+      "description": "Situational trigger engine for hum. Runs the sensor registry (data/hum-sensors.json), drains pushed events, and gates dispatches to the hum agent. KeepAlive=true. If it dies, trigger-hum.sh's stale-heartbeat watchdog reverts hum to a plain 20-min cron tick. Inspect with `hum-sense status`.",
+      "script": "bin/hum-sense",
       "logs": {
-        "stdout": "~/Library/Logs/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin/stdout.log",
-        "stderr": "~/Library/Logs/actions.runner.${MERLIN_OWNER}-merlin.${MERLIN_HOST}-merlin/stderr.log"
+        "stdout": "agent/logs/hum-sense-launchd.log",
+        "stderr": "agent/logs/hum-sense-launchd.log"
       },
       "expected_running": true
     },

@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+// migrate-crontab-to-wrapper — rewrite cron entries to invoke cron-run.
+//
+// Default: dry-run (prints unified diff). With --apply, backs up the current
+// crontab to ~/.crontab-backup-<ts> and installs the new one.
+//
+// Migration patterns:
+//   <sched> /path/script.sh ARGS                  → <sched> /path/cron-run --label LABEL -- /path/script.sh ARGS
+//   <sched> /path/script.sh ARGS >> /log 2>&1     → <sched> /path/cron-run --label LABEL -- /path/script.sh ARGS  (redirect kept outside)
+//   <sched> ENV=val /path/cmd                     → <sched> /path/cron-run --label LABEL -- bash -c 'ENV=val /path/cmd'
+//   <sched> compound (&&, ||, |, ;, $())          → <sched> /path/cron-run --label LABEL -- bash -c 'compound'
+//
+// Label resolution: trailing `# tag-name` if present, else basename of first
+// .sh/.js/.mjs/.py token, else first word. Lines already routed through
+// cron-run are passed through unchanged.
+
+import { execSync } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { basename } from "node:path";
+
+import { installTools } from "../lib/root.cjs";
+const CRON_RUN = installTools("bin/cron-run");
+const apply = process.argv.includes("--apply");
+
+const current = execSync("crontab -l", { encoding: "utf8" });
+const lines = current.split("\n");
+const out = [];
+
+const SHELL_META = /[\$&|;<>(){}`\\]|[A-Z_]+=/;
+
+const splitTrailingComment = (rest) => {
+  // Only treat ` # ` (space, hash, space-or-end) as the start of a tag comment.
+  // Inline `#` inside curl bodies, quotes, or URLs (#anchor) is left alone.
+  const m = rest.match(/(\s+#\s.*)$/);
+  if (m) return [rest.slice(0, m.index).trimEnd(), m[1]];
+  return [rest, ""];
+};
+
+const splitTrailingRedirect = (cmd) => {
+  // Pull `>> path 2>&1` or `> path` off the end so we keep redirects outside
+  // the wrapper. Only do this for simple (no metachar) commands; compound
+  // commands stay intact inside bash -c.
+  const m = cmd.match(/(\s+(?:>>?|2>&1|2>>?|&>>?)\s.*)$/);
+  if (m) return [cmd.slice(0, m.index).trimEnd(), m[1]];
+  return [cmd, ""];
+};
+
+const INTERPRETERS = new Set(["node", "bash", "sh", "zsh", "python", "python3", "perl", "ruby", "env", "curl"]);
+const deriveLabel = (cmd, comment) => {
+  // 1. Explicit `# tag` (skip `# merlin:` prefix and short directive words)
+  const c = comment.match(/#\s*(?:merlin:\s*)?(\S+)/);
+  if (c && !/^[a-z]+:/.test(c[1])) return c[1].replace(/[^a-zA-Z0-9_.-]/g, "_");
+  // 2. First .sh/.js/.mjs/.py basename anywhere in the cmd
+  const f = cmd.match(/(?:^|\s)([^\s]+\.(?:sh|mjs|js|py))\b/);
+  if (f) return basename(f[1]).replace(/\.(sh|mjs|js|py)$/, "");
+  // 3. First absolute path whose basename isn't an interpreter (skip /opt/.../node, /bin/bash, etc.)
+  for (const t of cmd.split(/\s+/)) {
+    if (!t.startsWith("/")) continue;
+    const b = basename(t);
+    if (INTERPRETERS.has(b)) continue;
+    return b.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  }
+  // 4. First non-env-var token
+  for (const t of cmd.split(/\s+/)) {
+    if (/^[A-Z][A-Z0-9_]*=/.test(t)) continue;
+    return basename(t).replace(/[^a-zA-Z0-9_.-]/g, "_") || "unknown";
+  }
+  return "unknown";
+};
+
+let migrated = 0, alreadyWrapped = 0, passed = 0;
+
+for (const line of lines) {
+  if (!line.trim() || line.trim().startsWith("#")) { out.push(line); continue; }
+
+  // Cron schedule = first 5 whitespace-separated tokens
+  const m = line.match(/^(\s*)((?:\S+\s+){5})(.*)$/);
+  if (!m) { out.push(line); passed++; continue; }
+  const [, leading, schedule, rest] = m;
+
+  if (rest.includes("cron-run")) { out.push(line); alreadyWrapped++; continue; }
+
+  const [restNoComment, comment] = splitTrailingComment(rest);
+  let cmd = restNoComment;
+  let redirect = "";
+
+  let newCmd;
+  if (!SHELL_META.test(cmd)) {
+    [cmd, redirect] = splitTrailingRedirect(cmd);
+    const label = deriveLabel(cmd, comment);
+    newCmd = `${CRON_RUN} --label ${label} -- ${cmd}${redirect}`;
+  } else {
+    const label = deriveLabel(cmd, comment);
+    // Single-quote the whole cmd for bash -c; escape embedded single quotes
+    const escaped = cmd.replace(/'/g, "'\\''");
+    newCmd = `${CRON_RUN} --label ${label} -- bash -c '${escaped}'`;
+  }
+
+  out.push(`${leading}${schedule}${newCmd}${comment}`);
+  migrated++;
+}
+
+const newCrontab = out.join("\n");
+
+// Show diff
+const curL = current.split("\n");
+const changedLines = [];
+for (let i = 0; i < Math.max(curL.length, out.length); i++) {
+  if (curL[i] !== out[i]) changedLines.push([curL[i] ?? "", out[i] ?? ""]);
+}
+
+console.log(`\nMigration summary: ${migrated} wrapped, ${alreadyWrapped} already wrapped, ${passed} unparsable (passed through), ${lines.length - migrated - alreadyWrapped - passed} blank/comment\n`);
+console.log("─── DIFF ───");
+for (const [a, b] of changedLines.slice(0, 200)) {
+  console.log(`- ${a.length > 200 ? a.slice(0, 197) + "..." : a}`);
+  console.log(`+ ${b.length > 200 ? b.slice(0, 197) + "..." : b}`);
+}
+if (changedLines.length > 200) console.log(`(${changedLines.length - 200} more changes…)`);
+console.log("─── END DIFF ───\n");
+
+if (!apply) {
+  console.log("Dry-run. Re-invoke with --apply to install the migrated crontab.");
+  process.exit(0);
+}
+
+const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+const backupPath = `${process.env.HOME}/.crontab-backup-${ts}`;
+writeFileSync(backupPath, current);
+console.log(`Backed up current crontab → ${backupPath}`);
+
+const tmpPath = `/tmp/crontab-migrated-${Date.now()}`;
+writeFileSync(tmpPath, newCrontab);
+try {
+  execSync(`crontab "${tmpPath}"`);
+  console.log(`Installed migrated crontab (${migrated} entries wrapped)`);
+} finally {
+  try { unlinkSync(tmpPath); } catch {}
+}

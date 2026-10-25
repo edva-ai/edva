@@ -1,0 +1,7 @@
+{
+  "_comment": "Hum suggestion identity (lib/suggestion-key.mjs): how one place or event keeps one key across sources. Copy to agent/local/config/suggestion-key.json. `event_lanes`: extra lanes keyed like concerts (act + venue); `name_city_tags` / `area_city_tags`: trailing city or borough tags your sources append, stripped from names and areas; `name_dash_suffixes`: what may follow ' — ' after a place name and is dropped. Values are regex alternation fragments, matched case-insensitively.",
+  "event_lanes": ["festivals", "sports"],
+  "name_city_tags": ["springfield", "spfld"],
+  "area_city_tags": ["springfield"],
+  "name_dash_suffixes": ["reopen.*", "relocat.*", "new location", "springfield"]
+}

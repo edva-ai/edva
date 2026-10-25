@@ -1,0 +1,101 @@
+#!/usr/bin/env node
+// self-improve — WP11 OWNER approval CLI. **BREAK-GLASS ONLY as of 2026-07-19.**
+//
+// The PRIMARY approval path is now the app: a high-risk proposal surfaces in the
+// "Improvements" channel and the user approves it with Face ID (Secure-Enclave
+// signature verified by bin/self-improve-approval-poll). That is the
+// unified flow — WP11 capabilities AND the nightly executor's HIGH-risk fixes
+// both route through the self_improve_approvals table + app signing. This CLI is
+// kept as an out-of-band fallback for when the phone path is unavailable (e.g.
+// the app can't reach Supabase). It approves modules staged the OLD way; the
+// unified flow does NOT need it.
+//
+// The autonomous agent can only PROPOSE (mcp__tools__propose_module); ONLY the user
+// — via Face ID in the app, or this CLI — can approve. Keeping approval off the
+// agent's tool surface is the gate: a prompt-injected/confused agent can never
+// self-approve its own code. See system/wp11-self-improvement-gate-design.md.
+//
+// Usage:
+//   self-improve list                 — pending proposals awaiting your review
+//   self-improve show <id>            — full diff/code of a proposal
+//   self-improve approve <id>         — promote to ext/, git-commit, activate
+//   self-improve deny <id> [reason]   — discard the proposal
+//   self-improve modules              — currently-loaded ext/ modules
+//   self-improve off | on             — kill-switch (block/allow all loading)
+
+import path from "node:path";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { installRoot } from "../lib/root.cjs";
+const exec = promisify(execFile);
+
+const ROOT = installRoot();
+process.env.MEMORY_INDEX_DB = process.env.MEMORY_INDEX_DB || path.join(ROOT, "data/memory-index.db");
+
+const { createApprovalGate } = await import(path.join(ROOT, "agent/core/approval-gate.mjs"));
+const { createSelfImprove } = await import(path.join(ROOT, "agent/core/self-improve.mjs"));
+const store = await import(path.join(ROOT, "agent/core/message-store.mjs"));
+
+const si = createSelfImprove({
+  root: ROOT,
+  approvalGate: createApprovalGate({}),
+  pluginLoader: null,          // approve = promote + commit; tools-mcp serves ext/ on next start
+  store,
+  exec: (cmd, args, opts) => exec(cmd, args, opts),
+  notify: null,
+});
+
+const [cmd, arg, ...rest] = process.argv.slice(2);
+
+function fmtAge(ts) { const m = Math.round((Date.now() - ts) / 60000); return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; }
+
+switch (cmd) {
+  case "list": {
+    const p = si.pendingProposals();
+    if (!p.length) { console.log("No pending proposals."); break; }
+    console.log(`${p.length} pending proposal(s):\n`);
+    for (const row of p) console.log(`  ${row.id}\n    ${row.summary}\n    created ${fmtAge(row.created_at)} · expires ${new Date(row.expires_at).toLocaleString()}\n`);
+    console.log(`Review with: self-improve show <id>  ·  approve/deny with: self-improve approve|deny <id>`);
+    break;
+  }
+  case "show": {
+    if (!arg) { console.error("usage: self-improve show <id>"); process.exit(64); }
+    const staged = path.join(si.STAGE);
+    // find the module name from the approval row
+    const row = createApprovalGate({}).get?.(arg);
+    let name = null; try { name = JSON.parse(row?.input_json || "{}").name; } catch {}
+    if (!name) { console.error("unknown proposal id (or already decided)"); process.exit(1); }
+    const dir = path.join(staged, name);
+    if (!fs.existsSync(dir)) { console.error(`no staged files for '${name}' (maybe already decided)`); process.exit(1); }
+    console.log(`Proposal ${arg} — module "${name}"\nStaged at ${dir}\n`);
+    for (const f of walk(dir)) { console.log(`── ${path.relative(dir, f)} ──`); console.log(fs.readFileSync(f, "utf8")); console.log(); }
+    console.log(`Approve: self-improve approve ${arg}   ·   Deny: self-improve deny ${arg} "reason"`);
+    break;
+  }
+  case "approve": {
+    if (!arg) { console.error("usage: self-improve approve <id>"); process.exit(64); }
+    const res = await si.approve(arg);
+    if (res?.ok) console.log(`✓ Approved + loaded. Module is committed to ext/ and will be served as mcp__tools__* on the next agent session refresh.\n  ${JSON.stringify(res.result || res)}`);
+    else { console.error(`✗ Approve failed: ${res?.error || JSON.stringify(res)}`); process.exit(1); }
+    break;
+  }
+  case "deny": {
+    if (!arg) { console.error("usage: self-improve deny <id> [reason]"); process.exit(64); }
+    const res = si.deny(arg, rest.join(" "));
+    console.log(res?.ok ? "✓ Denied and discarded." : `✗ ${res?.error}`);
+    break;
+  }
+  case "modules": {
+    const m = si.listModules();
+    console.log(m.length ? "Loaded ext/ modules:\n  " + m.join("\n  ") : "No ext/ modules yet.");
+    break;
+  }
+  case "off": { console.log(si.killSwitch(true).disabled ? "🔴 Kill-switch ON — all self-improve loading blocked." : "failed"); break; }
+  case "on": { si.killSwitch(false); console.log("🟢 Kill-switch OFF — self-improve loading allowed."); break; }
+  default:
+    console.error("usage: self-improve list | show <id> | approve <id> | deny <id> [reason] | modules | off | on");
+    process.exit(64);
+}
+
+function walk(dir) { const out = []; for (const e of fs.readdirSync(dir, { withFileTypes: true })) { const p = path.join(dir, e.name); if (e.isDirectory()) out.push(...walk(p)); else out.push(p); } return out; }
