@@ -179,8 +179,8 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
           # Full name of the "3rd Party Mac Developer Installer: <Name> (<TEAM>)"
-          # identity in the runner's keychain (repo variable).
-          MAC_INSTALLER_IDENTITY: ${{ vars.MAC_INSTALLER_IDENTITY }}
+          # identity in the runner's keychain (repo secret, so logs mask it).
+          MAC_INSTALLER_IDENTITY: ${{ secrets.MAC_INSTALLER_IDENTITY }}
         run: |
           mkdir -p ~/private_keys
           echo "$ASC_PRIVATE_KEY" > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
@@ -188,7 +188,7 @@ jobs:
           PKG_PATH=$(find $RUNNER_TEMP/export-macos -name "*.pkg" -o -name "*.ipa" -o -name "*.app" | head -1)
           if [[ "$PKG_PATH" == *.app ]]; then
             productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Merlin.pkg \
-              --sign "${MAC_INSTALLER_IDENTITY:?set the MAC_INSTALLER_IDENTITY repo variable}"
+              --sign "${MAC_INSTALLER_IDENTITY:?set the MAC_INSTALLER_IDENTITY repo secret}"
             PKG_PATH=$RUNNER_TEMP/export-macos/Merlin.pkg
           fi
 
