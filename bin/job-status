@@ -1,0 +1,46 @@
+#!/usr/bin/env node
+// job-status — full detail + log tail for a single job launched via job-run.
+//
+// Usage: job-status <id> [--lines N]
+
+import fs from "node:fs";
+import { readRegistry } from "../lib/job-runner.mjs";
+
+const args = process.argv.slice(2);
+const id = args.find((a) => !a.startsWith("--"));
+if (!id) {
+  process.stderr.write("Usage: job-status <id> [--lines N]\n");
+  process.exit(2);
+}
+const linesIdx = args.indexOf("--lines");
+const tailLines = linesIdx >= 0 ? Number(args[linesIdx + 1]) || 40 : 40;
+
+const job = readRegistry(id);
+if (!job) {
+  process.stderr.write(`no such job: ${id}\n`);
+  process.exit(1);
+}
+
+console.log(`id:           ${job.id}`);
+console.log(`name:         ${job.name}`);
+console.log(`status:       ${job.status}`);
+console.log(`command:      ${job.command} ${(job.args || []).join(" ")}`);
+console.log(`started_at:   ${job.started_at}`);
+console.log(`finished_at:  ${job.finished_at || "(still running)"}`);
+console.log(`pid:          ${job.pid ?? "(none yet)"}`);
+console.log(`exit_code:    ${job.exit_code ?? "(none)"}`);
+if (job.signal) console.log(`signal:       ${job.signal}`);
+if (job.cancel_requested) console.log(`cancel:       requested`);
+if (job.on_complete) {
+  console.log(`on_complete:  tier=${job.on_complete.tier} notified=${job.notified} attempts=${job.notify_attempts || 0}`);
+}
+if (job.error) console.log(`error:        ${job.error}`);
+console.log(`log_file:     ${job.log_file}`);
+
+if (job.log_file && fs.existsSync(job.log_file)) {
+  const content = fs.readFileSync(job.log_file, "utf8");
+  const lines = content.split("\n");
+  const tail = lines.slice(Math.max(0, lines.length - tailLines));
+  console.log(`\n--- last ${tail.length} line(s) of log ---`);
+  console.log(tail.join("\n"));
+}

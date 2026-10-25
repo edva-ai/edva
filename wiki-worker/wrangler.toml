@@ -1,0 +1,51 @@
+# <wiki hostname> — the wiki, served from the cloud.
+#
+# Reads the Supabase mirror that bin/wiki-cloud-sync keeps current
+# (wiki_pages / wiki_page_links / wiki_page_revisions / wiki_config), so the
+# site stays up when the host is down. Renders with the SAME code as the
+# host's `wiki serve` (lib/wiki-render.js, lib/wiki-scope.js).
+#
+# Auth: Cloudflare Access sits in front of the hostname (Google sign-in,
+# existing application), AND this worker verifies the Cf-Access-Jwt-Assertion
+# itself — Access is a second lock, never the only one. Per-person page scopes
+# come from wiki_config.share_scopes (= data/wiki-share-scopes.json).
+#
+# This file is the template: the route and [vars] below are placeholders. An
+# installation keeps its filled-in copy at agent/local/wiki-worker/wrangler.toml
+# (`main` pointing back at this directory's src/index.js) and deploys that one.
+#
+# Deploy:  cd wiki-worker && wrangler deploy --config ../agent/local/wiki-worker/wrangler.toml
+#          (set both secrets FIRST — without them every viewer gets 403)
+# Secrets (wrangler secret put):
+#   SUPABASE_SERVICE_ROLE_KEY — merlin project service role (.env)
+#   CF_ACCESS_AUD             — the wiki hostname's Access application's AUD tag (.env)
+
+name = "merlin-wiki"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+workers_dev = false
+preview_urls = false
+
+# A ROUTE, not a custom domain: the wiki hostname's DNS is the (proxied) tunnel
+# CNAME, which a custom domain would refuse to replace. The route makes this
+# Worker answer every request on the hostname, so the tunnel origin is never
+# contacted and the site no longer depends on the host. Cloudflare Access
+# still runs in front. Rollback: remove this line and deploy, or delete the
+# route in the dashboard — traffic falls back to the tunnel.
+routes = [{ pattern = "wiki.example.com/*", zone_name = "example.com" }]
+
+[vars]
+SUPABASE_URL = "https://<your-project-ref>.supabase.co"
+CF_ACCESS_TEAM_DOMAIN = "<your-team>.cloudflareaccess.com"
+
+# The site icon (src/index.js imports "wiki-favicon"). The kernel default has
+# none (/favicon.* is a 404); an installation's copy points the alias (a path
+# relative to that config file) at its own small module that imports its PNG
+# by a relative path and default-exports it (the PNG rule below bundles it).
+[alias]
+"wiki-favicon" = "./src/favicon-none.js"
+
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
+fallthrough = false

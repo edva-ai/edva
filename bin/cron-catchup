@@ -1,0 +1,187 @@
+#!/usr/bin/env node
+// cron-catchup — list or replay cron firings that should have happened in a window.
+//
+// macOS vixie cron does not track or replay missed firings. When the system is
+// unresponsive or off, scheduled jobs are silently lost: a runaway job that
+// hangs the host overnight can take hours of cron firings with it.
+//
+// Usage:   (times are the host's local clock)
+//   cron-catchup --start "2026-01-10 22:00" --end "2026-01-11 08:45"
+//   cron-catchup --start "..." --end "..." --execute       # actually run them
+//   cron-catchup --start "..." --end "..." --include-polls # don't skip <=30min jobs
+//   cron-catchup --start "..." --end "..." --grep digest   # filter by command substring
+//
+// Defaults: dry-run, sequential execution, skip jobs with interval <= 30 min
+// (those catch up automatically at next firing — replaying adds nothing).
+
+import { execSync, spawnSync } from "node:child_process";
+
+const args = process.argv.slice(2);
+const opt = (name, hasValue = true) => {
+  const i = args.indexOf(name);
+  if (i < 0) return null;
+  return hasValue ? args[i + 1] : true;
+};
+
+const startStr = opt("--start");
+const endStr = opt("--end");
+const execute = opt("--execute", false);
+const includePolls = opt("--include-polls", false);
+const grepFilter = opt("--grep");
+
+if (!startStr || !endStr) {
+  console.error("Usage: cron-catchup --start 'YYYY-MM-DD HH:MM' --end 'YYYY-MM-DD HH:MM' [--execute] [--include-polls] [--grep SUBSTR]");
+  process.exit(2);
+}
+
+const start = new Date(startStr.replace(" ", "T"));
+const end = new Date(endStr.replace(" ", "T"));
+if (isNaN(start) || isNaN(end) || end <= start) {
+  console.error("invalid window");
+  process.exit(2);
+}
+
+// ── cron field parser ────────────────────────────────────────────────────────
+// Supports: *, N, N-M, N-M/S, */S, lists (a,b,c).
+// Fields: minute (0-59), hour (0-23), dom (1-31), month (1-12), dow (0-6, Sun=0).
+
+function parseField(spec, min, max) {
+  const out = new Set();
+  for (const part of spec.split(",")) {
+    let m = part.match(/^(\*|\d+(?:-\d+)?)(?:\/(\d+))?$/);
+    if (!m) throw new Error(`bad cron field: ${part}`);
+    const [, range, step] = m;
+    const stride = step ? parseInt(step, 10) : 1;
+    let from, to;
+    if (range === "*") {
+      from = min; to = max;
+    } else if (range.includes("-")) {
+      [from, to] = range.split("-").map((n) => parseInt(n, 10));
+    } else {
+      from = to = parseInt(range, 10);
+      if (step) to = max; // "5/10" → 5,15,25,...
+    }
+    for (let i = from; i <= to; i += stride) out.add(i);
+  }
+  return out;
+}
+
+function parseCronLine(line) {
+  // Returns {minute, hour, dom, month, dow, command, intervalMin} or null.
+  // Skips lines we can't replay safely (inline curl, multi-statement compound).
+  line = line.replace(/^\s+/, "");
+  if (!line || line.startsWith("#")) return null;
+  const parts = line.split(/\s+/);
+  if (parts.length < 6) return null;
+  const [minSpec, hourSpec, domSpec, monSpec, dowSpec, ...rest] = parts;
+  let command = rest.join(" ");
+  try {
+    const minute = parseField(minSpec, 0, 59);
+    const hour = parseField(hourSpec, 0, 23);
+    const dom = parseField(domSpec, 1, 31);
+    const month = parseField(monSpec, 1, 12);
+    const dow = parseField(dowSpec, 0, 6);
+    // Approximate interval: smallest gap in the minute set when hour is *
+    let intervalMin = null;
+    if (hourSpec === "*" && minSpec.startsWith("*/")) {
+      intervalMin = parseInt(minSpec.slice(2), 10);
+    } else if (hourSpec === "*" && minute.size > 1) {
+      const sorted = [...minute].sort((a, b) => a - b);
+      let gap = 60;
+      for (let i = 1; i < sorted.length; i++) gap = Math.min(gap, sorted[i] - sorted[i - 1]);
+      intervalMin = gap;
+    } else if (hourSpec === "*" && minute.size === 1) {
+      intervalMin = 60;
+    }
+    return { minute, hour, dom, month, dow, command, intervalMin, raw: line };
+  } catch {
+    return null;
+  }
+}
+
+function firingsInWindow(spec, startD, endD) {
+  const out = [];
+  // Iterate minute-by-minute from start to end
+  const cursor = new Date(startD);
+  cursor.setSeconds(0, 0);
+  while (cursor <= endD) {
+    const m = cursor.getMinutes();
+    const h = cursor.getHours();
+    const dm = cursor.getDate();
+    const mo = cursor.getMonth() + 1;
+    const dw = cursor.getDay();
+    if (spec.minute.has(m) && spec.hour.has(h) && spec.month.has(mo) &&
+        // Standard cron: if BOTH dom and dow are restricted, fire if EITHER matches.
+        // Here we approximate: fire if both unrestricted-or-match.
+        spec.dom.has(dm) && spec.dow.has(dw)) {
+      out.push(new Date(cursor));
+    }
+    cursor.setMinutes(cursor.getMinutes() + 1);
+  }
+  return out;
+}
+
+// ── load crontab ─────────────────────────────────────────────────────────────
+
+const crontab = execSync("crontab -l", { encoding: "utf8" }).split("\n");
+const specs = [];
+for (const line of crontab) {
+  const s = parseCronLine(line);
+  if (s) specs.push(s);
+}
+
+// ── compute missed firings ───────────────────────────────────────────────────
+
+const missed = [];
+for (const spec of specs) {
+  if (!includePolls && spec.intervalMin !== null && spec.intervalMin <= 30) continue;
+  if (grepFilter && !spec.command.includes(grepFilter)) continue;
+  const fires = firingsInWindow(spec, start, end);
+  if (fires.length === 0) continue;
+  // Dedupe to one firing per command (running a daily-digest twice in catch-up is pointless)
+  missed.push({ command: spec.command, fires, intervalMin: spec.intervalMin });
+}
+
+missed.sort((a, b) => a.fires[0] - b.fires[0]);
+
+// ── report ───────────────────────────────────────────────────────────────────
+
+const pad = (n) => String(n).padStart(2, "0");
+const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+console.log(`\nWindow: ${fmt(start)} → ${fmt(end)} local`);
+console.log(`Missed firings (deduped per command, polls ≤30min ${includePolls ? "INCLUDED" : "skipped"}):`);
+console.log("─".repeat(110));
+
+for (const m of missed) {
+  const times = m.fires.length === 1 ? fmt(m.fires[0]) : `${fmt(m.fires[0])} (+${m.fires.length - 1} more)`;
+  const cmd = m.command.length > 70 ? m.command.slice(0, 67) + "..." : m.command;
+  console.log(`  ${times.padEnd(36)} ${cmd}`);
+}
+console.log("─".repeat(110));
+console.log(`${missed.length} unique commands missed in window\n`);
+
+if (!execute) {
+  console.log("(dry-run — pass --execute to actually run them sequentially)");
+  process.exit(0);
+}
+
+// ── execute ──────────────────────────────────────────────────────────────────
+
+console.log("Executing missed jobs sequentially...\n");
+let okCount = 0, failCount = 0;
+for (const m of missed) {
+  const cmd = m.command;
+  process.stdout.write(`▶ ${cmd.slice(0, 90)}${cmd.length > 90 ? "..." : ""}\n`);
+  const t0 = Date.now();
+  const r = spawnSync("/bin/bash", ["-c", cmd], { stdio: ["ignore", "inherit", "inherit"], timeout: 25 * 60 * 1000 });
+  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+  if (r.status === 0) {
+    console.log(`  ✓ done in ${dt}s\n`);
+    okCount++;
+  } else {
+    console.log(`  ✗ exit ${r.status} (${dt}s)\n`);
+    failCount++;
+  }
+}
+console.log(`\nDone: ${okCount} succeeded, ${failCount} failed.`);

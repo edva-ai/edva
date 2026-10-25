@@ -36,6 +36,8 @@ The closest thing to a "system identity" for the agent. What name to use for you
 ./bin/wiki pin user_owner   # so it lands in every session's initial context
 ```
 
+`wiki pin-defaults` pins a curated starter set at once; list your own in `agent/local/config/wiki.json` (`default_pins`, template in `examples/local/config/wiki.json`), along with `owner_page` if your profile page is not `user_owner`.
+
 Suggested frontmatter:
 
 ```yaml
@@ -49,7 +51,7 @@ pin_locked: true
 ---
 ```
 
-### 2. A `user_daily_schedule.md` page — when you're available
+### 2. A schedule page (`user_schedule.md`) — when you're available
 
 Affects hum's quiet windows, the calendar harvester's "is this event during work hours" classification, the morning-digest's section ordering. Keep it short — a few bullet points per day-of-week pattern.
 
@@ -57,7 +59,7 @@ Affects hum's quiet windows, the calendar harvester's "is this event during work
 
 Things you've decided you want the agent to honor without explaining each time. Examples:
 
-- `feedback_no_em_dashes.md` — agent-originated text avoids em/en dashes (it's an LLM tell).
+- `feedback_units.md` — use metric units and 24-hour times in anything sent to you.
 - `feedback_short_replies.md` — keep phone-channel replies to ≤3 sentences unless asked otherwise.
 - `feedback_explain_then_act.md` — for non-trivial actions, lead with one line on what you're about to do, then do it.
 
@@ -144,18 +146,19 @@ In normal operation:
 
 - **You author directly** via `wiki edit`.
 - **The agent writes** when you ask it to remember something (`"remember that I prefer terse replies"` → agent calls `wiki_save` on a `feedback_*` page).
-- **Jobs write** — `hum-answer` writes to `hum-learnings.jsonl` AND can route to a wiki page; `daily-summary` produces a `day_YYYY-MM-DD` page each night.
+- **Jobs write** — `hum-answer` writes to `hum-learnings.jsonl` AND can route to a wiki page; a nightly summary job of your own can write `day_YYYY-MM-DD` pages, which the session bundle surfaces (the three most recent).
 - **The memory-write precheck** (`bin/memory-write-precheck.mjs`) sits in front of agent-initiated writes; it searches existing memory for direct contradictions before letting the write land. Fail-open: if the precheck breaks, writes proceed. See `bin/memory-write-precheck.mjs` for the contract.
 
 ## Backup
 
-The auto-memory dir is a git repo. The `memory-snapshot` job (every 30 min) auto-commits + pushes to a private backup repo:
+The auto-memory dir (`~/.claude/projects/<slug>/memory/`, where the slug is your session start path — `node lib/instance.cjs --memory-dir` prints it) can be its own git repo. The `memory-snapshot` job (`bin/memory-snapshot`, cron) stages everything, commits when something changed and pushes to that repo's `origin`. Make it a repo with a **private** remote once:
 
-```
-MERLIN_BACKUP_REPO=git@github.com:<your-user>/merlin-personal-backup.git
+```bash
+cd "$(node ~/Dev/merlin/lib/instance.cjs --memory-dir)"
+git init && git remote add origin https://github.com/<you>/<private-memory-repo>.git
 ```
 
-Set this in `.env` once. The remote needs to exist (private repo, you create it). Without it, snapshotting silently skips the push and you have local-only backups under `data/memory-snapshots/`.
+Without a repo the job exits with code 2 and nothing is backed up; `memory-snapshot --no-push` keeps local commits only.
 
 The wiki DB (`data/memory-index.db`) has its own hourly hot-snapshot via `wiki-db-snapshot` job — rotates to 24 in `data/memory-db-snapshots/`. Defense in depth against FTS5 corruption.
 

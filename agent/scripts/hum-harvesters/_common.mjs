@@ -11,13 +11,62 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 
+import { installTools } from "../../../lib/root.cjs";
+import { optionalBin } from "../../../lib/ext-hooks.mjs";
 const HOME = os.homedir();
-const CACHE_DIR = path.join(HOME, "dev/merlin/data/hum-cache");
-const STATE_FILE = path.join(HOME, "dev/merlin/data/hum-interests-state.json");
-const RUNS_FILE = path.join(HOME, "dev/merlin/data/hum-runs.jsonl");
+
+// Per-instance values (lib/instance.cjs). GOG_ACCOUNT: the Google account
+// gog reads (the operator's own address; empty → gog's default account).
+const { instance, localConfig } = createRequire(import.meta.url)("../../../lib/instance.cjs");
+export const GOG_ACCOUNT = instance().owner_email;
+// The operator's name for ranker-facing text, and the home timezone.
+export const OWNER_NAME = instance().owner_name;
+export const HOME_TZ = instance().tz;
+export { localConfig };
+const BIN_DIR = installTools("bin");
+const CACHE_DIR = installTools("data/hum-cache");
+const STATE_FILE = installTools("data/hum-interests-state.json");
+const RUNS_FILE = installTools("data/hum-runs.jsonl");
 
 const SILENCE_LIMIT_PER_DAY = 3;
+
+// ─── Preview mode ───────────────────────────────────────────────────────────
+//
+// `hum-harvest-all --preview` runs the harvest to SEE what candidates exist
+// without committing anything — the hum-sense gate uses it to decide whether
+// an idle tick has anything eligible at all before waking a model. Harvesters
+// write state all over data (cadence stamps, caches, seen-sets,
+// suggestion-history, ping-media); a preview that stamped `last_run_at` would
+// push every lane's real run back by a whole cadence. Rather than teach thirty
+// harvesters a flag, every in-process write under data becomes a no-op
+// here, before any harvester body runs (this module is imported first by all
+// of them). syncBuiltinESMExports() propagates the patch to named imports
+// (`import { writeFileSync } from "node:fs"`) as well as `fs.writeFileSync`.
+// Writes outside data (os.tmpdir() scratch) still go through.
+// Child processes a harvester spawns are NOT covered — which is why preview
+// also skips the model-forking lanes entirely (hum-harvest-all MODEL_LANES).
+export const PREVIEW = process.env.HUM_HARVEST_PREVIEW === "1";
+if (PREVIEW) {
+  const { syncBuiltinESMExports } = await import("node:module");
+  const DATA_DIR = installTools("data");
+  const guarded = (p) => {
+    try { return path.resolve(String(p instanceof URL ? p.pathname : p)).startsWith(DATA_DIR); } catch { return false; }
+  };
+  for (const name of ["writeFileSync", "appendFileSync", "renameSync", "unlinkSync", "rmSync", "mkdirSync", "copyFileSync"]) {
+    const orig = fs[name];
+    if (typeof orig !== "function") continue;
+    fs[name] = function previewGuard(p, ...rest) { return guarded(p) ? undefined : orig.call(fs, p, ...rest); };
+  }
+  for (const name of ["writeFile", "appendFile", "rename", "unlink", "rm", "mkdir", "copyFile"]) {
+    const orig = fs.promises[name];
+    if (typeof orig !== "function") continue;
+    fs.promises[name] = async function previewGuard(p, ...rest) { return guarded(p) ? undefined : orig.call(fs.promises, p, ...rest); };
+  }
+  syncBuiltinESMExports();
+}
 
 /**
  * Count how many times a dedup_key has appeared as a candidate AND been
@@ -49,7 +98,7 @@ function countSilencedToday(dedupKey) {
 
 /**
  * Read the harvester input envelope from stdin.
- * Contract (post 2026-04-14): the wrapper writes ONE JSON object:
+ * Contract: the wrapper writes ONE JSON object:
  *   { situation, context }
  * where:
  *   situation = output of `merlin hum situation --json`
@@ -60,17 +109,27 @@ function countSilencedToday(dedupKey) {
  * context lazily in-process.
  */
 export async function readStdinJson() {
+  const empty = { situation: {}, context: {}, moment: null, intent: null };
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (!raw) return { situation: {}, context: {} };
+  if (!raw) return empty;
   let payload;
-  try { payload = JSON.parse(raw); } catch { return { situation: {}, context: {} }; }
+  try { payload = JSON.parse(raw); } catch { return empty; }
   if (payload && typeof payload === "object" && ("situation" in payload || "context" in payload)) {
-    return { situation: payload.situation || {}, context: payload.context || {} };
+    return {
+      situation: payload.situation || {},
+      context: payload.context || {},
+      // `moment` — the event(s) this turn was woken for, with their data (an
+      // arrival's lat/lon) and how stale they are. `intent` — today's agreed
+      // plan plus the user's own recent messages. Harvesters that predate
+      // these fields simply ignore them.
+      moment: payload.moment || null,
+      intent: payload.intent || null,
+    };
   }
   // legacy: caller passed situation directly
-  return { situation: payload, context: {} };
+  return { ...empty, situation: payload };
 }
 
 export function readCache(topic) {
@@ -122,12 +181,55 @@ export function emit(candidate) {
     freshness_min: Math.max(0, Math.round(candidate.freshness_min ?? 0)),
     dedup_key: dedupKey,
     supporting_data: candidate.supporting_data || {},
+    // Optional temporal_fit metadata. Lets the ranker score WHEN a candidate is best
+    // surfaced relative to the user's current situation, not just whether
+    // it's interesting. Harvesters can pass this verbatim; omitted = the
+    // ranker treats it as "no temporal preference" (anytime). Schema:
+    //   { relative_to: "calendar_event"|"time_of_day"|"transition"|"working_on"|"free_window"|"commitment"|"always",
+    //     anchor: <descriptor> (e.g. event id, HH:MM range, commitment text),
+    //     boost_during: ["pre_event_30min"|"post_event_15min"|"evening_wind_down"|...],
+    //     expires_after_iso: <ISO> }
+    // The situation harvester (hum-harvesters/situation.mjs) sets this
+    // aggressively; domain harvesters fill it lazily as they get retrofitted.
+    temporal_fit: candidate.temporal_fit || null,
+    // Optional act_fit metadata. The
+    // companion to temporal_fit: where temporal_fit captures WHEN to surface,
+    // act_fit captures whether the user can ACT on the suggestion. Heavy-lift
+    // candidates (art / music / new restaurant requiring research) get a
+    // small ranker deboost AND trigger a post-rank evaluator that bundles
+    // decision_aids inline so the surfaced ping is yes/no instead of a
+    // research project. Schema:
+    //   { effort_to_act: "quick_win" | "moderate" | "heavy_lift",
+    //     steps_to_act: [...],    (ordered, concrete)
+    //     decision_aids: {        (populated lazily by post-rank evaluator
+    //                             for moderate/heavy_lift winners; absent ok)
+    //       for: ["why yes"], against: ["why no"], primer: "<research bundle>"
+    //     }
+    //   }
+    // Harvester self-tags effort_to_act per its domain; doesn't pre-compute
+    // decision_aids (that's the evaluator's job, fires only on the chosen
+    // winner). Omitted entirely = ranker treats as "moderate" (neutral).
+    act_fit: candidate.act_fit || null,
   };
   console.log(JSON.stringify(shaped));
 }
 
 export function emitNull(reason) {
   if (reason) console.error(`[${path.basename(process.argv[1])}] null: ${reason}`);
+  console.log("null");
+}
+
+/**
+ * Emit an explicit BENIGN no-op — an expected, non-error reason to have no
+ * candidate this tick (e.g. a geo-gate decline while traveling). Writes a stable
+ * `[noop]` marker so hum-harvest-all's classifier scores it as a noop
+ * DETERMINISTICALLY instead of regex-guessing from the prose (which mis-scored
+ * "gated: away…" as a harvester error). Use this instead
+ * of emitNull for outcomes that must never count against the error scorecard.
+ * (Genuine fetch failures stay on emitNull — a real outage should stay visible.)
+ */
+export function emitNoop(reason) {
+  console.error(`[${path.basename(process.argv[1])}] noop [noop]: ${reason || ""}`);
   console.log("null");
 }
 
@@ -184,4 +286,39 @@ export function stampRun(topic, hadSignal) {
   const updates = { last_run_at: now };
   if (hadSignal) updates.last_signal_at = now;
   writeTopicState(topic, updates);
+}
+
+/**
+ * City-on-date geo-gate for event recommendations. Returns { suppress, reason }.
+ *
+ * Suppress when the user will NOT be in `metro` on `dateStr` — UNLESS `artist` is
+ * on the installation's own always-worth-it list (an optional `headliner` CLI:
+ * `headliner check <name>`, exit 0 = on the list). Where the user will be comes
+ * from an optional travel-timeline CLI (`travel in-city <metro> <date>`: exit 0 =
+ * there or unknown, 1 = away); an installation without one never suppresses.
+ * Fail-open everywhere: any error, unknown location, or missing metro/date → do
+ * NOT suppress (never silence a lane for a plumbing hiccup).
+ *
+ * @param {string} metro    city / venue / metro string (normalized by `travel`)
+ * @param {string} dateStr  event date "YYYY-MM-DD" (or any when-string)
+ * @param {string} [artist] performer / event title for the headliner bypass
+ */
+export function geoGate(metro, dateStr, artist) {
+  if (!metro || !dateStr) return { suppress: false, reason: "no metro/date — gate skipped" };
+  const headlinerBin = artist ? optionalBin(BIN_DIR, "headliner", "MERLIN_HEADLINER_BIN") : null;
+  if (headlinerBin) {
+    try {
+      execFileSync(headlinerBin, ["check", String(artist)], { stdio: "ignore", timeout: 8000 });
+      return { suppress: false, reason: `headliner bypass (${artist})` };
+    } catch { /* exit 1 = not a headliner → fall through to the geo-gate */ }
+  }
+  const travelBin = optionalBin(BIN_DIR, "travel", "MERLIN_TRAVEL_BIN");
+  if (!travelBin) return { suppress: false, reason: "no travel timeline — gate skipped" };
+  try {
+    execFileSync(travelBin, ["in-city", String(metro), String(dateStr)], { stdio: "ignore", timeout: 10000 });
+    return { suppress: false, reason: `in ${metro} on ${dateStr}` }; // exit 0 = in (or unknown→fail-open)
+  } catch (e) {
+    if (e && e.status === 1) return { suppress: true, reason: `away — not in ${metro} on ${dateStr}` };
+    return { suppress: false, reason: `gate error (${e && e.message}) — fail-open` };
+  }
 }

@@ -1,0 +1,12 @@
+{
+  "_comment": "Who and where this installation is. Copy to agent/local/instance.json (gitignored) — `merlin init` writes it for you. Read by lib/instance.cjs; each key can be overridden by its MERLIN_* environment variable (shown in the right-hand comment of .env.example). Leave out what you don't use: an absent key falls back to the generic default (owner 'the user', the host's time zone).",
+  "owner_name": "Alex Example",
+  "owner_email": "alex@example.com",
+  "agent_email": "assistant@example.com",
+  "domain": "example.com",
+  "tz": "America/Denver",
+  "host": "my-server",
+  "supabase_project": "abcdefghijklmnopqrst",
+  "gcp_project": "my-gcp-project",
+  "github_owner": "alex-example"
+}

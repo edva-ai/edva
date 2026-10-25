@@ -19,7 +19,7 @@ import { spawn, execSync } from "node:child_process";
 // The tests skip gracefully when this is detected.
 function canChildListen() {
   try {
-    execSync(`${"node"} -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"`, { timeout: 3000, stdio: "pipe" });
+    execSync(`${"/opt/homebrew/bin/node"} -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{s.close();process.exit(0)})"`, { timeout: 3000, stdio: "pipe" });
     return true;
   } catch { return false; }
 }
@@ -27,7 +27,7 @@ function canChildListen() {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MOCK_CLAUDE = path.join(__dirname, "mock-claude.mjs");
 const CHAT_SUPERVISOR = path.join(__dirname, "..", "supervisor", "chat-supervisor.mjs");
-const NODE = "node";
+const NODE = "/opt/homebrew/bin/node";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -65,7 +65,7 @@ function writeTestConfig(dir, port, overrides = {}) {
 }
 
 // Spawn the chat supervisor process with mock claude.
-function startSupervisor({ port, configPath, stateDir, claudeArgs = [] }) {
+function startSupervisor({ port, configPath, stateDir, claudeArgs = [], env = {} }) {
   const logDir = path.join(stateDir, "logs");
   fs.mkdirSync(logDir, { recursive: true });
 
@@ -84,7 +84,9 @@ function startSupervisor({ port, configPath, stateDir, claudeArgs = [] }) {
   ], {
     cwd: stateDir,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, HOME: os.homedir() },
+    // Isolate the events_fts tee (EventLog writes into memory-index.db) into the
+    // test state dir so the suite never pollutes the real wiki DB.
+    env: { ...process.env, HOME: os.homedir(), MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env },
   });
 
   const stderr = [];
@@ -357,7 +359,7 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     await httpPost(port, "/dispatch", { content: "log-test", source: "test", priority: "high" });
     await sleep(500);
 
-    const logDir = path.join(os.homedir(), "dev/merlin/agent/logs/supervisor-test-chat");
+    const logDir = path.join(os.homedir(), "Dev/merlin/agent/logs/supervisor-test-chat");
     // Events and cost logs should exist (or in the stateDir — let's check both).
     // The EventLog uses eventDir which is constructed from the agent name.
     const eventsPath = path.join(logDir, "events.ndjson");
@@ -507,5 +509,102 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     const health = await httpGet(port, "/health");
     assert.ok(health.body.restartCount >= 1, "Should have restarted at least once");
     assert.equal(health.body.childAlive, true, "Child should be alive after restart");
+  });
+
+  // ── CHAT_SUBSTRATE=loop (Conway-substrate step 1) ─────────────────
+
+  describe("loop mode (CHAT_SUBSTRATE=loop)", () => {
+    it("dispatches through the Agent and reports chatAgent health fields", async () => {
+      port = allocPort();
+      tmp = tmpDir();
+      const configPath = writeTestConfig(tmp.dir, port);
+      sup = startSupervisor({ port, configPath, stateDir: tmp.dir, env: { CHAT_SUBSTRATE: "loop" } });
+      await sup.waitForReady();
+      await sleep(4000); // init
+
+      const { status, body } = await httpPost(port, "/dispatch", { content: "hello loop mode", source: "test", priority: "high" });
+      assert.equal(status, 200);
+      assert.ok(body.id);
+      await sleep(500);
+
+      const health = await httpGet(port, "/health");
+      assert.equal(health.body.substrateMode, "loop");
+      assert.ok(health.body.completed >= 2, `Expected >=2 completed (init + dispatch), got ${health.body.completed}`);
+      assert.equal(health.body.queueDepth, 0);
+      assert.equal(health.body.inFlight, null);
+      // The Agent should have run one turn per dispatched item (init + this message).
+      assert.ok(health.body.chatAgentTurns >= 2, `Expected chatAgent.turns >= 2, got ${health.body.chatAgentTurns}`);
+      assert.equal(health.body.chatAgentStatus, "idle");
+    });
+
+    it("still restarts and self-heals when claude crashes mid-turn", async () => {
+      port = allocPort();
+      tmp = tmpDir();
+      const configPath = writeTestConfig(tmp.dir, port);
+      sup = startSupervisor({ port, configPath, stateDir: tmp.dir, claudeArgs: ["--fail-after", "1"], env: { CHAT_SUBSTRATE: "loop" } });
+      await sup.waitForReady();
+      await sleep(5000); // init
+
+      await httpPost(port, "/dispatch", { content: "trigger-crash", source: "test", priority: "high" });
+      await sleep(10000); // crash + backoff restart + respawn
+
+      const logs = sup.stderr.join("");
+      const health = await httpGet(port, "/health");
+      assert.ok(logs.includes("claude exited"), `Expected 'claude exited' in logs. Got:\n${logs.slice(-1000)}`);
+      assert.ok(logs.includes("restart #"), `Expected 'restart #' in logs. Got:\n${logs.slice(-1000)}`);
+      assert.ok(health.body.restartCount >= 1, `Restart count should be >=1, got ${health.body.restartCount}`);
+      assert.equal(health.body.childAlive, true, "Child should be alive after restart");
+      assert.equal(health.body.substrateMode, "loop");
+    });
+
+    it("still requeues and restarts on dispatch_error (session-not-running guard preserved)", async () => {
+      port = allocPort();
+      tmp = tmpDir();
+      const configPath = writeTestConfig(tmp.dir, port);
+      sup = startSupervisor({ port, configPath, stateDir: tmp.dir, claudeArgs: ["--fail-after", "1"], env: { CHAT_SUBSTRATE: "loop" } });
+      await sup.waitForReady();
+      await sleep(5000); // init
+
+      await httpPost(port, "/dispatch", { content: "will-crash", source: "test", priority: "high" });
+      await sleep(10000); // crash + restart + reprocessing
+
+      const health = await httpGet(port, "/health");
+      assert.ok(health.body.restartCount >= 1, "Should have restarted at least once");
+      assert.equal(health.body.childAlive, true, "Child should be alive after restart");
+    });
+
+    it("POST /restart tears down and rebuilds the chatAgent cleanly", async () => {
+      port = allocPort();
+      tmp = tmpDir();
+      const configPath = writeTestConfig(tmp.dir, port);
+      sup = startSupervisor({ port, configPath, stateDir: tmp.dir, env: { CHAT_SUBSTRATE: "loop" } });
+      await sup.waitForReady();
+      await sleep(4000); // init
+
+      const { status, body } = await httpPost(port, "/restart", {});
+      assert.equal(status, 202);
+      assert.equal(body.restarting, true);
+      // Backoff (2s) + spawn + init dispatch (3s delayed) + processing — mirrors
+      // the non-loop "sendInit is called after restart" test's wait, not the
+      // shorter one from the plain "POST /restart triggers session restart" test
+      // (which never asserts on `completed`).
+      await sleep(10000);
+
+      const health = await httpGet(port, "/health");
+      assert.equal(health.body.childAlive, true);
+      assert.ok(health.body.restartCount >= 1);
+      // The rebuilt chatAgent should have processed the post-restart init turn.
+      assert.ok(health.body.completed >= 1, `Expected >=1 completed after restart, got ${health.body.completed}`);
+      assert.equal(health.body.chatAgentStatus, "idle");
+
+      // A dispatch after restart should still complete normally through the
+      // freshly-rebuilt Agent — confirms the old Agent's teardown didn't leave
+      // the new one in a bad state.
+      await httpPost(port, "/dispatch", { content: "post-restart message", source: "test", priority: "high" });
+      await sleep(500);
+      const final = await httpGet(port, "/health");
+      assert.equal(final.body.queueDepth, 0);
+      assert.equal(final.body.inFlight, null);
+    });
   });
 });

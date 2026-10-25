@@ -62,7 +62,7 @@ struct ContentView: View {
     @State private var memoryMode = false
     @StateObject private var memoryState = WebViewState()
 
-    /// Wiki HTTP browser served from the Mac mini (Tailscale / home LAN).
+    /// Wiki HTTP browser served from the agent host (Tailscale / home LAN).
     /// Centralized here so it can be tweaked without touching MemoryView.
     private static let memoryWikiURL = URL(string: "http://${MERLIN_HOST}:9096")!
 

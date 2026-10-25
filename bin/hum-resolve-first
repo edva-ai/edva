@@ -1,0 +1,130 @@
+#!/usr/bin/env node
+// hum-resolve-first — the "work it out before asking" gate for every hum send.
+//
+// Called by bin/merlin-send-curl for each chat-channel message whose
+// --intent starts with `hum:` (hum-ping, hum-ask, hum-deliver-qual all pass
+// one). Reads Merlin's own records, asks Opus whether they already answer what
+// the message asks or leaves open, and says what to do with it. Design and
+// rationale: lib/hum-resolve-first.mjs, docs/hum-resolve-first.md.
+//
+// Usage:
+//   <json> | hum-resolve-first [--capture-id FILE] [--dry-run]
+//       stdin {message, intent, evidence_as_of?, choices?, context_file?}
+//       stdout one JSON line {action: send|rewrite|drop, text?, keep_choices?,
+//              still_question?, verdict, decision_id, reason}
+//       Always exits 0. Any failure prints {action: "send"}: fail-open.
+//       --dry-run runs the full pass but writes nothing (no log, no memory,
+//       no capture files) — for trying a message by hand.
+//   hum-resolve-first stats [--since 7d] [--json]
+//   hum-resolve-first tail [-n 10]
+//   hum-resolve-first forget <decision_id|dedup_key> [--reason "..."]
+//       Withdraw an answer the user says is wrong, so the question may be asked.
+//
+// Kill switch: touch data/.hum-resolve-first-off (or HUM_RESOLVE_FIRST_OFF=1).
+
+import fs from "node:fs";
+import {
+  resolveFirst, appendLog, rememberIfSettled, writeCaptureArtifacts, DEADLINE_MS, LOG_FILE,
+} from "../lib/hum-resolve-first.mjs";
+import { forgetResolved } from "../lib/hum-resolve-first-store.mjs";
+
+const argv = process.argv.slice(2);
+const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
+const has = (name) => argv.includes(name);
+
+function emit(o) { process.stdout.write(JSON.stringify(o) + "\n"); }
+
+function readLog() {
+  const file = process.env.HUM_RESOLVE_FIRST_LOG || LOG_FILE;
+  try {
+    return fs.readFileSync(file, "utf8").split("\n").filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function sinceMs(spec) {
+  const n = parseInt(spec, 10);
+  if (!Number.isFinite(n)) return 0;
+  if (String(spec).endsWith("h")) return Date.now() - n * 3_600_000;
+  return Date.now() - n * 86_400_000;
+}
+
+async function gate() {
+  let input = null;
+  try { input = JSON.parse(fs.readFileSync(0, "utf8")); } catch {}
+  if (!input || typeof input !== "object") { emit({ action: "send", verdict: "skipped", reason: "bad input" }); return; }
+  const dry = has("--dry-run");
+  const capture = opt("--capture-id");
+
+  // The pass carries its own deadline; this outer one is the backstop for a
+  // hung child process, so the send path is never held past it.
+  const backstop = new Promise((resolve) => {
+    const t = setTimeout(() => resolve({ action: "send", verdict: "error", reason: "deadline", decision_id: null }), DEADLINE_MS + 5_000);
+    t.unref();
+  });
+  const d = await Promise.race([resolveFirst(input), backstop]);
+
+  if (!dry) {
+    appendLog(d);
+    rememberIfSettled(d);
+    writeCaptureArtifacts(capture, d);
+  }
+  const out = { action: d.action, verdict: d.verdict, decision_id: d.decision_id, reason: d.private ? null : d.reason };
+  if (d.action === "rewrite") Object.assign(out, { text: d.text, still_question: Boolean(d.still_question), keep_choices: Boolean(d.keep_choices) });
+  if (dry) Object.assign(out, { dry_run: true, answer: d.answer ?? null, sources: d.sources || [], checked: d.checked ?? null, evidence: d.evidence || null, latency_ms: d.latency_ms ?? null });
+  emit(out);
+}
+
+function stats() {
+  const since = sinceMs(opt("--since") || "7d");
+  const rows = readLog().filter((r) => Date.parse(r.ts || "") >= since && !r.dry_run);
+  const count = (k) => rows.reduce((m, r) => { m[r[k] ?? "?"] = (m[r[k] ?? "?"] || 0) + 1; return m; }, {});
+  const lat = rows.map((r) => r.latency_ms).filter(Number.isFinite).sort((a, b) => a - b);
+  const errors = rows.filter((r) => r.verdict === "error").reduce((m, r) => { const k = String(r.reason || "?").split(":")[0]; m[k] = (m[k] || 0) + 1; return m; }, {});
+  const s = {
+    since: new Date(since).toISOString(), decisions: rows.length,
+    by_verdict: count("verdict"), by_action: count("action"), by_lane: count("lane"), errors,
+    median_latency_ms: lat.length ? lat[Math.floor(lat.length / 2)] : null,
+  };
+  if (has("--json")) { emit(s); return; }
+  console.log(`hum-resolve-first since ${s.since}: ${s.decisions} decisions`);
+  console.log(`  verdicts ${JSON.stringify(s.by_verdict)}`);
+  console.log(`  actions  ${JSON.stringify(s.by_action)}`);
+  console.log(`  lanes    ${JSON.stringify(s.by_lane)}`);
+  if (Object.keys(errors).length) console.log(`  errors   ${JSON.stringify(errors)}`);
+  console.log(`  median latency ${s.median_latency_ms ?? "–"} ms`);
+}
+
+function tail() {
+  const n = Number(opt("-n") || 10);
+  for (const r of readLog().slice(-n)) {
+    const said = typeof r.original === "string" ? r.original.slice(0, 90) : "(private)";
+    console.log(`${r.ts} ${r.decision_id || "-"} ${r.lane} ${r.verdict}/${r.action}  ${said}${r.sent_text && typeof r.sent_text === "string" ? `  →  ${r.sent_text.slice(0, 90)}` : ""}`);
+  }
+}
+
+const cmd = argv[0] && !argv[0].startsWith("--") ? argv[0] : "gate";
+try {
+  if (cmd === "gate") {
+    await gate();
+    // Exit now rather than when the last child process does: after the
+    // backstop fires, a hung source must not keep merlin-send-curl waiting.
+    process.exit(0);
+  }
+  else if (cmd === "stats") stats();
+  else if (cmd === "tail") tail();
+  else if (cmd === "forget") {
+    const id = argv[1];
+    if (!id) { console.error("usage: hum-resolve-first forget <decision_id|dedup_key> [--reason \"...\"]"); process.exit(2); }
+    const ok = forgetResolved(id, { reason: opt("--reason") || "" });
+    console.log(ok ? `forgot ${id}: it may be asked again` : `could not write the forget row for ${id}`);
+    process.exit(ok ? 0 : 1);
+  } else {
+    console.error("usage: hum-resolve-first [--capture-id F] [--dry-run] < input.json | stats [--since 7d] [--json] | tail [-n N] | forget <id>");
+    process.exit(2);
+  }
+} catch (e) {
+  // The gate path must never fail the send.
+  if (cmd === "gate") { emit({ action: "send", verdict: "error", reason: `cli error: ${String(e?.message || e).slice(0, 160)}` }); process.exit(0); }
+  else { console.error(String(e?.message || e)); process.exit(1); }
+}

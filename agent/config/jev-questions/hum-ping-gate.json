@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev gate in front of the hum agent turn (lib/jev-hum-gate.mjs, called from bin/hum-sense AFTER the deterministic gate in lib/hum-events.mjs already said dispatch). true = dispatch the hum turn; a confident false skips it. Kernel definition; an installation's own data/jev-questions/hum-ping-gate.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "notes": "A skipped turn is invisible — a good ping that never happens costs the moment; a needless turn only costs tokens. So Jev may skip only when very sure. Ground truth for a disagreement is the SKIPPED tick only (a tool-less Sonnet judgment over the same bundle). A dispatched tick that ended silent is calibration, not a disagreement. Idle-only bundles and health/exercise/finance/stocks lanes never reach Jev.",
+  "questions": {
+    "worth_reaching_out": {
+      "type": "boolean",
+      "instructions": "Hum is the user's proactive assistant. Its situational engine just detected the events in `events` (with their lanes = the topics hum would look into) under the circumstances in `context`. If hum's turn runs now, it harvests those lanes and sends the user ONE ping — a timely suggestion, useful information, or a context-building question — only when something clears its relevance bar; otherwise it stays silent. Will this moment give hum a concrete, timely reason to reach out that the user would plausibly welcome (e.g. they just arrived somewhere new, a meeting just ended with a free block after, a meal window opened, the weather turned)? Answer false only for moments that clearly offer nothing to act on now.",
+      "criteria": {
+        "true": "a concrete, timely opening for a useful ping or question exists in this moment",
+        "false": "nothing in these events gives hum a reason to reach out right now"
+      }
+    }
+  }
+}

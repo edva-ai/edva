@@ -1,0 +1,5 @@
+{
+  "_comment": "Decide-then-act email triage (lib/triage-decide.mjs). Copy to agent/local/config/triage-decide.json. `agent_tags` replaces the kernel's list of side effects that need a full agent turn (keep its order: the prompt shows it); `tag_help` adds one prompt line per extra tag, after the calendar-event line.",
+  "agent_tags": ["calendar-event", "meeting-cancellation", "instruction", "spam-campaign", "package-tracking", "other-agent"],
+  "tag_help": ["  package-tracking = a shipment notice whose tracking number should be added to the tracker;"]
+}

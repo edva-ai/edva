@@ -1,9 +1,18 @@
-# Personal CLI tool overlay drop.
+# Installation CLIs.
 #
-# Executables placed here are added to PATH inside agent-spawned child
-# processes (see agent/tools-mcp/index.mjs PATH wiring). Use this for
-# host-specific shell scripts that personal jobs/harvesters depend on
-# (e.g. `aso-rank-pulse-collect`, `flight-search`).
+# Executables your own jobs, harvesters and sensors depend on. Kernel code
+# that can use an optional provider finds it with optionalBin() in
+# lib/ext-hooks.mjs: $<ENV_VAR>, else bin/_ext/<name>, else bin/<name>, else
+# none (the feature is skipped). Names the kernel asks for:
 #
-# Anything you place under `_ext/` is gitignored — see .gitignore at repo
-# root and docs/architecture-public-private.md.
+#   apple-weather   JSON weather for the weather sensor (MERLIN_WEATHER_BIN)
+#   location-ask closers used by bin/hum-ping (see that file)
+#
+# bin/merlin-send-curl's event geo-gate takes two optional CLIs: an itinerary
+# check, `<cli> in-city <city> <date>` (MERLIN_TRAVEL_BIN), and a
+# must-see-performer check that bypasses the gate, `<cli> check <name>`
+# (MERLIN_HEADLINER_BIN); point those variables at copies kept here.
+# bin/hum-sense kicks bin/watch when it exists (with lib/_ext/watches.mjs).
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

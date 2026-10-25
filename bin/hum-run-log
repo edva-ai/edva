@@ -1,0 +1,398 @@
+#!/usr/bin/env node
+// hum-run-log — deterministic writer + honest reader for the hum tick trace.
+//
+// THE DEFECT (measured 2026-09-15). data/hum-runs.jsonl held 494
+// unparseable lines out of 5137, the first at line 81 and the last at 4988 —
+// so this is ongoing, not a historical scar. Two different readers, two
+// different wrong answers, neither of them loud:
+//
+//   jq (and any strict line reader) ABORTS at the first bad line. Every
+//   jq-based hum analysis therefore reads lines 1-80 — April 2026 — and exits
+//   0 believing it read the week.
+//
+//   The JS readers in bin/merlin are tolerant in the worst way:
+//   `try { JSON.parse(l) } catch { return null }` then `.filter(Boolean)`.
+//   They silently DROP 9.6% of hum's history and report a number as if it
+//   were complete.
+//
+// ROOT CAUSE. The trace row is authored by the agent turn, not by code.
+// jobs/hum.md § "Tick trace schema" gives a schema and says "writes ONE
+// enriched line"; jobs/hum-canary.md says "Append to hum-runs.jsonl". Neither
+// gives a command, so every tick improvises a shell append of hand-assembled
+// JSON. The observed corruption is exactly what that produces:
+//
+//   * raw newlines inside string values (harvester `err` text, wrapped URLs)
+//     split one record across many physical lines — 477 of the 494;
+//   * a record pretty-printed instead of compact leaves `{` alone on a line;
+//   * a previous append with no trailing newline glues the next record onto
+//     its tail, so one line holds two records ("Extra data").
+//
+// THE FIX IS TO MOVE THE INVARIANT INTO CODE. JSON.stringify escapes newlines,
+// quotes and backslashes by construction, so a record written through `append`
+// cannot be multi-line no matter what the model put in it — the turn hands
+// over a value, not a line of text. `append` also heals a missing trailing
+// newline before writing, which closes the glued-record mode.
+//
+// REPAIR (the user's call: unreadable lines get cleaned up and fixed).
+// `repair` rewrites the file once: each contiguous run of bad
+// lines is rejoined and re-scanned character by character — a raw newline
+// INSIDE a string becomes "\\n" (the split-string mode), one OUTSIDE a string
+// becomes a space (the pretty-print mode), and the text is cut into top-level
+// {...} values by brace depth (the glued-record mode). Every value that then
+// parses as an object is kept, in its original position. Whatever still does
+// not parse (truncated records) is moved verbatim to hum-runs.quarantine.jsonl
+// rather than deleted, and the untouched original is copied to
+// hum-runs.jsonl.bak-<timestamp> first. Appends that land during the repair are
+// carried over before the atomic rename. `read` still reports any skip.
+//
+// Usage:
+//   <json on stdin> | hum-run-log append     write exactly one record
+//   hum-run-log read [--tail N] [--since ISO] [--json]
+//   hum-run-log check [--json]               integrity report
+//   hum-run-log repair [--dry-run]           rejoin/split damaged records, quarantine the rest
+//
+// HUM_RUNS_FILE overrides the target path (tests only).
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { traceCandidate } from "../lib/hum-tick-core.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_FILE = path.resolve(HERE, "../data/hum-runs.jsonl");
+const FILE = process.env.HUM_RUNS_FILE || DEFAULT_FILE;
+
+function die(msg, code = 1) {
+  process.stderr.write(`hum-run-log: ${msg}\n`);
+  process.exit(code);
+}
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+// Append exactly one line. Two guarantees, both by construction rather than by
+// the caller remembering: JSON.stringify escapes any newline/quote/backslash in
+// a string value, and a file not ending in "\n" gets one before we write, so a
+// prior partial append can never glue itself to this record.
+function append(obj) {
+  const line = JSON.stringify(obj);
+  if (typeof line !== "string") die("payload did not serialize to JSON");
+  if (line.includes("\n")) die("serialized record contains a newline (should be impossible)");
+
+  let prefix = "";
+  try {
+    const st = fs.statSync(FILE);
+    if (st.size > 0) {
+      const fd = fs.openSync(FILE, "r");
+      const buf = Buffer.alloc(1);
+      fs.readSync(fd, buf, 0, 1, st.size - 1);
+      fs.closeSync(fd);
+      if (buf.toString("utf8") !== "\n") prefix = "\n";
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+
+  fs.mkdirSync(path.dirname(FILE), { recursive: true });
+  fs.appendFileSync(FILE, prefix + line + "\n");
+  return line;
+}
+
+// A record line is a JSON object starting in column 0 — `append` writes exactly
+// that. An INDENTED line that happens to parse (`      {"topic":"music",...}`)
+// is an array item torn out of a pretty-printed record, not a tick: counting it
+// as one both invents a bogus record and cuts the real one in half (2026-10-06:
+// 23 such lines in hum-runs.jsonl).
+function isRecordLine(l) {
+  if (l[0] !== "{") return null;
+  try { const v = JSON.parse(l); return v && typeof v === "object" && !Array.isArray(v) ? v : null; } catch { return null; }
+}
+
+// Parse the file without ever lying about what was skipped. Returns every
+// well-formed record AND the count/line numbers of what would not parse — a
+// caller that ignores the skip count has to do so deliberately.
+function scan() {
+  let raw;
+  try {
+    raw = fs.readFileSync(FILE, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return { records: [], skipped: 0, badLines: [], total: 0 };
+    throw e;
+  }
+  const records = [];
+  const badLines = [];
+  let total = 0;
+  const lines = raw.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) continue;
+    total++;
+    const v = isRecordLine(l);
+    if (v) records.push(v);
+    else badLines.push(i + 1);
+  }
+  return { records, skipped: badLines.length, badLines, total };
+}
+
+function cmdAppend() {
+  const input = readStdin().trim();
+  if (!input) die("append expects the trace record as JSON on stdin");
+  let obj;
+  try {
+    obj = JSON.parse(input);
+  } catch (e) {
+    die(`stdin is not valid JSON: ${e.message}`);
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    die("trace record must be a JSON object");
+  }
+  fillHarvestKeys(obj);
+  append(obj);
+}
+
+// harvest.candidates[] in an agent-authored trace is unreliable: the turn drops
+// `dedup_key` (despite jobs/hum.md's schema) and paraphrases `signal`
+// ("<landmark> factoid" for a full sentence), so nothing downstream can
+// tell whether an item was already sent. The tick's own harvest is on disk
+// (hum-last-harvest.json, written by hum-harvest-all in the same run), so when
+// it belongs to this tick (within 30 min) code's copy REPLACES the turn's:
+// data code already holds is never re-authored by a model. The ranker's own
+// fields (sonnet.*) are untouched. Each candidate takes the same shape as
+// hum-tick's own trace (traceCandidate), including the item's link.
+function fillHarvestKeys(obj, harvest = readLastHarvest()) {
+  const src = harvest?.candidates;
+  if (!obj?.harvest || typeof obj.harvest !== "object" || !Array.isArray(src)) return obj;
+  const t = Date.parse(obj.ts || "");
+  const ht = Date.parse(harvest.meta?.ts || "");
+  if (!Number.isFinite(t) || !Number.isFinite(ht) || Math.abs(t - ht) > 30 * 60 * 1000) return obj; // not this tick's harvest
+  obj.harvest.candidates = src.map(traceCandidate);
+  obj.harvest.candidates_source = "hum-last-harvest";
+  return obj;
+}
+
+function readLastHarvest() {
+  const f = process.env.HUM_LAST_HARVEST || path.resolve(HERE, "../data/hum-last-harvest.json");
+  try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; }
+}
+
+function cmdRead(args) {
+  const json = args.includes("--json");
+  const tailIdx = args.indexOf("--tail");
+  const sinceIdx = args.indexOf("--since");
+  const tail = tailIdx >= 0 ? Number(args[tailIdx + 1]) : null;
+  const since = sinceIdx >= 0 ? args[sinceIdx + 1] : null;
+
+  const { records, skipped, total } = scan();
+  let out = records;
+  if (since) {
+    const cutoff = new Date(since).getTime();
+    if (!Number.isFinite(cutoff)) die(`--since is not a parseable date: ${since}`);
+    out = out.filter((r) => new Date(r.ts).getTime() >= cutoff);
+  }
+  if (Number.isFinite(tail) && tail > 0) out = out.slice(-tail);
+
+  if (json) {
+    process.stdout.write(JSON.stringify({ records: out, skipped, total, returned: out.length }) + "\n");
+  } else {
+    for (const r of out) process.stdout.write(JSON.stringify(r) + "\n");
+  }
+  // Never silent about damage: a reader must be told what it did not see.
+  if (skipped > 0) {
+    process.stderr.write(
+      `hum-run-log: skipped ${skipped} unparseable line(s) of ${total} in ${FILE}\n`
+    );
+  }
+}
+
+function cmdCheck(args) {
+  const { skipped, badLines, total, records } = scan();
+  if (args.includes("--json")) {
+    process.stdout.write(
+      JSON.stringify({
+        file: FILE,
+        total_lines: total,
+        parsed: records.length,
+        skipped,
+        first_bad_line: badLines[0] ?? null,
+        last_bad_line: badLines.length ? badLines[badLines.length - 1] : null,
+      }) + "\n"
+    );
+    return;
+  }
+  process.stdout.write(`file           ${FILE}\n`);
+  process.stdout.write(`lines          ${total}\n`);
+  process.stdout.write(`parsed         ${records.length}\n`);
+  process.stdout.write(`skipped        ${skipped}\n`);
+  if (badLines.length) {
+    process.stdout.write(`first bad line ${badLines[0]}\n`);
+    process.stdout.write(`last bad line  ${badLines[badLines.length - 1]}\n`);
+  }
+}
+
+// A tick that lost ONE brace mid-record (measured 2026-10-06: the close of
+// `harvest`, which nested sonnet + outcome inside it). Try a "}" before each
+// comma; accept only if EXACTLY ONE position yields the canonical tick shape —
+// the top-level key set that ~4,880 of 4,952 good ticks share. Anything else
+// is ambiguous nesting and stays in quarantine.
+const TICK_SHAPE = ["harvest", "outcome", "situation", "sonnet", "tick_id", "ts"].join("|");
+function closeMidRecord(text) {
+  const hits = [];
+  let inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch !== ",") continue;
+    let v = null;
+    try { v = JSON.parse(text.slice(0, i) + "}" + text.slice(i)); } catch { continue; }
+    if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+    if (Object.keys(v).sort().join("|") === TICK_SHAPE) hits.push(v);
+    if (hits.length > 1) return null;
+  }
+  return hits.length === 1 ? hits[0] : null;
+}
+
+// Sanitize then split a damaged fragment into top-level JSON values.
+export function salvage(text) {
+  let out = "", inStr = false, esc = false;
+  for (const ch of text) {
+    if (inStr) {
+      if (esc) { esc = false; out += ch; continue; }
+      if (ch === "\\") { esc = true; out += ch; continue; }
+      if (ch === '"') { inStr = false; out += ch; continue; }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r" || ch === "\t") { out += ch === "\t" ? "\\t" : "\\r"; continue; }
+      out += ch;
+    } else {
+      if (ch === '"') inStr = true;
+      out += ch === "\n" || ch === "\r" ? " " : ch;
+    }
+  }
+  // Cut into top-level {...} chunks by depth, string-aware.
+  const records = [], rejects = [];
+  const asObj = (t) => { try { const v = JSON.parse(t); return v && typeof v === "object" && !Array.isArray(v) ? v : null; } catch { return null; } };
+  // A record missing a closing brace swallows the tick glued after it; on a
+  // failed chunk, re-split at each embedded tick start and keep what parses.
+  const take = (chunk) => {
+    const v = asObj(chunk);
+    if (v) { records.push(v); return; }
+    for (const piece of chunk.split(/(?=\{\s*"tick_id")/)) {
+      const p = asObj(piece.trim());
+      if (p) records.push(p); else if (piece.trim()) rejects.push(piece.trim());
+    }
+  };
+  let depth = 0, start = -1, gap = "";
+  inStr = false; esc = false;
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; if (depth === 0) gap += ch; continue; }
+    if (ch === "{") { if (depth === 0) { if (gap.trim()) rejects.push(gap.trim()); gap = ""; start = i; } depth++; continue; }
+    if (ch === "}" && depth > 0) {
+      depth--;
+      if (depth === 0) {
+        take(out.slice(start, i + 1));
+        start = -1;
+      }
+      continue;
+    }
+    if (depth === 0) gap += ch;
+  }
+  if (depth > 0 && start >= 0) {
+    // Hand-written ticks often just dropped the final brace(s). Close them and
+    // accept ONLY if the record's spine lands at the top level where it belongs
+    // (tick_id + ts, and outcome when the text has one) — a brace lost mid-record
+    // would nest outcome one level down, and that stays in quarantine.
+    const tail = out.slice(start);
+    const closed = asObj(tail + "}".repeat(depth));
+    const spineOk = closed && closed.tick_id && closed.ts && (!/"outcome"\s*:/.test(tail) || Object.prototype.hasOwnProperty.call(closed, "outcome"));
+    if (spineOk) records.push(closed);
+    else if (depth === 1) { const mid = closeMidRecord(tail); if (mid) records.push(mid); else take(tail); }
+    else take(tail);
+  }
+  else if (gap.trim()) rejects.push(gap.trim());
+  return { records, rejects };
+}
+
+function cmdRepair(args) {
+  const dry = args.includes("--dry-run");
+  let raw;
+  try { raw = fs.readFileSync(FILE, "utf8"); } catch (e) { die(`cannot read ${FILE}: ${e.message}`); }
+  const lines = raw.split("\n");
+  const kept = [], quarantine = [];
+  let badLines = 0, recovered = 0, run = [];
+  // A line starting with "{" in column 0 always begins a new record (split
+  // strings continue with `"`, pretty-printed nesting is indented), so each
+  // segment is salvaged alone — a truncated record can't swallow the next one.
+  const flush = () => {
+    if (!run.length) return;
+    const segs = [];
+    for (const l of run) if (l[0] === "{" || !segs.length) segs.push([l]); else segs[segs.length - 1].push(l);
+    for (const seg of segs) {
+      const { records, rejects } = salvage(seg.join("\n"));
+      for (const r of records) kept.push(JSON.stringify(r));
+      recovered += records.length;
+      for (const q of rejects) quarantine.push(q);
+    }
+    run = [];
+  };
+  for (const l of lines) {
+    if (!l.trim()) continue;
+    if (isRecordLine(l)) { flush(); kept.push(l); } else { badLines++; run.push(l); }
+  }
+  flush();
+  const summary = { file: FILE, bad_lines: badLines, recovered_records: recovered, quarantined_fragments: quarantine.length, records_after: kept.length };
+  if (dry || badLines === 0) {
+    process.stdout.write(JSON.stringify({ ...summary, dry_run: dry, changed: false }) + "\n");
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = `${FILE}.bak-${stamp}`;
+  fs.copyFileSync(FILE, backup);
+  if (quarantine.length) {
+    const qfile = FILE.replace(/\.jsonl$/, "") + ".quarantine.jsonl";
+    fs.appendFileSync(qfile, quarantine.map((q) => JSON.stringify({ repaired_at: new Date().toISOString(), fragment: q })).join("\n") + "\n");
+    summary.quarantine_file = qfile;
+  }
+  // Carry over anything appended while we worked, then swap atomically.
+  const now = fs.readFileSync(FILE, "utf8");
+  const extra = now.length > raw.length && now.startsWith(raw) ? now.slice(raw.length).split("\n").filter((l) => l.trim()) : [];
+  const tmp = `${FILE}.repair-tmp`;
+  fs.writeFileSync(tmp, [...kept, ...extra].join("\n") + "\n");
+  fs.renameSync(tmp, FILE);
+  process.stdout.write(JSON.stringify({ ...summary, carried_over: extra.length, backup, changed: true }) + "\n");
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+switch (cmd) {
+  case "append":
+    cmdAppend();
+    break;
+  case "read":
+    cmdRead(rest);
+    break;
+  case "check":
+    cmdCheck(rest);
+    break;
+  case "repair":
+    cmdRepair(rest);
+    break;
+  default:
+    process.stderr.write(
+      "usage: <json on stdin> | hum-run-log append\n" +
+        "       hum-run-log read [--tail N] [--since ISO] [--json]\n" +
+        "       hum-run-log check [--json]\n" +
+        "       hum-run-log repair [--dry-run]\n"
+    );
+    process.exit(2);
+}

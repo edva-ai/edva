@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly Self Improvement Review (Tuesdays 05:00 local), which chains the
+  improvement-plan pass on a clean exit. Runs as an ephemeral Opus 5 agent.
+
+  05:00, not earlier: yesterday's daily summary is written at 04:00, so an
+  earlier run would read a day that does not exist yet.
+
+  A launchd USER agent, not crontab, and that is load-bearing: it loads into the
+  GUI login session and can therefore reach the keychain-stored Max credentials.
+  A cron-launched `claude -p` cannot — it prints "Not logged in" and exits 0,
+  silently skipping the whole weekly pass.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.improvement-review
+    (renders __MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__, then launchctl bootstrap)
+  and remove the old `trigger-nightly-review.sh` crontab line.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.improvement-review</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__MERLIN_TOOLS__/agent/scripts/trigger-nightly-review.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>2</integer>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/improvement-review-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/improvement-review-launchd.log</string>
+</dict>
+</plist>

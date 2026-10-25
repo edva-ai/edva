@@ -50,12 +50,12 @@ jobs:
           security import $RUNNER_TEMP/mac-cert.p12 -k "$KEYCHAIN_PATH" -P "$MAC_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
           rm $RUNNER_TEMP/mac-cert.p12
 
-          # Prepend under the host-wide mutex shared by every signing repo on this
-          # mini. This read-modify-write of the user search list was unsynchronized:
+          # Prepend under the host-wide mutex shared by every signing repo on the
+          # host. This read-modify-write of the user search list was unsynchronized:
           # two concurrent jobs lose each other's entry, and a list written from a
-          # stale read can drop login.keychain-db — which takes the Gandalf agent on
+          # stale read can drop login.keychain-db — which takes a Merlin agent on
           # this same host fully auth-down (Max OAuth token lives there, no API-key
-          # fallback by design). See the gandalf repo's architecture.md 2026-07-28.
+          # fallback by design; see docs/agent-auth-model.md).
           source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
           kc_lock_acquire
           kc_prepend "$KEYCHAIN_PATH"
@@ -178,6 +178,9 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          # Full name of the "3rd Party Mac Developer Installer: <Name> (<TEAM>)"
+          # identity in the runner's keychain (repo variable).
+          MAC_INSTALLER_IDENTITY: ${{ vars.MAC_INSTALLER_IDENTITY }}
         run: |
           mkdir -p ~/private_keys
           echo "$ASC_PRIVATE_KEY" > ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
@@ -185,7 +188,7 @@ jobs:
           PKG_PATH=$(find $RUNNER_TEMP/export-macos -name "*.pkg" -o -name "*.ipa" -o -name "*.app" | head -1)
           if [[ "$PKG_PATH" == *.app ]]; then
             productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Merlin.pkg \
-              --sign "3rd Party Mac Developer Installer: Moshe Raccah (TEAMID_PLACEHOLDER)"
+              --sign "${MAC_INSTALLER_IDENTITY:?set the MAC_INSTALLER_IDENTITY repo variable}"
             PKG_PATH=$RUNNER_TEMP/export-macos/Merlin.pkg
           fi
 
@@ -200,9 +203,9 @@ jobs:
         if: always()
         run: |
           # Remove ONLY this job's ASC key and ONLY the profiles this job
-          # installed. `AuthKey_*.p8` deleted sibling jobs' credentials
-          # mid-build — observed 2026-07-28 killing a concurrent Butterfly
-          # build with "AuthKey_***.p8 ... no such file".
+          # installed. A broad `AuthKey_*.p8` cleanup deletes sibling jobs'
+          # credentials mid-build: a concurrent build in another repo on the
+          # same runner then fails with "AuthKey_***.p8 ... no such file".
           source "$GITHUB_WORKSPACE/.github/scripts/ci-signing-assets.sh"
           sa_asc_key_remove "${{ secrets.ASC_KEY_ID }}"
           sa_cleanup_installed

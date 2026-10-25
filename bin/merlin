@@ -6,31 +6,60 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, execFileSync, spawnSync, spawn } = require('child_process');
 const os = require('os');
+const { installRoot, installTools } = require("../lib/root.cjs");
+
+// The shared hum ping budget as lib/ping-budget.mjs pingCaps() enforces
+// it (same env overrides and defaults; this CLI is CommonJS and cannot import
+// the ESM module synchronously). hum-state.json's max_pings_per_day /
+// min_ping_interval_minutes are NOT read: nothing mirrors them since the code
+// tick runner was retired (2026-10-22), and the seeded 999/0 is misleading.
+function enforcedPingCaps(env = process.env) {
+  const num = (k, d) => { const n = Number(env[k]); return env[k] !== undefined && env[k] !== '' && Number.isFinite(n) ? n : d; };
+  return { maxPerDay: num('HUM_MAX_PINGS_PER_DAY', 6), minIntervalMin: num('HUM_MIN_PING_INTERVAL_MIN', 45) };
+}
 
 // --- Paths ---
 const HOME = os.homedir();
-// MERLIN_HOME resolves the user's clone of the repo. Set explicitly via env;
-// otherwise default to $HOME/Dev/merlin (the canonical convention). Tools
-// outside this repo (CI, cron) should always export MERLIN_HOME — the env
-// var also propagates to every child process the supervisor spawns.
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(HOME, 'Dev/merlin');
-const ROOT = MERLIN_HOME;
-// Backwards compat: TOOLS used to be a separate dir wrapper. The layout drop
-// in Phase 2 means TOOLS now equals ROOT — keep the constant so the rest of
-// this file doesn't churn.
-const TOOLS = ROOT;
-const SYSTEM = path.join(ROOT, 'system');
-const TASKS_JSON = path.join(SYSTEM, 'tasks.json');
-const SERVICES_JSON = path.join(SYSTEM, 'services.json');
+const ROOT = installRoot();
+const TOOLS = installTools();
+const SYSTEM = path.join(TOOLS, 'system');
+// tasks.json / services.json are the kernel's registries; this installation's
+// own entries live in agent/local/{tasks,services}.json. Every read goes
+// through lib/registry.cjs, which merges the two; writes (pause/resume,
+// doctor --repair) go to the local file only.
+const registry = require(path.join(__dirname, '..', 'lib', 'registry.cjs'));
+const { instance } = require(path.join(__dirname, '..', 'lib', 'instance.cjs'));
+const OWNER = instance().owner_name;
+const OWNER_EMAIL = instance().owner_email;
 const ARCH_MD = path.join(SYSTEM, 'architecture.md');
-const OPS_CLAUDE = path.join(ROOT, 'agent/ops-agent/CLAUDE.md');
-const AGENT_LOGS = path.join(ROOT, 'agent/logs');
-const TOP_LOGS = path.join(ROOT, 'logs');
+const OPS_CLAUDE = path.join(TOOLS, 'agent/ops-agent/CLAUDE.md');
+const AGENT_LOGS = path.join(TOOLS, 'agent/logs');
+const TOP_LOGS = path.join(TOOLS, 'logs');
 const TRIAGE_LOG = path.join(TOP_LOGS, 'triage.log');
-const PAUSE_FLAG = path.join(ROOT, 'data/.triage-paused');
-const TRIAGE_PLAYBOOK = path.join(ROOT, 'data/email-triage-playbook.md');
-const SPAM_FILTER_BIN = path.join(ROOT, 'bin/spam-filter');
-const EMAIL_MEM_BIN = path.join(ROOT, 'bin/email-mem');
+const PAUSE_FLAG = path.join(TOOLS, 'data/.triage-paused');
+const TRIAGE_PLAYBOOK = path.join(TOOLS, 'data/email-triage-playbook.md');
+const SPAM_FILTER_BIN = path.join(TOOLS, 'bin/spam-filter');
+const P1_SENDER_BIN = path.join(TOOLS, 'bin/p1-sender');
+const EMAIL_MEM_BIN = path.join(TOOLS, 'bin/email-mem');
+
+// --- Per-installation hooks ---
+// bin/_ext/merlin-cli.cjs (CommonJS, every export optional) plugs this
+// installation's own signals into the CLI without the kernel naming them:
+//   sleepInfo({ TOOLS, shSafe })   → { wake_time_today, sleep_time_yesterday,
+//                                    asleep_now } or null (hum context `time`)
+//   activityOverride({ tz, localHour, ageMin, dataDir, readJson })
+//                                  → { state, reason } or null: a device signal
+//                                    that beats the clock rules of
+//                                    inferActivityState
+// No file: no hooks, and the CLI runs on its generic signals.
+let _cliExt;
+function cliExt() {
+  if (_cliExt === undefined) {
+    const f = path.join(__dirname, '_ext', 'merlin-cli.cjs');
+    _cliExt = fs.existsSync(f) ? require(f) : {};
+  }
+  return _cliExt;
+}
 
 // --- TTY + colors ---
 const NO_COLOR = !process.stdout.isTTY || process.env.NO_COLOR || process.argv.includes('--no-color');
@@ -52,8 +81,19 @@ function shSafe(cmd, opts = {}) {
   catch (e) { return null; }
 }
 
-function loadTasks() { return JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8')).tasks; }
-function loadServices() { return JSON.parse(fs.readFileSync(SERVICES_JSON, 'utf8')).services; }
+// A registry read with no install at the expected root (installRoot():
+// $MERLIN_HOME, else ~/Dev/merlin) says so instead of dying on an ENOENT stack.
+function loadRegistryOrHint(name) {
+  try { return registry.loadRegistryList(name, { root: ROOT }); }
+  catch (e) {
+    if (e && e.code === 'ENOENT' && !fs.existsSync(SYSTEM)) {
+      die(`no Merlin install at ${ROOT} (${SYSTEM} is missing). Set MERLIN_HOME to the repo root, e.g. MERLIN_HOME=${path.resolve(__dirname, '..', '..')} merlin ${process.argv.slice(2).join(' ')}`, 2);
+    }
+    throw e;
+  }
+}
+function loadTasks() { return loadRegistryOrHint('tasks'); }
+function loadServices() { return loadRegistryOrHint('services'); }
 
 function hasFlag(args, ...names) { return names.some(n => args.includes(n)); }
 function getFlag(args, name, def = null) {
@@ -81,32 +121,27 @@ function table(rows, headers) {
 // SUBCOMMANDS
 // ========================================================================
 
-function cmdHelp() {
+function cmdHelp(extensions = []) {
   console.log(c.bold('merlin') + ' — Merlin system self-awareness CLI\n');
   console.log('Usage: merlin <subcommand> [args...] [--flags]\n');
-  console.log(c.bold('BOOTSTRAP / RUN'));
-  console.log('  init [--force]                interactive config wizard → writes .env + token');
-  console.log('  overlay <subcmd>              attach/detach a personal overlay repo (see: overlay help)');
-  console.log('  up                            start process-manager in the foreground (Ctrl-C to stop)');
-  console.log('  dispatch <job> [--task ...]   POST a job to the ops-supervisor webhook');
-  console.log('  tail [ops|chat|<job>]         tail the ops/chat supervisor stream (or a job log)\n');
   console.log(c.bold('TASKS'));
   console.log('  tasks [list] [--json]         list automated tasks');
   console.log('  tasks show <name>             show full task detail');
   console.log('  tasks match "<phrase>"        find task by natural-language phrase');
   console.log('  tasks run <name>              dispatch task via webhook\n');
   console.log(c.bold('HEALTH'));
+  console.log('  whereami [--json|--banner|--role]  which machine am I on (the production host vs another)');
   console.log('  status                        system health dashboard');
   console.log('  services [--json]             LaunchAgents + tmux status');
   console.log('  doctor [--json] [--repair]    run drift checks; --repair auto-fixes schedule drift + orphan scripts');
-  console.log('  activity [--json]             the user\'s inferred state (active/winding_down/sleeping)');
+  console.log(`  activity [--json]             ${OWNER}'s inferred state (active/winding_down/sleeping)`);
   console.log('  context [--json] [--fresh]    unified merlin knowledge — profile + tastes + sources + recent\n');
   console.log(c.bold('TRIAGE'));
   console.log('  triage <subcmd>               email triage subsystem (see: triage help)');
   console.log('  triage status                 running? paused? last event?');
   console.log('  triage recent [N] | pending | rules | playbook');
   console.log('  triage pause | resume | reclassify <msgId>');
-  console.log('  triage memory ... | spam ...  (wrap email-mem / spam-filter)\n');
+  console.log('  triage memory ... | spam ... | p1 ...  (wrap email-mem / spam-filter / p1-sender)\n');
   console.log(c.bold('HUM'));
   console.log('  hum status                  next run, pings today, cool-down, pause state');
   console.log('  hum pause <duration>        "2h" | "today" | "until-morning" | "weekend"');
@@ -121,15 +156,19 @@ function cmdHelp() {
   console.log('  git                           branch + status + recent commits');
   console.log('  ci [--limit N]                GitHub Actions runs\n');
   console.log(c.bold('CONTROL'));
-  console.log('  restart <ops|chat|hookdeck|session>  restart tmux pane or whole session\n');
+  console.log('  restart <target>            bounce a supervised process; target:');
+  console.log('     ops | chat                 rotate the agent\'s claude session (POST supervisor /restart)');
+  console.log('     whatsapp-channel | wiki-server  SIGTERM the process-manager child; it respawns');
+  console.log('     session                    kickstart launchd — restart the whole stack\n');
   console.log(c.bold('DISCOVERY'));
-  console.log('  arch                          print architecture.md');
-  console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)\n');
-  console.log(c.bold('SAFETY'));
-  console.log('  audit [--commits N]           run sanitize-guard --all + scan last N commit messages (default 50)');
-  console.log(c.dim('                                — for monthly review of public/private boundary integrity'));
-  console.log('  review-pr <PR#> | --file F    Claude-powered narrative-leak review of a PR diff or file');
-  console.log(c.dim('                                — catches paraphrased personal content (Layer 6a)\n'));
+  console.log('  arch                          print architecture.md (+ architecture-local.md, changelog.md)');
+  console.log('  where <name>                  fuzzy-find by name (tasks, scripts, services)');
+  console.log('  watchdog [status] [--json]    open incidents from watchdog-incidents/ (consecutive failures, alert state)\n');
+  if (extensions.length) {
+    console.log(c.bold('EXTENSIONS') + c.dim(' (cli.d/)'));
+    for (const e of extensions) console.log(`  ${e.usage.padEnd(28)}  ${e.summary}`);
+    console.log('');
+  }
   console.log(c.dim('Flags: --json  --no-color  --help'));
 }
 
@@ -146,10 +185,9 @@ function cmdTasks(args) {
 }
 
 function writeTasks(tasks) {
-  // Preserve the top-level envelope ({ tasks: [...] }) when rewriting.
-  const raw = JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8'));
-  raw.tasks = tasks;
-  fs.writeFileSync(TASKS_JSON, JSON.stringify(raw, null, 2) + '\n');
+  // The merged list goes back as local entries/overrides (agent/local/tasks.json);
+  // the kernel's tasks.json is never rewritten from here.
+  registry.writeRegistryList('tasks', tasks, { root: ROOT });
 }
 
 function cmdTasksPause(args) {
@@ -211,7 +249,13 @@ function cmdTasksShow(args) {
   console.log(c.dim('  schedule:         ') + (task.schedule_human || 'manual'));
   console.log(c.dim('  cron:             ') + (task.schedule || '—'));
   console.log(c.dim('  trigger_script:   ') + task.trigger_script);
-  console.log(c.dim('  webhook:          ') + `POST ${task.webhook_url}`);
+  if (task.cron_label) console.log(c.dim('  cron line label:  ') + task.cron_label);
+  // A launchd job has no webhook — it is exec'd directly by its LaunchAgent
+  // (the ephemeral-Opus family: cron/webhook can't unlock the Max keychain).
+  // Printing "POST undefined" invited exactly the wrong next move.
+  console.log(c.dim('  dispatch:         ') + (task.webhook_url
+    ? `POST ${task.webhook_url}`
+    : `launchd — ai.claude.${task.name} runs ${task.trigger_script || 'its trigger'} directly (no webhook)`));
   console.log(c.dim('  webhook_task:     ') + task.webhook_task);
   console.log(c.dim('  playbook section: ') + `ops-agent/CLAUDE.md § ${task.ops_playbook_section}`);
   console.log(c.dim('  delivers_to:      ') + task.delivers_to);
@@ -284,11 +328,22 @@ function taskBody(task) {
 }
 
 function postWebhook(url, body) {
+  const headers = ['-H', 'Content-Type: application/json'];
+  // Every supervisor webhook (ops :9092, ops-light :9082) checks the same shared
+  // Bearer token (supervisor/http-server.mjs checkAuth), so attach it for any
+  // local target, same as the restart auth below. Until 2026-10-13 only :9092
+  // got it, so the :9082 tasks would come back 401 whenever chat ran one by hand.
+  let local = false;
+  try { local = ['localhost', '127.0.0.1'].includes(new URL(url).hostname); } catch {}
+  if (local) {
+    const token = readWebhookToken();
+    if (token) headers.push('-H', `Authorization: Bearer ${token}`);
+  }
   const result = spawnSync('curl', [
     '-s', '-o', '/dev/null', '-w', '%{http_code}',
     '--max-time', '10',
     '-X', 'POST', url,
-    '-H', 'Content-Type: application/json',
+    ...headers,
     '-d', body,
   ], { encoding: 'utf8' });
   return { code: (result.stdout || '').trim() || '000', stderr: (result.stderr || '').trim(), error: result.error };
@@ -299,6 +354,15 @@ function cmdTasksRun(args) {
   if (!name) die('tasks run: missing <name>. Try: merlin tasks');
   const task = loadTasks().find(t => t.name === name);
   if (!task) die(`No task named '${name}'. Try: merlin tasks`);
+  // Refuse rather than POST to `undefined`. A launchd job (the ephemeral-Opus
+  // family) has no webhook by design — dispatching one through the supervisor
+  // would run it on the resident Sonnet supervisor instead of the Opus fork it
+  // is specified to use, which is the exact bug the 2026-07-28 migration fixed.
+  if (!task.webhook_url) {
+    die(`tasks run: '${task.name}' is a launchd job, not a webhook job — it has no dispatch endpoint.\n` +
+        `  Run it now:   ${task.trigger_script || '(see tasks.json)'}\n` +
+        `  Or via launchd: launchctl kickstart -k gui/$(id -u)/ai.claude.${task.name}`);
+  }
   const body = taskBody(task);
   if (hasFlag(args, '--dry-run')) {
     console.log(c.dim('(dry-run — no dispatch)'));
@@ -511,7 +575,7 @@ function cmdServices(args) {
   const lc = shSafe('launchctl list') || '';
   const enriched = services.map(sv => {
     if (sv.type === 'tmux') {
-      const tmuxOut = shSafe('tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
+      const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t ' + sv.session + ' -F "#{pane_index} #{pane_current_command}"');
       return { ...sv, status: tmuxOut ? 'running' : 'not running' };
     }
     const line = lc.split('\n').find(l => l.endsWith('\t' + sv.label));
@@ -533,12 +597,11 @@ function cmdServices(args) {
 // --- logs ---
 function cmdLogs(args) {
   const name = args.find(a => !a.startsWith('--'));
-  if (!name) die('logs: missing <component>. Available: chat-agent, ops-agent, hookdeck, wiki-server, watchdog, heartbeat, triage, claude-launchagent');
+  if (!name) die('logs: missing <component>. Available: chat-agent, ops-agent, wiki-server, watchdog, heartbeat, triage, claude-launchagent');
   const tail = Number(getFlag(args, '--tail', '50'));
   const candidates = {
     'chat-agent': path.join(AGENT_LOGS, 'chat-agent.log'),
     'ops-agent': path.join(AGENT_LOGS, 'ops-agent.log'),
-    'hookdeck': path.join(AGENT_LOGS, 'hookdeck.log'),
     'wiki-server': path.join(AGENT_LOGS, 'wiki-server.log'),
     'watchdog': path.join(AGENT_LOGS, 'watchdog.log'),
     'claude-launchagent': path.join(AGENT_LOGS, 'claude-launchagent.log'),
@@ -567,8 +630,10 @@ function cmdCron(args) {
     if (!m) return { schedule: '(?)', script: line.slice(0, 60), task: '' };
     const schedule = m[1].trim();
     const cmd = m[2];
-    // Find matching task by trigger_script path
-    const task = tasks.find(t => cmd.includes(path.basename(t.trigger_script)));
+    // Find matching task by its explicit cron_label, else by trigger_script path
+    // (skip on-demand tasks with no trigger_script)
+    const task = tasks.find(t => t.cron_label && cmd.includes(`--label ${t.cron_label} `))
+      || tasks.find(t => t.trigger_script && cmd.includes(path.basename(t.trigger_script)));
     // Extract script name: find first arg that ends in .sh/.mjs/.js, else first path-like arg
     let script = '';
     for (const part of cmd.split(/\s+/)) {
@@ -624,7 +689,7 @@ function cmdTriage(args) {
   const subs = {
     status: cmdTriageStatus, stats: cmdTriageStats, recent: cmdTriageRecent,
     pending: cmdTriagePending, rules: cmdTriageRules, playbook: cmdTriagePlaybook,
-    memory: cmdTriageMemory, spam: cmdTriageSpam, pause: cmdTriagePause,
+    memory: cmdTriageMemory, spam: cmdTriageSpam, p1: cmdTriageP1, pause: cmdTriagePause,
     resume: cmdTriageResume, reclassify: cmdTriageReclassify, resolve: cmdTriageResolve,
   };
   const fn = subs[sub];
@@ -637,11 +702,12 @@ function cmdTriageHelp() {
   console.log('  status                   is triage running? paused? last event?');
   console.log('  stats [--today|--since Nh]   event counts by action');
   console.log('  recent [N]               last N triage events, color-coded');
-  console.log('  pending                  drafts awaiting the user\'s review (last 24h)');
+  console.log(`  pending                  drafts awaiting ${OWNER}'s review (last 24h)`);
   console.log('  rules                    print § Email Triage Rules from ops-agent/CLAUDE.md');
   console.log('  playbook                 print email-triage-playbook.md');
   console.log('  memory <search|list> ... wrap email-mem (classification memory)');
   console.log('  spam <list|block|unblock|check> ... wrap spam-filter');
+  console.log('  p1 <list|add|remove|check> ...   wrap p1-sender (always-P1 sender list)');
   console.log('  pause                    stop forwarding Gmail events to ops-agent');
   console.log('  resume                   re-enable + dispatch CATCH UP to process missed');
   console.log('  reclassify <messageId>   dispatch RECLASSIFY: <msgId> to ops-agent');
@@ -666,7 +732,7 @@ function cmdTriageStatus(args) {
     try { s.supervisor_health = JSON.parse(health); } catch {}
   }
   // ops-agent process in pane 1
-  const tmuxOut = shSafe('tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
+  const tmuxOut = shSafe('/opt/homebrew/bin/tmux list-panes -t claude -F "#{pane_index} #{pane_current_command}"');
   if (tmuxOut) {
     const line = tmuxOut.split('\n').find(l => l.startsWith('1 '));
     if (line) {
@@ -713,6 +779,32 @@ function cmdTriageStatus(args) {
   }
 }
 
+// triage.log rotates daily into `triage-YYYY-MM-DD.log` siblings, so reading
+// only the live file caps every window at "today" no matter what --since says.
+// Returns the live log plus every rotated sibling whose date falls inside the
+// window, oldest first. (2026-09-08 nightly-review: `--since 168h` reported 80
+// events for a week that actually held 6,360 lines / 789 distinct messages.)
+function triageLogFilesForWindow(cutoffMs) {
+  const files = [];
+  if (cutoffMs !== null) {
+    const dir = path.dirname(TRIAGE_LOG);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { names = []; }
+    const dated = names
+      .map(n => ({ n, m: /^triage-(\d{4}-\d{2}-\d{2})\.log$/.exec(n) }))
+      .filter(x => x.m)
+      // A file named for date D is rotated at the START of D and therefore holds
+      // D-1's entries; keep anything that could overlap the window, and let the
+      // per-line timestamp cutoff below do the exact filtering.
+      .filter(x => Date.parse(x.m[1] + 'T23:59:59Z') >= cutoffMs - 86400000)
+      .sort((a, b) => a.m[1].localeCompare(b.m[1]))
+      .map(x => path.join(dir, x.n));
+    files.push(...dated);
+  }
+  files.push(TRIAGE_LOG);
+  return files;
+}
+
 function cmdTriageStats(args) {
   if (!fs.existsSync(TRIAGE_LOG)) die('triage.log not found');
   const today = new Date().toISOString().slice(0, 10);
@@ -726,7 +818,8 @@ function cmdTriageStats(args) {
   }
   const counts = {};
   let total = 0;
-  const lines = fs.readFileSync(TRIAGE_LOG, 'utf8').split('\n');
+  const lines = triageLogFilesForWindow(cutoff)
+    .flatMap(f => { try { return fs.readFileSync(f, 'utf8').split('\n'); } catch { return []; } });
   for (const line of lines) {
     if (!line.trim()) continue;
     const [ts, action] = line.split('|').map(s => s.trim());
@@ -797,6 +890,13 @@ function cmdTriageRules() {
   const m = md.match(/## Email Triage Rules\s*\n([\s\S]*?)(?=\n## |\n---\n|$)/);
   if (!m) die('Email Triage Rules section not found');
   process.stdout.write('## Email Triage Rules\n' + m[1]);
+  // + this instance's own part of the section (agent/local/ops.md), which
+  // the ops supervisor appends to the agent's system prompt beside it.
+  const localDir = process.env.MERLIN_LOCAL_DIR || path.join(TOOLS, 'agent/local');
+  let local = '';
+  try { local = fs.readFileSync(path.join(localDir, 'ops.md'), 'utf8'); } catch {}
+  const l = local.match(/(## Email Triage Rules[^\n]*)\n([\s\S]*?)(?=\n## |\n---\n|$)/);
+  if (l) process.stdout.write('\n' + l[1] + '\n' + l[2]);
 }
 
 function cmdTriagePlaybook() {
@@ -809,6 +909,13 @@ function cmdTriageMemory(args) {
   // pass through to email-mem
   try {
     execFileSync(EMAIL_MEM_BIN, args, { stdio: 'inherit' });
+  } catch (e) { process.exit(e.status || 1); }
+}
+
+function cmdTriageP1(args) {
+  if (!fs.existsSync(P1_SENDER_BIN)) die('p1-sender not found at ' + P1_SENDER_BIN);
+  try {
+    execFileSync(P1_SENDER_BIN, args.length ? args : ['list'], { stdio: 'inherit' });
   } catch (e) { process.exit(e.status || 1); }
 }
 
@@ -873,131 +980,153 @@ function cmdTriageResolve(args) {
 }
 
 // --- restart ---
-const TMUX = 'tmux';
-
-// Wrappers that send raw argv to tmux — no shell interpolation.
-function tmuxRun(args) {
-  const r = spawnSync(TMUX, args, { encoding: 'utf8' });
-  return { ok: r.status === 0, stdout: r.stdout || '', stderr: r.stderr || '' };
-}
-function tmuxSend(target, keys) { return tmuxRun(['send-keys', '-t', target, ...keys]); }
-function tmuxPaneCommand(paneIdx) {
-  const r = tmuxRun(['list-panes', '-t', 'claude:0', '-F', '#{pane_index} #{pane_current_command}']);
-  if (!r.ok) return null;
-  const line = r.stdout.split('\n').find(l => l.startsWith(paneIdx + ' '));
-  return line ? line.slice(2) : null;
-}
-function tmuxPaneCount() {
-  const r = tmuxRun(['list-panes', '-t', 'claude:0']);
-  return r.ok ? r.stdout.trim().split('\n').length : 0;
+// Bearer token for authenticated supervisor POSTs (ops :9093 gates /restart on
+// it; chat :9094 does not). Absent file → null (ops auth degrades open).
+function readWebhookToken() {
+  try { return fs.readFileSync(path.join(TOOLS, 'secrets/webhook-token'), 'utf8').trim() || null; }
+  catch { return null; }
 }
 
-// Check if a TCP port is free by attempting to listen with `nc`.
-function portFree(port, timeoutSec = 3) {
-  const r = spawnSync('nc', ['-z', '-w', '1', 'localhost', String(port)], { encoding: 'utf8' });
-  // nc exits 0 if connection succeeds (port IN USE). exits non-0 if free.
-  return r.status !== 0;
-}
-
-function waitPortFree(port, maxSec = 4) {
-  for (let i = 0; i < maxSec; i++) {
-    if (portFree(port)) return true;
-    execFileSync('sleep', ['1']);
-  }
-  return portFree(port);
-}
-
+// restart — bounce a supervised process the way the LIVE architecture expects:
+// process-manager (agent/bin/process-manager.mjs) + launchd, NOT tmux.
+// (The previous tmux respawn-pane implementation was dead — there is no tmux
+//  in the supervision path; see changelog.md 2026-06-02.)
+//
+//   ops | chat        → POST the supervisor's own /restart (rotates the inner
+//                       claude session, re-reads agents.json; supervisor stays up)
+//   whatsapp-channel  → SIGTERM the process-manager child; ManagedProcess
+//   wiki-server         respawns it on exit. Confirms a fresh pid comes up.
+//   session           → launchctl kickstart -k of ai.claude.session (restarts
+//                       process-manager + every child)
 function cmdRestart(args) {
-  const target = args.find(a => !a.startsWith('--'));
-  if (!target) die('restart: usage: merlin restart <ops|chat|hookdeck|session>');
-  const CLAUDE = path.join(HOME, '.local/bin/claude');
-  const NODE = 'node';
-  const AGENT_DIR = path.join(TOOLS, 'agent');
-  const SUPERVISOR_DIR = path.join(AGENT_DIR, 'supervisor');
-  const CONFIG_DIR = path.join(AGENT_DIR, 'config');
+  const raw = args.find(a => !a.startsWith('--'));
+  if (!raw) die('restart: usage: merlin restart <ops|chat|whatsapp-channel|wiki-server|session>');
 
-  // Load config dynamically
-  function loadAgentConfig(name) {
-    const cfg = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'agents.json'), 'utf8')).agents[name];
-    if (!cfg) die(`restart: agent '${name}' not in agents.json`);
-    return cfg;
-  }
-
-  const configs = {
-    chat: { idx: 0, cwd: path.join(AGENT_DIR, 'chat-agent'), ports_to_free: [] },
-    ops: { idx: 1, cwd: SUPERVISOR_DIR, ports_to_free: [9090, 9092, 9093] },
-    hookdeck: { idx: 2, cwd: AGENT_DIR, launch: 'hookdeck listen 9090 gmail-source', ports_to_free: [] },
+  const ALIASES = {
+    ops: 'ops', chat: 'chat', session: 'session',
+    whatsapp: 'whatsapp-channel', wa: 'whatsapp-channel', 'whatsapp-channel': 'whatsapp-channel',
+    wiki: 'wiki-server', 'wiki-server': 'wiki-server',
   };
+  const target = ALIASES[raw];
+  if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, wiki-server, session.`);
 
-  // Session-level restart: kill tmux session, launchd rebuilds it.
+  const PM = 'http://127.0.0.1:9095/health';
+
+  // session: restart the whole stack. process-manager is booted by the
+  // ai.claude.session LaunchAgent; kickstart -k kills + relaunches it, tearing
+  // down and respawning every supervised child.
   if (target === 'session') {
-    console.log(c.dim('killing tmux session "claude" — launchd (ai.claude.session) will respawn with fresh panes...'));
-    const killed = tmuxRun(['kill-session', '-t', 'claude']);
-    if (!killed.ok && !killed.stderr.includes("can't find session")) {
-      die(`kill-session failed: ${killed.stderr}`);
-    }
-    console.log(c.green('✓ session killed. Wait ~30s, then: merlin status'));
+    const uid = process.getuid();
+    console.log(c.dim('kickstarting launchd ai.claude.session — restarts process-manager + all supervised children...'));
+    const out = shSafe(`launchctl kickstart -k gui/${uid}/ai.claude.session 2>&1`);
+    if (out === null) die('restart: launchctl kickstart failed. Try manually: launchctl kickstart -k gui/$(id -u)/ai.claude.session');
+    console.log(c.green('✓ kickstart sent. Wait ~30s, then: merlin status'));
     return;
   }
 
-  if (!tmuxRun(['has-session', '-t', 'claude']).ok) {
-    die('tmux session "claude" is not running. Start: launchctl kickstart gui/$(id -u)/ai.claude.session OR merlin restart session');
-  }
-
-  const cfg = configs[target];
-  if (!cfg) die(`restart: unknown target '${target}'. Use ops, chat, hookdeck, or session.`);
-
-  const paneCount = tmuxPaneCount();
-  const paneTarget = `claude:0.${cfg.idx}`;
-  if (cfg.idx >= paneCount) {
-    if (target === 'hookdeck') {
-      console.log(c.yellow(`pane ${cfg.idx} missing (only ${paneCount} panes) — creating...`));
-      const split = tmuxRun(['split-window', '-t', 'claude', '-v', '-c', cfg.cwd]);
-      if (!split.ok) die(`split-window failed: ${split.stderr}`);
-      tmuxRun(['select-layout', '-t', 'claude', 'even-vertical']);
-    } else {
-      die(`restart: pane ${cfg.idx} does not exist (session has only ${paneCount} panes)`);
+  // ops / chat: graceful — the supervisor's own /restart endpoint rotates the
+  // inner `claude -p` session (and re-reads agents.json) without killing the
+  // supervisor. Documented path: CLAUDE.md § Effort Policy. ops :9093 gates the
+  // POST behind a bearer token (secrets/webhook-token); chat :9094 does
+  // not — sending the header is harmless either way. The session warm-resumes
+  // (same sessionId), so success is verified by restartCount advancing.
+  const SUPERVISOR_PORT = { ops: 9093, chat: 9094 };
+  if (SUPERVISOR_PORT[target]) {
+    const port = SUPERVISOR_PORT[target];
+    const before = fetchJson(`http://127.0.0.1:${port}/health`);
+    if (!before) {
+      die(`restart: ${target} supervisor not reachable on :${port}. Is the stack up? (merlin status) — to restart everything: merlin restart session`);
     }
-  } else {
-    console.log(c.dim(`force-killing pane ${cfg.idx} (${target}) via tmux respawn-pane -k...`));
-    const respawn = tmuxRun(['respawn-pane', '-k', '-c', cfg.cwd, '-t', paneTarget, 'zsh']);
-    if (!respawn.ok) die(`respawn-pane failed: ${respawn.stderr}`);
-  }
-
-  execFileSync('sleep', ['1']);
-  for (const port of cfg.ports_to_free) {
-    if (!waitPortFree(port, 4)) {
-      console.log(c.yellow(`  warning: port ${port} still held after 4s — launch may fail to bind`));
+    const oldCount = before.restartCount ?? 0;
+    const token = readWebhookToken();
+    const authArg = token ? `-H "Authorization: Bearer ${token}" ` : '';
+    const code = shSafe(`curl -s --max-time 6 -o /dev/null -w "%{http_code}" ${authArg}-X POST http://127.0.0.1:${port}/restart`);
+    if (!code || !/^2\d\d$/.test(code.trim())) {
+      const hint = code && code.trim() === '401' ? ' (401 unauthorized — missing/stale secrets/webhook-token)' : '';
+      die(`restart: POST :${port}/restart returned ${code ? code.trim() : 'no response'}${hint} — check merlin logs ${target}-supervisor`);
     }
+    console.log(c.dim(`restart requested (HTTP ${code.trim()}) — waiting for the ${target} session to rotate...`));
+    let after = null;
+    for (let i = 0; i < 20; i++) {
+      execFileSync('sleep', ['1']);
+      const h = fetchJson(`http://127.0.0.1:${port}/health`);
+      if (h && (h.restartCount ?? 0) > oldCount && h.childAlive) { after = h; break; }
+    }
+    if (!after) {
+      console.log(c.yellow(`  ${target}: POST accepted but restartCount didn't advance within 20s — check merlin logs ${target}-supervisor`));
+      process.exit(1);
+    }
+    console.log(c.green(`✓ ${target} supervisor restarted`) + c.dim(` (session ${after.sessionId} resumed; restartCount ${oldCount}→${after.restartCount}; agents.json re-read).`));
+    return;
   }
 
-  let launchCmd;
-  if (target === 'hookdeck') {
-    launchCmd = cfg.launch;
-  } else if (target === 'ops') {
-    launchCmd = `${NODE} ${SUPERVISOR_DIR}/index.mjs --agent ops`;
+  // whatsapp-channel / wiki-server: plain process-manager children with no
+  // inner session. SIGTERM the child; process-manager (ManagedProcess) sees the
+  // exit (stopping=false → _scheduleRestart) and respawns it.
+  const CHILD = {
+    'whatsapp-channel': { verify: 'http://127.0.0.1:9100/health', verifyNote: 'paired + listening' },
+    'wiki-server':      { verify: 'http://127.0.0.1:9096/',       verifyNote: 'serving' },
+  };
+  const spec = CHILD[target];
+
+  const pm = fetchJson(PM);
+  if (!pm) {
+    die(`restart: process-manager unreachable on :9095 — it supervises ${target}, so a kill would NOT auto-respawn. Bring the stack up first: merlin restart session`);
+  }
+  const before = (pm.children || []).find((ch) => ch.name === target);
+  if (!before) {
+    die(`restart: process-manager has no child '${target}' (children: ${(pm.children || []).map((ch) => ch.name).join(', ')})`);
+  }
+  const oldPid = before.alive ? before.pid : null;
+
+  if (oldPid) {
+    console.log(c.dim(`stopping ${target} (pid ${oldPid}) — process-manager will respawn it...`));
+    try { process.kill(oldPid, 'SIGTERM'); }
+    catch (e) { die(`restart: failed to signal pid ${oldPid}: ${e.message}`); }
   } else {
-    // chat: interactive claude with dev-channels
-    const acfg = loadAgentConfig('chat');
-    const tools = acfg.allowedTools.map(t => /[*]/.test(t) ? `"${t}"` : t).join(' ');
-    const channels = (acfg.devChannels || []).map(c => 'server:' + c).join(' ');
-    launchCmd = `${CLAUDE} --model ${acfg.model} --dangerously-load-development-channels ${channels} --permission-mode ${acfg.permissionMode} --remote-control-session-name-prefix ${acfg.remoteControlPrefix} --allowedTools ${tools}`;
+    console.log(c.yellow(`  ${target} is not currently alive — waiting for process-manager to bring it up...`));
   }
-  tmuxSend(paneTarget, [launchCmd, 'Enter']);
 
-  console.log(c.green(`✓ ${target} relaunched in pane ${cfg.idx}`));
-  if (target === 'chat') {
-    console.log(c.dim('  launcher will auto-accept dev-channels prompt within ~5s'));
+  // Poll process-manager health until a fresh pid is alive (bounded ~25s,
+  // covering ManagedProcess restart backoff).
+  let fresh = null;
+  for (let i = 0; i < 25; i++) {
+    execFileSync('sleep', ['1']);
+    const h = fetchJson(PM);
+    const ch = h && (h.children || []).find((x) => x.name === target);
+    if (ch && ch.alive && ch.pid && ch.pid !== oldPid) { fresh = ch; break; }
   }
-  if (target === 'ops') {
-    console.log(c.dim('  supervisor handles startup catchup automatically'));
+  if (!fresh) {
+    console.log(c.yellow(`  ${target} did not report a new pid within 25s — it may be in restart backoff. Check: merlin status ; merlin logs ${target}`));
+    process.exit(1);
   }
+
+  // Best-effort service-level verification — the process is alive per
+  // process-manager, but its HTTP port can take a few seconds to bind, so
+  // retry briefly before deciding.
+  let note = '';
+  if (spec && spec.verify) {
+    let ok = false;
+    for (let i = 0; i < 8 && !ok; i++) {
+      ok = !!shSafe(`curl -sf --max-time 3 -o /dev/null "${spec.verify}" && echo ok`);
+      if (!ok) execFileSync('sleep', ['1']);
+    }
+    note = ok ? c.dim(` (${spec.verifyNote})`) : c.yellow(' — process up but health endpoint not responding yet; may still be starting');
+  }
+  console.log(c.green(`✓ ${target} restarted — new pid ${fresh.pid}`) + note);
 }
 
 // --- arch ---
+// The map, then the private halves it points to when present: the personal
+// subsystems (architecture-local.md) and the dated history (changelog.md),
+// which lived inside architecture.md until 2026-10-24.
 function cmdArch() {
   if (!fs.existsSync(ARCH_MD)) die('architecture.md not found');
   process.stdout.write(fs.readFileSync(ARCH_MD, 'utf8'));
+  for (const extra of ['architecture-local.md', 'changelog.md']) {
+    const p = path.join(SYSTEM, extra);
+    if (fs.existsSync(p)) process.stdout.write('\n' + fs.readFileSync(p, 'utf8'));
+  }
 }
 
 // --- where ---
@@ -1029,7 +1158,9 @@ function cmdWhere(args) {
 // --- doctor ---
 function cmdDoctor(args) {
   const checks = [];
-  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+  // `warn`: passing but wants a human look. Yellow "!", `warn: true` in --json,
+  // never a failure (doctor-preflight-check and the failing-count pings key on `ok`).
+  const add = (name, ok, detail, warn = false) => checks.push(warn ? { name, ok, detail, warn: true } : { name, ok, detail });
   const tasks = loadTasks();
   const services = loadServices();
 
@@ -1058,11 +1189,11 @@ function cmdDoctor(args) {
   // A task with paused_until = YYYY-MM-DD (or full ISO) is expected to be
   // absent from crontab until that date. When it passes, the check starts
   // enforcing again — forcing a resume/retire decision. Bare YYYY-MM-DD is
-  // anchored to end-of-day in America/New_York (not UTC midnight, which
-  // resumes ~4h early during EDT).
+  // anchored to end-of-day in the installation's home zone (instance().tz, the
+  // zone the crontab runs in), not UTC midnight, which resumes hours early.
   const nowMs = Date.now();
-  const ET_OFFSET_FMT = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York', timeZoneName: 'shortOffset',
+  const ZONE_OFFSET_FMT = new Intl.DateTimeFormat('en-US', {
+    timeZone: instance().tz, timeZoneName: 'shortOffset',
   });
   const pausedUntilMs = (val) => {
     if (!val) return null;
@@ -1072,10 +1203,11 @@ function cmdDoctor(args) {
     }
     const [y, m, d] = val.split('-').map(Number);
     const nextUtc = Date.UTC(y, m - 1, d + 1);
-    const tzPart = ET_OFFSET_FMT.formatToParts(new Date(nextUtc)).find(p => p.type === 'timeZoneName')?.value || 'GMT-5';
+    const tzPart = ZONE_OFFSET_FMT.formatToParts(new Date(nextUtc)).find(p => p.type === 'timeZoneName')?.value || 'GMT';
+    if (tzPart === 'GMT' || tzPart === 'UTC') return nextUtc; // a zone at UTC+0
     const match = tzPart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
     const sign = match?.[1] === '-' ? -1 : 1;
-    const hrs = match ? parseInt(match[2], 10) : 5;
+    const hrs = match ? parseInt(match[2], 10) : 0;
     const mins = match?.[3] ? parseInt(match[3], 10) : 0;
     return nextUtc - sign * (hrs * 60 + mins) * 60 * 1000;
   };
@@ -1083,20 +1215,65 @@ function cmdDoctor(args) {
     const until = pausedUntilMs(t.paused_until);
     return until !== null && until > nowMs;
   };
-  const scheduledTasks = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && !isPaused(t));
-  const pausedCount = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && isPaused(t)).length;
+  // `scheduler: "launchd"` tasks are fired by a launchd agent (see services.json +
+  // the plist), NOT crontab — cron can't reach the in-session Max keychain. Their
+  // plist existence is verified by the services.json check, so skip the cron check.
+  const scheduledTasks = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && t.scheduler !== 'launchd' && !isPaused(t));
+  const pausedCount = tasks.filter(t => t.schedule && t.schedule !== 'on-demand' && t.scheduler !== 'launchd' && isPaused(t)).length;
+  // Clock-anchored jobs (data/clock-jobs.json) have their crontab
+  // MM/HH/DOW fields intentionally rewritten nightly by cron-tz-sync to match
+  // the user's actual local time — so their live crontab entry legitimately
+  // diverges from tasks.json's nominal `schedule` field whenever the user is outside
+  // the instance's home zone. Match by label (= trigger_script basename minus .sh,
+  // the same key cron-tz-sync matches on) and compare against the
+  // currently-expected home-zone time instead of the literal tasks.json field.
+  const { loadClockJobs, resolveTz, localToHomeZone } = require(path.join(TOOLS, 'lib/clock-jobs.js'));
+  const clockJobList = loadClockJobs();
+  const clockJobsByLabel = new Map(clockJobList.map(j => [j.label, j]));
+  let clockTz = null;
   const unscheduled = [];
   for (const t of scheduledTasks) {
-    const want = path.basename(t.trigger_script);
-    // Multi-schedule separator is " / " (space-slash-space). Require
-    // whitespace on both sides so we don't split on the step-value "/" inside
-    // "*/20 * * * *" etc.
-    const schedParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).filter(Boolean);
+    // A cron-run-direct task (trigger_script: null, since 2026-10-10) is found by
+    // its `--label <name>`; path.basename(null) threw and took doctor down.
+    // A task whose cron line runs something OTHER than its trigger_script names
+    // that line's label in `cron_label` (2026-10-20): daily-summary-fix's trigger
+    // is launched by launchd off its queue directory, and its one cron line is the
+    // hourly `daily-summary-fix sweep`, labelled daily-summary-fix-sweep, so the
+    // trigger's basename is in no crontab line and doctor read the healthy sweep
+    // as "missing cron". Explicit, like clock-jobs.json's "task" field, never a
+    // label prefix; the trailing space stops a label matching a longer one.
+    const want = t.cron_label ? `--label ${t.cron_label} `
+      : t.trigger_script ? path.basename(t.trigger_script) : `--label ${t.name} `;
+    const base = t.cron_label || want.replace(/\.sh$/, '');
+    // One clock job keyed by the task's own label, or several when one script
+    // runs at more than one local time with a label per cron line, which
+    // clock-jobs.json ties back to the task by name ("task": "hum-explore" on
+    // trigger-hum-explore-midday and -evening). Before 2026-10-13 that second
+    // shape fell through to the literal tasks.json schedule and read as
+    // "missing cron". Matched explicitly, never by label prefix: trigger-hum
+    // is a prefix of trigger-hum-explore-midday.
+    const clockJobs = clockJobsByLabel.has(base)
+      ? [clockJobsByLabel.get(base)]
+      : clockJobList.filter(j => j.task === t.name);
+    let schedParts;
+    if (clockJobs.length) {
+      if (clockTz === null) clockTz = resolveTz().tz;
+      schedParts = clockJobs.map((j) => {
+        const { hour, minute, dow } = localToHomeZone(clockTz, j.local_time, j.dow);
+        return `${Number(minute)} ${Number(hour)} * * ${j.dow != null ? dow : '*'}`;
+      });
+    } else {
+      // Multi-schedule separator is " / " (space-slash-space). Require
+      // whitespace on both sides so we don't split on the step-value "/"
+      // inside "*/20 * * * *" etc.
+      schedParts = t.schedule.split(/\s+\/\s+/).map(s => s.trim()).filter(Boolean);
+    }
     const found = schedParts.every(sched => cronLines.some(l => l.includes(want) && l.startsWith(sched)));
-    if (!found) unscheduled.push(t.name);
+    if (!found) unscheduled.push(clockJobs.length ? `${t.name} (tz-adjusted)` : t.name);
   }
   const pausedSuffix = pausedCount ? `, ${pausedCount} paused` : '';
-  add('tasks.json schedules ↔ crontab', unscheduled.length === 0, unscheduled.length ? `missing cron: ${unscheduled.join(', ')}` : `${scheduledTasks.length} scheduled tasks, all in cron${pausedSuffix}`);
+  const tzSuffix = clockTz && clockTz !== instance().tz ? ` (${clockJobsByLabel.size} clock-anchored, tz=${clockTz})` : '';
+  add('tasks.json schedules ↔ crontab', unscheduled.length === 0, unscheduled.length ? `missing cron: ${unscheduled.join(', ')}` : `${scheduledTasks.length} scheduled tasks, all in cron${pausedSuffix}${tzSuffix}`);
 
   // 4. ops_playbook_section headers exist
   const opsMd = fs.existsSync(OPS_CLAUDE) ? fs.readFileSync(OPS_CLAUDE, 'utf8') : '';
@@ -1115,7 +1292,7 @@ function cmdDoctor(args) {
   // 6. no old Dev/Tools paths in tracked text files
   // Use git grep — it natively skips binary files and respects .gitignore.
   // Exclude files that legitimately contain the pattern (this tool + its test harness).
-  const grepOut = shSafe('git grep -l -E "${MERLIN_HOME_USER}/Dev/Tools/|~/Dev/Tools/|\\$HOME/Dev/Tools/" -- ":!*.png" ":!*.jpg" ":!*.pdf" ":!*.p8" ":!*.provisionprofile" ":!bin/merlin" ":!system/test-merlin.sh" ":!system/architecture.md" || true', { cwd: ROOT }) || '';
+  const grepOut = shSafe(`git grep -l -E "${HOME}/Dev/Tools/|~/Dev/Tools/|\\$HOME/Dev/Tools/" -- ":!*.png" ":!*.jpg" ":!*.pdf" ":!*.p8" ":!*.provisionprofile" ":!bin/merlin" ":!system/test-merlin.sh" ":!system/architecture.md" ":!system/changelog.md" || true`, { cwd: ROOT }) || '';
   const badPaths = grepOut.split('\n').filter(Boolean);
   add('no Dev/Tools/ residuals in tracked files', badPaths.length === 0,
       badPaths.length ? `found in: ${badPaths.slice(0, 5).join(', ')}${badPaths.length > 5 ? ` (+${badPaths.length-5})` : ''}` : 'clean');
@@ -1130,9 +1307,195 @@ function cmdDoctor(args) {
   const dupes = [...phraseMap.entries()].filter(([_, v]) => v.length > 1);
   add('task phrases are unique', dupes.length === 0, dupes.length ? `shared: ${dupes.map(([p, ts]) => `"${p}" in [${ts.join(',')}]`).join('; ')}` : `${phraseMap.size} unique phrases`);
 
-  // 8. trigger_script paths exist (skip tasks with null trigger_script — those are on-demand dispatch-only entries like mkt-outreach-apply)
+  // 8. trigger_script paths exist (skip tasks with null trigger_script — those are on-demand dispatch-only entries)
   const missingTrigs = tasks.filter(t => t.trigger_script && !fs.existsSync(path.join(ROOT, t.trigger_script))).map(t => t.name);
   add('trigger_script paths exist', missingTrigs.length === 0, missingTrigs.length ? `missing: ${missingTrigs.join(', ')}` : `${tasks.filter(t => t.trigger_script).length} trigger scripts verified`);
+
+  // 8b. trigger scripts are executable. cron-run spawns the script directly (not
+  // `bash script`), so a script lacking the +x bit fails with EACCES/exit 127 and
+  // the job silently never runs while every wiring check above still passes
+  // (a 3-day job outage: a set of per-platform scripts shipped
+  // -rw-r--r-- and failed for 3 days, undetected).
+  const notExec = tasks
+    .filter(t => t.trigger_script && fs.existsSync(path.join(ROOT, t.trigger_script)))
+    .filter(t => { try { return !(fs.statSync(path.join(ROOT, t.trigger_script)).mode & 0o100); } catch { return false; } })
+    .map(t => t.name);
+  add('trigger scripts executable', notExec.length === 0, notExec.length ? `NOT executable (cron-run → EACCES/127): ${notExec.join(', ')} — chmod +x` : `${tasks.filter(t => t.trigger_script).length} trigger scripts +x`);
+
+  // 8c. recent cron-run outcomes. The wiring checks pass even when a job RUNS and
+  // FAILS — only the `cron-runs.jsonl` ledger knows. We flag the high-signal
+  // "could not execute at all" band — exit 126 (not executable) / 127 (spawn
+  // ENOENT/EACCES, bad shebang/interpreter, command-not-found) — for any label
+  // whose most-recent run within 48h is in that band. This is exactly the
+  // EACCES outage class above, with no false positives. We do NOT
+  // flag generic non-zero (exit 1): it's ambiguous — merlin-sync/skills-sync
+  // exit 1 by design (divergence/dirty-tree), conditional reminders exit 1 when
+  // their condition isn't met. Those need per-job logic, not a blanket gate.
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'data/cron-runs.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    const latest = new Map();
+    for (const line of raw) { try { const r = JSON.parse(line); if (r.label && r.start) latest.set(r.label, r); } catch {} }
+    const failing = [...latest.values()]
+      .filter(r => new Date(r.start).getTime() >= cutoff && (r.exit === 126 || r.exit === 127))
+      .map(r => `${r.label}(exit ${r.exit})`);
+    add('recent cron runs executable', failing.length === 0, failing.length ? `couldn't execute (126/127) in last 48h: ${failing.join('; ')} — chmod +x / fix interpreter PATH` : `${latest.size} labels, no exec failures`);
+  } catch (e) { if (e.code !== 'ENOENT') add('recent cron runs executable', false, `cron-runs.jsonl read failed: ${e.message}`); }
+
+  // 8d. trigger scripts have a valid shebang. cron-run spawns scripts directly via
+  // execve, which requires the file to begin with the exact bytes "#!". A script
+  // that is +x but whose first line is malformed (e.g. "#\!/bin/bash" — a stray
+  // backslash from an echo/printf !-escape) throws ENOEXEC at spawn time; cron-run
+  // then crashes BEFORE writing a cron-runs.jsonl entry, so the 126/127 ledger
+  // check (8c) never even sees it — only a static scan catches this class.
+  // (db-retention shipped #\!/bin/bash on 2026-06-08 and silently never ran until
+  // 2026-06-24.) Scan every .sh cron-run executes directly: tasks.json triggers +
+  // any `… -- /Users/…/x.sh` target in the crontab (skips `-- bash -c '…'` lines).
+  const directShTargets = new Set();
+  for (const t of tasks) if (t.trigger_script && t.trigger_script.endsWith('.sh')) directShTargets.add(path.join(ROOT, t.trigger_script));
+  for (const line of cronLines) {
+    const after = line.split(/\s--\s/)[1];
+    const m = after && after.match(/^(\/Users\/\S+\.sh)\b/);
+    if (m) directShTargets.add(m[1]);
+  }
+  const badShebang = [];
+  for (const p of directShTargets) {
+    try {
+      const fd = fs.openSync(p, 'r'); const buf = Buffer.alloc(2);
+      const n = fs.readSync(fd, buf, 0, 2, 0); fs.closeSync(fd);
+      if (n < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) badShebang.push(path.basename(p)); // not "#!"
+    } catch {}
+  }
+  add('trigger scripts have valid shebang', badShebang.length === 0, badShebang.length ? `bad shebang (execve→ENOEXEC, no ledger entry): ${badShebang.join(', ')} — first two bytes must be "#!"` : `${directShTargets.size} direct cron scripts, all shebangs valid`);
+
+  // 8d2. cron-exec'd scripts have a RESOLVABLE interpreter. (8d) proves a file
+  // starts with "#!"; it does not prove the interpreter named there exists on
+  // cron's PATH. `#!/usr/bin/env node` is a perfectly VALID shebang that still
+  // dies with exit 127 under cron, because cron runs with a bare compiled-in
+  // PATH (/usr/bin:/bin — verified 2026-08-05: no PATH= line in the crontab,
+  // and the failure text was literally "env: node: No such file or directory")
+  // while Homebrew's node lives in /opt/homebrew/bin.
+  //
+  // Neither existing check catches this class:
+  //   - (8c) is ledger-based, so it only sees a job AFTER it has already failed,
+  //     and only for jobs run through `cron-run --label` — 31 of 123 entries
+  //     bypass cron-run entirely, and those never reach cron-runs.jsonl at all.
+  //   - (8d) only scans *.sh targets. Both real instances were EXTENSIONLESS
+  //     node scripts, so it never looked at them.
+  // calendar-attendee-audit failed silently every night until 2026-08-05, and
+  // hum-channel-audit carried the same shebang while firing once a year
+  // (0 8 23 6 *) with no --label — a 12-month-invisible breakage. Only a static
+  // scan closes this, which is why it is a sibling of (8d) rather than (8c).
+  //
+  // A shebang only matters when the script is exec'd DIRECTLY. Most Homebrew-node
+  // scripts under cron are safe precisely because their crontab line names
+  // /opt/homebrew/bin/node explicitly and the shebang is never consulted — so a
+  // token preceded by an interpreter (or by a redirect) is skipped, not flagged.
+  // Logic lives in lib/cron-interpreter-check.js so it is unit-testable
+  // (agent/test/cron-interpreter-check.test.mjs covers both real
+  // regressions plus the safe-by-explicit-interpreter case).
+  const { findUnresolvableInterpreters } = require(path.join(ROOT, 'lib/cron-interpreter-check.js'));
+  const { bad: unresolvable, scanned: execScanned } = findUnresolvableInterpreters(cronLines);
+  add("cron-exec'd scripts have a resolvable interpreter", unresolvable.length === 0,
+    unresolvable.length
+      // An `env node` script under cron-run stays red (the wrapper is deliberately
+      // not trusted) but is not said to exit 127 now: it runs while cron-run puts
+      // node on PATH (lib/cron-interpreter-check.js, BUT SAY WHICH).
+      ? `interpreter not on cron's bare PATH: ${unresolvable.map(b => `${b.file} (${b.shebang}${b.wrapperRescued ? '; runs only while cron-run puts node on PATH, exit 127 without it' : ' → exit 127'})`).join('; ')} — hardcode the absolute interpreter path (e.g. #!/opt/homebrew/bin/node)`
+      : `${execScanned.length} directly-exec'd cron scripts, all interpreters resolve`);
+
+  // 8d3. is every ACTIVE crontab entry still a well-formed schedule + command?
+  //
+  // Sibling of (8d2), and a static scan for the same reason: the failure never
+  // reaches the ledger, because a job that cannot run produces no row to fail.
+  //
+  // On 2026-09-05T04:05Z cron-tz-sync matched a DISABLED entry by its --label
+  // and rewrote it positionally, overwriting the `#HUMPAUSE#` marker with the
+  // minute and shifting every remaining field one place right:
+  //     #HUMPAUSE# 0 23 * * * /…/cron-run --label trigger-hum-daily -- …
+  //  →  0 23 23 * * *        /…/cron-run --label trigger-hum-daily -- …
+  // Six fields: cron reads `0 23 23 * *` as the schedule (23:00 on the 23rd)
+  // and the bare `*` as the command, which cannot run. The pause marker is
+  // gone too, so lifting the pause restores every OTHER lane and leaves this
+  // one dead. cron-tz-sync's own guards (added the same day) stop it happening
+  // again; they do not repair a line already damaged, and nothing else looked.
+  // (8c) is ledger-based and sees no failure; (8d)/(8d2) resolve the command's
+  // script and interpreter, and `*` is neither.
+  //
+  // The discriminator is that a schedule field is glyphs only while a command
+  // always contains a letter — zero false positives across all 238 lines of
+  // the live crontab. Logic lives in lib/cron-wellformed-check.js so it
+  // is unit-testable (agent/test/cron-wellformed-check.test.mjs covers
+  // the real regression plus the legal shapes that must stay green).
+  const { findMalformedCronEntries, describeMalformed } = require(path.join(ROOT, 'lib/cron-wellformed-check.js'));
+  const { bad: malformed, scanned: wellformedScanned } = findMalformedCronEntries(cronLines);
+  add('crontab entries are well-formed', malformed.length === 0,
+    malformed.length
+      ? `unrunnable cron entr${malformed.length === 1 ? 'y' : 'ies'} — ${describeMalformed(malformed)}. Repair the line by hand; a shifted schedule also means a pause marker was overwritten.`
+      : `${wellformedScanned} active cron entries, all schedule/command boundaries intact`);
+
+  // 8f. is the shared clone actually committable right now?
+  //
+  // `merlin-commit` is the only sanctioned write path and it can be blocked by
+  // conditions that belong to nobody in particular: an unmerged path left by a
+  // stash pop makes its plain `git commit` refuse for EVERY caller, and a file
+  // another session left staged trips its foreign-file guard (exit 3). Both are
+  // invisible until something tries to commit — and the thing that tries is
+  // usually self-improve-approval-poll landing a card the user has already signed,
+  // which records status "applied" whether or not the commit half succeeded.
+  // Logic lives in lib/repo-committable-check.js so it is unit-testable.
+  try {
+    const { findCommitBlockers, describeBlockers } = require(path.join(ROOT, 'lib/repo-committable-check.js'));
+    const gitRun = (a) => execFileSync('git', a, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const { ok: committable, blockers } = findCommitBlockers(gitRun);
+    add('repo is committable', committable,
+      committable
+        ? 'no unmerged paths, no conflict markers, nothing left staged'
+        : describeBlockers(blockers));
+  } catch (e) {
+    // Deliberately FAILS rather than degrading to green. This check exists
+    // because a blocked commit already reports success everywhere else in the
+    // pipeline; a version of it that answered "fine" whenever it could not run
+    // would reproduce the exact bug class it was written to catch.
+    add('repo is committable', false, `could not determine — ${e.message.split('\n')[0]}`);
+  }
+
+  // 8e. sustained cron-run failures. (8c) only flags the 126/127 "could not execute"
+  // band because a single non-zero exit is ambiguous (merlin-sync/skills-sync exit 1
+  // by design on divergence/dirty-tree; conditional reminders exit 1 until their
+  // condition is met). But a job whose newest run failed AND has failed every run for
+  // a sustained streak is unambiguously stuck — that's how skills-sync sat blocked 37×
+  // overnight 2026-06-24 while every other check stayed green. Flag a label whose
+  // newest run is non-zero with a consecutive-failure streak ≥ 3 (within 48h), excluding
+  // the 126/127 band (8c owns it) and ad-hoc one-shot reminders (UPPERCASE_…_<date>
+  // labels that exit 1 by design while polling for a condition).
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'data/cron-runs.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    const cutoff = Date.now() - 48 * 3600 * 1000;
+    const byLabel = new Map();
+    for (const line of raw) {
+      try {
+        const r = JSON.parse(line);
+        if (r.label && r.start && new Date(r.start).getTime() >= cutoff) {
+          if (!byLabel.has(r.label)) byLabel.set(r.label, []);
+          byLabel.get(r.label).push(r);
+        }
+      } catch {}
+    }
+    const adHoc = /^[A-Z][A-Z0-9_]*_\d{6,}$/;
+    const stuck = [];
+    for (const [label, runs] of byLabel) {
+      if (adHoc.test(label)) continue;
+      let streak = 0; // walk newest→oldest; count consecutive non-zero (non-exec-band) exits
+      for (let i = runs.length - 1; i >= 0; i--) {
+        const ex = runs[i].exit;
+        if (ex === 0 || ex === 126 || ex === 127) break;
+        streak++;
+      }
+      if (streak >= 3) stuck.push(`${label}(${streak}× fail, last exit ${runs[runs.length - 1].exit})`);
+    }
+    add('cron runs not stuck-failing', stuck.length === 0, stuck.length ? `sustained failures (≥3 in a row, last 48h): ${stuck.join('; ')}` : `no label failing ≥3× in a row`);
+  } catch (e) { if (e.code !== 'ENOENT') add('cron runs not stuck-failing', false, `cron-runs.jsonl read failed: ${e.message}`); }
 
   // 9. process-manager running (check HTTP health endpoint — pgrep can't see cross-session processes on macOS)
   const pmHealth = shSafe('curl -sf --max-time 3 http://127.0.0.1:9095/health');
@@ -1143,6 +1506,18 @@ function cmdDoctor(args) {
   add('chat supervisor reachable', !!chatHealth, chatHealth ? 'HTTP 200' : 'unreachable on :9094');
   const opsHealth = fetchJson('http://127.0.0.1:9093/health');
   add('ops supervisor reachable', !!opsHealth, opsHealth ? 'HTTP 200' : 'unreachable on :9093');
+
+  // 10b. WhatsApp channel reachable + paired. Runs as the 5th process-manager
+  // child (Baileys gateway). If the process is up but unpaired, the host_jid
+  // field is null and we need to re-run the pair flow.
+  const waHealth = fetchJson('http://127.0.0.1:9100/health');
+  const waPaired = waHealth && waHealth.host_jid;
+  add('whatsapp-channel reachable + paired', !!waPaired,
+    waPaired
+      ? `paired as ${waHealth.host_jid} (${waHealth.host_name || 'unknown'})`
+      : waHealth
+        ? 'up but unpaired — wa-auth missing or session revoked; re-pair via `npm run pair -- --phone <E164>` in agent/whatsapp-channel'
+        : 'unreachable on :9100 — process-manager should be supervising it; check whatsapp-channel.log');
 
   // 11. MCP configs are valid JSON
   for (const name of ['chat-mcp-config.json', 'mcp-config.json']) {
@@ -1234,25 +1609,89 @@ function cmdDoctor(args) {
   const cdpUp = cdpProbe === '200';
   add('chrome CDP port reachable', cdpUp, cdpUp
     ? 'HTTP 200 on :9222/json/version'
-    : `HTTP ${cdpProbe} on :9222 — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.merlin.chrome-cdp. Browser-automation jobs (broadway-lottery etc.) will skip until this clears.`);
+    : `HTTP ${cdpProbe} on :9222 — automation Chrome not running. Check LaunchAgent: launchctl list | grep com.merlin.chrome-cdp. Browser-automation jobs will skip until this clears.`);
 
   // 15. gog tasks CLI reachable. The 2026-04-29 review documented memories
   // #914/#920 falsely flagging "gog CLI unavailable" because the symlink
   // target was inspected instead of the actual binary. Probe by invoking a
   // no-op subcommand: a non-zero exit surfaces real auth/binary regressions
   // (renamed binary, expired token bucket) without reading the symlink.
-  const gogProbe = shSafe('gog tasks lists --plain --account=${MERLIN_OWNER_EMAIL} --no-input 2>&1 | head -3');
+  const gogProbe = shSafe(`/opt/homebrew/bin/gog tasks lists --plain ${OWNER_EMAIL ? `--account=${OWNER_EMAIL} ` : ''}--no-input 2>&1 | head -3`);
   const gogOk = gogProbe && !/no auth|missing|not found|error/i.test(gogProbe);
   add('gog tasks CLI reachable', !!gogOk, gogOk
     ? `lists fetched (${gogProbe.split('\n').filter(Boolean).length} rows)`
-    : `gog tasks list failed: ${(gogProbe || '<empty>').slice(0, 160)}. Re-auth via 'gog auth add ${MERLIN_OWNER_EMAIL} --services tasks' or fall back to service account.`);
+    : `gog tasks list failed: ${(gogProbe || '<empty>').slice(0, 160)}. Re-auth via 'gog auth add ${OWNER_EMAIL || '<your-account>'} --services tasks' or fall back to service account.`);
+
+  // 16. CI keychain-lock fleet in sync. Every macOS-signing repo on this host
+  // mutates ONE global user keychain search list. When that goes wrong the
+  // symptom is not a build failure — it is login.keychain-db being evicted,
+  // which takes Merlin's Max auth down with "Not logged in" and no API-key
+  // fallback. A defect like this gets copy-pasted across workflows and repos,
+  // so the expensive part is DISCOVERY, not the fix; this check re-runs that
+  // audit continuously. Skipped, not failed, when gh is missing or
+  // unauthenticated (exit 2) — doctor runs on hosts without gh, and a network
+  // hiccup must not read as fleet drift.
+  const kcAudit = installTools("bin/ci-keychain-lock-audit");
+  if (fs.existsSync(kcAudit)) {
+    const kcOut = shSafe(`${kcAudit} 2>&1; echo "EXIT:$?"`) || 'EXIT:2';
+    const kcCode = (kcOut.match(/EXIT:(\d+)\s*$/) || [, '2'])[1];
+    if (kcCode === '2') {
+      add('CI keychain-lock fleet in sync', true, 'skipped (gh unavailable/unauthenticated)');
+    } else if (kcCode === '0') {
+      add('CI keychain-lock fleet in sync', true, 'all signing repos byte-identical + sourcing the helper');
+    } else {
+      const bad = kcOut.split('\n').filter(l => /FAIL/.test(l))
+        .map(l => l.trim().replace(/\s+/g, ' ')).slice(0, 4).join('; ');
+      add('CI keychain-lock fleet in sync', false,
+        `${bad || 'drift detected'}. Run bin/ci-keychain-lock-audit for the full list; re-vendor with 'cp .github/scripts/ci-keychain-lock.sh <repo>/.github/scripts/'. A repo that stops sourcing the helper can evict login.keychain-db and take Max auth down.`);
+    }
+  }
+
+  // 17. one Claude Code on a job's PATH — WARN-level: a latent hazard once no call
+  // site runs a bare `claude`; red would sit in every pre-flight log. No spawn, no network.
+  // Logic: lib/claude-binaries.js (tests/claude-binaries.test.mjs).
+  try {
+    const { findClaudeBinaries, describeClaudeBinaries } = require(path.join(__dirname, '../lib/claude-binaries.js'));
+    const { warn, detail } = describeClaudeBinaries(findClaudeBinaries({ homedir: HOME }), { homedir: HOME });
+    add("one Claude Code on a job's PATH", true, detail, warn);
+  } catch (e) {
+    add("one Claude Code on a job's PATH", true, `could not determine — ${e.message.split('\n')[0]}`, true);
+  }
+
+  // 18 + 19. Landed but not live; code left uncommitted — WARN-level.
+  // A daemon runs the code it started with (one landed fix sat inert in hum-sense
+  // for a week), and an uncommitted edit lives only in the working tree, where a revert or a
+  // failed autostash undoes it (2026-10-10). Read-only: supervisor-code-reload --report.
+  const scr = shSafe(`"${process.execPath}" "${path.join(__dirname, 'supervisor-code-reload')}" --report`, { timeout: 60_000 });
+  let rep = null;
+  try { rep = scr ? JSON.parse(scr) : null; } catch {}
+  if (!rep || !rep.ok) {
+    add('running code matches what landed', true, 'could not determine — supervisor-code-reload --report gave no answer', true);
+  } else {
+    const hour = 3_600_000;
+    const sups = rep.supervisors.filter((s) => s.stale_since && Date.now() - Date.parse(s.stale_since) > hour);
+    const late = [
+      ...rep.late.map((l) => `${l.name} (pid ${l.pid}, up since ${l.started.slice(0, 16)}Z, missing code committed from ${l.since.slice(0, 16)}Z on, newest ${l.newest}; ${l.fix})`),
+      ...sups.map((s) => `${s.agent} supervisor (stale since ${s.stale_since.slice(0, 16)}Z${s.held ? `, reload held: ${s.held}` : ''}; merlin restart session)`),
+    ];
+    add('running code matches what landed', true, late.length
+      ? `landed but not live: ${late.join('; ')}`
+      : `${rep.running} of ${rep.watched} watched daemons running, each on the code that landed; supervisors current (supervisor-code-reload)`, late.length > 0);
+    if (rep.uncommitted) {
+      const old = rep.uncommitted.code.filter((a) => a.hours > 24);
+      const dataOld = rep.uncommitted.data.filter((a) => a.hours > 24).length;
+      add('no code file uncommitted over 24h', true, (old.length
+        ? `${old.length} code file(s) modified but not committed for over a day; a revert or failed sync would silently undo them: ${old.map((a) => `${a.path} (since ${a.since.slice(0, 16)}Z)`).join(', ')}. Commit each with merlin-commit -m "..." -- <path>.`
+        : `${rep.uncommitted.code.length} code file(s) modified, none known to be over a day.`)
+        + ` Runtime data (data/, not warned): ${rep.uncommitted.data.length} modified, ${dataOld} over a day.`, old.length > 0);
+    }
+  }
 
   if (hasFlag(args, '--json')) { console.log(JSON.stringify(checks, null, 2)); process.exit(checks.every(c => c.ok) ? 0 : 1); }
 
   // --repair: auto-fix repairable drift (schedule mismatches + orphan scripts in cron)
   if (hasFlag(args, '--repair')) {
-    const raw = JSON.parse(fs.readFileSync(TASKS_JSON, 'utf8'));
-    const mutableTasks = raw.tasks;
+    const mutableTasks = loadTasks();
     let repaired = 0;
 
     // Build cron map: triggerBasename -> [schedule strings]
@@ -1313,24 +1752,26 @@ function cmdDoctor(args) {
     }
 
     if (repaired > 0) {
-      fs.writeFileSync(TASKS_JSON, JSON.stringify(raw, null, 2) + '\n');
-      console.log(c.green(`\n  ${repaired} repair(s) applied to tasks.json. Run 'merlin doctor' to verify.`));
+      writeTasks(mutableTasks);
+      console.log(c.green(`\n  ${repaired} repair(s) applied to agent/local/tasks.json. Run 'merlin doctor' to verify.`));
     } else {
       console.log(c.dim('  nothing to repair'));
     }
     process.exit(0);
   }
 
-  let failed = 0;
+  let failed = 0, warned = 0;
   for (const ck of checks) {
-    const mark = ck.ok ? c.green('✓') : c.red('✗');
+    const mark = !ck.ok ? c.red('✗') : ck.warn ? c.yellow('!') : c.green('✓');
     console.log(`${mark} ${c.bold(ck.name)}`);
     console.log(`  ${c.dim(ck.detail)}`);
     if (!ck.ok) failed++;
+    else if (ck.warn) warned++;
   }
   console.log('');
-  if (failed === 0) console.log(c.green(`${checks.length}/${checks.length} checks passed`));
-  else { console.log(c.red(`${failed}/${checks.length} checks FAILED`)); process.exit(1); }
+  const warnSuffix = warned ? c.yellow(` (${warned} warning${warned === 1 ? '' : 's'})`) : '';
+  if (failed === 0) console.log(c.green(`${checks.length}/${checks.length} checks passed`) + warnSuffix);
+  else { console.log(c.red(`${failed}/${checks.length} checks FAILED`) + warnSuffix); process.exit(1); }
 }
 
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
@@ -1429,8 +1870,13 @@ function cmdHum(args) {
     learn: cmdHumLearn,
     learnings: cmdHumLearnings,
     situation: cmdHumSituation,
+    sense: cmdHumSense,
     insight: cmdHumInsight,
     audit: cmdHumAudit,
+    reactions: cmdHumReactions,
+    signal: cmdHumSignal,
+    intervention: cmdHumIntervention,
+    lane: cmdHumLane,
   };
   const fn = subs[sub];
   if (!fn) die(`unknown: hum ${sub}. Try: merlin hum help`);
@@ -1452,7 +1898,12 @@ function cmdHumHelp() {
   console.log('  learn <id> <answer>          record a manual answer for the pending question');
   console.log('  learnings [--tail N]         tail hum-learnings.jsonl (default 10)');
   console.log('  situation [--json]           composite snapshot: where/env/time/now/next/working-on');
+  console.log('  sense [status|once|sensors|tail|emit ...]   situational trigger engine (default: status)');
   console.log('  insight [--since Nd]         aggregate last N days of tick traces into metrics (default 7d)');
+  console.log('  reactions [--since Nd] [--json]  per-lane reaction-rate (surfaced/reacted/positive) from hum-feedback.jsonl');
+  console.log('  signal [--since Nd] [--lane <name>] [--json]  weighted signal dashboard (love=2x, up=1x; canonical: hum-improvement-loop.md)');
+  console.log('  intervention list | record | measure  hum-improvement-loop intervention attribution ledger');
+  console.log('  lane status | enable <name> [reason] | disable <name> [reason]  manual lever for auto-quiesce (2 consecutive expired-unanswered lane_diagnosis questions pauses a lane)');
   console.log('  audit [--window 24h|7d] [--json]  drift check: outcome.sent count vs hum-feedback entries\n');
   console.log(c.dim('State files:'));
   console.log(c.dim(`  ${HUM_STATE}`));
@@ -1471,7 +1922,7 @@ function cmdHumStatus(args) {
   } else {
     console.log(`  state:   ${c.green('active')}`);
   }
-  const minIntMin = s.min_ping_interval_minutes ?? 60;
+  const minIntMin = enforcedPingCaps().minIntervalMin; // the code-enforced budget (lib/ping-budget.mjs)
   if (s.last_ping_at) {
     const lastPingMs = Date.now() - new Date(s.last_ping_at).getTime();
     const minMs = minIntMin * 60 * 1000;
@@ -1483,7 +1934,7 @@ function cmdHumStatus(args) {
     }
   }
   const today = s.today || {};
-  const cap = s.max_pings_per_day ?? 4;
+  const cap = enforcedPingCaps().maxPerDay; // the code-enforced budget (lib/ping-budget.mjs)
   const capColor = (today.pings || 0) >= cap ? c.red : c.green;
   const runs = today.runs || 0;
   const pings = today.pings || 0;
@@ -1554,7 +2005,22 @@ function humFeedbackLockAcquire(timeoutMs = 5000) {
 }
 function humFeedbackLockRelease() { try { fs.rmdirSync(HUM_FEEDBK_LOCK); } catch {} }
 
-function cmdHumFeedback(args) {
+// Maps a normalized tapback token (see HUM_REACTION_ALIASES) to the
+// disposition/reaction_token vocabulary shared by suggestion-history.mjs and
+// hum-responses.mjs, so a one-word reaction scores the same as its
+// conversational equivalent ("more"/heart = love-strength, "helpful"/thumbs-up
+// = up-strength — matches the split suggestion-classify already uses).
+function humReactionToDisposition(norm) {
+  switch (norm) {
+    case 'helpful': return { disposition: 'positive', reaction_token: 'up' };
+    case 'more':    return { disposition: 'positive', reaction_token: 'love' };
+    case 'skip':    return { disposition: 'negative', reaction_token: 'down' };
+    case 'snooze':  return { disposition: 'snoozed', reaction_token: 'snooze' };
+    default:        return { disposition: null, reaction_token: null };
+  }
+}
+
+async function cmdHumFeedback(args) {
   let pingId = args[0];
   const reaction = args[1];
   if (!pingId || !reaction) die('hum feedback <ping-id|last> <reaction>');
@@ -1585,6 +2051,7 @@ function cmdHumFeedback(args) {
   }
 
   let found = false;
+  let matchedEntry = null;
   const out = lines.map(line => {
     if (!line.trim()) return line;
     try {
@@ -1593,6 +2060,7 @@ function cmdHumFeedback(args) {
         r.reaction = norm;
         r.reaction_at = new Date().toISOString();
         found = true;
+        matchedEntry = r;
         return JSON.stringify(r);
       }
       return line;
@@ -1611,6 +2079,52 @@ function cmdHumFeedback(args) {
     humFeedbackLockRelease();
   }
   console.log(`${c.green('Recorded')} reaction "${norm}" for ${pingId}`);
+
+  // Dual-log write: a tapback/reaction-word reply ("helpful"/"skip"/"snooze"/
+  // "more") used to only flip `reaction` on the matching hum-feedback.jsonl
+  // row above. That left hum-responses.jsonl (overnight consolidation + same-
+  // day re-ask suppression) and suggestion-history.jsonl (the signal tracker
+  // hum-improvement-loop scores read) blind to every reaction-word reply —
+  // only free-text replies through suggestion-classify wrote those. Mirror
+  // that path here so both mechanisms see the same reply regardless of shape.
+  // (Fixed after hum's "ideas" lane reported 11 pings/0
+  // reactions when at least 4 had actually gotten a "helpful".)
+  const headline = (matchedEntry?.findings || [])[0] || null;
+  const subjectKey = headline?.subject_key || headline?.dedup_key || null;
+  const display = headline?.subject_display || headline?.signal?.slice(0, 80) || null;
+  const { disposition, reaction_token } = humReactionToDisposition(norm);
+  try {
+    const { appendResponse } = await import(path.join(TOOLS, 'lib/hum-responses.mjs'));
+    appendResponse({
+      ping_id: pingId,
+      lane: matchedEntry?.lane || null,
+      subject: display,
+      subject_key: subjectKey,
+      ping_text: display,
+      reply_text: reaction,
+      disposition,
+      source: 'tapback_merlin_cli',
+    });
+  } catch (e) {
+    console.error(c.dim(`  (hum-responses capture warn: ${e.message})`));
+  }
+  if (subjectKey && disposition) {
+    try {
+      const { appendReaction } = await import(path.join(TOOLS, 'lib/suggestion-history.mjs'));
+      appendReaction({
+        subject_key: subjectKey,
+        disposition,
+        reaction_token,
+        reason: null,
+        reason_detail: null,
+        source: 'phone_tapback',
+        evidence: reaction,
+        message_id: null,
+      });
+    } catch (e) {
+      console.error(c.dim(`  (suggestion-history capture warn: ${e.message})`));
+    }
+  }
 
   // Reinforcement loop: if the ping originated from an idea, append the
   // reaction to hum-ideas.jsonl so the next ideation run can read it and
@@ -1657,10 +2171,13 @@ function cmdHumRuns(args) {
       return {
         ts: String(r.ts || '').slice(0, 19),
         mode: modeColor(r.mode || '?'),
-        lane: r.lane_rotated || '—',
-        top: r.top_score != null ? r.top_score.toFixed(2) : '—',
-        decision: r.decision || '—',
-        reason: r.deferral_reason || c.dim('—'),
+        // Current trace (hum.md Step 4) nests the ranker verdict under
+        // `sonnet.*`; the flat top_score/decision/deferral_reason fields are
+        // the pre-2026-07 shape, kept as a fallback for old rows.
+        lane: (r.sonnet && r.sonnet.based_on_topic) || r.lane_rotated || '—',
+        top: (() => { const s = r.sonnet && typeof r.sonnet.score === 'number' ? r.sonnet.score : r.top_score; return typeof s === 'number' ? s.toFixed(2) : '—'; })(),
+        decision: (r.sonnet && r.sonnet.decision) || r.decision || '—',
+        reason: (r.sonnet && r.sonnet.silent_root_cause) || (r.outcome && r.outcome.downgrade_reason) || r.deferral_reason || c.dim('—'),
       };
     } catch { return { ts: c.dim('(unparsable)'), mode: '', lane: '', top: '', decision: '', reason: '' }; }
   });
@@ -1705,13 +2222,23 @@ function cmdHumTest(args) {
   console.log(c.green('Dispatched.') + ' Tail progress: ' + c.dim('merlin hum runs --tail 5'));
 }
 
+// Passthrough to the situational trigger engine — `merlin hum sense status`
+// is the same thing as `hum-sense status`, and lives here so the whole hum
+// subsystem is discoverable from one place.
+function cmdHumSense(args) {
+  const { spawnSync } = require('child_process');
+  const r = spawnSync(path.join(TOOLS, 'bin/hum-sense'), args.length ? args : ['status'], { stdio: 'inherit' });
+  process.exit(r.status ?? 0);
+}
+
 function cmdHumTune(args) {
   const s = loadHumState();
   console.log(c.bold('Hum tuning') + '\n');
-  console.log(`  min_ping_interval_minutes: ${s.min_ping_interval_minutes ?? 60}`);
-  console.log(`  max_pings_per_day: ${s.max_pings_per_day ?? 4}`);
+  console.log(`  min_ping_interval_minutes: ${enforcedPingCaps().minIntervalMin}`);
+  console.log(`  max_pings_per_day: ${enforcedPingCaps().maxPerDay}`);
   console.log(`  schema_version: ${s.schema_version ?? 1}`);
-  console.log(c.dim('\nTo edit: modify ' + HUM_STATE + ' directly and save.'));
+  console.log(c.dim('\nThe ping budget is enforced in code (lib/ping-budget.mjs; env HUM_MAX_PINGS_PER_DAY /'));
+  console.log(c.dim('HUM_MIN_PING_INTERVAL_MIN); the two fields in ' + HUM_STATE + ' are ignored.'));
   console.log(c.dim('Weekly hum-review proposes tuning based on reactions + answer rates.'));
 }
 
@@ -1734,9 +2261,9 @@ function cmdCost(args) {
   console.log(`  entries: ${j.entries || 0}`);
 }
 
-const HUM_PENDING_Q = path.join(HOME, 'dev/merlin/data/hum-pending-question.json');
-const HUM_LEARNINGS = path.join(HOME, 'dev/merlin/data/hum-learnings.jsonl');
-const HUM_ANSWER_BIN = path.join(HOME, 'dev/merlin/bin/hum-answer');
+const HUM_PENDING_Q = installTools("data/hum-pending-question.json");
+const HUM_LEARNINGS = installTools("data/hum-learnings.jsonl");
+const HUM_ANSWER_BIN = installTools("bin/hum-answer");
 
 function cmdHumQuestion(args) {
   try {
@@ -1800,7 +2327,7 @@ function readJsonSafe(p) {
 
 function buildSituation() {
   const fs = require('fs');
-  const tz = readJsonSafe(path.join(TOOLS, 'data/user-timezone.json'))?.timezone || 'America/New_York';
+  const tz = readJsonSafe(path.join(TOOLS, 'data/user-timezone.json'))?.timezone || instance().tz;
   const cursor = readJsonSafe(path.join(TOOLS, 'data/phone-channel-cursor.json'));
   const lastInboundMs = cursor?.lastSeenAt ? Date.now() - new Date(cursor.lastSeenAt).getTime() : null;
   const inboundMinAgo = lastInboundMs !== null ? Math.round(lastInboundMs / 60000) : null;
@@ -1817,27 +2344,39 @@ function buildSituation() {
     ) || 'null');
   } catch {}
 
-  // Sleep/wake inference — actual wake-time today + last-active yesterday
-  // from phone_unlocks + phone_context + merlin_messages. Closes context
-  // gap cg-20260413-02. See lib/sleep-wake.js for source priority.
-  let sleepWake = null;
+  // Sleep/wake — actual wake time today + last-active yesterday, from the
+  // installation's own sleep signal (cliExt().sleepInfo) when it has one.
+  let sleepInfo = null;
   try {
-    sleepWake = JSON.parse(shSafe(
-      `node -e "require('${path.join(TOOLS, 'lib/sleep-wake.js')}').inferToday().then(r=>console.log(JSON.stringify(r)))"`
-    ) || 'null');
+    if (typeof cliExt().sleepInfo === 'function') sleepInfo = cliExt().sleepInfo({ TOOLS, shSafe }) || null;
   } catch {}
 
   // Current location via findme (single call; cached by findme itself)
   let location = null;
   try {
-    const raw = shSafe(`"${path.join(TOOLS, 'bin/findme')}" locate --json`);
+    // `locate me` = the owner's own phone (findme treats it exactly like the owner's name).
+    const raw = shSafe(`"${path.join(TOOLS, 'bin/findme')}" locate me --json`);
     location = JSON.parse(raw || 'null');
+  } catch {}
+
+  // Scheduled presence from the canonical travel timeline — the authoritative
+  // answer to "where is the user". findme is a live GPS/device signal and goes
+  // null whenever the phone is stale, which is exactly when hum most needs to
+  // know: once the situation snapshot carried where_place=null while
+  // `travel where` had the correct city, and hum shipped a ping asserting
+  // a different one. Always resolve it (cheap, one query) and expose it
+  // separately so consumers can tell the GPS reading from the itinerary.
+  let scheduled = null;
+  try {
+    const raw = shSafe(`"${path.join(TOOLS, 'bin/travel')}" where now --json 2>/dev/null`);
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && parsed.metro) scheduled = parsed;
   } catch {}
 
   // Today's git commits (topic extraction)
   let todayCommits = [];
   try {
-    const out = shSafe(`cd ${HOME}/dev/merlin && git log --oneline --since="today 00:00" --no-color 2>/dev/null`);
+    const out = shSafe(`cd ${installRoot()} && git log --oneline --since="today 00:00" --no-color 2>/dev/null`);
     todayCommits = (out || '').trim().split('\n').filter(Boolean).slice(0, 20);
   } catch {}
 
@@ -1845,7 +2384,7 @@ function buildSituation() {
   // subject lines (minus prefixes like "feat:"/"fix:" and small words). Top 5.
   let weekTopics = [];
   try {
-    const raw = shSafe(`cd ${HOME}/dev/merlin && git log --since="7 days ago" --pretty=%s --no-color 2>/dev/null`) || '';
+    const raw = shSafe(`cd ${installRoot()} && git log --since="7 days ago" --pretty=%s --no-color 2>/dev/null`) || '';
     const stop = new Set(['the','and','for','with','from','into','that','this','add','adds','added','fix','fixes','fixed','update','updates','updated','feat','chore','docs','test','tests','when','what','have','has','not','now','new','use','uses','used','one','two','all','any','via','per']);
     const freq = {};
     for (const line of raw.split('\n')) {
@@ -1865,7 +2404,7 @@ function buildSituation() {
     if (w) {
       const parsed = JSON.parse(w);
       const cur = parsed?.currentWeather || parsed?.current || null;
-      if (cur) weather = { temp_f: cur.temperature, condition: cur.conditionCode, uv: cur.uvIndex };
+      if (cur) weather = { temp_f: cur.temperature != null ? (cur.temperature * 9) / 5 + 32 : null, condition: cur.conditionCode, uv: cur.uvIndex };
     }
   } catch {}
 
@@ -1884,7 +2423,7 @@ function buildSituation() {
   // trumps most other candidates).
   let upcomingEvents = [];
   try {
-    const raw = shSafe(`gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 1 --max 20 --json 2>/dev/null`) || '';
+    const raw = shSafe(`/opt/homebrew/bin/gog calendar list ${OWNER_EMAIL ? `--account ${OWNER_EMAIL} ` : ''}--days 1 --max 20 --json 2>/dev/null`) || '';
     const data = JSON.parse(raw || '{}');
     const events = data?.events || data?.items || [];
     const now = Date.now();
@@ -1908,7 +2447,7 @@ function buildSituation() {
   // Due-today + overdue tasks — lightweight counts + top-3 titles
   let dueToday = [], overdueCount = 0;
   try {
-    const plain = shSafe(`gog tasks list @default --plain 2>/dev/null`) || '';
+    const plain = shSafe(`/opt/homebrew/bin/gog tasks list @default --plain 2>/dev/null`) || '';
     const today = new Date().toISOString().slice(0, 10);
     for (const line of plain.split('\n').filter(Boolean)) {
       if (line.includes('completed')) continue;
@@ -1924,13 +2463,53 @@ function buildSituation() {
     dueToday = dueToday.slice(0, 3);
   } catch {}
 
+  // `findme locate --json` emits a LIST of device records — `_print_devices`
+  // does `print(json.dumps(out))` over `matched` — and each record is keyed
+  // `lat`/`lon`, with the reverse-geocoded name under `place`.
+  //
+  // This block read `location.latitude` off the list. Two independent
+  // mismatches (array-vs-object, and latitude-vs-lat), so `where.lat` and
+  // `where.lon` were ALWAYS null on this path — not when the phone went quiet,
+  // always. Every location-aware lane reads those two fields, so `nearby` and
+  // `dining` path (a) could never fire: the 2026-08-04 debug trace shows
+  // "nearby lane itself found nothing" on every single tick, all day, while the
+  // app was posting a fresh fix every few minutes (183 rows into
+  // location_history in 12h, plus lat/lon on every chat message).
+  //
+  // The failure was invisible because `place` still populated — from
+  // `scheduled?.label`, the travel timeline — so the snapshot looked healthy
+  // ("<City>, <Country> — <lodging name>…") while carrying no coordinates at all. It
+  // even self-reported `place_source: "travel_timeline"`, which was the tell.
+  //
+  // findme itself was never the problem: `cmd_locate` already prefers the
+  // Merlin app's live GPS over iCloud and returns without touching Find My.
+  // The consumer just never unwrapped what it handed back.
+  const device = Array.isArray(location) ? location[0] : location;
+  // Accept both spellings so this cannot break again if the emitter changes.
+  const devLat = device?.lat ?? device?.latitude ?? null;
+  const devLon = device?.lon ?? device?.longitude ?? null;
+  const devPlace = device?.place || device?.place_name || device?.placeName || null;
+
   return {
     where: {
-      lat: location?.latitude ?? null,
-      lon: location?.longitude ?? null,
-      place: location?.place_name || location?.placeName || null,
-      companions: location?.companions || [],
-      activity: location?.activity || null,
+      lat: devLat,
+      lon: devLon,
+      // Live device reading first; fall back to the itinerary so `place` is
+      // never null just because the phone went quiet.
+      place: devPlace || scheduled?.label || scheduled?.metro || null,
+      place_source: devPlace ? 'device' : (scheduled ? 'travel_timeline' : null),
+      // Always present when the timeline knows: the AUTHORITATIVE city for
+      // today, independent of GPS freshness. Any candidate asserting the user is
+      // somewhere else is wrong — see lib/claim-facts.mjs.
+      scheduled_metro: scheduled?.metro || null,
+      scheduled_label: scheduled?.label || null,
+      companions: device?.companions || [],
+      activity: device?.activity || null,
+      // Reverse-geocoded country, straight from findme. Cheap to carry and it
+      // is what picks the right Wikipedia edition for local lore lookups — a
+      // local edition often has an article on a small street that en does not.
+      country: device?.country || null,
+      city: device?.city || null,
     },
     environment: {
       weather,
@@ -1945,9 +2524,9 @@ function buildSituation() {
       activity_state: activity.state,
       inbound_min_ago: inboundMinAgo,
       outbound_min_ago: outboundMinAgo,
-      wake_time_today: sleepWake?.wake_time_today || null,
-      sleep_time_yesterday: sleepWake?.sleep_time_yesterday || null,
-      asleep_now: sleepWake?.asleep_now || false,
+      wake_time_today: sleepInfo?.wake_time_today || null,
+      sleep_time_yesterday: sleepInfo?.sleep_time_yesterday || null,
+      asleep_now: sleepInfo?.asleep_now || false,
     },
     now_activity: {
       at_desk_min: atDeskMin,
@@ -2145,11 +2724,18 @@ function cmdHumInsight(args) {
     bucket[d] = (bucket[d] || 0) + 1;
     if (r.outcome?.sent) sent++;
     if (r.outcome?.downgrade_reason) downgrades++;
-    for (const c of (r.harvest?.candidates || [])) {
-      perTopicCandidates[c.topic] = (perTopicCandidates[c.topic] || 0) + 1;
+    // harvest.candidates/errors are normally arrays, but a schema variant has
+    // written `candidates` as an int (a count) — `|| []` doesn't guard a truthy
+    // non-array, so `for...of` on an int throws. Guard with Array.isArray.
+    const cands = Array.isArray(r.harvest?.candidates) ? r.harvest.candidates : [];
+    for (const c of cands) {
+      const t = c && typeof c === 'object' ? c.topic : null;
+      if (t) perTopicCandidates[t] = (perTopicCandidates[t] || 0) + 1;
     }
-    for (const e of (r.harvest?.errors || [])) {
-      perTopicErrors[e.topic] = (perTopicErrors[e.topic] || 0) + 1;
+    const errs = Array.isArray(r.harvest?.errors) ? r.harvest.errors : [];
+    for (const e of errs) {
+      const t = e && typeof e === 'object' ? e.topic : null;
+      if (t) perTopicErrors[t] = (perTopicErrors[t] || 0) + 1;
     }
     if (r.sonnet?.based_on_topic) {
       perTopicWins[r.sonnet.based_on_topic] = (perTopicWins[r.sonnet.based_on_topic] || 0) + 1;
@@ -2165,6 +2751,44 @@ function cmdHumInsight(args) {
   const positiveRate = (positive + negative) ? positive / (positive + negative) : 0;
   const answerRate = bucket.question ? learnings.length / bucket.question : 0;
 
+  // hum-review Step 3 criteria table, computed here (2026-10-04) so the review
+  // turn quotes PASS/FAIL instead of re-deriving arithmetic by hand. Rows that
+  // need a judgement or a source this CLI does not read (attention hit-rate,
+  // LLM-invocation efficiency, the wiki half of memory growth) come back as
+  // status "MODEL" with a note — the review fills those in.
+  const answerMins = learnings
+    .map((l) => (Date.parse(l.answered_at || '') - Date.parse(l.asked_at || '')) / 60000)
+    .filter((m) => Number.isFinite(m) && m >= 0)
+    .sort((a, b) => a - b);
+  const medianAnswerMin = answerMins.length ? answerMins[Math.floor(answerMins.length / 2)] : null;
+  const subjectTicks = {};
+  for (const r of runs) {
+    const subj = r.sonnet?.subject;
+    if (subj && (r.sonnet?.decision === 'info' || r.sonnet?.decision === 'question')) subjectTicks[subj] = (subjectTicks[subj] || 0) + 1;
+  }
+  const dupSubjects = Object.entries(subjectTicks).filter(([, n]) => n > 1).map(([k, n]) => ({ subject: k, ticks: n }));
+  const perTopicAttempts = {};
+  for (const r of runs) {
+    for (const t of Array.isArray(r.harvest?.attempted) ? r.harvest.attempted : []) perTopicAttempts[t] = (perTopicAttempts[t] || 0) + 1;
+  }
+  const errRates = Object.keys(perTopicErrors).map((t) => ({
+    topic: t, errors: perTopicErrors[t], attempts: perTopicAttempts[t] || (perTopicCandidates[t] || 0) + perTopicErrors[t],
+  })).map((x) => ({ ...x, rate: x.attempts ? x.errors / x.attempts : 1 }));
+  const worstErr = errRates.sort((a, b) => b.rate - a.rate)[0] || null;
+  const grade = (value, ok) => (value == null ? 'N/A' : ok ? 'PASS' : 'FAIL');
+  const criteria = [
+    { criterion: 'Silent rate', value: silentRate, target: '>= 0.85', status: grade(silentRate, silentRate >= 0.85) },
+    { criterion: 'Info positive rate', value: (positive + negative) ? positiveRate : null, target: '>= 0.60', status: grade((positive + negative) ? positiveRate : null, positiveRate >= 0.60) },
+    { criterion: 'Info response rate', value: feedback.length ? responseRate : null, target: '>= 0.30', status: grade(feedback.length ? responseRate : null, responseRate >= 0.30) },
+    { criterion: 'Question answer rate', value: bucket.question ? answerRate : null, target: '>= 0.40', status: grade(bucket.question ? answerRate : null, answerRate >= 0.40) },
+    { criterion: 'Median time-to-answer (min)', value: medianAnswerMin, target: '<= 30', status: grade(medianAnswerMin, medianAnswerMin <= 30) },
+    { criterion: 'Subject dedup', value: dupSubjects.length, detail: dupSubjects, target: '= 0', status: grade(dupSubjects.length, dupSubjects.length === 0) },
+    { criterion: 'Harvester error rate (worst topic)', value: worstErr ? worstErr.rate : 0, detail: errRates, target: '<= 0.10', status: grade(0, !worstErr || worstErr.rate <= 0.10) },
+    { criterion: 'Memory growth', value: learnings.length, target: '>= 3 per week', status: 'MODEL', note: `hum-learnings rows only (${learnings.length}); add wiki pages updated in-window` },
+    { criterion: 'Attention hit-rate', value: null, target: '>= 0.70', status: 'MODEL', note: 'needs week_commit_topics / upcoming events / 👍-history judgement' },
+    { criterion: 'LLM-invocation efficiency', value: null, target: '>= 0.40', status: 'MODEL', note: 'bash-gated skips live in watchdog.log' },
+  ];
+
   if (hasFlag(args, '--json')) {
     console.log(JSON.stringify({
       window_days: sinceDays,
@@ -2172,7 +2796,9 @@ function cmdHumInsight(args) {
       info_sent: sent, downgrades,
       info_response_rate: responseRate, info_positive_rate: positiveRate,
       questions_asked: bucket.question, questions_answered: learnings.length, answer_rate: answerRate,
+      median_time_to_answer_min: medianAnswerMin,
       per_topic_candidates: perTopicCandidates, per_topic_wins: perTopicWins, per_topic_errors: perTopicErrors,
+      criteria,
     }, null, 2));
     return;
   }
@@ -2207,6 +2833,368 @@ function cmdHumInsight(args) {
     const p90 = scoreDist[Math.floor(scoreDist.length * 0.9)];
     console.log('\n  ' + c.bold('Sonnet score distribution') + `  median=${med.toFixed(2)}  p90=${p90.toFixed(2)}  (threshold 0.55)`);
   }
+
+  console.log('\n  ' + c.bold('Intent criteria (hum-review Step 3)'));
+  for (const k of criteria) {
+    const v = k.value == null ? '—' : (typeof k.value === 'number' && !Number.isInteger(k.value) ? k.value.toFixed(2) : String(k.value));
+    const col = k.status === 'PASS' ? c.green : k.status === 'FAIL' ? c.red : c.dim;
+    console.log(`    ${k.criterion.padEnd(36)} ${v.padStart(6)}  ${k.target.padEnd(14)} ${col(k.status)}`);
+  }
+}
+
+// merlin hum reactions — per-lane reaction-rate detection (backloop
+// variant). Hum surfaces a finding through TWO channels, and a lane
+// can live in either, so this reads two ledgers:
+//
+//   1. INFO pings — data/hum-feedback.jsonl, the per-ping ledger every
+//      hum info-send appends to (one row per ping: {ping_id, sent_at, lane,
+//      reaction, reaction_at, ...}) — the same file `merlin hum insight`
+//      already reads. Engagement = a non-null `reaction` (a tapback token).
+//   2. QUESTIONS — data/hum-runs.jsonl rows whose `sonnet.decision` is
+//      "question". These never get a hum-feedback.jsonl row at all; their
+//      answers land in data/hum-learnings.jsonl (written by
+//      bin/hum-answer), keyed by the run's `outcome.question_id`.
+//      Engagement = that id appearing in hum-learnings.jsonl.
+//
+// For each lane in the window:
+//   surfaced  = info_surfaced + question_surfaced
+//   reacted   = info_reacted  + question_answered
+//   positive  = reaction ∈ {helpful, more, 👍}   (same vocabulary as insight)
+//   negative  = reaction ∈ {skip, snooze, 👎, 💤}
+//   other     = engaged without valence — includes every answered question
+//
+// response_rate = reacted / surfaced (how often the user engages with the lane)
+// positive_rate = positive / (positive + negative) (how often engagement is positive)
+//
+// Flags a lane as DECAYING when surfaced >= 3 AND response_rate < 0.10
+// (lots of pings, no engagement) or when info_surfaced >= 5 AND
+// positive_rate < 0.40 (the user reacts but mostly negatively). hum-review
+// reads --json output to surface decay candidates per topic.
+//
+// Previously sourced from data/suggestion-history.jsonl's `kind:"surfaced"`
+// rows keyed by subject_key — but nothing in the current codebase writes that
+// kind (appendSurfaced in lib/suggestion-history.mjs has no callers), so
+// `surfaced` there was frozen near zero while `hum insight` (sourced from
+// hum-runs.jsonl + hum-feedback.jsonl) kept counting normally. That produced
+// the >30x disagreement flagged in the 2026-07-26 hum-review (Proposal 5).
+// hum-feedback.jsonl is populated on every real send and already carries
+// `lane` directly (no subject_key-prefix guessing needed), so it's both the
+// more complete and the simpler source.
+//
+// Questions were folded in on 2026-07-30, closing the successor to that same
+// gap: hum-feedback.jsonl only ever gets a row for an *info* decision, so a
+// lane that mostly asks questions was invisible here. In the 14d to 2026-07-30
+// there were 44 question ticks contributing nothing — `ideas` alone was short
+// 17 real surfacings (8 counted vs 25 actual), and `location_context` had 8
+// sent-and-unanswered questions that the tool could not see at all. A lane
+// the user answers fine through the question channel could therefore be flagged
+// `low_engagement` on the strength of its info pings alone. Three deliberate
+// choices in that fold:
+//   · Only questions with `outcome.sent === true` AND an `outcome.question_id`
+//     count as surfaced. 11 of those 44 were never actually sent (downgraded
+//     by `pending_question_active`, `precheck_suppressed`, `wiki_settled`,
+//     a killed hung send, ...). Counting an unsent question as surfaced would
+//     depress response_rate and manufacture the very false decay signal this
+//     fold exists to remove.
+//   · An answered question counts toward `reacted`/`other`, never
+//     `positive`/`negative`. hum-answer records free text, which carries no
+//     thumbs-up/down valence to read; inventing one would be a fabricated
+//     sentiment score.
+//   · `mostly_negative` therefore still gates on `info_surfaced >= 5`, NOT on
+//     the combined total — preserving its pre-2026-07-30 behavior exactly.
+//     Questions add no valence, so letting them inflate that gate would let a
+//     3-reaction sample trip a valence verdict it is far too small to support.
+function cmdHumReactions(args) {
+  const fsLocal = require('fs');
+  let sinceDays = 7;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)([dh]?)$/);
+      if (m) sinceDays = parseInt(m[1], 10) * (m[2] === 'h' ? 1 / 24 : 1);
+    }
+  }
+  const cutoffMs = Date.now() - sinceDays * 24 * 3600 * 1000;
+  const readJsonl = (p) => {
+    try {
+      return fsLocal.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean)
+        .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter(Boolean);
+    } catch { return null; }
+  };
+  const feedbackAll = readJsonl(HUM_FEEDBK);
+  const runsAll = readJsonl(HUM_RUNS);
+  if (feedbackAll === null && runsAll === null) {
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify({ window_days: sinceDays, lanes: {}, total_surfaced: 0, total_reacted: 0 }, null, 2)); return; }
+    console.log(c.dim(`hum-feedback.jsonl / hum-runs.jsonl not readable; no reactions to summarize.`));
+    return;
+  }
+  const rows = (feedbackAll || []).filter((r) => new Date(r.sent_at || r.ts || 0).getTime() >= cutoffMs);
+  const runs = (runsAll || []).filter((r) => new Date(r.ts || 0).getTime() >= cutoffMs);
+  // Answered-question ids. Deliberately NOT windowed: a question surfaced
+  // inside the window can only have been answered at or after it was asked, so
+  // windowing this set can only produce false negatives (an edge-of-window
+  // question whose answer parses oddly), never false positives. Rows without
+  // an `id` are not question answers at all — hum-learnings.jsonl also carries
+  // canary-feedback/chat rule rows, which carry no id and must not count.
+  const answeredIds = new Set((readJsonl(HUM_LEARNINGS) || []).map((r) => r.id).filter(Boolean));
+
+  // Same reaction-token vocabulary `cmdHumInsight` uses, so the two commands
+  // never disagree on what counts as positive vs. negative.
+  const POSITIVE_TOKENS = ['helpful', 'more', '👍'];
+  const NEGATIVE_TOKENS = ['skip', 'snooze', '👎', '💤'];
+
+  // One row per real send — no subject-centric dedup needed (unlike the old
+  // suggestion-history path, a ping_id here is never double-counted).
+  const lanes = {};
+  const touch = (lane) => {
+    if (!lanes[lane]) lanes[lane] = { info_surfaced: 0, question_surfaced: 0, surfaced: 0, reacted: 0, positive: 0, negative: 0, other: 0 };
+    return lanes[lane];
+  };
+  for (const r of rows) {
+    const lane = r.lane || 'unknown';
+    const slot = touch(lane);
+    slot.info_surfaced += 1;
+    slot.surfaced += 1;
+    if (r.reaction) {
+      slot.reacted += 1;
+      if (POSITIVE_TOKENS.includes(r.reaction)) slot.positive++;
+      else if (NEGATIVE_TOKENS.includes(r.reaction)) slot.negative++;
+      else slot.other++;
+    }
+  }
+  // Question surfacings. Only ones that actually reached the user AND carry an
+  // id we can match an answer against — see the header comment for why an
+  // unsent question must never count as surfaced.
+  for (const r of runs) {
+    if (r.sonnet?.decision !== 'question') continue;
+    const out = r.outcome || {};
+    if (out.sent !== true || !out.question_id) continue;
+    const slot = touch(r.sonnet.based_on_topic || 'unknown');
+    slot.question_surfaced += 1;
+    slot.surfaced += 1;
+    if (answeredIds.has(out.question_id)) {
+      slot.reacted += 1;
+      slot.other += 1; // engaged, but a free-text answer carries no valence
+    }
+  }
+  const totalSurfaced = Object.values(lanes).reduce((a, b) => a + b.surfaced, 0);
+  const totalReacted = Object.values(lanes).reduce((a, b) => a + b.reacted, 0);
+  // Per-lane derived metrics + decay flag.
+  const perLane = {};
+  for (const [lane, s] of Object.entries(lanes)) {
+    const responseRate = s.surfaced ? s.reacted / s.surfaced : 0;
+    const known = s.positive + s.negative;
+    const positiveRate = known ? s.positive / known : null;
+    let decay = null;
+    // `mostly_negative` gates on info_surfaced (the valence-bearing
+    // population), not the combined total — questions contribute no
+    // positive/negative signal, so they must not inflate this gate.
+    if (s.info_surfaced >= 5 && positiveRate !== null && positiveRate < 0.40) decay = 'mostly_negative';
+    else if (s.surfaced >= 3 && responseRate < 0.10) decay = 'low_engagement';
+    perLane[lane] = { ...s, response_rate: responseRate, positive_rate: positiveRate, decay };
+  }
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ window_days: sinceDays, total_surfaced: totalSurfaced, total_reacted: totalReacted, lanes: perLane }, null, 2));
+    return;
+  }
+  console.log(c.bold(`Hum reactions — last ${sinceDays}d`) + '\n');
+  console.log(`  total surfaced: ${totalSurfaced}    total reacted: ${totalReacted}    overall response: ${totalSurfaced ? ((totalReacted / totalSurfaced) * 100).toFixed(0) : 0}%\n`);
+  const laneNames = Object.keys(perLane).sort();
+  if (laneNames.length === 0) { console.log(c.dim('  (no surfaced/reaction rows in window)')); return; }
+  console.log('  LANE             SURF  INFO    Q  RXN  POS  NEG  RESPONSE  POSITIVE  DECAY');
+  for (const lane of laneNames) {
+    const s = perLane[lane];
+    const rr = (s.response_rate * 100).toFixed(0).padStart(3) + '%';
+    const pr = s.positive_rate === null ? ' n/a' : (s.positive_rate * 100).toFixed(0).padStart(3) + '%';
+    const decayCol = s.decay ? c.yellow(s.decay) : '';
+    console.log(`  ${lane.padEnd(16)} ${String(s.surfaced).padStart(4)}  ${String(s.info_surfaced).padStart(4)}  ${String(s.question_surfaced).padStart(3)}  ${String(s.reacted).padStart(3)}  ${String(s.positive).padStart(3)}  ${String(s.negative).padStart(3)}  ${rr.padStart(8)}  ${pr.padStart(8)}  ${decayCol}`);
+  }
+}
+
+// merlin hum signal — the hum-improvement-loop dashboard. Reads the daily
+// time series in data/hum-metrics-state.json (canonical schema in
+// data/hum-improvement-loop.md). Shows today vs 7d rolling vs 30d
+// baseline + per-lane breakdown + open decay events.
+function cmdHumSignal(args) {
+  const fsLocal = require('fs');
+  const STATE = path.join(TOOLS, 'data/hum-metrics-state.json');
+  let sinceDays = 14;
+  let laneFilter = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--since' && args[i + 1]) {
+      const m = args[++i].match(/^(\d+)d?$/); if (m) sinceDays = parseInt(m[1], 10);
+    } else if (args[i] === '--lane' && args[i + 1]) {
+      laneFilter = args[++i];
+    }
+  }
+  let state;
+  try { state = JSON.parse(fsLocal.readFileSync(STATE, 'utf8')); }
+  catch {
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify({ daily: [], decay_events: [] })); return; }
+    console.log(c.dim('hum-metrics-state.json not present yet — run `hum-metrics-collect` first.'));
+    return;
+  }
+  const daily = (state.daily || []).slice(-sinceDays);
+  const decayEvents = (state.decay_events || []).slice(-20);
+  if (hasFlag(args, '--json')) {
+    console.log(JSON.stringify({ daily, decay_events: decayEvents, lane: laneFilter }, null, 2));
+    return;
+  }
+  if (daily.length === 0) { console.log(c.dim('(no daily rows yet)')); return; }
+  const last = daily[daily.length - 1];
+  console.log(c.bold(`Hum signal — last ${sinceDays}d (latest: ${last.date})`) + '\n');
+  // Headline (latest row).
+  const fmt = (n, d = 3) => n === null || n === undefined ? c.dim('n/a') : Number(n).toFixed(d);
+  console.log(c.bold('  Latest day'));
+  console.log(`    surfaced:           ${last.surfaced}`);
+  console.log(`    signal_score_raw:   ${fmt(last.signal_score_raw, 2)}`);
+  console.log(`    signal_per_surfaced:${' '}${fmt(last.signal_per_surfaced)}`);
+  console.log(`    surface_rate:       ${fmt(last.surface_rate)}`);
+  console.log(`    silent_rate:        ${fmt(last.silent_rate)}`);
+  const r7 = last.rolling_7d;
+  const r30 = last.rolling_30d_baseline;
+  if (r7) {
+    console.log(c.bold('\n  Rolling 7d'));
+    console.log(`    signal_per_surfaced:${' '}${fmt(r7.signal_per_surfaced)}    surface_rate: ${fmt(r7.surface_rate)}`);
+  }
+  if (r30) {
+    console.log(c.bold('\n  Rolling 30d baseline'));
+    console.log(`    signal_per_surfaced:${' '}${fmt(r30.signal_per_surfaced)}    surface_rate: ${fmt(r30.surface_rate)}`);
+  }
+  // Per-lane (latest day; or filtered).
+  const lanes = last.lane_yield || {};
+  const laneKeys = Object.keys(lanes).filter(k => !laneFilter || k === laneFilter).sort();
+  if (laneKeys.length) {
+    console.log(c.bold('\n  Per-lane (latest day)'));
+    console.log('    LANE             CAND  SURF  LOVE  UP   DOWN  SNOOZ  SIG/SURF');
+    for (const lane of laneKeys) {
+      const ly = lanes[lane];
+      const rx = ly.reactions || {};
+      const cell = (n) => String(n || 0).padStart(4);
+      const sps = fmt(ly.signal_per_surfaced);
+      console.log(`    ${lane.padEnd(16)} ${cell(ly.candidates)}  ${cell(ly.surfaced)}  ${cell(rx.love)}  ${cell(rx.up)}  ${cell(rx.down)}  ${cell(rx.snooze)}   ${sps.padStart(6)}`);
+    }
+  }
+  // Decay events.
+  if (decayEvents.length) {
+    console.log(c.bold('\n  Recent decay events'));
+    for (const ev of decayEvents) {
+      const ts = (ev.ts || '').slice(0, 19);
+      const lane = ev.lane ? `[${ev.lane}]` : '[global]';
+      const extra = ev.type === 'lane_decay_silent' ? `surfaced=${ev.surfaced_in_window} silent_days=${ev.days_silent}`
+                  : ev.type === 'global_decay_drop' ? `Δ=${ev.delta_pct} today=${ev.today_3d} base=${ev.baseline_7d}`
+                  : ev.type.includes('surface_rate') ? `rolling_3d=${ev.rolling_3d}`
+                  : '';
+      console.log(`    ${c.yellow(ev.type.padEnd(24))} ${lane.padEnd(10)} ${extra}    ${c.dim(ts)}`);
+    }
+  }
+  // Sparkline (signal_per_surfaced over window).
+  const series = daily.map(r => r.signal_per_surfaced).filter(v => v !== null);
+  if (series.length >= 3) {
+    const min = Math.min(...series), max = Math.max(...series);
+    const bars = '▁▂▃▄▅▆▇█';
+    const scale = (max - min) || 1;
+    const spark = daily.map(r => {
+      const v = r.signal_per_surfaced;
+      if (v === null) return c.dim('·');
+      const idx = Math.min(7, Math.floor(((v - min) / scale) * 7));
+      return bars[idx];
+    }).join('');
+    console.log(c.bold('\n  Signal/surfaced trend ') + c.dim(`(min=${fmt(min)}, max=${fmt(max)})`));
+    console.log(`    ${spark}`);
+  }
+}
+
+// merlin hum intervention — attribution ledger for the hum-improvement-loop.
+// Subcommands:
+//   list                     — open + measured interventions
+//   record <id> <hypothesis> — manually add an entry (auto-impl flow does this too)
+//   measure                  — re-run attribution (also runs in hum-metrics-collect --measure)
+function cmdHumIntervention(args) {
+  const fsLocal = require('fs');
+  const LEDGER = path.join(TOOLS, 'data/hum-interventions.jsonl');
+  const sub = args[0];
+  if (!sub || sub === 'list' || sub === 'help' || sub === '--help') {
+    let rows = [];
+    try { rows = fsLocal.readFileSync(LEDGER, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)); }
+    catch { rows = []; }
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(rows, null, 2)); return; }
+    if (rows.length === 0) { console.log(c.dim('(no interventions logged yet)')); return; }
+    console.log(c.bold(`Hum interventions (${rows.length})`) + '\n');
+    for (const r of rows) {
+      const m = r.measurement;
+      const verdict = m ? `${m.verdict} (Δ=${m.delta_signal_per_surfaced})` : c.yellow('pending');
+      console.log(`  ${c.bold(r.id)}  ${r.lane || 'global'}  ${verdict}`);
+      console.log(`    applied: ${r.applied_at}  commit: ${(r.commit || '').slice(0,7)}`);
+      console.log(`    ${r.hypothesis || ''}\n`);
+    }
+    return;
+  }
+  if (sub === 'record') {
+    const id = args[1]; const hypothesis = args.slice(2).join(' ');
+    if (!id || !hypothesis) die('hum intervention record <id> <hypothesis>');
+    const row = {
+      id, applied_at: new Date().toISOString(),
+      commit: (require('child_process').execSync('git rev-parse --short HEAD').toString().trim()),
+      lane: null, hypothesis, predicted_effect: {},
+      baseline_window: null,
+      measure_at: new Date(Date.now() + 7 * 86400 * 1000).toISOString(),
+    };
+    fsLocal.appendFileSync(LEDGER, JSON.stringify(row) + '\n');
+    console.log(`recorded ${id}`);
+    return;
+  }
+  if (sub === 'measure') {
+    const { spawnSync } = require('child_process');
+    const collect = path.join(TOOLS, 'bin/hum-metrics-collect');
+    if (!fs.existsSync(collect)) die('hum intervention measure: this installation has no bin/hum-metrics-collect');
+    const r = spawnSync(collect,
+      ['--measure', '--dry-run'], { encoding: 'utf8' });
+    if (r.stdout) process.stdout.write(r.stdout);
+    if (r.stderr) process.stderr.write(r.stderr);
+    return;
+  }
+  die(`unknown: hum intervention ${sub}. Try: list | record | measure`);
+}
+
+// merlin hum lane — manual lever for the auto-quiesce mechanism
+// (lib/hum-lane-quiesce.mjs). hum-sense's own housekeeping already
+// auto-quiesces a lane after 2 consecutive expired-unanswered lane_diagnosis
+// questions and auto-re-enables it on a positive reaction; this is the
+// explicit path for "bring back <lane>" or a manual pause, same shared
+// library so both mechanisms log to the same state + intervention ledger.
+async function cmdHumLane(args) {
+  const { quiesceLane, reenableLane, laneQuiesceStatus } =
+    await import(path.join(TOOLS, 'lib/hum-lane-quiesce.mjs'));
+  const sub = args[0];
+  if (!sub || sub === 'status' || sub === 'help' || sub === '--help') {
+    const rows = laneQuiesceStatus();
+    if (hasFlag(args, '--json')) { console.log(JSON.stringify(rows, null, 2)); return; }
+    console.log(c.bold('Hum lanes') + '\n');
+    for (const r of rows) {
+      const state = r.enabled ? c.green('enabled') : c.yellow('disabled');
+      const streak = r.consecutive_expired ? c.dim(`  (unanswered streak: ${r.consecutive_expired})`) : '';
+      console.log(`  ${r.lane.padEnd(18)} ${state}${streak}`);
+      if (!r.enabled && r.quiesced_reason) console.log(c.dim(`    ${r.quiesced_reason}`));
+    }
+    return;
+  }
+  const lane = args[1];
+  if (!lane) die(`hum lane ${sub}: lane name required. Try: merlin hum lane status | enable <name> [reason] | disable <name> [reason]`);
+  const reason = args.slice(2).join(' ') || null;
+  if (sub === 'enable') {
+    const result = reenableLane(lane, reason);
+    if (!result) { console.log(c.red(`unknown lane: ${lane}`)); return; }
+    console.log(result.changed ? c.green(`${lane} re-enabled.`) : c.dim(`${lane} was already enabled.`));
+    return;
+  }
+  if (sub === 'disable') {
+    const result = quiesceLane(lane, reason);
+    if (!result) { console.log(c.red(`unknown lane: ${lane}`)); return; }
+    console.log(result.changed ? c.yellow(`${lane} disabled.`) : c.dim(`${lane} was already disabled.`));
+    return;
+  }
+  die(`unknown: hum lane ${sub}. Try: status | enable <name> [reason] | disable <name> [reason]`);
 }
 
 // Infer the user's current activity state from existing signals. Reads
@@ -2215,11 +3203,11 @@ function cmdHumInsight(args) {
 // trigger-hum.sh as a soft gate and exposed here for ad-hoc inspection.
 function inferActivityState() {
   const fs = require('fs');
-  const dataDir = `${process.env.MERLIN_HOME || `${process.env.HOME}/Dev/merlin`}/data`;
+  const dataDir = path.join(TOOLS, 'data');
   const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
   const cursor = readJson(`${dataDir}/phone-channel-cursor.json`);
   const tzdata = readJson(`${dataDir}/user-timezone.json`);
-  const tz = (tzdata && tzdata.timezone) || 'America/New_York';
+  const tz = (tzdata && tzdata.timezone) || instance().tz;
   const lastSeenAt = cursor && cursor.lastSeenAt ? new Date(cursor.lastSeenAt) : null;
   const ageMin = lastSeenAt ? Math.round((Date.now() - lastSeenAt.getTime()) / 60000) : null;
   const localHour = parseInt(
@@ -2228,6 +3216,18 @@ function inferActivityState() {
   );
   let state = 'active';
   let reason = `${localHour}:00 local, inbound ${ageMin ?? '?'}m ago`;
+
+  // A device signal the installation has (cliExt().activityOverride: the phone
+  // locked since bed hours → sleeping, whatever the clock says) beats the clock
+  // rules below; no signal, or a stale one, falls through to them.
+  let override = null;
+  try {
+    if (typeof cliExt().activityOverride === 'function') override = cliExt().activityOverride({ tz, localHour, ageMin, dataDir, readJson });
+  } catch {}
+  if (override && override.state) {
+    return { state: override.state, last_inbound_min_ago: ageMin, local_hour: localHour, local_tz: tz, reason: override.reason };
+  }
+
   if (localHour >= 1 && localHour < 7) {
     state = 'sleeping';
     reason = `sleep window ${localHour}:00 local`;
@@ -2276,987 +3276,91 @@ function cmdActivity(args) {
 }
 
 // ========================================================================
-// BOOTSTRAP / RUN-LOOP SUBCOMMANDS
-// ========================================================================
-
-function cmdInit(args) {
-  // Interactive config wizard. Writes ROOT/.env (unless --force, asks before overwrite).
-  // Generates a webhook-token. Creates required data/ subdirs.
-  const readline = require('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = (q, def = '') => new Promise(r =>
-    rl.question(`  ${q}${def ? c.dim(` [${def}]`) : ''}: `, ans => r(ans.trim() || def))
-  );
-  const envPath = path.join(ROOT, '.env');
-  const force = hasFlag(args, '--force');
-
-  (async () => {
-    console.log(c.bold('Merlin init') + ' — interactive config\n');
-
-    if (fs.existsSync(envPath) && !force) {
-      const ans = await ask('.env already exists. Overwrite? (yes/no)', 'no');
-      if (!/^y(es)?$/i.test(ans)) { console.log(c.dim('  aborted — .env left alone')); rl.close(); return; }
-    }
-
-    console.log(c.dim('  press Enter to accept defaults; leave fields blank for optional integrations\n'));
-
-    const env = {};
-    env.MERLIN_HOME = await ask('MERLIN_HOME (absolute path to this clone)', ROOT);
-
-    console.log(c.bold('\n  Anthropic auth'));
-    console.log(c.dim('  Mode 1: paste an API key  ·  Mode 2: leave blank and use `claude` login (Max subscription)'));
-    env.ANTHROPIC_API_KEY = await ask('ANTHROPIC_API_KEY', '');
-
-    console.log(c.bold('\n  Identity'));
-    env.MERLIN_OWNER_EMAIL = await ask('Your primary email', '');
-    env.MERLIN_OWNER = await ask('GitHub username / owner', '');
-
-    console.log(c.bold('\n  Webhook channel'));
-    const crypto = require('crypto');
-    env.WEBHOOK_TOKEN = crypto.randomBytes(32).toString('hex');
-    console.log(c.dim(`  generated WEBHOOK_TOKEN (random)`));
-
-    console.log(c.bold('\n  Optional integrations') + c.dim(' (leave blank to skip; you can add later by editing .env)'));
-    env.SUPABASE_URL = await ask('SUPABASE_URL', '');
-    if (env.SUPABASE_URL) {
-      env.SUPABASE_SERVICE_ROLE_KEY = await ask('SUPABASE_SERVICE_ROLE_KEY', '');
-      env.MERLIN_SUPABASE_PROJECT = await ask('MERLIN_SUPABASE_PROJECT (project-ref)', '');
-    }
-    env.OLLAMA_URL = await ask('OLLAMA_URL', 'http://127.0.0.1:11434');
-    env.LOCAL_LLM_MODEL = await ask('LOCAL_LLM_MODEL', 'gemma3:4b');
-    env.LOCAL_EMBED_MODEL = await ask('LOCAL_EMBED_MODEL', 'nomic-embed-text');
-
-    // Telemetry consent — fully transparent, default-on but with an obvious
-    // opt-out. We fire one POST per host (see sendInstallPing below) with no
-    // PII and no raw IP — see apps/telemetry/README.md for the exact payload.
-    console.log(c.bold('\n  Telemetry'));
-    console.log(c.dim('  One anonymous "first-run" ping helps us see how many people are')
-                + c.dim('\n  actually installing Merlin. No PII, no raw IP, no environment')
-                + c.dim('\n  contents. Source: apps/telemetry/api/ping.ts. Skip with N.'));
-    const telemetryAns = await ask('Send anonymous install ping? (Y/n)', 'Y');
-    env.MERLIN_TELEMETRY = /^n(o)?$/i.test(telemetryAns) ? 'off' : 'on';
-
-    rl.close();
-
-    const lines = [
-      '# Merlin environment — generated by `merlin init`. Edit anytime.',
-      `# Generated ${new Date().toISOString()}`,
-      '',
-      ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
-      '',
-    ];
-    fs.writeFileSync(envPath, lines.join('\n'));
-
-    // Create runtime dirs
-    for (const d of ['data', 'data/hum-cache', 'logs', 'agent/logs', 'agent/logs/supervisor-ops', 'agent/logs/supervisor-chat', 'agent/supervisor/state/ops', 'agent/supervisor/state/chat', 'secrets', 'credentials']) {
-      fs.mkdirSync(path.join(ROOT, d), { recursive: true });
-    }
-    // Write the webhook token to the secrets dir (scripts read this directly)
-    fs.writeFileSync(path.join(ROOT, 'secrets', 'webhook-token'), env.WEBHOOK_TOKEN + '\n');
-
-    // Seed runtime config from examples/, but never overwrite existing files —
-    // the user may have customized them between init runs.
-    const seedMap = [
-      ['examples/hum-interests.example.json', 'data/hum-interests.json'],
-      ['examples/hum-intent.example.md',      'data/hum-intent.md'],
-      ['examples/user-timezone.example.json', 'data/user-timezone.json'],
-    ];
-    const seeded = [];
-    for (const [src, dst] of seedMap) {
-      const dstAbs = path.join(ROOT, dst);
-      if (fs.existsSync(dstAbs)) continue;
-      const srcAbs = path.join(ROOT, src);
-      if (!fs.existsSync(srcAbs)) continue;
-      fs.copyFileSync(srcAbs, dstAbs);
-      seeded.push(dst);
-    }
-
-    console.log(c.green('\n  ✓ .env written'));
-    console.log(c.green('  ✓ data/, logs/, supervisor state/, secrets/ created'));
-    console.log(c.green('  ✓ webhook-token written to secrets/webhook-token'));
-    if (seeded.length) {
-      console.log(c.green('  ✓ seeded ' + seeded.length + ' runtime config files from examples/:'));
-      for (const s of seeded) console.log(c.dim('      ' + s));
-    }
-    console.log(c.dim('\nNext: ') + c.bold('./bin/merlin up'));
-    console.log(c.dim('See docs/hum.md + docs/memory.md to populate the ambient-awareness loop + memory layer.'));
-
-    // Fire-and-forget install ping. Never blocks, never errors out the
-    // install, and is a complete no-op if the user opted out above.
-    if (env.MERLIN_TELEMETRY === 'on') {
-      sendInstallPing('fresh-install').catch(() => {});
-    }
-  })().catch(err => { console.error(c.red('Error: ') + err.message); process.exit(1); });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Install telemetry — see apps/telemetry/ for the receiving end and the
-// privacy posture. Honors `MERLIN_NO_TELEMETRY=1` (env) and the
-// `MERLIN_TELEMETRY=off` value the init wizard writes to .env. Idempotent —
-// per-host, fires at most once per `bin/merlin install` ctx via the touchfile
-// `data/.install-pinged-<ctx>`.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// The deployed Vercel URL goes here after `cd apps/telemetry && vercel --prod`.
-// Forks of merlin can either repoint this at their own deploy, set
-// MERLIN_TELEMETRY_URL=… at install time, or leave MERLIN_NO_TELEMETRY=1 set.
-const DEFAULT_TELEMETRY_URL = 'https://merlin-telemetry.vercel.app/install';
-
-async function sendInstallPing(ctx) {
-  // Hard kill switches — checked again here even though cmdInit also checks,
-  // so callers that fire pings outside cmdInit still get the same gates.
-  if (process.env.MERLIN_NO_TELEMETRY === '1') return;
-  try {
-    const envText = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
-    if (/^MERLIN_TELEMETRY=off$/m.test(envText)) return;
-  } catch { /* no .env yet — that's fine, only relevant inside cmdInit */ }
-
-  // One ping per (host, ctx). Re-running `merlin init --force` with the same
-  // ctx is treated as the same install for telemetry purposes.
-  const touch = path.join(ROOT, 'data', `.install-pinged-${ctx}`);
-  try { if (fs.existsSync(touch)) return; } catch {}
-
-  const cryptoMod = require('crypto');
-  const hostFp = cryptoMod
-    .createHash('sha256')
-    .update(`${os.hostname()}|${os.userInfo().username || ''}`)
-    .digest('hex')
-    .slice(0, 16);
-
-  let sha = '';
-  try {
-    sha = execSync('git rev-parse --short HEAD', { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] })
-      .toString().trim();
-  } catch {}
-
-  let ver = '';
-  try {
-    ver = require(path.join(ROOT, 'package.json')).version || '';
-  } catch {}
-
-  const url = process.env.MERLIN_TELEMETRY_URL || DEFAULT_TELEMETRY_URL;
-  const payload = JSON.stringify({
-    host_fp: hostFp,
-    os: process.platform,
-    arch: process.arch,
-    ver,
-    sha,
-    ctx,
-  });
-
-  // 3-second hard timeout — telemetry must never make install feel slow.
-  await new Promise((resolve) => {
-    const lib = url.startsWith('https:') ? require('https') : require('http');
-    const u = new URL(url);
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname + u.search,
-        method: 'POST',
-        timeout: 3000,
-        headers: {
-          'content-type': 'application/json',
-          'content-length': Buffer.byteLength(payload),
-          'user-agent': `merlin-cli/${ver || 'dev'} (${process.platform}; ${process.arch})`,
-        },
-      },
-      (res) => { res.resume(); res.on('end', resolve); res.on('error', resolve); }
-    );
-    req.on('timeout', () => { try { req.destroy(); } catch {} resolve(); });
-    req.on('error', resolve);
-    req.write(payload);
-    req.end();
-  });
-
-  // Touchfile written regardless of HTTP outcome — we don't want a flaky
-  // network to cause repeated pings on every re-init.
-  try { fs.mkdirSync(path.dirname(touch), { recursive: true }); fs.writeFileSync(touch, new Date().toISOString() + '\n'); } catch {}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Overlay subcommand — attach a personal-overlay repo onto this merlin clone.
-//
-// `merlin overlay add <path>` walks the personal repo's well-known subdirs and
-// symlinks individual files into the kernel's matching `_ext/` directories
-// plus `local/`. `status` reports active overlays. `sync` re-creates symlinks
-// after the overlay repo changes. `remove` unlinks (leaves the overlay repo
-// untouched).
-//
-// Refuses to symlink anything outside the declared extension surface — see
-// `OVERLAY_MAP` below. This is the safety boundary: a malformed overlay
-// cannot replace kernel code, only extend it.
-//
-// See docs/architecture-public-private.md for the full overlay model.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Source-subdir-in-overlay → destination-subdir-in-merlin. Order matters only
-// for `status` output. Every other path in the overlay repo is ignored.
-const OVERLAY_MAP = [
-  { src: 'CLAUDE.md',           dst: 'local/CLAUDE.md',                              type: 'file' },
-  { src: 'jobs',                dst: 'agent/ops-agent/jobs/_ext',                    type: 'dir'  },
-  { src: 'harvesters',          dst: 'agent/scripts/hum-harvesters/_ext',            type: 'dir'  },
-  { src: 'tools-mcp',           dst: 'agent/tools-mcp/_ext',                         type: 'dir'  },
-  { src: 'bin',                 dst: 'bin/_ext',                                     type: 'dir'  },
-  { src: 'memory-seed',         dst: 'local/memory-seed',                            type: 'dir'  },
-];
-
-const OVERLAY_REGISTRY = path.join(ROOT, 'data', '.overlay-registry.json');
-
-function readOverlayRegistry() {
-  try { return JSON.parse(fs.readFileSync(OVERLAY_REGISTRY, 'utf8')); }
-  catch { return { overlays: [] }; }
-}
-
-function writeOverlayRegistry(reg) {
-  fs.mkdirSync(path.dirname(OVERLAY_REGISTRY), { recursive: true });
-  fs.writeFileSync(OVERLAY_REGISTRY, JSON.stringify(reg, null, 2) + '\n');
-}
-
-// Build the planned symlink list for a given overlay-repo root. Each entry is
-// `{ from: <absolute source>, to: <absolute target in merlin> }`. Files that
-// would land outside the declared OVERLAY_MAP destinations are dropped.
-function planOverlayLinks(overlayRoot) {
-  const plan = [];
-  for (const m of OVERLAY_MAP) {
-    const srcAbs = path.join(overlayRoot, m.src);
-    if (!fs.existsSync(srcAbs)) continue;
-    if (m.type === 'file') {
-      plan.push({ from: srcAbs, to: path.join(ROOT, m.dst) });
-      continue;
-    }
-    // Directory mode — symlink each contained file individually so kernel
-    // `.gitkeep` placeholders in `_ext/` aren't shadowed and so a single
-    // overlay file going missing doesn't take down the whole dir.
-    for (const name of fs.readdirSync(srcAbs)) {
-      if (name.startsWith('.')) continue;            // skip .DS_Store, .git artifacts
-      const from = path.join(srcAbs, name);
-      const to = path.join(ROOT, m.dst, name);
-      // Defense in depth: target must remain inside the declared dst dir.
-      const dstDir = path.resolve(path.join(ROOT, m.dst));
-      if (!path.resolve(to).startsWith(dstDir + path.sep)) continue;
-      plan.push({ from, to });
-    }
-  }
-  return plan;
-}
-
-function applyPlan(plan, { dryRun = false } = {}) {
-  const made = [];
-  for (const link of plan) {
-    fs.mkdirSync(path.dirname(link.to), { recursive: true });
-    try {
-      const lstat = fs.lstatSync(link.to);
-      // If the existing entry is already the symlink we'd create, no-op.
-      if (lstat.isSymbolicLink() && fs.readlinkSync(link.to) === link.from) continue;
-      // Refuse to overwrite a real file — the user wrote something there and
-      // we should not silently destroy it.
-      if (!lstat.isSymbolicLink()) {
-        console.error(c.red('  refuse: ') + `${link.to} is a real file, not a symlink — leaving it alone`);
-        continue;
-      }
-      if (!dryRun) fs.unlinkSync(link.to);
-    } catch { /* ENOENT — fine, we'll create it below */ }
-    if (!dryRun) fs.symlinkSync(link.from, link.to);
-    made.push(link);
-  }
-  return made;
-}
-
-function cmdOverlay(args) {
-  const sub = args[0];
-  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
-    console.log(c.bold('merlin overlay') + ' — personal-overlay management\n');
-    console.log('Usage:');
-    console.log('  merlin overlay add <path>      attach a personal overlay repo (symlinks _ext/ + local/)');
-    console.log('  merlin overlay status          list active overlays + their resolved symlinks');
-    console.log('  merlin overlay sync             re-create symlinks for every registered overlay');
-    console.log('  merlin overlay remove <path>   unlink a previously-added overlay');
-    console.log('\nSee docs/architecture-public-private.md for the full overlay contract.');
-    return;
-  }
-
-  if (sub === 'add') {
-    const target = args[1];
-    if (!target) die('usage: merlin overlay add <path-to-personal-overlay-repo>');
-    const overlayRoot = path.resolve(target.replace(/^~/, HOME));
-    if (!fs.existsSync(overlayRoot)) die(`overlay path not found: ${overlayRoot}`);
-    const reg = readOverlayRegistry();
-    if (reg.overlays.find((o) => o.path === overlayRoot)) {
-      console.log(c.dim(`  already registered: ${overlayRoot} — running sync instead`));
-    } else {
-      reg.overlays.push({ path: overlayRoot, added_at: new Date().toISOString() });
-      writeOverlayRegistry(reg);
-    }
-    const plan = planOverlayLinks(overlayRoot);
-    if (plan.length === 0) {
-      console.log(c.yellow(`  no files to link — does ${overlayRoot} have any of: ${OVERLAY_MAP.map(m => m.src).join(', ')}?`));
-      return;
-    }
-    const made = applyPlan(plan);
-    console.log(c.green(`  ✓ overlay registered: ${overlayRoot}`));
-    console.log(c.green(`  ✓ linked ${made.length} file(s):`));
-    for (const link of made) console.log(c.dim(`      ${path.relative(ROOT, link.to)}  →  ${path.relative(overlayRoot, link.from)}`));
-    return;
-  }
-
-  if (sub === 'sync') {
-    const reg = readOverlayRegistry();
-    if (reg.overlays.length === 0) { console.log(c.dim('  no overlays registered. Use: merlin overlay add <path>')); return; }
-    for (const o of reg.overlays) {
-      const plan = planOverlayLinks(o.path);
-      const made = applyPlan(plan);
-      console.log(c.green(`  ✓ ${o.path}: ${made.length} link(s) updated`));
-    }
-    return;
-  }
-
-  if (sub === 'status') {
-    const reg = readOverlayRegistry();
-    if (reg.overlays.length === 0) { console.log(c.dim('  no overlays registered')); return; }
-    for (const o of reg.overlays) {
-      console.log(c.bold(o.path) + c.dim(`  (added ${o.added_at})`));
-      const plan = planOverlayLinks(o.path);
-      for (const link of plan) {
-        const exists = fs.existsSync(link.to);
-        const correct = exists && fs.lstatSync(link.to).isSymbolicLink() && fs.readlinkSync(link.to) === link.from;
-        const tag = correct ? c.green('linked') : exists ? c.yellow('stale ') : c.red('missing');
-        console.log(`  ${tag}  ${path.relative(ROOT, link.to)}`);
-      }
-    }
-    return;
-  }
-
-  if (sub === 'remove') {
-    const target = args[1];
-    if (!target) die('usage: merlin overlay remove <path>');
-    const overlayRoot = path.resolve(target.replace(/^~/, HOME));
-    const reg = readOverlayRegistry();
-    const before = reg.overlays.length;
-    reg.overlays = reg.overlays.filter((o) => o.path !== overlayRoot);
-    if (reg.overlays.length === before) die(`overlay not registered: ${overlayRoot}`);
-    writeOverlayRegistry(reg);
-    // Unlink everything that points back at this overlay root, anywhere in
-    // the declared dst dirs. We don't recompute the plan — the overlay repo
-    // may already be gone — we just walk the dst dirs and unlink any
-    // symlink whose target starts with overlayRoot + '/'.
-    let removed = 0;
-    for (const m of OVERLAY_MAP) {
-      const dstAbs = path.join(ROOT, m.dst);
-      if (!fs.existsSync(dstAbs)) continue;
-      const entries = m.type === 'file' ? [path.basename(m.dst)] : (fs.readdirSync(path.dirname(dstAbs)).includes(path.basename(dstAbs)) ? fs.readdirSync(dstAbs) : []);
-      for (const name of entries) {
-        const full = m.type === 'file' ? dstAbs : path.join(dstAbs, name);
-        try {
-          const lstat = fs.lstatSync(full);
-          if (!lstat.isSymbolicLink()) continue;
-          if (fs.readlinkSync(full).startsWith(overlayRoot + path.sep) || fs.readlinkSync(full) === overlayRoot) {
-            fs.unlinkSync(full);
-            removed++;
-          }
-        } catch { /* ignore */ }
-      }
-    }
-    console.log(c.green(`  ✓ overlay removed: ${overlayRoot} (${removed} link(s) unlinked)`));
-    return;
-  }
-
-  die(`unknown: overlay ${sub}. Try: merlin overlay help`);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Audit subcommand — periodic-review wrapper around the safety surface.
-//
-// What it checks (and is honest about what it can't):
-//   1. Runs `.tools/sanitize-guard.py --all` to surface any drift between
-//      the current tree and the accepted baseline.
-//   2. Greps the last N commit messages (default 50) against the same
-//      personal-identifier patterns the guard uses on file content —
-//      commit messages aren't scanned by the pre-commit hook today.
-//   3. Reports baseline stats so the user can spot the "growing baseline"
-//      anti-pattern (i.e. accepting hits because they're annoying to fix
-//      rather than because they're intentional public content).
-//   4. Reports the number of tracked files in `local/` or `**/_ext/`
-//      (should always be zero — if not, something bypassed .gitignore).
-//
-// What it cannot check (be honest in the report):
-//   • Narrative/paraphrased personal content (no pattern triggers).
-//   • Past commits already on the public remote — those need history audit
-//     tooling outside this scope; flag it but don't claim coverage.
-//   • Content in forks or archive crawlers.
-//
-// Run cadence: monthly per docs/architecture-public-private.md.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function cmdAudit(args) {
-  const commitsN = parseInt(getFlag(args, '--commits', '50'), 10) || 50;
-  const guard = path.join(ROOT, '.tools/sanitize-guard.py');
-  const baseline = path.join(ROOT, '.tools/sanitize-guard-baseline.json');
-
-  console.log(c.bold('merlin audit') + c.dim(` — public/private boundary review (${new Date().toISOString().slice(0,10)})\n`));
-
-  // ── 1. sanitize-guard --all
-  console.log(c.bold('1. sanitize-guard (all tracked files vs. baseline)'));
-  let guardExit = 0;
-  if (!fs.existsSync(guard)) {
-    console.log(c.red('   guard script missing at .tools/sanitize-guard.py'));
-    guardExit = 2;
-  } else {
-    const result = spawnSync('python3', [guard, '--all'], { stdio: 'inherit', cwd: ROOT });
-    guardExit = result.status ?? 1;
-    if (guardExit === 0) console.log(c.green('   ✓ clean against baseline'));
-  }
-
-  // ── 2. commit message scan
-  console.log('\n' + c.bold(`2. commit message scan (last ${commitsN} commits)`));
-  let commitHits = [];
-  try {
-    const log = execSync(`git log -n ${commitsN} --format="%h%x09%s%x09%b%x1e"`, { cwd: ROOT }).toString();
-    // Read the same pattern set the guard uses by extracting from the JSON
-    // baseline's keys — that always reflects the live PERSONAL_PATTERNS set
-    // (any pattern that has ever fired is in there as a hit-key prefix).
-    let patternNames = [];
-    try {
-      const b = JSON.parse(fs.readFileSync(baseline, 'utf8'));
-      const names = new Set();
-      for (const hits of Object.values(b)) {
-        for (const k of hits) names.add(k.split(':')[0]);
-      }
-      patternNames = [...names];
-    } catch { /* empty baseline = no pattern set yet */ }
-    // Use the guard's --list-patterns output instead — authoritative.
-    let patternMap = {};
-    try {
-      const out = execSync(`python3 ${guard} --list-patterns`, { cwd: ROOT }).toString();
-      for (const line of out.split('\n')) {
-        const m = line.match(/^\s+(\w+)\s+(.+)$/);
-        if (m) patternMap[m[1]] = new RegExp(m[2], 'i');
-      }
-    } catch {}
-    const commits = log.split('\x1e').filter(Boolean);
-    for (const entry of commits) {
-      const [hash, subject, ...bodyParts] = entry.split('\t');
-      const body = bodyParts.join('\t');
-      const text = `${subject}\n${body}`;
-      for (const [name, regex] of Object.entries(patternMap)) {
-        if (regex.test(text)) {
-          commitHits.push({ hash: hash.trim(), pattern: name, line: subject.trim().slice(0, 80) });
-        }
-      }
-    }
-  } catch (err) {
-    console.log(c.red(`   couldn't read git log: ${err.message}`));
-  }
-  if (commitHits.length === 0) {
-    console.log(c.green('   ✓ no personal-identifier hits in recent commit messages'));
-  } else {
-    console.log(c.red(`   ✗ ${commitHits.length} hit(s) in commit messages:`));
-    for (const h of commitHits) {
-      console.log(`     ${c.dim(h.hash)}  [${h.pattern}]  ${h.line}`);
-    }
-    console.log(c.dim('     (note: commit messages live in history forever; sanitization requires'));
-    console.log(c.dim('      rewriting history + force push + asking GitHub to clear caches.)'));
-  }
-
-  // ── 3. baseline drift stats
-  console.log('\n' + c.bold('3. baseline state'));
-  if (!fs.existsSync(baseline)) {
-    console.log(c.dim('   no baseline file — run: .tools/sanitize-guard.py --baseline'));
-  } else {
-    try {
-      const b = JSON.parse(fs.readFileSync(baseline, 'utf8'));
-      const fileCount = Object.keys(b).length;
-      const hitCount = Object.values(b).reduce((s, v) => s + v.length, 0);
-      console.log(`   files with accepted hits: ${fileCount}`);
-      console.log(`   total accepted hits:      ${hitCount}`);
-      console.log(c.dim('   → review periodically — accepting hits should be a deliberate choice, not a habit.'));
-      // Surface the top-3 files by hit count so review is easy.
-      const top = Object.entries(b).map(([f, h]) => [f, h.length]).sort((a, b) => b[1] - a[1]).slice(0, 3);
-      if (top.length) {
-        console.log(c.dim('   top files:'));
-        for (const [f, n] of top) console.log(c.dim(`     ${n.toString().padStart(3)}  ${f}`));
-      }
-    } catch (err) {
-      console.log(c.red(`   couldn't read baseline: ${err.message}`));
-    }
-  }
-
-  // ── 4. tracked-files-in-overlay-dirs check
-  console.log('\n' + c.bold('4. tracked files in overlay locations (should be empty except .gitkeep)'));
-  try {
-    const tracked = execSync(
-      `git ls-files 'local/' 'local/**' '**/_ext/' '**/_ext/**' 2>/dev/null || true`,
-      { cwd: ROOT }
-    ).toString().split('\n').filter(Boolean).filter((f) => !f.endsWith('/.gitkeep'));
-    if (tracked.length === 0) {
-      console.log(c.green('   ✓ clean — no overlay content tracked'));
-    } else {
-      console.log(c.red(`   ✗ ${tracked.length} unexpected tracked file(s) in overlay dirs:`));
-      for (const t of tracked) console.log(`     ${t}`);
-      console.log(c.dim('     (these slipped past .gitignore via `git add -f` or similar; investigate)'));
-    }
-  } catch (err) {
-    console.log(c.dim(`   skip: ${err.message}`));
-  }
-
-  // ── 5. coverage caveats — print every time so it never feels solved
-  console.log('\n' + c.bold('5. what this audit cannot tell you'));
-  console.log(c.dim('   • paraphrased / narrative personal content (no pattern fires)'));
-  console.log(c.dim('   • content already in past commits — only HEAD is scanned by the guard'));
-  console.log(c.dim('   • content in forks, archive crawlers (Software Heritage, etc.), AI'));
-  console.log(c.dim('     training datasets, or GitHub search caches'));
-  console.log(c.dim('   → for narrative leaks, consider an LLM-based PR review pass'));
-  console.log(c.dim('     (`bin/merlin review-pr <N>` not yet built — see roadmap).'));
-
-  // Exit code reflects the strictest finding so audit is callable from CI.
-  const hadFailure = guardExit !== 0 || commitHits.length > 0;
-  process.exit(hadFailure ? 1 : 0);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// review-pr — Layer 6a of the public/private boundary: LLM-based narrative
-// leak detection.
-//
-// The pattern-based sanitize-guard catches *explicit* identifiers (canonical
-// names, addresses, emails, codenames, credentials, paths). It cannot catch
-// content that, without using any flagged token, still uniquely identifies
-// a real person, event, or transaction. Examples:
-//
-//   - "the property I bought in 2024 for $X"
-//   - "my partner's medical condition"
-//   - a code comment dated to a specific personal milestone
-//   - AI-generated docs that paraphrase personal context
-//
-// That's what this subcommand asks Claude to look for.
-//
-// Usage:
-//   merlin review-pr <PR#>             diff via `gh pr diff <N>`
-//   merlin review-pr --file <path>     scan a local file (any text)
-//   merlin review-pr --stdin           read diff from stdin
-//   merlin review-pr <PR#> --json      machine-readable output
-//   merlin review-pr <PR#> --model M   override default model
-//
-// Defaults to claude-haiku-4-5 for cost (a typical PR review runs ~$0.005-$0.02).
-// Requires ANTHROPIC_API_KEY in the env or in .env (set by `merlin init` Mode 1).
-//
-// See docs/architecture-public-private.md § Layer 6a.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const REVIEW_PR_SYSTEM_PROMPT = `You are reviewing a code diff for personal-content leaks that would land in a PUBLIC open-source repository called Merlin. Your job is one thing only: catch personal/identity-coupled content that pattern-based scanners cannot.
-
-## What's already screened (do NOT re-flag)
-
-A pattern-based pre-commit hook (\`.tools/sanitize-guard.py\`) catches these and blocks the commit. Do not flag instances of:
-- Canonical first names, GitHub handles, owner emails
-- Known property names, business names, project codenames
-- Known credentials, third-party service hostnames, known Supabase/GCP project IDs
-- Hardcoded paths like \`/Users/<owner>/\`
-
-If you see these in the diff, they are pre-approved (in the baseline) or will be blocked separately. Do not waste a finding on them.
-
-## What you ARE looking for
-
-Content that, without using any of the above explicit identifiers, still:
-
-1. **Narrative personal context** — descriptions of a specific real person, relationship, household, business operation, or life event that a reader could plausibly tie back to the operator.
-   Examples: "the property I bought in 2024", "my partner runs the ops side", "the apartment we moved into".
-
-2. **Specific financial or transactional detail** — concrete dollar amounts, contract terms, or transaction details that appear personal rather than illustrative.
-   Examples: "the $42,300 settlement", "monthly rent of $4,250", "the 18% commission on the X deal".
-   NOT this: arbitrary numbers in code (port 9090, timeout 5000), illustrative pricing in docs ("$10/month for Pro plan").
-
-3. **Specific dated events** — a date paired with a concrete event that reads as a real autobiographical reference, not a generic example.
-   Examples: "the launch on March 15, 2026", "after the merger in Q3", "since my surgery last spring".
-   NOT this: release dates, copyright years, schema migration timestamps, ISO date format examples.
-
-4. **Geographic specificity that triangulates** — a city + a specific landmark/street/neighborhood/property type that narrows to a real address.
-   Examples: "the 3rd-floor walkup on Chelsea's west side", "our Miami house near the marina".
-   NOT this: generic city names in API examples ("San Francisco, CA").
-
-5. **Relationship reveal** — references to spouse, partner, child, business partner by role even without name.
-   Examples: "my wife handles the books", "the kids' school schedule".
-
-6. **AI-generated text with personal echoes** — auto-written prose (docs, comments, commit messages) that includes uniquely identifying details, even if no single pattern fires.
-
-## What you are NOT looking for
-
-- Generic technical content (port numbers, byte sizes, timeouts, hex colors)
-- Generic examples in docs ("example.com", "Alice and Bob")
-- Sanitized hypotheticals ("Suppose you have 3 properties")
-- Standard open-source boilerplate (MIT license year, contributor guides)
-- Public dates (release of Node.js 22, etc.)
-- Public-facing URLs the project is intentionally publishing (e.g. project marketing links in the README)
-
-## How to calibrate severity
-
-- **high** — would clearly identify a real person/transaction/event to a stranger reading the public repo
-- **medium** — adds personally identifying context that, combined with other public info, could narrow identity
-- **low** — feels personal but is ambiguous; flag for human review
-
-Be honest about uncertainty. If you can't tell whether a passage is generic or personal, mark it **low** and explain the ambiguity. Better to surface a borderline case than silently miss one.
-
-## Output
-
-You MUST emit valid JSON matching the schema provided. \`findings\` may be an empty array. \`summary.verdict\`:
-- **ship** — no findings, or only \`low\` findings that are clearly false-positive territory
-- **review** — at least one \`medium\` or borderline \`high\` finding; human should look
-- **block** — at least one \`high\` finding that should be sanitized before merge`;
-
-const REVIEW_PR_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['findings', 'summary'],
-  properties: {
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['file', 'severity', 'category', 'snippet', 'why', 'suggestion'],
-        properties: {
-          file: { type: 'string', description: 'Path of the file in the diff (use "(unknown)" if not derivable)' },
-          line_hint: { type: 'integer', description: 'Approximate line number, or 0 if unknown' },
-          severity: { type: 'string', enum: ['low', 'medium', 'high'] },
-          category: {
-            type: 'string',
-            enum: [
-              'narrative_personal',
-              'specific_financial',
-              'specific_event',
-              'geographic_reveal',
-              'relationship_reveal',
-              'ai_generated_echo',
-              'other',
-            ],
-          },
-          snippet: { type: 'string', description: 'The exact passage (≤200 chars)' },
-          why: { type: 'string', description: 'One sentence explaining why this is a leak risk' },
-          suggestion: { type: 'string', description: 'How to fix it — generalize, redact, or move to overlay' },
-        },
-      },
-    },
-    summary: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['total_findings', 'highest_severity', 'verdict'],
-      properties: {
-        total_findings: { type: 'integer' },
-        highest_severity: { type: 'string', enum: ['none', 'low', 'medium', 'high'] },
-        verdict: { type: 'string', enum: ['ship', 'review', 'block'] },
-      },
-    },
-  },
-};
-
-const REVIEW_PR_DEFAULT_MODEL = 'claude-haiku-4-5';
-const REVIEW_PR_MAX_DIFF_BYTES = 80 * 1024;        // ~20k tokens — cost cap per call
-const REVIEW_PR_SKIP_PATH_PATTERNS = [
-  /(^|\/)package-lock\.json$/,
-  /(^|\/)yarn\.lock$/,
-  /(^|\/)pnpm-lock\.yaml$/,
-  /(^|\/)Gemfile\.lock$/,
-  /\.gitkeep$/,
-  /(^|\/)node_modules\//,
-  /\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|tar|gz|xcarchive|woff2?)$/i,
-];
-
-function loadAnthropicKey() {
-  if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
-  try {
-    const env = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
-    const m = env.match(/^ANTHROPIC_API_KEY=(.+)$/m);
-    if (m) return m[1].trim();
-  } catch {}
-  return null;
-}
-
-// Trim a unified diff to fit within maxBytes by dropping skip-listed files
-// first, then truncating remaining hunks. Preserves the file-by-file header
-// shape so the model can still attribute findings to filenames.
-function filterAndTrimDiff(rawDiff, maxBytes) {
-  // Split on `diff --git ` headers, keeping the header on each chunk.
-  const parts = rawDiff.split(/^(?=diff --git )/m);
-  const kept = [];
-  let droppedSkipped = 0;
-  for (const part of parts) {
-    if (!part.trim()) continue;
-    const header = part.split('\n', 1)[0];
-    // header looks like:  diff --git a/path/to/x b/path/to/x
-    const m = header.match(/diff --git a\/(\S+) b\/(\S+)/);
-    const filePath = m ? m[2] : '';
-    if (filePath && REVIEW_PR_SKIP_PATH_PATTERNS.some((re) => re.test(filePath))) {
-      droppedSkipped++;
-      continue;
-    }
-    kept.push(part);
-  }
-  let body = kept.join('');
-  let truncated = false;
-  if (Buffer.byteLength(body, 'utf8') > maxBytes) {
-    // Truncate to maxBytes worth of bytes; cut at the last newline to keep
-    // a partial hunk valid-looking.
-    const buf = Buffer.from(body, 'utf8').slice(0, maxBytes);
-    const lastNl = buf.lastIndexOf(0x0a);
-    body = (lastNl > 0 ? buf.slice(0, lastNl) : buf).toString('utf8');
-    truncated = true;
-  }
-  return { body, droppedSkipped, truncated };
-}
-
-async function cmdReviewPr(args) {
-  if (args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
-    console.log(c.bold('merlin review-pr') + ' — LLM-based narrative leak detection\n');
-    console.log('Usage:');
-    console.log('  merlin review-pr <PR#> [--model M] [--max-diff-bytes N] [--json]');
-    console.log('  merlin review-pr --file <path>  [--model M] [--json]');
-    console.log('  merlin review-pr --stdin        [--model M] [--json]');
-    console.log('\nDefaults: --model claude-haiku-4-5  --max-diff-bytes 81920');
-    console.log('Requires ANTHROPIC_API_KEY in env or .env.\n');
-    console.log('Catches what sanitize-guard cannot: paraphrased personal context,');
-    console.log('specific dated events, financial detail, relationship reveals.');
-    console.log('See docs/architecture-public-private.md § Layer 6a.');
-    return;
-  }
-
-  const model = getFlag(args, '--model', REVIEW_PR_DEFAULT_MODEL);
-  const maxBytes = parseInt(getFlag(args, '--max-diff-bytes', String(REVIEW_PR_MAX_DIFF_BYTES)), 10);
-  const filePath = getFlag(args, '--file');
-  const fromStdin = hasFlag(args, '--stdin');
-  const jsonOut = hasFlag(args, '--json');
-  const prArg = args.find((a) => /^\d+$/.test(a));
-
-  // Source the diff/text.
-  let rawDiff = '';
-  let source = '';
-  if (filePath) {
-    try { rawDiff = fs.readFileSync(filePath, 'utf8'); }
-    catch (err) { die(`can't read --file ${filePath}: ${err.code || err.message}`); }
-    source = `file: ${filePath}`;
-  } else if (fromStdin) {
-    rawDiff = fs.readFileSync(0, 'utf8');
-    source = 'stdin';
-  } else if (prArg) {
-    try {
-      rawDiff = execSync(`gh pr diff ${prArg}`, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
-    } catch (err) {
-      die(`gh pr diff ${prArg} failed: ${err.message.split('\n')[0]}`);
-    }
-    source = `PR #${prArg}`;
-  } else {
-    die('usage: merlin review-pr <PR#> | --file <path> | --stdin  (--help for flags)');
-  }
-
-  if (!rawDiff.trim()) die(`no diff content from ${source}`);
-
-  const { body: trimmedDiff, droppedSkipped, truncated } = filterAndTrimDiff(rawDiff, maxBytes);
-  if (!trimmedDiff.trim()) die('diff was non-empty but every file was skip-listed (lockfiles, binaries, etc.)');
-
-  const apiKey = loadAnthropicKey();
-  if (!apiKey) die('No ANTHROPIC_API_KEY in env or .env.  Set it, or run: merlin init');
-
-  // Lazy-require the SDK so users who never run review-pr don't pay the import cost.
-  let Anthropic;
-  try {
-    Anthropic = require('@anthropic-ai/sdk').default;
-  } catch (err) {
-    die('@anthropic-ai/sdk not installed. Run: npm install --prefix ' + ROOT);
-  }
-  const client = new Anthropic({ apiKey });
-
-  if (!jsonOut) {
-    console.log(c.bold('merlin review-pr') + c.dim(` — ${source}, model=${model}`));
-    if (droppedSkipped) console.log(c.dim(`  skipped ${droppedSkipped} lockfile/binary file(s)`));
-    if (truncated) console.log(c.yellow(`  warning: diff truncated to ${maxBytes} bytes — large PR, consider splitting`));
-    console.log(c.dim('  calling Claude…\n'));
-  }
-
-  let response;
-  try {
-    response = await client.messages.create({
-      model,
-      max_tokens: 8000,
-      // System prompt is the cache-eligible portion. On Haiku 4.5 the
-      // minimum cacheable prefix is ~4096 tokens and our prompt is smaller —
-      // the marker is benign (no-op when below threshold) and pays off if a
-      // future revision grows the prompt past the floor.
-      system: [
-        { type: 'text', text: REVIEW_PR_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
-      ],
-      messages: [
-        {
-          role: 'user',
-          content: `Review this diff:\n\n\`\`\`diff\n${trimmedDiff}\n\`\`\``,
-        },
-      ],
-      // Constrain the response to our finding schema. Validated server-side;
-      // first request on a new schema pays a one-time compile cost.
-      output_config: {
-        format: { type: 'json_schema', schema: REVIEW_PR_SCHEMA },
-      },
-    });
-  } catch (err) {
-    if (err && err.constructor && err.constructor.name === 'AuthenticationError') {
-      die('Anthropic auth failed — check ANTHROPIC_API_KEY value');
-    }
-    if (err && err.constructor && err.constructor.name === 'RateLimitError') {
-      die('rate-limited by Anthropic — retry in a moment');
-    }
-    if (err && err.status) {
-      die(`Anthropic API error ${err.status}: ${err.message}`);
-    }
-    die(`unexpected error calling Claude: ${err.message || err}`);
-  }
-
-  // Extract the JSON text block. With output_config.format, content is still
-  // a list of blocks — find the text block and JSON.parse it.
-  const textBlock = (response.content || []).find((b) => b.type === 'text');
-  if (!textBlock) die('Claude returned no text block — unexpected response shape');
-  let parsed;
-  try {
-    parsed = JSON.parse(textBlock.text);
-  } catch (err) {
-    die(`Claude returned non-JSON: ${textBlock.text.slice(0, 200)}…`);
-  }
-
-  // Cost report — Haiku 4.5 is $1/M in, $5/M out.
-  const usage = response.usage || {};
-  const inTok = (usage.input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
-  const cacheRead = usage.cache_read_input_tokens || 0;
-  const outTok = usage.output_tokens || 0;
-  // Use haiku rates for the estimate regardless of model — close enough for
-  // a back-of-envelope number, and conservative (haiku is cheapest).
-  const estCost = (inTok / 1e6) * 1.00 + (cacheRead / 1e6) * 0.10 + (outTok / 1e6) * 5.00;
-
-  if (jsonOut) {
-    console.log(JSON.stringify({ ...parsed, _meta: { model, source, usage, est_cost_usd: estCost } }, null, 2));
-    process.exit(parsed.summary.verdict === 'block' ? 1 : 0);
-  }
-
-  // Pretty output.
-  const sevColor = (s) => (s === 'high' ? c.red : s === 'medium' ? c.yellow : c.dim);
-  console.log(c.bold(`Verdict: `) + sevColor(parsed.summary.verdict)(parsed.summary.verdict.toUpperCase()));
-  console.log(c.dim(`  ${parsed.summary.total_findings} finding(s), highest severity: ${parsed.summary.highest_severity}`));
-  console.log(c.dim(`  ${inTok} in + ${cacheRead} cache-read + ${outTok} out tokens · est $${estCost.toFixed(4)}`));
-  if (parsed.findings.length === 0) {
-    console.log('\n' + c.green('✓ no narrative leaks detected'));
-  } else {
-    console.log('');
-    for (const f of parsed.findings) {
-      const tag = sevColor(f.severity)(`[${f.severity.toUpperCase()}]`);
-      const loc = f.line_hint ? `${f.file}:${f.line_hint}` : f.file;
-      console.log(`${tag} ${c.bold(loc)}  ${c.dim('(' + f.category + ')')}`);
-      console.log(`  ${c.dim('snippet:')} ${f.snippet}`);
-      console.log(`  ${c.dim('why:    ')} ${f.why}`);
-      console.log(`  ${c.dim('fix:    ')} ${f.suggestion}`);
-      console.log('');
-    }
-  }
-  // Reminder + caveats — every time, never feel solved.
-  console.log(c.dim('Caveats: LLM review is probabilistic — false-positive and false-negative both possible.'));
-  console.log(c.dim('This is Layer 6a (narrative) — pattern-based sanitize-guard (Layer 2/3) remains primary.'));
-
-  process.exit(parsed.summary.verdict === 'block' ? 1 : 0);
-}
-
-function cmdUp(args) {
-  // Foreground mode: spawn process-manager as a child of this process,
-  // forward signals so Ctrl-C cleanly tears down the whole tree.
-  const pm = path.join(ROOT, 'agent/bin/process-manager.mjs');
-  if (!fs.existsSync(pm)) die(`process-manager not found at ${pm}`);
-  console.log(c.bold('Merlin up') + c.dim(' — Ctrl-C to stop'));
-  console.log(c.dim(`  ROOT: ${ROOT}`));
-  console.log();
-  const child = spawn(process.execPath, [pm], { stdio: 'inherit', cwd: ROOT });
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(sig, () => { try { child.kill(sig); } catch {} });
-  }
-  child.on('exit', (code, sig) => process.exit(code ?? (sig ? 128 : 0)));
-}
-
-function cmdDispatch(args) {
-  // POST a job to the ops-supervisor webhook.
-  //   merlin dispatch <job-name> [--task "task description"] [--port 9092]
-  if (args.length === 0 || hasFlag(args, '-h', '--help')) {
-    console.log('Usage: merlin dispatch <job-name> [--task "...task text..."] [--port <N>]');
-    console.log('       merlin dispatch                   # list dispatch-able jobs');
-    if (args.length === 0) {
-      const tasks = loadTasks().filter(t => t.webhook_task);
-      if (tasks.length) {
-        console.log('\nDispatch-able jobs:');
-        for (const t of tasks) console.log(`  ${t.name.padEnd(24)} ${c.dim(t.description?.slice(0, 60) || '')}`);
-      }
-    }
-    return;
-  }
-  const jobName = args[0];
-  const task = getFlag(args, '--task') || jobName.toUpperCase().replace(/-/g, ' ');
-  const port = getFlag(args, '--port', '9092');
-  // Resolve token from .env or secrets/webhook-token
-  let token = process.env.WEBHOOK_TOKEN;
-  if (!token) {
-    try { token = fs.readFileSync(path.join(ROOT, 'secrets/webhook-token'), 'utf8').trim(); } catch {}
-  }
-  if (!token) {
-    try {
-      const env = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
-      const m = env.match(/^WEBHOOK_TOKEN=(.+)$/m);
-      if (m) token = m[1].trim();
-    } catch {}
-  }
-  if (!token) die('No WEBHOOK_TOKEN — run `merlin init` first.');
-  const payload = JSON.stringify({ task, source: 'merlin-cli', job: jobName });
-  const cmd = `curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:${port} -H 'Authorization: Bearer ${token}' -H 'Content-Type: application/json' -d '${payload.replace(/'/g, "'\\''")}'`;
-  try {
-    const code = execSync(cmd, { encoding: 'utf8' }).trim();
-    if (code.startsWith('2')) console.log(c.green('✓') + ` dispatched ${c.bold(jobName)} (HTTP ${code})`);
-    else die(`dispatch failed: HTTP ${code}. Is the supervisor running? Try \`merlin up\`.`);
-  } catch (e) { die(`dispatch failed: ${e.message}`); }
-}
-
-function cmdTail(args) {
-  // Tail one of the well-known log streams.
-  //   merlin tail              # ops supervisor events (default)
-  //   merlin tail ops|chat     # supervisor stream
-  //   merlin tail <job-name>   # logs/<job>.log
-  //   merlin tail --all        # multiplex ops + chat
-  const which = args[0] || 'ops';
-  const all = hasFlag(args, '--all');
-  const candidates = [];
-  if (all || which === 'ops') candidates.push({ label: 'ops', path: path.join(AGENT_LOGS, 'supervisor-ops/events.ndjson') });
-  if (all || which === 'chat') candidates.push({ label: 'chat', path: path.join(AGENT_LOGS, 'supervisor-chat/events.ndjson') });
-  if (!all && which !== 'ops' && which !== 'chat') {
-    // Treat as a job name → logs/<name>.log
-    candidates.length = 0;
-    candidates.push({ label: which, path: path.join(TOP_LOGS, `${which}.log`) });
-  }
-  const ok = candidates.filter(c => fs.existsSync(c.path));
-  if (!ok.length) {
-    console.log(c.dim('No log files yet — start the system with `merlin up` and try again.'));
-    for (const c of candidates) console.log(c.dim(`  expected: ${c.path}`));
-    return;
-  }
-  // Just shell out to `tail -F` for the best UX
-  const tailArgs = ['-F'].concat(ok.map(c => c.path));
-  const child = spawn('tail', tailArgs, { stdio: 'inherit' });
-  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { try { child.kill(sig); } catch {} });
-  child.on('exit', (code) => process.exit(code ?? 0));
-}
-
-// ========================================================================
 // MAIN DISPATCH
 // ========================================================================
 const [, , cmd, ...args] = process.argv;
-if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { cmdHelp(); process.exit(0); }
+
+// merlin watchdog — summarize watchdog-incidents/.
+// Each file in the incident dir is a per-incident probe state:
+//   <key>             — consecutive-failure counter (integer)
+//   <key>.green_streak — consecutive-recovery counter (integer)
+//   <key>.alerted     — touched when an alert was sent (mtime is alert time)
+//   <key>.alert_count — alerts within the current max_window
+//   <key>.alert_first — mtime is first alert in the window
+// Read shape from agent/scripts/watchdog.sh incident_seen / incident_should_alert.
+function cmdWatchdog(args) {
+  const sub = args[0];
+  if (sub && !sub.startsWith('--') && sub !== 'status') {
+    console.error(c.red(`unknown merlin watchdog subcommand: ${sub}`));
+    console.error('Usage: merlin watchdog [status] [--json]');
+    process.exit(1);
+  }
+  const incidentDir = installTools("data/watchdog-incidents");
+  let entries;
+  try { entries = fs.readdirSync(incidentDir); } catch { entries = []; }
+  // Group by base key.
+  const byKey = {};
+  for (const f of entries) {
+    let key = f, kind = 'failures';
+    if (f.endsWith('.green_streak')) { key = f.slice(0, -'.green_streak'.length); kind = 'green_streak'; }
+    else if (f.endsWith('.alerted')) { key = f.slice(0, -'.alerted'.length); kind = 'alerted_mtime'; }
+    else if (f.endsWith('.alert_count')) { key = f.slice(0, -'.alert_count'.length); kind = 'alert_count'; }
+    else if (f.endsWith('.alert_first')) { key = f.slice(0, -'.alert_first'.length); kind = 'alert_first_mtime'; }
+    if (!byKey[key]) byKey[key] = {};
+    const full = path.join(incidentDir, f);
+    try {
+      if (kind === 'failures' || kind === 'green_streak' || kind === 'alert_count') {
+        byKey[key][kind] = parseInt(fs.readFileSync(full, 'utf8').trim(), 10) || 0;
+      } else {
+        byKey[key][kind] = new Date(fs.statSync(full).mtimeMs).toISOString();
+      }
+    } catch {}
+  }
+  const rows = Object.entries(byKey).map(([key, v]) => ({ key, ...v })).sort((a, b) => a.key.localeCompare(b.key));
+  if (args.includes('--json')) {
+    console.log(JSON.stringify({ incidents: rows, count: rows.length }, null, 2));
+    return;
+  }
+  if (rows.length === 0) { console.log(c.dim('no watchdog incidents on disk — all probes clean')); return; }
+  console.log(c.bold(`Watchdog incidents (${rows.length})\n`));
+  console.log('KEY                              FAILS  GREEN  ALERTS  LAST_ALERT');
+  for (const r of rows) {
+    const fails = r.failures ?? 0;
+    const green = r.green_streak ?? 0;
+    const alerts = r.alert_count ?? 0;
+    const last = r.alerted_mtime ?? '-';
+    const failsStr = fails > 0 ? c.yellow(String(fails).padEnd(5)) : String(fails).padEnd(5);
+    console.log(`${r.key.padEnd(32)} ${failsStr}  ${String(green).padEnd(5)}  ${String(alerts).padEnd(6)}  ${last}`);
+  }
+}
+
+// --- whereami / host identity ---
+// Which physical machine is this? Sessions used to guess from a cwd path
+// string and get it backwards ("laptop, nothing running" while on the
+// production host with everything healthy). Resolves deterministically via
+// lib/host-identity.js (hostname/alias → hardware-UUID fallback) against
+// system/hosts.json.
+function cmdWhereami(args) {
+  const { resolveHost, hostBanner } = require(path.join(TOOLS, 'lib/host-identity.js'));
+  const h = resolveHost();
+  if (hasFlag(args, '--json')) { console.log(JSON.stringify(h, null, 2)); return; }
+  if (hasFlag(args, '--banner')) { console.log(hostBanner(h)); return; }
+  if (hasFlag(args, '--role')) { console.log(h.role); process.exit(h.known ? 0 : 1); }
+  const roleColor = h.isProduction ? c.green : (h.known ? c.cyan : c.yellow);
+  console.log(roleColor(c.bold(h.known ? h.role.toUpperCase() : 'UNKNOWN')) + c.dim(` (${h.label})`));
+  console.log(c.dim('hostname: ') + h.hostname);
+  console.log(c.dim('uuid:     ') + (h.uuid || 'n/a'));
+  if (h.notes) console.log(c.dim('notes:    ') + h.notes);
+  if (!h.known) {
+    console.log(c.yellow('\nUnregistered host — not the production Merlin host. Add it to system/hosts.json (hostname + uuid + role) so sessions self-identify.'));
+  }
+  console.log(c.dim('\n⚠ The default Bash-tool sandbox masks localhost + process lists (pgrep/launchctl/curl); run unsandboxed to verify Merlin service health.'));
+}
 
 const dispatch = {
-  // Bootstrap / run-loop
-  init: cmdInit,
-  overlay: cmdOverlay,
-  up: cmdUp,
-  dispatch: cmdDispatch,
-  tail: cmdTail,
-  // Observability + task registry
   tasks: cmdTasks,
+  whereami: cmdWhereami,
+  host: cmdWhereami,
   status: cmdStatus,
   services: cmdServices,
   logs: cmdLogs,
@@ -3272,10 +3376,52 @@ const dispatch = {
   cost: cmdCost,
   activity: cmdActivity,
   context: cmdContext,
-  audit: cmdAudit,
-  'review-pr': cmdReviewPr,
+  watchdog: cmdWatchdog,
 };
 
-const fn = dispatch[cmd];
-if (!fn) { console.error(c.red(`unknown subcommand: ${cmd}`) + '\n'); cmdHelp(); process.exit(1); }
-fn(args);
+// --- CLI extensions (cli.d/) ---
+// An installation adds its own subcommands without editing this file: each
+// bin/cli.d/<name>.mjs (next to this CLI) default-exports
+//   { name?: "<subcommand>" (default: the file name), summary: "<one line>",
+//     usage?: "<name> <args>", async run(args, ctx) }
+// ctx = { ROOT, TOOLS, HOME, OWNER, c, table, hasFlag, getFlag, die }.
+// The built-in subcommands win on a name; a module that fails to load is
+// reported and skipped. `merlin help` lists them under EXTENSIONS. Contract
+// and examples: bin/cli.d/README.md.
+const CLI_D = path.join(__dirname, 'cli.d');
+function cliExtensionFiles() {
+  try { return fs.readdirSync(CLI_D).filter((f) => f.endsWith('.mjs') && !f.startsWith('_')).sort(); }
+  catch { return []; }
+}
+async function loadCliExtensions() {
+  const { pathToFileURL } = require('url');
+  const out = [];
+  for (const f of cliExtensionFiles()) {
+    try {
+      const mod = await import(pathToFileURL(path.join(CLI_D, f)).href);
+      const ext = mod.default || mod;
+      const name = ext.name || f.replace(/\.mjs$/, '');
+      if (typeof ext.run !== 'function') { console.error(c.yellow(`cli.d/${f}: no run(args, ctx) — skipped`)); continue; }
+      if (dispatch[name] || name === 'help' || out.some((e) => e.name === name)) { console.error(c.yellow(`cli.d/${f}: '${name}' is already a subcommand — skipped`)); continue; }
+      out.push({ name, summary: ext.summary || '', usage: ext.usage || name, run: ext.run });
+    } catch (e) {
+      console.error(c.yellow(`cli.d/${f}: failed to load: ${e.message}`));
+    }
+  }
+  return out;
+}
+const cliCtx = { ROOT, TOOLS, HOME, OWNER, c, table, hasFlag, getFlag, die };
+
+if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+  if (!cliExtensionFiles().length) { cmdHelp(); process.exit(0); }
+  loadCliExtensions().then((ext) => { cmdHelp(ext); process.exit(0); });
+} else if (dispatch[cmd]) {
+  dispatch[cmd](args);
+} else {
+  loadCliExtensions().then(async (ext) => {
+    const e = ext.find((x) => x.name === cmd);
+    if (!e) { console.error(c.red(`unknown subcommand: ${cmd}`) + '\n'); cmdHelp(ext); process.exit(1); }
+    try { await e.run(args, cliCtx); }
+    catch (err) { die(`${cmd}: ${err && err.message ? err.message : err}`); }
+  });
+}

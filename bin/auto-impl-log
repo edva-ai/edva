@@ -9,7 +9,7 @@
 //   auto-impl-log                       # last 7 days
 //   auto-impl-log --since 24h|7d|30d
 //   auto-impl-log --json                # full records as JSON
-//   auto-impl-log --id s-20260419-05    # one item
+//   auto-impl-log --id s-YYYYMMDD-NN    # one item
 //
 // Output columns (TTY): date · sha7 · id · risk · category · critic · title
 
@@ -19,11 +19,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execSync } = require("node:child_process");
+const { installRoot, installTools } = require("../lib/root.cjs");
 
-const STATE_PATH = path.join(
-  os.homedir(),
-  "dev/merlin/data/nightly-review-state.json",
-);
+const STATE_PATH = installTools("data/nightly-review-state.json");
 
 function flag(name, def = undefined) {
   const argv = process.argv.slice(2);
@@ -70,7 +68,7 @@ function gitLogAutoImpl(since) {
   let out;
   try {
     out = execSync(`git ${args.map((a) => JSON.stringify(a)).join(" ")}`, {
-      cwd: path.join(os.homedir(), "dev/merlin"),
+      cwd: installRoot(),
       encoding: "utf8",
     });
   } catch (err) {

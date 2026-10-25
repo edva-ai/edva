@@ -1,6 +1,6 @@
 # Integration: Outbound email (SMTP)
 
-`bin/email-send` is the agent's outbound mail tool. The shipped implementation talks to **SMTP2Go** because that's what the upstream gandalf source used — easy to swap to any other transactional SMTP provider (SendGrid, Postmark, Mailgun, Resend, etc.) since the API surface is similar.
+`bin/email-send` is the agent's outbound mail tool. The shipped implementation talks to **SMTP2Go** — easy to swap to any other transactional SMTP provider (SendGrid, Postmark, Mailgun, Resend, etc.) since the API surface is similar.
 
 This integration is needed for:
 
@@ -15,20 +15,22 @@ If you only want inbound triage + chat replies on the phone, you can skip this e
 1. Sign up at [smtp2go.com](https://smtp2go.com). Free tier: 1,000 emails/month, plenty for personal use.
 2. Verify the sending domain (or use their `smtp2go.com` subdomain initially).
 3. Create an API key with **Send Email** permission.
-4. Add to `.env`:
+4. Add the key to `.env`, and the addresses to `agent/local/instance.json` (`merlin init` asks for them; `MERLIN_AGENT_FROM_EMAIL` / `MERLIN_OWNER_EMAIL` / `MERLIN_DOMAIN` in `.env` override):
    ```
+   # .env
    SMTP2GO_API_KEY=api-...
-   MERLIN_AGENT_FROM_EMAIL=merlin@your-domain.com    # the From: address
-   MERLIN_OWNER_EMAIL=you@your-domain.com            # the Reply-To
-   MERLIN_DOMAIN=your-domain.com
    ```
+   ```json
+   { "agent_email": "assistant@example.com", "owner_email": "someone@example.com", "domain": "example.com" }
+   ```
+   `agent_email` is the From: address; `owner_email` is where agent mail to you goes. `EMAIL_FROM_ADDRESS` / `EMAIL_FROM_NAME` override the sender per process.
 5. DNS records for your sending domain (in your registrar's DNS console):
    - SPF: `v=spf1 include:spf.smtp2go.com ~all`
    - DKIM + DMARC — SMTP2Go generates these in their console; copy into your DNS.
 6. Test:
    ```bash
-   ${MERLIN_HOME}/bin/email-send \
-     --to "${MERLIN_OWNER_EMAIL}" \
+   "$MERLIN_HOME/bin/email-send" \
+     --to someone@example.com \
      --subject "Merlin test" \
      --body "If you see this, outbound mail works."
    ```
@@ -55,17 +57,11 @@ email-send --to <to> --subject <subj> [--body <text> | --body-file <path>] [--ht
 
 ## Option C — use Gmail directly (on-behalf-of)
 
-If you want some emails sent FROM the user's actual Gmail (not from a Merlin sender), that's a separate path — see the `gmail-action send --from "${MERLIN_OWNER_EMAIL}" ...` pattern in `agent/CLAUDE.md` § Outbound Email Policy. Requires the same Gmail OAuth flow as inbound triage (`docs/integrations/gmail.md`). Strict rule: only used when the user explicitly asks the agent to email a third party as themselves.
+If you want some emails sent FROM the user's actual Gmail (not from a Merlin sender), that's a separate path — see the `gmail-action send --from <your address> ...` pattern in `agent/CLAUDE.md` § Outbound Email Policy. Requires the same Gmail OAuth flow as inbound triage (`docs/integrations/gmail.md`). Strict rule: only used when the user explicitly asks the agent to email a third party as themselves.
 
-## House style enforced by `email-send`
+## House style
 
-The default sender (`MERLIN_AGENT_FROM_EMAIL`) is hard-coded to reject:
-
-- **Em dashes (U+2014) and en dashes (U+2013)** in the subject or body. These are an LLM tell. Override with `EMAIL_SEND_ALLOW_DASHES=1` for legitimate use (e.g. forwarding a quote with dashes verbatim).
-
-The reject is per-recipient: only fires when sender = the agent and recipient = the owner. Third-party emails (via `--from ${MERLIN_OWNER_EMAIL}`) don't trigger it.
-
-Edit `bin/email-send` to add or remove style rules — they're a few lines of regex.
+`email-send` itself applies no style gate; style rules for agent-written mail live in the agent rules (`agent/CLAUDE.md` § Outbound Email Policy) and in your own `agent/local/` rules. Mail the agent sends to your own address is auto-labeled on arrival so triage does not treat it as new inbound mail.
 
 ## Receipts / bounce handling
 

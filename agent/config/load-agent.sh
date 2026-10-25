@@ -10,10 +10,8 @@
 #   AGENT_SUPERVISOR_CONTROL_PORT, _GMAIL_PUBSUB_PORT, _WEBHOOK_PORT, _HEALTH_PORT
 
 set -euo pipefail
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
-
 AGENT="${1:?usage: load-agent.sh <name>}"
-CONFIG="${AGENT_CONFIG:-${MERLIN_HOME}/agent/config/agents.json}"
+CONFIG="${AGENT_CONFIG:-$HOME/Dev/merlin/agent/config/agents.json}"
 
 exec node -e '
 const cfg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));

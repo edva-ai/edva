@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+// jev-email-classify — intake email classifier: Jev primary, local-classify /
+// Sonnet as shadow. Logic lives in lib/jev-email-triage.mjs; called by
+// agent/supervisor/gmail-source.mjs (intakeJevClassify). See docs/jev.md.
+//
+// Usage:
+//   jev-email-classify <messageId> --from "<From header>" --subject "<subject>"
+//       → one JSON line: {auto, label, priority, via, source, reason}
+//         auto=true means "label + mark-read, skip the dispatch".
+//         Exit 2 on internal error (caller falls back to local-classify).
+//   jev-email-classify --shadow-sonnet <messageId> --from ... --subject ... --jev-json '<json>'
+//       → detached side-effect-free Sonnet classification for the shadow comparison.
+
+const args = process.argv.slice(2);
+const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
+
+const lib = await import("../lib/jev-email-triage.mjs");
+
+if (args[0] === "--shadow-sonnet") {
+  let jev = null; try { jev = JSON.parse(flag("--jev-json") || "null"); } catch {}
+  const v = await lib.runSonnetShadow({ messageId: args[1], from: flag("--from") || "", subject: flag("--subject") || "", jev }).catch(() => null);
+  process.stdout.write(JSON.stringify(v) + "\n");
+  process.exit(0);
+}
+
+const messageId = args[0];
+if (!messageId || messageId.startsWith("--")) {
+  console.error('usage: jev-email-classify <messageId> --from "<from>" --subject "<subject>"');
+  process.exit(64);
+}
+try {
+  const out = await lib.classifyInbound({ messageId, from: flag("--from") || "", subject: flag("--subject") || "" });
+  process.stdout.write(JSON.stringify(out) + "\n");
+  process.exit(0);
+} catch (err) {
+  process.stdout.write(JSON.stringify({ auto: false, error: String(err?.message || err).slice(0, 300) }) + "\n");
+  process.exit(2);
+}

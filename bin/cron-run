@@ -1,0 +1,162 @@
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
+// cron-run — wrap a cron command and append start/end/exit to cron-runs.jsonl.
+// (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
+// string and a comment. cron runs this with a bare PATH that has no node, so
+// `#!/usr/bin/env node` would exit 127; the launcher tries the stable Homebrew
+// and /usr/local paths first, then PATH. Same as lib/root.cjs nodeBin.)
+//
+// Usage: cron-run [--label LABEL] [--] COMMAND ARGS...
+//
+// Designed for cron lines. Stdio is inherited (so existing >> log 2>&1 redirects
+// keep working). The wrapper's own metadata goes to data/cron-runs.jsonl
+// — one JSON object per line, never blocks the child.
+//
+// The jsonl log is the source of truth for "when did the system last successfully
+// run a cron job", which cron-boot-catchup uses to compute the outage window.
+
+import { spawn } from "node:child_process";
+import { appendFile, mkdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, basename } from "node:path";
+
+import { installTools } from "../lib/root.cjs";
+const LOG = installTools("data/cron-runs.jsonl");
+const ENV_FILE = installTools(".env");
+
+// Cron spawns jobs with a bare environment — no shell profile, no .env. Several
+// jobs shell out to the `gog` CLI, which (with keyring_backend=file) needs
+// GOG_KEYRING_PASSWORD in its env to decrypt its token store; more generally,
+// loading .env here gives every cron child the same secrets the
+// long-lived supervisors get at boot. Parse is deliberately minimal (KEY=value,
+// skip comments/blanks, strip one layer of quotes) and never overrides a value
+// already present in process.env. Fail-open: any error just leaves the child
+// with cron's bare env, exactly as before — a malformed .env never breaks cron.
+function loadDotenv(file) {
+  const out = {};
+  try {
+    if (!existsSync(file)) return out;
+    for (const raw of readFileSync(file, "utf8").split("\n")) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      let val = line.slice(eq + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) ||
+          (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+      out[key] = val;
+    }
+  } catch { /* fail-open: bare env */ }
+  return out;
+}
+const dotenv = loadDotenv(ENV_FILE);
+
+// NEVER let .env route a cron-forked `claude` onto the metered API. The
+// supervisors authenticate with the Max subscription (OAuth), but a cron child
+// that forks `claude -p` directly (e.g. trigger-slack-poll, trigger-location-
+// confirm) would inherit ANTHROPIC_API_KEY from the dotenv below and silently
+// bill real $ at full API rates instead of the subscription. Nothing in the
+// codebase legitimately consumes these keys, so strip them here — Claude Code
+// then falls back to the Max session like every other dispatch. (2026-06-28:
+// this leak burned through the API key's spend cap via slack-poll, 288×/day.)
+const AUTH_OVERRIDE_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+for (const k of AUTH_OVERRIDE_KEYS) delete dotenv[k];
+
+const childEnv = { ...dotenv, ...process.env }; // process.env wins on conflict
+for (const k of AUTH_OVERRIDE_KEYS) delete childEnv[k]; // belt-and-suspenders
+
+// Cron hands its children a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin) that does
+// not contain the directory Homebrew installs node into. A child whose shebang
+// is `#!/usr/bin/env node` therefore dies with exit 127 before it runs a single
+// line ("env: node: No such file or directory") — the very trap this wrapper's
+// own launcher (lines 1-2) sidesteps, and which every script invoked bare
+// through it still walks straight into. Every other execution context on this
+// host (interactive shell, the supervisors, launchd agents that source the
+// profile) already has that directory on PATH; cron is the lone outlier, and
+// that divergence IS the exit-127 class.
+//
+// The directory appended is dirname(process.execPath) — the RESOLVED
+// interpreter, which on a Homebrew install is the version-pinned Cellar bin
+// (…/Cellar/node/<version>/bin) that /opt/homebrew/bin/node symlinks into, NOT
+// /opt/homebrew/bin itself. That is deliberate and is the conservative choice:
+// it exposes exactly node, npm and npx to the child rather than the ~800
+// binaries in /opt/homebrew/bin. It also stays correct across a node upgrade,
+// because it is recomputed from this process on every invocation.
+//
+// APPENDED, never prepended. Appending cannot change which binary an existing
+// job resolves — anything findable in cron's PATH today is still found first,
+// so no currently-working command changes meaning. It only gives a name that
+// resolves to NOTHING today one more place to look. (One narrow exception:
+// empty PATH components, which POSIX reads as the working directory, are
+// dropped by the filter below. Cron never produces one, and dropping an
+// implicit "." from PATH is hardening rather than a hazard.)
+//
+// Skipped entirely when PATH is absent or empty: appending to nothing would
+// REPLACE the system default resolution path rather than extend it, which could
+// make an existing job worse. A no-op is the right answer in the only case
+// where this could do harm.
+const interpDir = dirname(process.execPath);
+const pathParts = String(childEnv.PATH || "").split(":").filter(Boolean);
+if (interpDir && pathParts.length && !pathParts.includes(interpDir)) {
+  childEnv.PATH = [...pathParts, interpDir].join(":");
+}
+
+let args = process.argv.slice(2);
+let label = null;
+// (MERLIN_JOB is set below, once the label is known.)
+while (args[0]?.startsWith("--")) {
+  if (args[0] === "--") { args.shift(); break; }
+  if (args[0] === "--label") { label = args[1]; args = args.slice(2); continue; }
+  console.error(`cron-run: unknown flag ${args[0]}`);
+  process.exit(2);
+}
+if (!args.length) {
+  console.error("usage: cron-run [--label LABEL] [--] COMMAND ARGS...");
+  process.exit(2);
+}
+if (!label) label = basename(args[0]).replace(/\.(sh|js|mjs|py)$/, "");
+
+// Which job this is, for anything below that records who called it (the
+// Places call log, 2026-10-20). A cron-run inside a cron-run extends the chain.
+childEnv.MERLIN_JOB = label;
+childEnv.MERLIN_JOB_CHAIN = process.env.MERLIN_JOB_CHAIN ? `${process.env.MERLIN_JOB_CHAIN}>${label}` : label;
+
+const start = new Date();
+const child = spawn(args[0], args.slice(1), { stdio: "inherit", env: childEnv });
+
+const forward = (sig) => { try { child.kill(sig); } catch {} };
+process.on("SIGTERM", () => forward("SIGTERM"));
+process.on("SIGINT", () => forward("SIGINT"));
+process.on("SIGHUP", () => forward("SIGHUP"));
+
+child.on("error", async (err) => {
+  await log({ label, start: start.toISOString(), end: new Date().toISOString(),
+              duration_ms: Date.now() - start.getTime(), exit: 127, signal: null,
+              error: err.message, cmd: args.join(" ") });
+  process.exit(127);
+});
+
+child.on("exit", async (code, signal) => {
+  const end = new Date();
+  await log({
+    label,
+    start: start.toISOString(),
+    end: end.toISOString(),
+    duration_ms: end - start,
+    exit: code ?? -1,
+    signal: signal ?? null,
+    cmd: args.join(" "),
+  });
+  process.exit(code ?? (signal ? 128 : 1));
+});
+
+async function log(entry) {
+  try {
+    if (!existsSync(dirname(LOG))) await mkdir(dirname(LOG), { recursive: true });
+    await appendFile(LOG, JSON.stringify(entry) + "\n");
+  } catch (e) {
+    process.stderr.write(`cron-run: log failed: ${e.message}\n`);
+  }
+}

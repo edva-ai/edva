@@ -1,0 +1,277 @@
+#!/usr/bin/env node
+// self-improve-request — create ONE unified high-risk self-improvement approval.
+// The single entry point for anything that needs the user's Face-ID sign-off: WP11
+// capabilities (via mcp__tools__propose_module) AND the nightly executor's
+// HIGH-risk code fixes route here instead of email ACTION ITEMS. Creates a
+// self_improve_approvals row + posts to the Improvements channel; NOTHING is
+// applied until the user's signature verifies (self-improve-approval-poll).
+//
+// Since rubric schema v4 this is for complex, high-blast-radius
+// changes only — everything else lands through self-improve-auto-apply, which
+// exits 3 and points here when a change belongs on a card.
+//
+// Usage:
+//   self-improve-request --type code-fix --summary "..." \
+//     --problem "..." --impact "..." --fix "..." --side-effects "..." [--details "..."] [--rebuild-of <approval id>] --files-json <path>
+//   self-improve-request --type new-capability ...same four... --files-json <path>   # {name, files}
+// --files-json is a file holding the item JSON (code-fix: {files:{path:content}};
+//   new-capability: {name, files:{...}}).
+// Exit 65: the installation's landing check refused the code-fix (personal data
+//   added to a kernel file, a new file left unclassified, …) — redraft, refile.
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import { installRoot } from "../lib/root.cjs";
+const exec = promisify(execFile);
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
+
+function arg(name) { const i = process.argv.indexOf("--" + name); return i > 0 ? process.argv[i + 1] : null; }
+
+const type = arg("type");
+const summary = arg("summary");
+const filesJson = arg("files-json");
+const USAGE = 'usage: self-improve-request --type code-fix|new-capability --summary "..." --problem "..." --impact "..." --fix "..." --side-effects "..." [--details "..."] --files-json <path>';
+if (!type || !summary || !filesJson) {
+  console.error(USAGE);
+  process.exit(64);
+}
+
+// Every card is written in plain language, in four parts, for a reader who may
+// not have the background: the problem being solved, its current implications,
+// the proposed solution, and possible side effects (if any). Enforced
+// here rather than asked for in each playbook: the card cannot be filed without
+// them. --rationale still works as the technical detail that follows them.
+const { composeCard } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
+let rationale;
+try {
+  rationale = composeCard({
+    problem: arg("problem"),
+    impact: arg("impact"),
+    fix: arg("fix"),
+    sideEffects: arg("side-effects"),
+    details: arg("details") || arg("rationale") || "",
+  });
+} catch (e) {
+  console.error(`self-improve-request: ${e.message}. A card must say, in plain language, what is wrong (--problem), why it matters now (--impact), what the change does (--fix), and what else it could affect (--side-effects; "none expected" plus why is a valid answer).`);
+  console.error(USAGE);
+  process.exit(64);
+}
+if (!["code-fix", "new-capability"].includes(type)) { console.error("type must be code-fix or new-capability"); process.exit(64); }
+let item; try { item = JSON.parse(fs.readFileSync(filesJson, "utf8")); } catch (e) { console.error("bad --files-json:", e.message); process.exit(64); }
+
+// Validate the item SHAPE before this ever reaches the user's phone for a
+// signature. Without this, a malformed --files-json (e.g. the file map
+// passed as the top-level object instead of nested under "files") still
+// creates a real approval request — the user Face-IDs it, and only THEN does
+// applyItem discover there's nothing to write, ~20+ minutes later with no
+// way to recover the intended fix (this happened with a card authored as
+// {path: content} instead of {files: {path: content}}).
+function badShape(msg) { console.error(`bad --files-json: ${msg}`); process.exit(64); }
+
+// Accept the BARE file map as well as the wrapped {files:{...}} form, for
+// type=code-fix only. Both shapes are in circulation because the documented
+// one and the accepted one disagree: jobs/system-issue-review.md Step 6b's
+// --files-json example shows the bare {"<path>": "<content>"} map, while the
+// validation above requires the wrapper. A system-issue-review
+// pass once followed its own playbook, got exit 64, and had to re-author the card.
+// Rejecting was the right call originally (a bare map used to reach
+// the user's phone and then fail at apply with "no files — nothing to write"),
+// but normalising is strictly safer than rejecting: the malformed-item hazard
+// was the SILENT pass-through, not the shape itself, and downstream still
+// only ever sees {files:{...}}.
+//
+// Deliberately narrow so this cannot become the silent pass-through it
+// replaces: every top-level key must be a repo-relative path (contain "/")
+// with a string value, and an item that already carries an unusable `files`
+// key is still a genuine malformation and still rejected.
+if (type === "code-fix" && item && typeof item === "object" && !Array.isArray(item)
+    && !("files" in item) && !("name" in item)) {
+  const keys = Object.keys(item);
+  if (keys.length && keys.every((k) => k.includes("/") && typeof item[k] === "string")) {
+    console.error(`note: --files-json held a bare {path: content} map (${keys.length} file(s)) — wrapping it as {files:{...}}`);
+    item = { files: item };
+  }
+}
+if (type === "code-fix") {
+  if (!item.files || typeof item.files !== "object" || Array.isArray(item.files) || !Object.keys(item.files).length) {
+    badShape('code-fix item needs a non-empty "files": {"path/to/file": "content"} object — got ' + JSON.stringify(Object.keys(item || {})));
+  }
+} else if (type === "new-capability") {
+  if (!item.name || typeof item.name !== "string") badShape('new-capability item needs a "name" string');
+  if (!item.files || typeof item.files !== "object" || Array.isArray(item.files) || !Object.keys(item.files).length) {
+    badShape('new-capability item needs a non-empty "files": {"path/to/file": "content"} object — got ' + JSON.stringify(Object.keys(item || {})));
+  }
+}
+
+// Postgres `text` cannot hold U+0000, so a staged file carrying a raw NUL byte
+// is rejected at insert with 22P05 "unsupported Unicode escape sequence —
+// \u0000 cannot be converted to text". Before this guard that surfaced as an
+// unhandled throw: four stack frames, with the status and body only on the
+// first line — the line a caller piping to `tail` never sees. The natural
+// misreading is "the approval pipeline is down" rather than "this one file
+// cannot be encoded", and it once cost three filing attempts to
+// identify while staging bin/system-alert-dedup, whose hash separator is
+// a literal NUL (deliberate, and correct at runtime).
+//
+// Scope is NUL exactly, which is the whole class reachable here: the other way
+// to make Postgres reject a text payload is a lone surrogate, and these
+// contents are produced by a utf8 read, which substitutes U+FFFD for any
+// invalid sequence — so a lone surrogate cannot survive to this point. U+0000
+// can, because it is valid UTF-8.
+for (const [f, content] of Object.entries(item.files || {})) {
+  if (typeof content !== "string") continue;
+  const at = content.indexOf("\u0000");
+  if (at === -1) continue;
+  const byte = Buffer.byteLength(content.slice(0, at), "utf8");
+  const line = content.slice(0, at).split("\n").length;
+  badShape(
+    `${f} contains a NUL byte (U+0000) at line ${line}, byte offset ${byte} — Postgres text ` +
+    `cannot store it, so staging this file would fail at insert with 22P05. Rewrite that byte ` +
+    `as an escape in the source (e.g. "\\0" or "\\u0000" inside a string literal) and re-run.`
+  );
+}
+
+// The installation's landing check (lib/self-improve-landing.mjs
+// installationRefusals: e.g. personal data added to a kernel file, a new file
+// left unclassified). What it refuses cannot land on a signature either — the
+// commit would be refused after the user had signed — so it is refused here,
+// before the card is filed, with what to fix. (A new capability is written
+// under agent/ext/<name>/, which is this installation's own by
+// definition: nothing to check.)
+if (type === "code-fix") {
+  const { installationRefusals } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
+  const before = Object.fromEntries(Object.keys(item.files || {}).map((rel) => {
+    try { return [rel, fs.readFileSync(path.resolve(ROOT, rel), "utf8")]; } catch { return [rel, null]; }
+  }));
+  const refusals = installationRefusals({ files: item.files || {}, before });
+  if (refusals.length) {
+    console.error("self-improve-request: refused — redraft the change and file it again:");
+    for (const r of refusals) console.error(`  - ${r}`);
+    process.exit(65);
+  }
+}
+
+// Paths whose contents are read ONCE at process boot. A fix to one of these is
+// on disk the moment the approval applies and INERT until the process tree
+// restarts — self-improve-approval-poll writes, commits, and reports "applied"
+// with no reload path of any kind.
+//
+// That gap once cost the user two signatures for one bug: a supervisor fix
+// applied hours before the supervisor tree restarted, the defect it fixed fired
+// twice more in that window, and a SECOND card shipped a per-source workaround
+// for a fix already sitting on disk. Disclosure was supposed to come from the authoring
+// agent remembering a prose rule. It didn't — so the card now says it itself.
+//
+// Citations for each entry: supervisor/phone-channel/chat-supervisor/
+// process-manager are long-lived node processes that resolve their ES modules
+// at boot; agents.json and the agent CLAUDE.md files are read at `claude -p`
+// spawn time (agent/CLAUDE.md § Effort Policy: "Changing an agent's
+// baseline requires a supervisor restart"); .mcp.json servers spawn with the
+// session.
+const BOOT_LOADED = [
+  /^tools\/agent\/supervisor\//,
+  /^tools\/agent\/phone-channel\//,
+  /^tools\/agent\/chat-supervisor\.mjs$/,
+  /^tools\/agent\/bin\/process-manager\.mjs$/,
+  /^tools\/agent\/config\/agents\.json$/,
+  /^tools\/agent\/[^/]*\/?CLAUDE\.md$/,
+  // the instance's local rules, appended to the system prompt at spawn beside them
+  /^tools\/agent\/local\/(shared|chat|ops)\.md$/,
+  /^tools\/agent\/[^/]+\/\.mcp\.json$/,
+];
+
+// --rebuild-of <approval id>: this card re-authors an approved card
+// whose apply failed because its files moved on (lib/self-improve-rebuild.mjs,
+// jobs/chat-build.md § Rebuilding an approved card). Recorded inside item_json, so
+// the signature covers it and the applier can tell a rebuild from an original: a
+// rebuild that conflicts again is never rebuilt a second time.
+const rebuildOf = arg("rebuild-of");
+if (rebuildOf) {
+  if (type !== "code-fix") badShape("--rebuild-of applies to code-fix cards only");
+  if (!/^[0-9a-f-]{8,64}$/i.test(rebuildOf)) badShape(`--rebuild-of must be an approval id, got ${JSON.stringify(rebuildOf)}`);
+  item.rebuild_of = rebuildOf;
+}
+
+// STALE-BASE FINGERPRINT. A code-fix card carries the WHOLE new
+// content of each file it touches, captured when the card was authored. If the
+// file changes on disk between authoring and Face-ID approval, applying the card
+// writes the old snapshot back and silently reverts whatever landed in between —
+// including another card the user already approved.
+//
+// That is not hypothetical. One card rewrote three criteria in
+// data/jev-questions/email-triage.json; a second card, approved about an
+// hour later, had been authored from the earlier file, so applying it reverted
+// all three. Nothing reported it:
+// both cards confirmed "Approved + applied", both were, and the second one's
+// own rationale had warned in prose that "two cards rewriting this file would
+// clobber each other" — shortly before it did exactly that. Prose in a
+// _doc cannot hold a race; a fingerprint can.
+//
+// So: record the hash of each staged file AS IT IS NOW. The applier compares
+// before writing (self-improve-approval-poll, applyItem) and refuses rather
+// than reverting. Only files that already EXIST are fingerprinted — a brand-new
+// file has no base to drift from — so `base_sha256` is deliberately partial,
+// and a card filed before this existed carries none at all and is unaffected.
+if (type === "code-fix") {
+  const base = {};
+  for (const rel of Object.keys(item.files || {})) {
+    const fp = path.resolve(ROOT, rel);
+    if (!fp.startsWith(ROOT + path.sep)) continue;          // the applier rejects it anyway
+    try {
+      base[rel] = createHash("sha256").update(fs.readFileSync(fp)).digest("hex");
+    } catch {
+      // Missing (a new file) or unreadable — nothing to pin. Never fail filing
+      // over a fingerprint: the guard is a safety net, not a gate on authoring.
+    }
+  }
+  if (Object.keys(base).length) item.base_sha256 = base;
+}
+
+const inert = Object.keys(item.files).filter((f) => BOOT_LOADED.some((re) => re.test(f)));
+let rationaleOut = rationale;
+if (inert.length) {
+  const which = inert.length === 1 ? inert[0] : `${inert.length} files, including ${inert[0]}`;
+  rationaleOut = `${rationale}${rationale ? "\n\n" : ""}\u23f3 Heads up: this one needs a restart before it does anything. It changes ${which}, which the supervisors read once when they start up — so approving it writes the file, but the running processes keep the old code until they come back. \`launchctl kickstart -k gui/$(id -u)/ai.claude.session\` is what brings them back. Restarting just the claude child (POST :9093/restart) will not do it — that leaves the same node process holding the same old code.`;
+}
+
+const u = createUnifiedApproval({
+  store: {
+    async insertApproval(r) { const res = await fetch(`${BASE}/rest/v1/self_improve_approvals`, { method: "POST", headers: H, body: JSON.stringify(r) }); if (!res.ok) throw new Error(`insert ${res.status}: ${await res.text()}`); },
+    // Duplicate guard: the core refuses a card whose content hash
+    // already belongs to a live, skipped, in-flight or applied card.
+    async findByItemHash(hash) { const res = await fetch(`${BASE}/rest/v1/self_improve_approvals?item_hash=eq.${encodeURIComponent(hash)}&select=id,status,skipped,risk,expires_at,expires_at_ms`, { headers: H }); if (!res.ok) throw new Error(`lookup ${res.status}`); return res.json(); },
+  },
+  deviceKeys: { getKey: async () => null },
+  postSuggestion: async (s, r) => { try { await exec(path.join(ROOT, "bin/merlin-send-curl"), ["--channel", "improvements", "--skip-precheck", `🔧 ${s}\n${r || ""}\n\nApprove in the app (Face ID) to apply.`], { timeout: 15000 }); } catch {} },
+  applyItem: async () => ({ ok: false }),
+});
+
+const r = await u.requestApproval({ itemType: type, summary, rationale: rationaleOut, item });
+if (r?.dropped && r.duplicate_of) {
+  // The same content (same item_hash) is already a card that is waiting, was
+  // skipped, is being applied, or has been applied. Same "nothing filed" shape
+  // as a stale drop: a normal outcome, not a CLI error.
+  console.log(`Dropped — no approval was created: this exact change is a ${r.reason}.`);
+} else if (r?.dropped) {
+  // The staleness recheck (self-improve-unified.mjs) decided the
+  // finding behind this card has gone stale or was already resolved — no row
+  // was created and nothing was posted. This is a normal, successful outcome
+  // (the same "no card is filed" shape as a critic REVERT), not a CLI error.
+  console.log(`Dropped — no approval was created. The finding behind this card looked stale or already resolved: ${r.reason}`);
+} else {
+  console.log(`Requested approval ${r.id} (${type}) — posted to the Improvements channel for Face-ID approval.`);
+  if (r.staleness_rewritten) console.log("Note: the rationale was re-framed by the staleness check before posting — see self-improve-show for the full text.");
+}

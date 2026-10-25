@@ -2,7 +2,7 @@
 # wiki-db-snapshot — atomic snapshot of memory-index.db for backup.
 #
 # Runs SQLite VACUUM INTO into a timestamped file, then keeps only the last
-# 24 snapshots (~1 day at hourly cron). Defense-in-depth complement to the
+# 4 snapshots (hourly cron; was 24 until 2026-10-17, ~76 GB). Defense-in-depth complement to the
 # file-based memory-snapshot cron — if the DB itself corrupts (the FTS5
 # bridge briefly did so during a 2026-05-02 experiment), restoring from the
 # most recent snapshot is one cp away.
@@ -15,7 +15,7 @@
 # Usage:
 #   wiki-db-snapshot              # snapshot + rotate
 #   wiki-db-snapshot --quiet      # no stdout unless something failed
-#   wiki-db-snapshot --keep N     # rotate to last N (default 24)
+#   wiki-db-snapshot --keep N     # rotate to last N (default 4)
 #   wiki-db-snapshot --dest <dir> # override destination dir
 #
 # Exit codes:
@@ -23,14 +23,11 @@
 #   1  snapshot failed
 #   2  source DB missing
 
-const path = require("node:path");
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
-
 set -euo pipefail
 
-DB_PATH="${MEMORY_INDEX_DB:-${MERLIN_HOME}/data/memory-index.db}"
-DEST_DIR="${MERLIN_HOME}/data/memory-db-snapshots"
-KEEP=24
+DB_PATH="${MEMORY_INDEX_DB:-$HOME/Dev/merlin/data/memory-index.db}"
+DEST_DIR="$HOME/Dev/merlin/data/memory-db-snapshots"
+KEEP=4
 QUIET=0
 
 while [[ $# -gt 0 ]]; do

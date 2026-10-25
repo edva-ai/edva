@@ -2,29 +2,37 @@
 // process-manager.mjs — direct process supervisor, replaces tmux session management.
 //
 // Manages 4 child processes with independent restart:
-//   1. Chat supervisor  (Node.js — manages Claude session for Merlin messages)
-//   2. Ops supervisor   (Node.js — manages Claude session for email triage + tasks)
-//   3. Hookdeck         (webhook relay for Gmail Pub/Sub)
-//   4. Wiki server      (HTTP wiki browser at 127.0.0.1:9096)
+//   1. Chat supervisor   (Node.js — manages Claude session for Merlin messages)
+//   2. Ops supervisor    (Node.js — manages Claude session for email triage + tasks)
+//   3. Wiki server       (HTTP wiki browser at 127.0.0.1:9096)
+//   4. WhatsApp channel  (Baileys gateway for the user's personal WhatsApp on :9100)
+//
+// Gmail Pub/Sub push and the CF Email Worker reach :9090 through a Cloudflare
+// Tunnel (push hostname → localhost:9090) managed by its own launchd agent
+// (com.cloudflare.cloudflared), NOT by this process-manager.
 //
 // Each process restarts independently with exponential backoff.
 // One crashing does not affect the others.
 //
 // Managed by launchd (ai.claude.session).
 
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { ManagedProcess } from "../lib/managed-process.mjs";
-
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
+import { listJobs, updateRegistry, isPidAlive, registryPath, logPath } from "../../lib/job-runner.mjs";
+import { installRoot, installTools, nodeBin } from "../../lib/root.cjs";
+const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 const HOME = process.env.HOME;
-const MERLIN = MERLIN_HOME;
+const MERLIN = installRoot();
 const AGENT_DIR = path.join(MERLIN, "agent");
 const LOG_DIR = path.join(AGENT_DIR, "logs");
 const SUPERVISOR_DIR = path.join(AGENT_DIR, "supervisor");
-const NODE = "node";
+// The node every managed child runs on (lib/root.cjs nodeBin: $MERLIN_NODE,
+// else a stable Homebrew / /usr/local path, else this interpreter).
+const NODE = nodeBin();
 
 // Load .env into process.env so secrets (SUPABASE_ACCESS_TOKEN, etc.)
 // propagate to every child process — supervisors, Claude, and MCP servers
@@ -78,29 +86,41 @@ function createProcesses() {
     })
   );
 
-  // 3. Hookdeck relay. Spawn the native Go binary directly instead of the
-  // `hookdeck` shim on PATH — the shim is a node wrapper that execs the
-  // native binary as a grandchild, and SIGTERM to the wrapper doesn't
-  // reach the grandchild. That left orphaned hookdeck listeners from
-  // prior manager restarts still connected to the Hookdeck cloud and
-  // load-balancing Gmail pushes onto dead tunnels (observed 2026-04-16).
+  // 2b. Ops-light supervisor — Sonnet sibling of ops. Handles cron/webhook
+  // jobs routed off Opus (job-routing.json model != opus); webhook-auth.sh
+  // picks the :9082/:9083 port pair by job tier. No Gmail ingress (that stays
+  // single-instance on ops). Lean cwd (ops-light-agent, Chrome-less .mcp.json)
+  // to bound the RAM footprint on a swap-constrained host (part of the cost
+  // re-architecture).
   children.push(
     new ManagedProcess({
-      name: "hookdeck",
-      command: "hookdeck",
-      // --log-level debug adds connection diagnostics to hookdeck.log
-      // (WebSocket close reasons, retry backoff, DNS/TLS errors) so when the
-      // tunnel drops, we have enough context to diagnose root cause instead of
-      // just "Connection lost, reconnecting...".
-      args: ["listen", "9090", "gmail-source", "--output", "compact", "--log-level", "debug"],
-      cwd: AGENT_DIR,
-      logFile: path.join(LOG_DIR, "hookdeck.log"),
+      name: "ops-light-supervisor",
+      command: NODE,
+      args: [path.join(SUPERVISOR_DIR, "index.mjs"), "--agent", "ops-light"],
+      cwd: SUPERVISOR_DIR,
+      logFile: path.join(LOG_DIR, "ops-light-supervisor.log"),
       log,
     })
   );
 
-  // 4. Wiki server — HTTP wiki browser on :9096. Binds to 0.0.0.0 so
-  // it's reachable over Tailscale (e.g. http://${MERLIN_HOST}:9096) and
+  // 2c. Ops-haiku supervisor — Haiku sibling. Handles the haiku-tier scan/watch
+  // jobs (job-routing.json model==haiku); webhook-auth.sh routes them to
+  // :9072/:9073. Sonnet→Haiku on these jobs saves ~67%. No Gmail ingress; same
+  // lean Chrome-less cwd pattern as ops-light (the Haiku tier of the same
+// cost re-architecture).
+  children.push(
+    new ManagedProcess({
+      name: "ops-haiku-supervisor",
+      command: NODE,
+      args: [path.join(SUPERVISOR_DIR, "index.mjs"), "--agent", "ops-haiku"],
+      cwd: SUPERVISOR_DIR,
+      logFile: path.join(LOG_DIR, "ops-haiku-supervisor.log"),
+      log,
+    })
+  );
+
+  // 3. Wiki server — HTTP wiki browser on :9096. Binds to 0.0.0.0 so
+  // it's reachable over Tailscale (e.g. http://<host>:9096) and
   // on the home LAN, not just localhost. Read-only, no auth — exposure is
   // gated by network trust (LAN + Tailscale), same model as before.
   children.push(
@@ -110,6 +130,47 @@ function createProcesses() {
       args: [path.join(MERLIN, "bin/wiki"), "serve", "--port", "9096", "--host", "0.0.0.0"],
       cwd: MERLIN,
       logFile: path.join(LOG_DIR, "wiki-server.log"),
+      log,
+    })
+  );
+
+  // 3b. Wiki server, INTERNET-FACING — the origin behind the public memory
+  // hostname. A separate process from the one above on purpose:
+  //
+  //   - it binds 127.0.0.1 only, so the sole route in is the cloudflared
+  //     tunnel, and
+  //   - it runs WIKI_PUBLIC=1, which makes a verified Cloudflare Access JWT
+  //     mandatory on every request and scopes what each identity may read
+  //     (lib/wiki-access.js, data/wiki-share-scopes.json).
+  //
+  // Keeping them separate preserves the unauthenticated Tailscale/LAN browsing
+  // above — which is network-trust gated and works fine — while guaranteeing
+  // the internet-facing instance can never serve a page without an identity.
+  // One process serving both would have meant choosing between the two.
+  children.push(
+    new ManagedProcess({
+      name: "wiki-server-public",
+      command: NODE,
+      args: [path.join(MERLIN, "bin/wiki"), "serve", "--port", "9097", "--host", "127.0.0.1"],
+      cwd: MERLIN,
+      env: { WIKI_PUBLIC: "1" },
+      logFile: path.join(LOG_DIR, "wiki-server-public.log"),
+      log,
+    })
+  );
+
+  // 4. WhatsApp channel — Baileys gateway holding the user's personal WhatsApp
+  // session. HTTP send-server on :9100, inbound to whatsapp-inbox.jsonl,
+  // chat-channel pings on filter-pass. If down, inbound stalls (WhatsApp
+  // servers queue messages for Linked Devices for a few hours, not days),
+  // so supervision matters here more than for wiki-server.
+  children.push(
+    new ManagedProcess({
+      name: "whatsapp-channel",
+      command: NODE,
+      args: [path.join(AGENT_DIR, "whatsapp-channel/index.mjs")],
+      cwd: path.join(AGENT_DIR, "whatsapp-channel"),
+      logFile: path.join(LOG_DIR, "whatsapp-channel.log"),
       log,
     })
   );
@@ -182,29 +243,46 @@ statusTimer.unref();
 // producing zero events for hours. This polls /health and SIGKILLs the
 // supervisor child when the dispatcher has been stuck with an in-flight task
 // for too long. ManagedProcess.on("exit") then kicks the normal restart path.
-// Added 2026-04-18 after a 5h silent hang went undetected by heartbeats.
+// (Heartbeats alone can miss a silent hang of hours.)
 
 const DISPATCH_HEALTH_PORTS = {
   "ops-supervisor": 9093,
+  "ops-light-supervisor": 9083,
+  "ops-haiku-supervisor": 9073,
 };
 const DISPATCH_POLL_INTERVAL = 2 * 60_000;
 const DISPATCH_STUCK_MS = 15 * 60_000;
 const DISPATCH_STUCK_MS_SLEEP_WINDOW = 30 * 60_000;
 
-// Returns true when local ET hour is in [01:00, 08:00) — quiet window where
-// nightly-review / daily-summary / hum-daily can legitimately run 15-25min
-// (web research + classifier + multiple email-sends). Bumping the stuck
-// threshold here avoids the recurring false-positive SIGKILL pattern that
-// produced phantom catchup-sweeps documented across 4/27-4/30 reviews.
-function inSleepWindowET() {
-  const etHour = Number(
+// The user's current timezone, from the phone-reported value the phone-channel
+// persists to user-timezone.json. Falls back to the home timezone
+// (lib/instance.cjs tz) when missing/unreadable.
+function userTz() {
+  try {
+    const tz = JSON.parse(
+      readFileSync(installTools("data/user-timezone.json"), "utf8")
+    )?.timezone;
+    if (tz && Intl.DateTimeFormat("en-US", { timeZone: tz })) return tz;
+  } catch {}
+  return instance().tz;
+}
+
+// Returns true when the user's LOCAL hour is in [01:00, 08:00) — quiet window
+// where nightly-review / daily-summary / hum-daily can legitimately run
+// 15-25min (web research + classifier + multiple email-sends). Keyed to the
+// user's local tz (not a fixed home-zone clock) because cron-tz-sync pins those heavy jobs to
+// local wall-clock, so their run window travels with the user. Bumping the
+// stuck threshold here avoids a recurring false-positive SIGKILL pattern that
+// produces phantom catchup-sweeps.
+function inSleepWindowLocal() {
+  const localHour = Number(
     new Intl.DateTimeFormat("en-US", {
-      timeZone: "America/New_York",
+      timeZone: userTz(),
       hour: "numeric",
       hour12: false,
     }).format(new Date())
   );
-  return etHour >= 1 && etHour < 8;
+  return localHour >= 1 && localHour < 8;
 }
 
 function fetchSupervisorHealth(port) {
@@ -230,7 +308,7 @@ async function checkDispatchLiveness() {
     if (!health) continue;
     const ageMs = health.lastEventAgeMs ?? 0;
     const inFlight = health.inFlight;
-    const threshold = inSleepWindowET() ? DISPATCH_STUCK_MS_SLEEP_WINDOW : DISPATCH_STUCK_MS;
+    const threshold = inSleepWindowLocal() ? DISPATCH_STUCK_MS_SLEEP_WINDOW : DISPATCH_STUCK_MS;
     if (inFlight && ageMs > threshold) {
       const window = threshold === DISPATCH_STUCK_MS_SLEEP_WINDOW ? "sleep" : "active";
       log(`[${child.name}] STUCK (${window}-window): inFlight=${inFlight.source} lastEventAge=${Math.round(ageMs / 60_000)}min — SIGKILL to trigger restart`);
@@ -244,9 +322,147 @@ const dispatchWatchdogTimer = setInterval(() => {
 }, DISPATCH_POLL_INTERVAL);
 dispatchWatchdogTimer.unref();
 
+// ── Job-completion watcher ───────────────────────────────────────────────
+// Companion to lib/job-runner.mjs (long-running processes in a
+// protected, uninterrupted container that runs in parallel to other tasks
+// in the system). Jobs
+// launched via `job-run` run as detached processes that are NOT descendants
+// of any agent session, so they survive session rotation/crash-loop/restart.
+// This process-manager is the one thing in the whole system that outlives
+// every individual agent session, which makes it the right home for the
+// piece that still needs to happen once a job finishes: telling an agent
+// about it. The registry file (data/jobs/<id>.json), not this
+// process's memory, is the durable source of truth — a process-manager
+// restart just re-reads the same files and picks up where it left off.
+//
+// Three things happen on each sweep:
+//   1. Terminal-but-unnotified jobs with an on_complete spec get dispatched
+//      to their tier's webhook (same POST-a-task pattern as cron dispatch —
+//      see agent/scripts/lib/webhook-auth.sh dispatch_or_skip).
+//   2. Jobs that still say status=="running" but whose pid is gone (wrapper
+//      itself crashed, or a reboot took everything down) get marked "lost"
+//      after two consecutive dead-pid observations, so a stuck job doesn't
+//      sit invisible forever — this still notifies if on_complete was set,
+//      framed as an unknown-outcome job so the agent knows to go check.
+//   3. Old terminal job files get pruned so the registry directory doesn't
+//      grow unbounded.
+
+const JOB_POLL_INTERVAL = 20_000;
+const JOB_NOTIFY_MAX_ATTEMPTS = 10;
+const JOB_PRUNE_AGE_MS = 7 * 24 * 60 * 60_000; // 7 days past finished_at
+const JOB_TIER_PORTS = { ops: 9092, "ops-light": 9082, "ops-haiku": 9072 };
+
+// pid observed dead but registry still says "running" — debounced across two
+// consecutive sweeps before declaring the job lost, so we don't race the
+// wrapper's own near-instant post-exit registry write.
+const pendingLostSince = new Map();
+
+function readWebhookToken() {
+  try {
+    return readFileSync(path.join(MERLIN, "secrets/webhook-token"), "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+const WEBHOOK_TOKEN = readWebhookToken();
+
+function postJobTask(port, taskText) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ task: taskText, source: "job-runner" });
+    const headers = { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) };
+    if (WEBHOOK_TOKEN) headers["Authorization"] = `Bearer ${WEBHOOK_TOKEN}`;
+    const req = http.request(
+      { host: "127.0.0.1", port, path: "/", method: "POST", headers, timeout: 8000 },
+      (res) => {
+        res.on("data", () => {});
+        res.on("end", () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.write(body);
+    req.end();
+  });
+}
+
+function renderTaskTemplate(template, job) {
+  return template
+    .replace(/\{\{status\}\}/g, job.status)
+    .replace(/\{\{exit_code\}\}/g, job.exit_code === null || job.exit_code === undefined ? "unknown" : String(job.exit_code))
+    .replace(/\{\{id\}\}/g, job.id)
+    .replace(/\{\{name\}\}/g, job.name);
+}
+
+async function checkJobCompletions() {
+  const jobs = listJobs();
+  const now = Date.now();
+
+  for (const job of jobs) {
+    // 1. Detect jobs whose pid died without the wrapper updating status —
+    // wrapper crash or machine reboot. Debounce across two sweeps.
+    if (job.status === "running" && job.pid) {
+      if (!isPidAlive(job.pid)) {
+        const firstSeen = pendingLostSince.get(job.id);
+        if (firstSeen) {
+          log(`[job-runner] ${job.id} (${job.name}) pid ${job.pid} gone, wrapper never updated status — marking lost`);
+          updateRegistry(job.id, {
+            status: "lost",
+            finished_at: new Date().toISOString(),
+            error: "wrapper did not report a terminal status (crashed, or host restarted)",
+          });
+          pendingLostSince.delete(job.id);
+        } else {
+          pendingLostSince.set(job.id, now);
+        }
+        continue; // re-read as terminal next sweep before notifying
+      } else {
+        pendingLostSince.delete(job.id);
+      }
+    }
+
+    // 2. Dispatch completion notification for terminal-but-unnotified jobs.
+    if (job.on_complete && !job.notified) {
+      const port = JOB_TIER_PORTS[job.on_complete.tier];
+      const isTerminal = ["done", "failed", "canceled", "lost"].includes(job.status);
+      if (!isTerminal || !port) continue;
+      const attempts = (job.notify_attempts || 0) + 1;
+      if (attempts > JOB_NOTIFY_MAX_ATTEMPTS) {
+        log(`[job-runner] ${job.id} (${job.name}) giving up on notify after ${attempts - 1} attempts — marking notified to stop retrying`);
+        updateRegistry(job.id, { notified: true, notify_attempts: attempts });
+        continue;
+      }
+      const taskText = renderTaskTemplate(job.on_complete.task, job);
+      const ok = await postJobTask(port, taskText);
+      if (ok) {
+        log(`[job-runner] ${job.id} (${job.name}) status=${job.status} — notified ${job.on_complete.tier}`);
+        updateRegistry(job.id, { notified: true, notify_attempts: attempts });
+      } else {
+        log(`[job-runner] ${job.id} (${job.name}) notify attempt ${attempts} to ${job.on_complete.tier} failed — will retry`);
+        updateRegistry(job.id, { notify_attempts: attempts });
+      }
+    }
+
+    // 3. Prune old terminal job files (registry + log) past the retention window.
+    if (["done", "failed", "canceled", "lost"].includes(job.status) && job.finished_at) {
+      const age = now - new Date(job.finished_at).getTime();
+      if (age > JOB_PRUNE_AGE_MS) {
+        try { unlinkSync(registryPath(job.id)); } catch {}
+        try { unlinkSync(logPath(job.id)); } catch {}
+      }
+    }
+  }
+}
+
+const jobWatcherTimer = setInterval(() => {
+  checkJobCompletions().catch((err) => log(`job-runner watcher error: ${err.message}`));
+}, JOB_POLL_INTERVAL);
+jobWatcherTimer.unref();
+
 async function shutdown(sig) {
   log(`received ${sig} — stopping all services`);
   clearInterval(statusTimer);
+  clearInterval(dispatchWatchdogTimer);
+  clearInterval(jobWatcherTimer);
   try { healthServer.close(); } catch {}
   for (const child of children) {
     child.stop();

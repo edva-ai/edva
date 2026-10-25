@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // email-mem — CLI for managing email classification memories.
 // Usage:
-//   email-mem add "Already handled SMH K-1 tax document for 2025" --tags "smh,tax,k-1"
+//   email-mem add "Already handled the ACME Accounting tax document" --tags "acme,tax"
 //   email-mem add "Ignore all emails from noreply@example.com" --tags "example.com" --expires 2026-12-31
-//   email-mem search "SMH tax"
+//   email-mem search "ACME tax"
 //   email-mem list
 //   email-mem list --tag tax
 //   email-mem remove 3
-//   email-mem test --from "smh@broker.com" --subject "Your K-1 is ready"
+//   email-mem test --from "statements@acme.example" --subject "Your tax document is ready"
 
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -22,14 +22,34 @@ function flag(name) {
   return args[i + 1];
 }
 
+// The memory body. Historically this was `args[1]` and nothing else, so a
+// caller writing the flag form — `email-mem add --text "..." --tags "..."` —
+// silently stored the literal string "--text" as the memory, and a caller
+// leading with --tags stored "--tags", and rows in a live store can be
+// corrupt that way. Two changes close it: --text
+// is now an accepted spelling, and a positional that is actually a flag is
+// refused instead of being written to the store.
+function memoryText() {
+  const viaFlag = flag("text");
+  if (viaFlag !== undefined) return { text: viaFlag };
+  const positional = args[1];
+  if (positional === undefined) return { text: undefined };
+  if (positional.startsWith("--")) {
+    return { text: undefined, badFlag: positional };
+  }
+  return { text: positional };
+}
+
 function usage() {
   console.log(`email-mem — manage email classification memories
 
 Commands:
   add <text> [--tags t1,t2] [--expires YYYY-MM-DD]   Add a memory
+  add --text "<text>" [--tags t1,t2]                   Same, flag form
   search <query>                                       Search memories
   list [--tag <tag>]                                   List all memories
   remove <id>                                          Remove a memory by ID
+  repair [--apply]                                     Find (and remove) rows whose body is a flag name
   test --from <f> --subject <s> [--snippet <sn>]       Test what memories match an email
   supersede <id> --by <id> [--add-tag tag] [--remove-tag tag]   Mark row superseded
 `);
@@ -37,10 +57,37 @@ Commands:
 
 switch (cmd) {
   case "add": {
-    const text = args[1];
+    const { text, badFlag } = memoryText();
+    if (badFlag) {
+      console.error(`email-mem add: "${badFlag}" is a flag, not the memory text.`);
+      console.error(`Write the memory as the first argument, or pass it as --text "...".`);
+      console.error(`Usage: email-mem add <text> [--tags ...] [--expires ...]`);
+      process.exit(1);
+    }
     if (!text) { console.error("Usage: email-mem add <text> [--tags ...] [--expires ...]"); process.exit(1); }
     const id = em.add({ text, tags: flag("tags") || "", expiresAt: flag("expires") || null });
     console.log(`Added memory #${id}: ${text}`);
+    break;
+  }
+  case "repair": {
+    // List (and with --apply, remove) rows whose body is just a flag name —
+    // the corruption the parser above now prevents. Read-only by default: a
+    // memory row is evidence about how triage should behave, so deleting one
+    // is the user's call, not a side effect of running a report.
+    const apply = args.includes("--apply");
+    const all = em.list({ limit: 100000 });
+    const corrupt = all.filter((r) => typeof r.text === "string" && r.text.trim().startsWith("--"));
+    if (corrupt.length === 0) { console.log("No corrupt memories found."); break; }
+    console.log(`${corrupt.length} corrupt memor${corrupt.length === 1 ? "y" : "ies"} (body is a flag name):`);
+    for (const r of corrupt) {
+      console.log(`  #${r.id} [${r.created_at}] ${JSON.stringify(r.text)}${r.tags ? ` (${r.tags})` : ""}`);
+    }
+    if (!apply) {
+      console.log(`\nNothing removed. Re-run with --apply to delete these ${corrupt.length} row(s).`);
+      break;
+    }
+    for (const r of corrupt) em.remove(r.id);
+    console.log(`\nRemoved ${corrupt.length} corrupt memor${corrupt.length === 1 ? "y" : "ies"}.`);
     break;
   }
   case "search": {

@@ -1,4 +1,11 @@
 node_modules/
 logs/
 whatsapp-bridge/wa-auth/
+whatsapp-channel/wa-auth/
 .DS_Store
+
+# managed by open-wa
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed by open-wa

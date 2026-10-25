@@ -1,0 +1,113 @@
+{
+  "$schema": "./job-routing.schema.json",
+  "_meta": {
+    "purpose": "Canonical per-job tier/model/locality classification for the June-15 cost re-architecture (docs/cost-rearchitecture-june2026.md). The single source of truth consumed by: (1) the supervisor ephemeral-mode model router (Lever B), (2) the scheduled-task roster setup (which job folds into which Cowork task), (3) local-offload wiring, (4) the mkt-* eliminations. Grounded in the 30d ledger (job-costs.ndjson) + each job's reasoning nature.",
+    "dispositions": {
+      "scheduled": "Tier S \u2014 runs as / folds into a Cowork scheduled task on the subscription (free). target = roster task name.",
+      "local": "Tier 0 \u2014 runs on the on-device model (lib/local-llm.mjs, Gemma). Free. Classification/extraction/flagging only (a RAM-constrained host = small model).",
+      "realtime-api": "Tier 2 \u2014 genuinely latency-sensitive; runs on the budget-capped API key. Keep volume low.",
+      "eliminate": "Tier 3 \u2014 pause, drop to weekly, or replace with deterministic code. ROI-gated.",
+      "script": "Tier C \u2014 runs as cron/launchd CODE, never dispatched to a supervisor (no webhook, no agent turn). `model` is the tier of its optional single tool-less judgment call made from inside the script (claude -p / max-judge), or null when the script makes no model call. webhook-auth.sh never sees these jobs. Added 2026-10-04 (determinism pass) to replace the mixed `eliminate`/`local` labels the scripted jobs had picked up."
+    },
+    "models": "opus = deep synthesis only | sonnet = digests/drafting/moderate reasoning | haiku = cheap classify/poll | local = on-device Gemma",
+    "mcp_manifest": "OPTIONAL per-job `mcp` array declaring which MCP servers the job actually uses (vocab: tools, health, supabase-merlin, gsc, chrome-devtools). tools+health are the universal baseline. Omit = 'the routed tier's default .mcp.json is fine' (no assertion). PURPOSE: make each job's MCP surface explicit + checkable via `bin/mcp-manifest-check` \u2014 it fails closed if a declared need can't be met by any tier, and flags jobs whose needs exceed their model-default tier (e.g. Chrome jobs \u2192 must route to `ops`, which webhook-auth.sh already does via override) plus per-tier servers no declaring job needs (trim candidates). NOTE: this is a declaration + audit layer only. Spawn-time enforcement (spawn ONLY a job's subset) is NOT wired \u2014 the supervisor runs one long-lived session per tier and spawns MCP servers once per session, not per dispatch; true per-dispatch subsetting needs the ephemeral-subprocess architecture (deferred, see architecture.md). Seeded 2026-07-08 on the 5 Chrome jobs.",
+    "consumed_by": [
+      "supervisor ephemeral router (A3)",
+      "scheduled-task roster (#6)",
+      "local migration (#7)",
+      "mkt elimination (#9)"
+    ],
+    "status": "v1 2026-06-06; LIVE since 2026-06-17 \u2014 the `model` field is now consumed by webhook-auth.sh tier routing: any job whose model is set and != 'opus' (except the Chrome/CDP jobs pinned to ops in webhook-auth.sh) dispatches to the ops-light (Sonnet) supervisor at :9082 instead of ops (Opus) at :9092. The `disposition`/`target` fields (scheduled\u2192Cowork, local\u2192Gemma, eliminate) are still aspirational and NOT yet wired. Not routed through this file: mail to the agent's own address runs in a stateless one-shot (bin/email-inbound-run, agents.json ops.emailInboundMode) and only escalates into ops; per-message Gmail triage is sent to ops-light by the ops supervisor itself (triage-route.mjs, agents.json ops.gmailTriageTarget). Jobs with disposition script never dispatch at all.",
+    "local": "This installation's own jobs (and field overrides of kernel jobs) live in agent/local/job-routing.json, same shape; every reader sees the two merged by lib/registry.cjs (`node lib/registry.cjs job-routing`)."
+  },
+  "jobs": {
+    "morning-digest": {
+      "disposition": "script",
+      "target": null,
+      "model": "sonnet",
+      "effort": "low",
+      "rationale": "Script since 2026-10-04: bin/morning-digest-run via launchd ai.claude.morning-digest; one pick call. No supervisor dispatch. Before: Morning briefing; calendar/weather/tasks/news. Sonnet adequate."
+    },
+    "nightly-review": {
+      "disposition": "scheduled",
+      "target": "weekly-review",
+      "model": "opus",
+      "effort": "xhigh",
+      "runtime": "ephemeral-opus",
+      "rationale": "7d self-assessment (Tue). Needs deep reasoning. Weekly slot. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.improvement-review), because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02, so this was silently a Sonnet job. Chains improvement-plan on a clean exit."
+    },
+    "improvement-plan": {
+      "disposition": "scheduled",
+      "target": "weekly-review",
+      "model": "opus",
+      "effort": "xhigh",
+      "runtime": "ephemeral-opus",
+      "rationale": "Acts on every ACTION ITEM of the weekly review: safe changes land through self-improve-auto-apply, complex or high-blast-radius ones become Face-ID cards in the Improvements channel (rubric schema v4, 2026-09-29) \u2014 authors real code changes to Merlin's own source, so it gets the deepest tier. Chained by trigger-nightly-review.sh; launchd ai.claude.improvement-plan (Tue 10:30) is a safety-net slot."
+    },
+    "cost-efficiency-review": {
+      "disposition": "scheduled",
+      "target": "weekly-review",
+      "model": "opus",
+      "effort": "xhigh",
+      "runtime": "ephemeral-opus",
+      "rationale": "DAILY review of WHERE the Max budget went \u2014 cost split by token type, measured context floor per supervisor, working window, compact/rotate churn. Added 2026-08-06 after one overnight window burned a large slice of the weekly cap, most of it cache traffic rather than work, and nothing noticed: nightly-review's cost lens is weekly and job-shaped, so it could not see a structural context-floor problem (a job re-writing a 100k prefix every dispatch looks like a job doing work). Improvement process \u2192 Opus 5 per the standing rule; `runtime: ephemeral-opus` because `model: opus` here is only a TIER label and the heavy supervisor has run claude-sonnet-5 since 2026-07-02. Launched by launchd (ai.claude.cost-efficiency-review, 02:37 local slot from merlin-cron-slots), NOT cron \u2014 cron cannot unlock the keychain for a claude -p. The trigger gates below 20 dispatches/24h, so a quiet day costs nothing."
+    },
+    "system-issue-review": {
+      "disposition": "scheduled",
+      "target": "nightly-synthesis",
+      "model": "opus",
+      "effort": "xhigh",
+      "runtime": "ephemeral-opus",
+      "rationale": "Nightly root-cause pass over the system channel that authors real code fixes. Capped at 3 clusters/night. 2026-07-28: NO LONGER webhook-dispatched \u2014 runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS (claude-opus-5-5 since 2026-10-06, pinned in agent/config/models.env)` via launchd (ai.claude.system-issue-review{,-critical}), same reason as nightly-review. Its trigger's gate is unchanged and still decides whether to run at all."
+    },
+    "hum": {
+      "disposition": "realtime-api",
+      "target": null,
+      "model": "sonnet",
+      "effort": "medium",
+      "rationale": "The 20-min proactive check-in tick \u2014 the single biggest token consumer. Bash-gated upstream (sleep/activity/meeting), so most ticks never dispatch; the ones that do are relevance-judgment + light research + a voice ping. Moved Opus\u2192Sonnet 2026-06-19 (~1.67x cheaper). WATCH: hum's whole value is NOT interrupting the user unless it matters \u2014 if Sonnet over-pings or misses signal, bump back to opus (one-line revert). The hum harvesters already fork claude -p --model sonnet --effort low, so Sonnet is proven on the sub-tasks."
+    },
+    "hum-ideation": {
+      "disposition": "scheduled",
+      "target": "hum-ideation",
+      "model": "sonnet",
+      "effort": "medium",
+      "rationale": "Creative ideation. 4x/day \u2192 2 scheduled slots. Candidate harvest can go local."
+    },
+    "hum-daily": {
+      "disposition": "script",
+      "target": null,
+      "model": null,
+      "effort": null,
+      "rationale": "Script since 2026-10-04: bin/hum-daily-run. No supervisor dispatch."
+    },
+    "hum-review": {
+      "disposition": "scheduled",
+      "target": "weekly-review",
+      "model": "sonnet",
+      "effort": "medium",
+      "rationale": "Weekly hum feedback review (Sun). Weekly slot."
+    },
+    "hum-explore": {
+      "disposition": "script",
+      "target": null,
+      "model": null,
+      "effort": null,
+      "rationale": "Script: bin/hum-explore-run (replaced hum-canary 2026-10-07). No supervisor dispatch."
+    },
+    "skill-repair": {
+      "disposition": "on-demand",
+      "target": null,
+      "model": "sonnet",
+      "effort": null,
+      "rationale": "Same-day repair of a broken read-only browser action / page parser (jobs/skill-repair.md). Queued by lib/skill-repair.mjs requestRepair() from its producers (skill-health and the installation's event-listing ingest), dispatched by trigger-skill-repair.sh. Pinned to ops by config/chrome-jobs.json (needs the chrome-devtools MCP to read the live page). Runs only when something broke; capped at 4/day."
+    },
+    "email-inbound": {
+      "disposition": "scheduled",
+      "target": "email-batch",
+      "model": "sonnet",
+      "effort": "low",
+      "rationale": "Triage/label/route batched on watermark. P1 re-scan folds in. Urgency flag is separate (local, realtime)."
+    }
+  }
+}

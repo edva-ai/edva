@@ -2,23 +2,27 @@
 # claude-session-launcher.sh — managed by launchd (ai.claude.session)
 #
 # Long-lived process. launchd's KeepAlive restarts it when it exits non-zero.
-# Creates 3-pane tmux layout:
+# Creates 2-pane tmux layout:
 #   Pane 0: Chat agent (Sonnet, interactive)  — launched via claude CLI + dev-channels
 #   Pane 1: Ops agent  (Opus, supervised)      — launched via Node supervisor (stream-json)
-#   Pane 2: Hookdeck                           — Gmail webhook relay → supervisor :9090
+#
+# Gmail-push ingress is NOT a pane here: it's a Cloudflare
+# Tunnel (push hostname → :9090) under its own launchd agent
+# (com.cloudflare.cloudflared), replacing an old relay pane.
+#
+# NOTE: this tmux launcher is legacy/observability — the supervision path is
+# process-manager.mjs under ai.claude.session, not tmux. See architecture.md.
 #
 # All launch config (model, allowedTools, channels, ports) lives in
 # agent/config/agents.json. This script reads it via load-agent.sh.
 
 set -euo pipefail
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
 
-
-TMUX=tmux
+TMUX=/opt/homebrew/bin/tmux
 CLAUDE="$HOME/.local/bin/claude"
-NODE=node
+NODE=/opt/homebrew/bin/node
 SESSION=claude
-WORKDIR="${MERLIN_HOME}/agent"
+WORKDIR="$HOME/Dev/merlin/agent"
 CHAT_DIR="$WORKDIR/chat-agent"
 SUPERVISOR_DIR="$WORKDIR/supervisor"
 CONFIG_DIR="$WORKDIR/config"
@@ -83,7 +87,7 @@ else
   $TMUX kill-session -t "$SESSION" 2>/dev/null || true
   sleep 1
 
-  log "Starting 3-pane tmux session (chat / ops-supervisor / hookdeck)"
+  log "Starting 2-pane tmux session (chat / ops-supervisor)"
 
   # Pane 0: chat-agent (interactive claude, Sonnet, phone-channel)
   $TMUX new-session -d -s "$SESSION" -c "$CHAT_DIR"
@@ -94,20 +98,14 @@ else
   $TMUX split-window -t "$SESSION" -v -c "$SUPERVISOR_DIR"
   $TMUX send-keys -t "$SESSION:0.1" "$NODE $SUPERVISOR_DIR/index.mjs --agent ops" Enter
 
-  # Pane 2: hookdeck relay (POST → :9090, unchanged from old setup)
-  $TMUX split-window -t "$SESSION" -v -c "$WORKDIR"
-  $TMUX send-keys -t "$SESSION:0.2" 'hookdeck listen 9090 gmail-source' Enter
-
   $TMUX select-layout -t "$SESSION" even-vertical
 
   CHAT_LOG="$LOGDIR/chat-agent.log"
   OPS_LOG="$LOGDIR/ops-supervisor.log"
-  HOOKDECK_LOG="$LOGDIR/hookdeck.log"
   $TMUX pipe-pane -t "$SESSION:0.0" -o "cat >> '$CHAT_LOG'"
   $TMUX pipe-pane -t "$SESSION:0.1" -o "cat >> '$OPS_LOG'"
-  $TMUX pipe-pane -t "$SESSION:0.2" -o "cat >> '$HOOKDECK_LOG'"
 
-  log "tmux session started — chat→$CHAT_LOG ops→$OPS_LOG hookdeck→$HOOKDECK_LOG"
+  log "tmux session started — chat→$CHAT_LOG ops→$OPS_LOG"
 
   watch_and_accept_prompts &
   WATCHER_PID=$!

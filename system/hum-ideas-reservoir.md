@@ -46,8 +46,8 @@ ideation run reads this first, then writes an updated version.
     ...
   },
   "by_lens": {
-    "pop-art-photography-closing": {...},
-    "project-X-blocker-cleared":   {...},
+    "<exhibit>-closing":           {...},
+    "<project>-host-unblock":      {...},
     ...
   },
   "rejected_patterns": [
@@ -114,7 +114,7 @@ Append-only JSONL. Each idea:
   "created_at": "2026-04-15T18:00:00Z",
   "source": "hum-ideation-agent" | "manual",
   "category": "event-prep" | "stale-p1" | "weekend-planning" | "travel-prep"
-           | "family" | "project" | "taste-match"
+           | "family" | "<project>" | "<business>" | "taste-match"
            | "cross-topic" | "stuck-task" | "seasonal-closing",
   "subject": "short phone-ping-ready subject (<60 chars)",
   "rationale": "why this is worth a pulse",
@@ -162,25 +162,24 @@ a minimum-urgency floor (0.35).
    pinged + what was rejected and why). Read `hum-feedback.jsonl` last
    30 days (what the user reacted to).
 2. Pull broad context: calendar next 14 days, Google Tasks all open,
-   active projects (from `user_*` / `project_*` wiki pages), the user's
-   tastes, trip-history, recent photos.
+   active projects (businesses, household milestones, upcoming trips),
+   the user's tastes, trip-history, recent photos.
 3. For each of these lenses, propose candidate ideas:
    - Event prep: any calendar item in 1-5 days needing context, prep,
      logistics, or a decision
    - Stale P1 escalation: P1 emails pending >5 days — suggest escalation
      path, not just the reminder
-   - Weekend planning: weekend openings + shared-time blocks +
-     venues filtered by user preferences + closing-soon events
+   - Weekend planning: Sat+Sun openings + time with the household +
+     venues that suit everyone coming + shows closing soon
    - Travel prep: trip in <14 days → pre-flight prep, dining research,
-     event alignment
-   - Family / recurring people: milestones, gift prep starting 2mo out,
-     birthday brainstorms — sourced from the user's contacts + tagged
-     wiki pages
-   - Taste-match: new openings / limited-run / matching the user's
-     profile pages
+     events at the destination
+   - Family: household members — milestones, gift prep starting 2mo out,
+     birthday brainstorms
+   - Taste-match: openings, limited-run events and tours that match the
+     user's profile
    - Cross-topic synthesis: two weak signals that together make a strong
-     idea (e.g., partner out of town + event opening + dog-friendly walk
-     = a candidate solo-day plan)
+     idea (e.g., a free day + an opening that matches the user's taste +
+     good weather = a day plan)
    - Stuck tasks: tasks open >14d — propose an unblock
    - Seasonal closing: exhibits/events ending in <7d that match taste
 4. Filter out anything dup of current reservoir or pinged in last 48h.
@@ -203,27 +202,116 @@ echo '{"id":"<idea-id>","consumed":true,"consumed_at":"<now>","ping_id":"<ping-i
   >> data/hum-ideas.jsonl
 ```
 
-## Pruning
+## Pruning — `bin/hum-reservoir-prune`, nightly 02:40 local time
 
-Weekly (Sundays via `hum-review` job) — prune ideas where:
-- `consumed=true` AND `consumed_at` older than 14 days
-- `time_sensitive_until` in the past by >7 days
-- `created_at` older than 60 days and still unconsumed (never clicked → not
-  interesting)
+The weekly-prune-via-`hum-review` sketch this section used to describe was never
+built, and the cost of that showed up on **2026-08-06**: 492 "unconsumed" ideas,
+of which **415 were dead** — 349 already past their own `time_sensitive_until`,
+51 stale and undated, the rest geo-stale or premise-dead. Both halves of the
+lane were choking on the same garbage, in opposite ways:
 
-Write pruned file by rebuilding (not in-place edit). Keep ~last 200 records.
+- **Surfacing.** `ideas.mjs` nominates ONE idea per tick. Dead-but-high-urgency
+  entries kept winning that slot, the ranker kept correctly deboosting them to
+  ~0.28 as location-stale, and the lane published **nothing for two days** while
+  fresh trip ideas written that morning sat unconsumed. The user noticed from the
+  outside: every ping that day was a `nearby` street factoid.
+- **Generation.** `hum-ideation` Step 6 Rule 1 refuses to write any idea sharing
+  ≥3 content words with an unconsumed subject. 415 dead subjects is a veto list
+  covering most of what is worth saying — which is why the job dispatched 4×/day
+  at ~$12/day and produced **3 ideas**.
+
+The prune is deterministic — no model, no cost, sub-second — and retires an idea
+when:
+
+| reason | rule |
+|---|---|
+| `expired_window` | `time_sensitive_until` passed (6h grace for a last-evening tick) |
+| `stale_age` | no `time_sensitive_until` and >21d old — its moment was the week it was written |
+| `geo_stale` | place-bound category whose named place is nowhere on the travel timeline for 90 days (`lib/hum-idea-locality.mjs`) |
+| `premise_dead` | `travelPremiseValid` — the timeline contradicts its location premise |
+| `bad_dow` | `dowValid` — stated weekday doesn't match the date |
+| `ranker_retired` | the hum ranker rejected it for a durable reason, or `hum-place-repeat` vetoed it as a re-recommendation (both below) |
+
+Expiry is **append-only**, like every other writer here: a `{id, expired: true,
+expired_at, expire_reason}` record collapses onto the original. Nothing is
+destroyed. `expired` is deliberately a **different field from `consumed`** — a
+consumed idea became a ping and owns a `ping_id` the scorecard joins reactions
+against; an expired one never surfaced and must never be counted as sent.
+
+Records for ideas dead longer than 30 days move to
+`data/hum-ideas-archive.jsonl` and the live log is rewritten without them
+(temp-file + rename, so a crash can't truncate the reservoir). First run:
+2.69 MB → 898 KB.
+
+### The digest — `data/hum-ideas-digest.json`
+
+Written by the same run. Holds the collapsed list of *live* unconsumed ideas
+plus every dedup block set `hum-ideation` Step 1.5 used to build by hand
+(`task_ids_blocked`, `thread_ids_blocked`, `consumed_recent`,
+`unconsumed_thread_ids`). Subject comparisons (Rules 1, 10, 11 and the
+`hum-reservoir-review` sweep) are by embedding in `hum-ideas-append` /
+`lib/hum-topic-match.mjs` since 2026-10-04 — the per-idea keyword bags
+are gone. The ideation
+job reads this instead of the raw log — parsing 2.7 MB of mostly-dead JSONL was
+consuming the turn budget that should have gone to generating.
+
+### Ranker write-back — the reason a deterministic gate can't be the whole answer
+
+`localityVerdict` can only judge places the travel timeline still knows about.
+A dining idea for a city that burned two nominations in one day is invisible
+to it *by construction*: that leg was swapped off the itinerary, so no
+authority anywhere still knows the city is a city. The gate
+sees "no place named" and passes it.
+
+The Sonnet ranker knew — both times, in writing, in the tick trace. That
+judgment was then thrown away, so the same idea came back the next tick. So
+`jobs/hum.md` Step 4 now carries `sonnet.retire_ideas`: when the ranker rejects
+the ideas candidate for a reason that will still be true tomorrow (place the user has
+left for good, subject settled in chat, premise spent), it calls
+
+```bash
+hum-reservoir-prune --expire "<idea_id>" --reason "<why>"
+```
+
+Losing a tick on score, a cooldown, or a window that hasn't opened yet is
+**transient** and must not retire anything. The asymmetry is deliberate: a
+wrongly-retired idea is silently deleted, a wrongly-kept one costs one
+nomination.
+
+### Second writer — the place re-recommendation veto (2026-10-13)
+
+The hum pre-rank filter (`lib/hum-vetoes.mjs` `findSamePlacePitch`, Jev
+site `hum-place-repeat`, see `docs/jev.md`) vetoes a dining / taste-match
+idea that re-recommends a place Merlin already recommended in the last 21 days
+under another idea id (the motivating case: one restaurant pitched under two
+idea ids, nine days apart). The
+veto fires only on Jev at ≥ 0.85, or on Sonnet when Jev is below that, and only
+in a commit harvest. It then retires the idea through the same CLI the ranker
+uses, so it stops winning the ideas slot until its own window ends:
+
+```bash
+hum-reservoir-prune --expire "<idea_id>" --reason "hum-place-repeat: re-recommends a place already recommended (<ping_id>)"
+```
+
+`--expire` has no reason-code argument, so these retirements are logged as
+`expire_reason: "ranker_retired"`. Tell them apart by `expire_detail`, which
+always starts with `hum-place-repeat:`.
 
 ## Integration with existing hum rules
 
 - Idea ping counts as one ping per run; daily cap unchanged
-- Configured quiet windows (see `hum.md` § QUIET WINDOWS) still suppress
+- Protected windows (meals, standing calls, sleep, the user's own routine windows) still suppress
 - Ideas don't bypass threshold — they compete at the Sonnet rank stage
-- `urgency=high` ideas can pass soft quiet windows the same as live
-  high-urgency candidates
+- `urgency=high` ideas can pass soft quiet windows (e.g. meals) the
+  same as live high-urgency candidates
 
 ## Files
 
-- `data/hum-ideas.jsonl` — reservoir + consumption + reaction log (new)
+- `data/hum-ideas.jsonl` — reservoir + consumption + expiry + reaction log
+- `data/hum-ideas-archive.jsonl` — records for ideas dead >30d, moved out of the live log
+- `data/hum-ideas-digest.json` — live unconsumed inventory + pre-built dedup block sets; what `hum-ideation` reads
+- `bin/hum-reservoir-prune` — nightly deterministic GC + digest writer; also the `--expire` write-back path for the ranker and for `hum-place-repeat`
+- `lib/hum-idea-locality.mjs` — "can the user act on this from where they'll be?" (distinct from claim-facts' "is this claim true?")
 - `data/hum-ideas-scorecard.json` — rolling reaction aggregates (new; rebuilt each ideation run)
 - `agent/ops-agent/jobs/hum-ideation.md` — ideation job playbook (new)
 - `agent/scripts/hum-harvest-all.mjs` — add `ideas` harvester (edit)

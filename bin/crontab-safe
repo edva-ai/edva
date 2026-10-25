@@ -1,0 +1,73 @@
+#!/bin/bash
+# crontab-safe — change only the tagged lines of the crontab, and only after
+# reading the whole crontab.
+#
+# Usage:
+#   crontab-safe remove  <tag>             drop every line containing <tag>
+#   crontab-safe replace <tag> [line ...]  drop them and append these lines
+#                                          (each must contain <tag>)
+# <tag> is a fixed string, not a pattern.
+#
+# Exit: 0 installed, or nothing to change; 1 skipped, crontab left exactly as it
+# was; 2 usage.
+#
+# Why (2026-10-20): `crontab -l | grep -v TAG | crontab -` installs whatever the
+# read produced. When `crontab -l` fails or hangs (it has hung on a macOS
+# permission prompt on this machine), that is an empty or cut-off crontab and
+# every Merlin job (~250 lines) is gone. So the read goes to a file under a
+# timeout; a failed, timed-out or empty read is a skip; what gets installed is
+# recounted first (lines read, minus the tagged ones, plus the new ones, never
+# empty); and only then does anything reach `crontab -`.
+#
+# Env: CRONTAB_SAFE_TIMEOUT seconds per crontab call (default 20; a caller
+# with its own timeout setting passes it in this one). CRONTAB_SAFE_LOG gets
+# one line per skip (default data/logs/crontab-safe.log).
+
+CMD="$1"; TAG="$2"
+usage() { echo "usage: crontab-safe {remove|replace} <tag> [line ...]${1:+ ($1)}" >&2; exit 2; }
+case "$CMD" in remove|replace) ;; *) usage ;; esac
+[ -n "$TAG" ] || usage "empty tag"
+shift 2
+[ "$CMD" = remove ] && [ $# -gt 0 ] && usage "remove takes no lines"
+for l in "$@"; do
+  case "$l" in *"$TAG"*) ;; *) usage "a new line lacks the tag: $l" ;; esac
+  case "$l" in *$'\n'*) usage "a new line contains a newline" ;; esac
+done
+
+TIMEOUT="${CRONTAB_SAFE_TIMEOUT:-20}"
+LOG="${CRONTAB_SAFE_LOG:-$HOME/Dev/merlin/data/logs/crontab-safe.log}"
+PERL=/usr/bin/perl; [ -x "$PERL" ] || PERL=perl
+
+skip() {
+  echo "crontab-safe: crontab not changed ($CMD '$TAG'): $*" >&2
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  echo "$(date -u +%FT%TZ) [$CMD '$TAG'] skipped: $*" >> "$LOG" 2>/dev/null
+  exit 1
+}
+# perl's alarm survives the exec; a hung crontab dies of SIGALRM (status 142).
+timed() { "$PERL" -e 'alarm shift; exec @ARGV or exit 127' "$TIMEOUT" "$@"; }
+
+TMP=$(mktemp -d -t crontab-safe) || skip "no temp dir"
+trap 'rm -rf "$TMP"' EXIT
+
+timed crontab -l > "$TMP/read" 2> "$TMP/err"; rc=$?
+[ "$rc" -eq 142 ] && skip "crontab -l timed out after ${TIMEOUT}s"
+[ "$rc" -ne 0 ] && skip "crontab -l exited $rc: $(head -c 200 "$TMP/err" | tr '\n' ' ')"
+[ -s "$TMP/read" ] || skip "crontab -l returned nothing"
+
+n=$(grep -c '' "$TMP/read")
+t=$(grep -cF -- "$TAG" "$TMP/read")
+k=$#
+[ "$t" -eq 0 ] && [ "$k" -eq 0 ] && exit 0          # nothing to change, nothing written
+
+grep -vF -- "$TAG" "$TMP/read" > "$TMP/kept"
+m=$(grep -c '' "$TMP/kept")
+[ "$m" -eq $((n - t)) ] || skip "recount: read $n lines, $t tagged, but $m kept"
+[ "$m" -gt 0 ] || skip "all $n lines carry the tag; refusing to install an empty crontab"
+{ cat "$TMP/kept"; [ "$k" -gt 0 ] && printf '%s\n' "$@"; } > "$TMP/new"
+f=$(grep -c '' "$TMP/new")
+[ "$f" -eq $((m + k)) ] || skip "recount: $m kept + $k new, but $f to install"
+
+timed crontab - < "$TMP/new" 2> "$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] || skip "crontab install exited $rc: $(head -c 200 "$TMP/err" | tr '\n' ' ')"
+exit 0

@@ -1,0 +1,327 @@
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
+// hum-reservoir-prune — nightly garbage collection for the hum ideas reservoir.
+// (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
+// string and a comment. cron runs this with a bare PATH that has no node, so
+// `#!/usr/bin/env node` would exit 127; the launcher tries the stable Homebrew
+// and /usr/local paths first, then PATH. Same as lib/root.cjs nodeBin.)
+//
+// Why this exists. `hum-ideas.jsonl` is append-only and nothing ever retired an
+// idea that simply went stale — only a ping consuming it, or `hum-reservoir-review`
+// being told a topic was handled. That once left 492 unconsumed ideas
+// in a 2.7 MB log, and both halves of the ideas lane were choking on it:
+//
+//   SURFACING — `ideas.mjs` nominates ONE idea per tick. Ideas anchored to a
+//   city the user had left or a 33-day-old prompt kept out-scoring fresh local
+//   ones, so the ranker deboosted them as location-stale and the lane published
+//   nothing for two days while good local ideas waited unconsumed.
+//
+//   GENERATION — hum-ideation Step 6 refuses to write any idea sharing ≥3
+//   content words with ANY currently-unconsumed subject (Rule 1). With 492 of
+//   them, that suppression surface covers most of what's worth saying: the job
+//   dispatched 4×/day at ~$12/day and produced 3 ideas in a day against a
+//   target of 8–15 per cycle.
+//
+// Both symptoms are the same disease — the reservoir accumulates but never
+// forgets. This retires dead ideas deterministically (no model, no cost), so
+// the harvester picks from live inventory and the generator gets its vocabulary
+// back.
+//
+// It is append-only in the same style as every other writer here: an expiry is
+// a new `{id, expired: true, ...}` record that collapses onto the original, so
+// nothing is destroyed and the history stays auditable. `expired` is a distinct
+// field from `consumed` on purpose — a consumed idea became a ping and owns a
+// `ping_id` the scorecard joins reactions against; an expired one never
+// surfaced and must not be counted as sent.
+//
+// Usage:
+//   hum-reservoir-prune [--stale-days N] [--archive-days N] [--dry-run] [--json]
+//   hum-reservoir-prune --expire <idea_id> --reason "<why>"
+//
+// The `--expire` form is the ranker's write-back path (jobs/hum.md Step 4,
+// `retire_ideas`). Every tick, Sonnet judges the ideas candidate against full
+// situational context and sometimes rejects it for a reason that will still be
+// true tomorrow — "the user is in <city B>, not <city A>", "settled in chat this morning".
+// Until now that judgment was discarded, so the same dead idea kept winning the
+// lane's one nomination per tick and kept being deboosted: a restaurant idea
+// for a dropped city did exactly that twice in one day while fresh local
+// ideas waited. No deterministic gate can catch that particular one — the city
+// was swapped off the itinerary, so no authority still knows it is a city — but
+// the ranker knew both times. This just stops throwing the answer away.
+//
+// Exit codes: 0 ok · 1 unexpected error · 2 bad usage
+
+import { buildScorecard } from "../lib/hum-ideas-scorecard.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { loadTimelineSync } from "../lib/claim-facts.mjs";
+import { localityVerdict } from "../lib/hum-idea-locality.mjs";
+import { travelPremiseValid, dowValid } from "../agent/scripts/hum-harvesters/ideas.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const HOME = os.homedir();
+const DATA = installTools("data");
+const RESERVOIR = path.join(DATA, "hum-ideas.jsonl");
+const ARCHIVE = path.join(DATA, "hum-ideas-archive.jsonl");
+const DIGEST = path.join(DATA, "hum-ideas-digest.json");
+const SCORECARD = path.join(DATA, "hum-ideas-scorecard.json");
+const FEEDBACK = path.join(DATA, "hum-feedback.jsonl");
+
+const args = process.argv.slice(2);
+const dryRun = args.includes("--dry-run");
+const asJson = args.includes("--json");
+const numArg = (flag, dflt) => {
+  const i = args.indexOf(flag);
+  if (i === -1) return dflt;
+  const v = Number(args[i + 1]);
+  return Number.isFinite(v) ? v : dflt;
+};
+
+// An idea with no explicit deadline that nothing has surfaced in three weeks is
+// not waiting for its moment — its moment was the week it was written. 21d is
+// deliberately generous: `event-prep`/`seasonal-closing` ideas carry a real
+// `time_sensitive_until` and are retired by rule 1 long before this bites.
+const STALE_DAYS = numArg("--stale-days", 21);
+// How long a dead record stays in the live log before moving to the archive.
+// Keeps the file the ideation agent reads small without losing history.
+const ARCHIVE_DAYS = numArg("--archive-days", 30);
+
+
+function readJsonl(p) {
+  try {
+    return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
+  } catch { return []; }
+}
+
+function collapse(records) {
+  const byId = new Map();
+  for (const r of records) {
+    if (!r.id) continue;
+    byId.set(r.id, { ...(byId.get(r.id) || {}), ...r });
+  }
+  return byId;
+}
+
+function ageDays(iso, now) {
+  const t = new Date(iso || 0).getTime();
+  if (!Number.isFinite(t) || t <= 0) return null;
+  return (now - t) / 86400000;
+}
+
+// Single-idea expiry, called by the hum tick when the ranker retires a
+// candidate. Deliberately does no collapsing or archiving — it's one append on
+// the hot path and must stay cheap and safe to run mid-tick.
+function expireOne(id, reason) {
+  if (!id) {
+    console.error('usage: hum-reservoir-prune --expire <idea_id> --reason "<why>"');
+    process.exit(2);
+  }
+  const rec = {
+    id,
+    expired: true,
+    expired_at: new Date().toISOString(),
+    expire_reason: "ranker_retired",
+    expire_detail: reason || "retired by the hum ranker",
+  };
+  fs.appendFileSync(RESERVOIR, JSON.stringify(rec) + "\n");
+  console.log(`expired ${id} — ${rec.expire_detail}`);
+}
+
+function main() {
+  const expireIdx = args.indexOf("--expire");
+  if (expireIdx !== -1) {
+    const reasonIdx = args.indexOf("--reason");
+    return expireOne(args[expireIdx + 1], reasonIdx === -1 ? null : args[reasonIdx + 1]);
+  }
+
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const raw = readJsonl(RESERVOIR);
+  if (!raw.length) {
+    console.log("hum-reservoir-prune: reservoir empty or unreadable — nothing to do");
+    return;
+  }
+  const byId = collapse(raw);
+  const ideas = [...byId.values()];
+  const timeline = loadTimelineSync();
+
+  const expiries = [];
+  const reasons = { expired_window: 0, stale_age: 0, geo_stale: 0, premise_dead: 0, bad_dow: 0 };
+
+  for (const idea of ideas) {
+    if (idea.consumed || idea.expired) continue;
+    if (!idea.subject) continue;
+
+    let reason = null;
+    let detail = null;
+
+    // 1. Its own deadline has passed. A 6h grace covers an idea whose window
+    //    closes late tonight and could still fire on the last evening tick.
+    if (!reason && idea.time_sensitive_until) {
+      const t = new Date(idea.time_sensitive_until).getTime();
+      if (Number.isFinite(t) && t < now - 6 * 3600 * 1000) {
+        reason = "expired_window";
+        detail = `time_sensitive_until ${idea.time_sensitive_until} has passed`;
+      }
+    }
+
+    // 2. Undated and old. Nothing surfaced it in STALE_DAYS; the situation that
+    //    prompted it has moved on.
+    if (!reason && !idea.time_sensitive_until) {
+      const age = ageDays(idea.created_at, now);
+      if (age !== null && age > STALE_DAYS) {
+        reason = "stale_age";
+        detail = `${Math.round(age)}d old with no time_sensitive_until`;
+      }
+    }
+
+    // 3. Unreachable: a place-bound idea about somewhere the user won't be. This is
+    //    the dropped-city class — true, well-written, and impossible to act on.
+    if (!reason && timeline) {
+      const v = localityVerdict(idea, timeline, { now });
+      if (v.status === "stale") {
+        reason = "geo_stale";
+        detail = v.reason;
+      }
+    }
+
+    // 4/5. The existing per-incident validators, applied once at rest instead of
+    //      re-derived on every tick by every reader.
+    if (!reason && !travelPremiseValid(idea)) {
+      reason = "premise_dead";
+      detail = "travel premise contradicted by the timeline";
+    }
+    if (!reason && !dowValid(idea)) {
+      reason = "bad_dow";
+      detail = "stated weekday does not match the date";
+    }
+
+    if (reason) {
+      reasons[reason]++;
+      expiries.push({
+        id: idea.id,
+        expired: true,
+        expired_at: nowIso,
+        expire_reason: reason,
+        expire_detail: detail,
+        subject: idea.subject,
+        category: idea.category,
+      });
+    }
+  }
+
+  // Apply expiries in-memory so the digest below reflects the post-prune world
+  // even on a dry run.
+  const expiredIds = new Set(expiries.map((e) => e.id));
+
+  // Archive: records for ideas that have been dead (consumed or expired) longer
+  // than ARCHIVE_DAYS move out of the live log. This is what keeps the file the
+  // ideation agent reads from growing without bound.
+  const archivable = new Set();
+  for (const idea of ideas) {
+    const dead = idea.consumed || idea.expired;
+    if (!dead) continue;
+    const deadAt = idea.consumed_at || idea.expired_at;
+    const age = ageDays(deadAt, now);
+    if (age !== null && age > ARCHIVE_DAYS) archivable.add(idea.id);
+  }
+
+  const live = [];
+  const archived = [];
+  for (const rec of raw) {
+    (archivable.has(rec.id) ? archived : live).push(rec);
+  }
+
+  // Digest: the small file hum-ideation reads instead of the whole log. Every
+  // dedup set Step 1.5 builds by hand is pre-computed here, deterministically,
+  // for free — the agent's turns are better spent generating than parsing 2.7 MB.
+  const surviving = ideas.filter((i) => !i.consumed && !i.expired && !expiredIds.has(i.id) && i.subject);
+  const consumedRecently = ideas.filter((i) => {
+    if (!i.consumed) return false;
+    const age = ageDays(i.consumed_at, now);
+    return age !== null && age <= 2;
+  });
+  const digest = {
+    generated_at: nowIso,
+    reservoir_file: RESERVOIR,
+    counts: {
+      total_ideas: ideas.length,
+      unconsumed_live: surviving.length,
+      expired_this_run: expiries.length,
+      archived_this_run: archived.length,
+    },
+    unconsumed: surviving
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+      .map((i) => ({
+        id: i.id,
+        subject: i.subject,
+        category: i.category,
+        created_at: i.created_at || null,
+        time_sensitive_until: i.time_sensitive_until || null,
+        task_id: i.supporting_data?.task_id || null,
+        thread_id: i.supporting_data?.thread_id || i.supporting_data?.gmail_thread_id || null,
+      })),
+    // Step 1.5's block sets, pre-built.
+    task_ids_blocked: [...new Set(consumedRecently.map((i) => i.supporting_data?.task_id).filter(Boolean))],
+    thread_ids_blocked: [...new Set(consumedRecently
+      .map((i) => i.supporting_data?.thread_id || i.supporting_data?.gmail_thread_id).filter(Boolean))],
+    // Rule 11's corpus: subjects of ideas consumed in the last 48h. hum-ideas-append
+    // compares a new idea against these by embedding, not word overlap (2026-10-04).
+    consumed_recent: consumedRecently.map((i) => ({ id: i.id, subject: i.subject })).filter((x) => x.subject),
+    unconsumed_thread_ids: [...new Set(surviving
+      .map((i) => i.supporting_data?.thread_id || i.supporting_data?.gmail_thread_id).filter(Boolean))],
+    expired_this_run: expiries.map((e) => ({ id: e.id, reason: e.expire_reason, subject: e.subject })),
+  };
+
+  if (!dryRun) {
+    if (archived.length) {
+      // Rewrite the live log without the archived records, expiries folded in.
+      // Written to a temp file and renamed so a crash mid-write can never
+      // truncate the reservoir. The expiries go in HERE rather than via a
+      // separate append — appending first and then rewriting would leave a
+      // window where a concurrent reader sees them twice.
+      fs.appendFileSync(ARCHIVE, archived.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      const tmp = `${RESERVOIR}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, live.concat(expiries).map((r) => JSON.stringify(r)).join("\n") + "\n");
+      fs.renameSync(tmp, RESERVOIR);
+    } else if (expiries.length) {
+      fs.appendFileSync(RESERVOIR, expiries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    }
+    const dtmp = `${DIGEST}.tmp.${process.pid}`;
+    fs.writeFileSync(dtmp, JSON.stringify(digest, null, 2) + "\n");
+    fs.renameSync(dtmp, DIGEST);
+    // hum-ideation Step 2's scorecard, rebuilt here in code (2026-10-04) — a
+    // join of reactions to consumed ideas plus a fixed formula. The archive is
+    // included so a 30-day reaction still finds an idea archived after 30 days dead.
+    try {
+      const all = collapse(readJsonl(ARCHIVE).concat(raw));
+      const sc = buildScorecard(all, readJsonl(FEEDBACK), now);
+      const stmp = `${SCORECARD}.tmp.${process.pid}`;
+      fs.writeFileSync(stmp, JSON.stringify(sc, null, 2) + "\n");
+      fs.renameSync(stmp, SCORECARD);
+    } catch (e) {
+      console.error(`hum-reservoir-prune: scorecard rebuild failed: ${e.message}`);
+    }
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify({ dry_run: dryRun, reasons, ...digest.counts }, null, 2));
+    return;
+  }
+  const tag = dryRun ? "[dry-run] " : "";
+  console.log(`${tag}hum-reservoir-prune: ${ideas.length} ideas · expired ${expiries.length} (${
+    Object.entries(reasons).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(" ") || "none"
+  }) · archived ${archived.length} records · ${surviving.length} live unconsumed`);
+  for (const e of expiries.slice(0, 20)) {
+    console.log(`${tag}  ${e.expire_reason.padEnd(15)} ${e.id} — ${String(e.subject).slice(0, 70)}`);
+  }
+  if (expiries.length > 20) console.log(`${tag}  … and ${expiries.length - 20} more`);
+}
+
+try { main(); } catch (e) {
+  console.error(`hum-reservoir-prune failed: ${e.stack || e.message}`);
+  process.exit(1);
+}

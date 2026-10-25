@@ -40,9 +40,8 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
 
-          # Prepend this keychain to the user search list. Serialized via
-          # Prepend under the HOST-WIDE mutex shared by every signing repo on this
-          # mini. This used to use /tmp/merlin-ci-keychain.lock — a per-repo lock,
+          # Prepend this keychain to the user search list, under the HOST-WIDE
+          # mutex shared by every signing repo on the host. This used to use /tmp/merlin-ci-keychain.lock — a per-repo lock,
           # which serialized this repo against itself but NOT against the other
           # signing repos sharing this runner, all of which mutate the same global
           # user search list on this host. A lock nobody else contends for is
@@ -187,7 +186,7 @@ jobs:
           if [ -n "$KEYCHAIN" ] && [ -e "$KEYCHAIN" ]; then
             # $REMAINING could come back EMPTY (our keychain the only entry), and
             # `list-keychains -s` with no arguments SETS an empty list rather than
-            # doing nothing — evicting login.keychain-db and taking the Gandalf agent
+            # doing nothing — evicting login.keychain-db and taking a Merlin agent
             # on this host auth-down. kc_remove guarantees login survives. It also
             # matches the path literally (grep -vxF); "^$KEYCHAIN$" treated the dots
             # in the path as regex wildcards.

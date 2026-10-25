@@ -1,22 +1,29 @@
 #!/usr/bin/env node
 /**
  * Gmail OAuth helper — gets a fresh refresh token using the existing
- * OAuth client from the Claude Agent GCP project.
+ * OAuth client from your GCP project.
  *
  * Usage: node scripts/gmail-auth.mjs
  * Then visit the URL, authorize, paste the code.
  */
 
 import { createServer } from "http";
+import { createRequire } from "module";
 
 // Loaded from env (preferred) or 1Password via `op run --env-file=- -- node scripts/gmail-auth.mjs`.
-// Item: op://Dev/Merlin Gmail OAuth Client
+// Item: the Gmail OAuth client in the 1Password vault (see the hint below).
+// The hint's 1Password references come from agent/local/config/gmail-auth.json.
+const { localConfig } = createRequire(import.meta.url)("../../lib/instance.cjs");
+const OP_REFS = localConfig("gmail-auth", {
+  op_client_id_ref: "<1Password secret reference to the OAuth client id>",
+  op_client_secret_ref: "<1Password secret reference to the OAuth client secret>",
+});
 const CLIENT_ID = process.env.GMAIL_OAUTH_CLIENT_ID;
 const CLIENT_SECRET = process.env.GMAIL_OAUTH_CLIENT_SECRET;
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error("Set GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_CLIENT_SECRET, e.g.:");
-  console.error('  export GMAIL_OAUTH_CLIENT_ID="$(op read \'op://Dev/Merlin Gmail OAuth Client/username\')"');
-  console.error('  export GMAIL_OAUTH_CLIENT_SECRET="$(op read \'op://Dev/Merlin Gmail OAuth Client/credential\')"');
+  console.error(`  export GMAIL_OAUTH_CLIENT_ID="$(op read '${OP_REFS.op_client_id_ref}')"`);
+  console.error(`  export GMAIL_OAUTH_CLIENT_SECRET="$(op read '${OP_REFS.op_client_secret_ref}')"`);
   process.exit(1);
 }
 const REDIRECT_URI = "http://localhost:3456";

@@ -5,6 +5,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "http";
+import { createRequire } from "node:module";
+
+// Who the notifications are for (lib/instance.cjs; "the user" in a fresh install).
+const OWNER = createRequire(import.meta.url)("../../lib/instance.cjs").instance().owner_name;
 
 const PORT = 9093;
 
@@ -19,11 +23,11 @@ const mcp = new Server(
     instructions: `You are receiving notifications from the background agent (email triage, scheduled tasks).
 
 When a notification arrives:
-1. Read the content — it's a summary meant for the user
+1. Read the content — it's a summary meant for ${OWNER}
 2. Present it clearly and concisely
-3. If it says "action needed", ask the user what they'd like to do
+3. If it says "action needed", ask ${OWNER} what they'd like to do
 
-These are informational push messages. Keep responses short — the user is on their phone.`,
+These are informational push messages. Keep responses short — ${OWNER} is on their phone.`,
   }
 );
 

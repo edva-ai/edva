@@ -1,0 +1,12 @@
+{
+  "_comment": "Email triage label set. Copy to agent/local/config/triage-labels.json. Read by lib/triage-labels.cjs and every triage path (local-triage, jev-email-triage, triage-decide, p1-sender). `labels` is the full ordered list (the order prompts show it in) and must keep \"spam\", which maps to Gmail's Spam folder; `descriptions` are the one-line glosses the classifier sees; `vendor_examples` names platforms you use, for the spam-vs-vendor line. Labels are lowercase Gmail label names.",
+  "labels": ["personal", "work", "household", "vendor", "spam"],
+  "descriptions": {
+    "personal": "friends, family, tickets, personal finance",
+    "work": "mail about your job or your own projects",
+    "household": "utilities, repairs, deliveries, school",
+    "vendor": "SaaS / billing / status / app-store / CI",
+    "spam": "junk"
+  },
+  "vendor_examples": "a ticketing site, a forum, a cloud host, etc."
+}

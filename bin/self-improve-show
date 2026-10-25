@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// self-improve-show — print everything known about one improvement card.
+//
+// Written for the CHAT path: the card's "Chat" menu action drops
+// the user into a threaded conversation about a specific improvement, and the chat
+// agent answering the user needs more than the summary quoted in the thread — which
+// files it touches, what the change actually does, whether it applied, why it
+// failed. Without this the agent's only honest answer to "what does this
+// actually change?" is a guess, which on a self-modification queue is the worst
+// possible answer.
+//
+// Read-only. Prints the row plus a per-file preview of item_json.files, with
+// content truncated so a large capability payload can't blow out the agent's
+// context window.
+//
+// Usage:
+//   self-improve-show <id> [--full]     — --full prints whole file contents
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!K) { console.error("self-improve-show: no SUPABASE_SERVICE_ROLE_KEY"); process.exit(1); }
+const H = { apikey: K, Authorization: "Bearer " + K };
+
+const args = process.argv.slice(2);
+const full = args.includes("--full");
+const id = args.find((a) => !a.startsWith("--"));
+if (!id) { console.error("usage: self-improve-show <id> [--full]"); process.exit(64); }
+
+const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}&select=*&limit=1`, { headers: H });
+const rows = r.ok ? await r.json() : [];
+const row = rows[0];
+if (!row) { console.error(`No improvement with id ${id}.`); process.exit(1); }
+
+// Per-file cap. A new-capability payload is whole source files; the agent is
+// answering a question about the change, not reviewing every byte of it.
+const PREVIEW_CHARS = 2000;
+
+const state = row.skipped ? `${row.status} (SKIPPED${row.skipped_at ? " " + row.skipped_at : ""})` : row.status;
+console.log(`id:        ${row.id}`);
+console.log(`type:      ${row.item_type}`);
+console.log(`risk:      ${row.risk || "(unset)"}`);
+console.log(`status:    ${state}`);
+console.log(`created:   ${row.created_at}`);
+if (row.decided_at) console.log(`decided:   ${row.decided_at}`);
+if (row.applied_at) console.log(`applied:   ${row.applied_at}`);
+if (row.expires_at) console.log(`expires:   ${row.expires_at}`);
+if (row.chat_message_id) console.log(`chat:      thread anchored at merlin_messages ${row.chat_message_id}`);
+console.log(`\nsummary:   ${row.summary}`);
+if (row.rationale) console.log(`\nrationale:\n${row.rationale}`);
+if (row.result) console.log(`\nresult:\n${JSON.stringify(row.result, null, 2)}`);
+
+const item = row.item_json || {};
+if (item.name) console.log(`\ncapability name: ${item.name}`);
+const files = item.files || {};
+const names = Object.keys(files);
+if (!names.length) {
+  console.log(`\nfiles:     (none — this row carries no payload)`);
+} else {
+  console.log(`\nfiles (${names.length}):`);
+  for (const n of names) console.log(`  - ${n}`);
+  for (const n of names) {
+    const content = String(files[n] ?? "");
+    const body = full || content.length <= PREVIEW_CHARS
+      ? content
+      : content.slice(0, PREVIEW_CHARS) + `\n…[truncated ${content.length - PREVIEW_CHARS} chars — re-run with --full]`;
+    console.log(`\n───── ${n} ─────\n${body}`);
+  }
+}

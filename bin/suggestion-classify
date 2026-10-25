@@ -1,13 +1,24 @@
 #!/usr/bin/env node
-// suggestion-classify — read a the user phone reply and, if it's a reaction to
+// suggestion-classify — read a user phone reply and, if it's a reaction to
 // a recent advisory hum ping, write a `reaction` event to suggestion-history.
 //
 // Designed to run fork-and-forget from phone-channel right after handling an
 // inbound user message. Latency budget: must NOT block the user-facing reply
-// flow. ~5s rules-first; only falls back to Gemma when rules are ambiguous.
+// flow.
 //
-// Auth model: rules + local Gemma only. NEVER calls Anthropic SDK / Haiku /
-// Sonnet — that would be API-key-billed (forbidden outside agent supervisors).
+// Classifier: Jev (lib/jev.mjs)
+// is PRIMARY; the old path — regex RULES first, local Gemma for the ambiguous
+// middle — is the LEGACY mechanism, run as a shadow during the Jev shadow week
+// and as the fallback when Jev is unavailable or below threshold. The RULES
+// pattern-match the user's own words, which is exactly what "never regex on
+// language" forbids; they survive only inside the legacy path. Questions live in
+// data/jev-questions/suggestion-classify.json; decisions are logged by
+// lib/jev-shadow.mjs. Replies to health/exercise-lane pings never go to
+// Jev (no external models on health rows) — they stay on the legacy path.
+//
+// Auth model: NEVER calls Anthropic SDK / Haiku / Sonnet — that would be
+// API-key-billed (forbidden outside agent supervisors). Jev is billed per
+// request through the AI Gateway key.
 //
 // Usage:
 //   suggestion-classify --message-id <uuid> --text "<user message>"
@@ -24,7 +35,23 @@ import os from "node:os";
 import path from "node:path";
 
 import { appendReaction } from "../lib/suggestion-history.mjs";
+import { appendResponse } from "../lib/hum-responses.mjs";
 import { localLlmChat } from "../lib/local-llm.mjs";
+import { resolveHumTarget, openHumItems } from "../lib/hum-reply-target.mjs";
+import { splitMultiAnswer, soleTarget } from "../lib/hum-reply-segments.mjs";
+import { decide, privacyOn } from "../lib/jev-shadow.mjs";
+import { answerConfidence, boolOf } from "../lib/jev.mjs";
+import { request } from "../lib/supabase-rest.js";
+import { createRequire } from "node:module";
+
+import { installTools } from "../lib/root.cjs";
+const { instance, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+// Who sends the messages classified here (agent/local/instance.json).
+const OWNER = instance().owner_name;
+// "after <X>" deferrals the legacy timing rule recognises; an installation
+// names its own trips and people in agent/local/config/suggestion-classify.json
+// (defer_after, the full list).
+const DEFER_AFTER = localConfig("suggestion-classify", { defer_after: ["the trip", "vacation"] }).defer_after;
 
 const args = process.argv.slice(2);
 function flag(name, hasValue = true) {
@@ -39,6 +66,9 @@ function die(msg, code = 2) { console.error(msg); process.exit(code); }
 function debug(...m) { if (process.env.SUGGESTION_CLASSIFY_DEBUG) console.error("[classify]", ...m); }
 
 const messageId = flag("--message-id");
+// The merlin_messages.id this reply is THREADED to, when the user used the app's
+// Reply action. Pins the ping instead of guessing by recency (see §4).
+const replyTo = flag("--reply-to");
 const fromStdin = flag("--stdin", false);
 let text = flag("--text");
 const dryRun = flag("--dry-run", false);
@@ -52,16 +82,64 @@ if (!text || !text.trim()) die("usage: suggestion-classify --message-id <uuid> -
 text = text.trim();
 
 // ---------------------------------------------------------------------------
-// 1. Find the most recent advisory hum ping that the user could be reacting
-//    to. Window: 6 hours (matches the ambiguous-tapback window in CLAUDE.md).
-//    Returns null if no recent advisory ping exists — most user messages are
+// 1. Find the most recent OPEN hum ping (any lane) that the user could be
+//    reacting to. Window: 6 hours (matches the ambiguous-tapback window in
+//    CLAUDE.md). Returns null if no recent ping exists — most user messages are
 //    fresh commands, not reactions.
+//
+//    Broadened from advisory-lanes-only to EVERY lane. Replies to
+//    exercise / situation / travel / property / project / ideas pings used
+//    to be dropped on the floor (only dining/music/art/etc. were matched), so a
+//    free-text answer to those never reached memory and hum re-asked. Every
+//    classified reply is now captured to hum-responses.jsonl (the durable
+//    capture log the overnight wiki consolidation reads); the suggestion-history
+//    reaction write still fires when the ping carries a key for recall/dedup.
 // ---------------------------------------------------------------------------
-const HUM_FEEDBACK_PATH = path.join(os.homedir(), "dev/merlin/data/hum-feedback.jsonl");
-const ADVISORY_LANES = new Set(["dining", "music", "art", "talks", "ideas", "watchlist", "concerts", "village", "broadway", "location_context"]);
+const HUM_FEEDBACK_PATH = installTools("data/hum-feedback.jsonl");
 const REACTION_WINDOW_MS = 6 * 60 * 60 * 1000;
 
-function findRecentAdvisoryPing(now = Date.now()) {
+/**
+ * A display that only stands in for a name: canonicalDisplay's "(idea)",
+ * "(place)", "(title?)". Every ideas-lane ping is stored with subject_display
+ * "(idea)" (the finding carries no subject field for canonicalDisplay to read),
+ * and as the first choice it hid the real headline in `signal`. Jev and Gemma
+ * were asked whether a reply about a weekend market plan reacted to "(idea)"
+ * when the ping named that very plan (a Jev disagreement), and the
+ * same placeholder went into hum-responses as ping_text, so every later gate
+ * read the user's reply as "(in reply to: (idea))". About one in ten
+ * suggestion-classify decisions carried it. Machine-made strings, so a shape
+ * check, not a reading of the user's words.
+ */
+function isPlaceholder(s) {
+  const t = String(s || "").trim();
+  return !t || (t.startsWith("(") && t.endsWith(")"));
+}
+
+/** hum-feedback.jsonl row → the shape the classifier works with. */
+function shapePing(entry) {
+  const headline = (entry.findings || [])[0];
+  if (!headline) return null;
+  // Key the reply by subject_key (advisory lanes) or the derived dedup_key
+  // (every ping carries one via hum-ping Gate 2a). Without ANY key we can't
+  // record a suggestion-history reaction, but we can still capture the reply
+  // text to hum-responses, so don't skip the row.
+  const key = headline.subject_key || headline.dedup_key || null;
+  return {
+    ping_id: entry.ping_id,
+    message_id: entry.message_id,
+    sent_at: entry.sent_at,
+    lane: entry.lane,
+    subject_key: key,            // null only when the ping had neither key
+    has_subject_key: !!headline.subject_key,
+    // A placeholder display gives way to the headline; with neither, it stays.
+    display: [headline.subject_display, headline.signal?.slice(0, 80)].find((s) => !isPlaceholder(s))
+      || headline.subject_display || "",
+    attrs: headline.subject_attrs || {},
+    reaction_already: entry.reaction || null,
+  };
+}
+
+function findRecentOpenPing(now = Date.now()) {
   let raw;
   try { raw = fs.readFileSync(HUM_FEEDBACK_PATH, "utf8"); }
   catch { return null; }
@@ -71,24 +149,65 @@ function findRecentAdvisoryPing(now = Date.now()) {
     if (!line) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
-    if (!entry.lane || !ADVISORY_LANES.has(entry.lane)) continue;
+    if (!entry.lane) continue;
     const sentAt = new Date(entry.sent_at).getTime();
     if (now - sentAt > REACTION_WINDOW_MS) return null; // newer than this is also too old
-    const headline = (entry.findings || [])[0];
-    if (!headline) continue;
-    // Require subject_key — older rows without one can't be classified by key.
-    // hum-ping now writes subject_key; pre-rollout entries simply don't qualify.
-    if (!headline.subject_key) continue;
-    return {
-      ping_id: entry.ping_id,
-      message_id: entry.message_id,
-      sent_at: entry.sent_at,
-      lane: entry.lane,
-      subject_key: headline.subject_key,
-      display: headline.subject_display || headline.signal?.slice(0, 80) || "",
-      attrs: headline.subject_attrs || {},
-      reaction_already: entry.reaction || null,
-    };
+    const shaped = shapePing(entry);
+    if (shaped) return shaped;
+  }
+  return null;
+}
+
+/**
+ * What the assistant last said to the user AFTER this ping and BEFORE the user's message,
+ * or null when the ping is still the latest thing in the chat.
+ *
+ * findRecentOpenPing() takes the newest ping in the last 6h whether or not the
+ * conversation has moved on since. It usually has: of the 12 non-threaded replies
+ * classified over several weeks, 10 came after the chat agent had said something
+ * else, and roughly 8 of those answered THAT — "Yes" to "Want me to write up the
+ * card now?" filed as a positive on a location ask the user had answered half an
+ * hour earlier; a watchlist request filed as `visited` on a local-history
+ * factoid. Neither the rules nor Jev
+ * could tell, because neither was shown the later message. This is conversation
+ * structure, not interpretation: the model gets the text and decides which of the
+ * two the user's message answers (Rule #0b).
+ *
+ * Fail-soft: any lookup failure returns null, which is exactly today's state.
+ */
+async function saidSince(ping, msgId) {
+  if (!ping?.sent_at || !msgId) return null;
+  try {
+    const me = await request(`/rest/v1/merlin_messages?id=eq.${encodeURIComponent(msgId)}&select=created_at`, { timeoutMs: 3000 });
+    const at = me?.[0]?.created_at;
+    if (!at) return null;
+    const from = new Date(ping.sent_at).toISOString();
+    const rows = await request(
+      `/rest/v1/merlin_messages?select=id,content,channel&role=eq.assistant` +
+      `&created_at=gt.${encodeURIComponent(from)}&created_at=lt.${encodeURIComponent(at)}` +
+      `&order=created_at.desc&limit=10`, { timeoutMs: 3000 });
+    const hit = (rows || []).find((r) => (!r.channel || r.channel === "chat") && r.id !== ping.message_id && r.content);
+    return hit ? String(hit.content).slice(0, 400) : null;
+  } catch { return null; }
+}
+
+/**
+ * Exact ping lookup by id — no recency window. Used by the threaded-reply path,
+ * where the target is already known and may be arbitrarily old.
+ */
+function pingFromFeedbackRow(pingId) {
+  if (!pingId) return null;
+  let raw;
+  try { raw = fs.readFileSync(HUM_FEEDBACK_PATH, "utf8"); }
+  catch { return null; }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.ping_id !== pingId) continue;
+    return shapePing(entry);
   }
   return null;
 }
@@ -123,9 +242,7 @@ const RULES = [
     disposition: "negative", reason: "cuisine_mismatch", confidence: 0.7 },
 
   // Timing / deferred.
-  // Tune `after (...)` alternatives to the user's recurring deferral phrases
-  // (e.g. "after the trip", "after vacation", a partner's name, a city name).
-  { re: /\b(not (now|right now|today|tonight)|after (the trip|vacation)|maybe later|later this (week|month)|next (week|month))\b/i,
+  { re: new RegExp(String.raw`\b(not (now|right now|today|tonight)|after (${DEFER_AFTER.join("|")})|maybe later|later this (week|month)|next (week|month))\b`, "i"), // lang-regex-ok: legacy fallback rule, same pattern as before
     disposition: "deferred", reason: "timing", confidence: 0.75 },
 
   // Plain rejection.
@@ -134,11 +251,16 @@ const RULES = [
   { re: /\b(not (interested|for me|my thing)|hard pass)\b/i,
     disposition: "negative", reason: "explicit_no", confidence: 0.9 },
 
-  // Positive signals.
+  // Positive signals — split by strength so reaction_token captures love-vs-up
+  // (see data/hum-improvement-loop.md § north-star metrics).
+  // "Love-strength" pattern: strong-affect words / heart / "love" alone.
   { re: /\b(love (it|this)|sounds (great|perfect|amazing)|booking|let's go|going|reserved|reservation made|on it|yes(,| -)? booking|i'm in)\b/i,
-    disposition: "positive", reason: null, confidence: 0.85 },
-  { re: /^(yes|yep|yeah|👍|❤️|love|nice|perfect|great|book it)$/i,
-    disposition: "positive", reason: null, confidence: 0.85 },
+    disposition: "positive", reason: null, confidence: 0.85, reaction_token: "love" },
+  { re: /^(❤️|love)$/i,
+    disposition: "positive", reason: null, confidence: 0.9, reaction_token: "love" },
+  // "Up-strength" pattern: bare thumbs-up / casual acknowledgments.
+  { re: /^(yes|yep|yeah|👍|nice|perfect|great|book it)$/i,
+    disposition: "positive", reason: null, confidence: 0.85, reaction_token: "up" },
 ];
 
 function applyRules(t) {
@@ -149,19 +271,60 @@ function applyRules(t) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Rules that only apply in MULTI-ANSWER mode.
+//
+// The rules above have to survive being tested against a whole message whose
+// subject is only inferred, so the positive ones are deliberately tight —
+// anchored single tokens (`^great$`) or fixed phrases. That's why a segment
+// like "Booked the cave tour already, thanks." classified as nothing.
+//
+// In multi-answer mode the segment has ALREADY been bound to exactly one hum
+// item by the attribution model (hum-reply-segments), so the ambiguity those rules guard against is
+// gone: "was great" in a segment that names the cave tour is unambiguously
+// about the cave tour. These looser patterns are therefore safe HERE and nowhere else —
+// keep them out of RULES.
+// ---------------------------------------------------------------------------
+const MULTI_RULES = [
+  // Acted on it — the strongest possible positive.
+  { re: /\b(booked|reserved|got (tickets|a table|seats)|signed up|bought (it|tickets)|we're going|i'm going|did it|went ahead)\b/i,
+    disposition: "positive", reason: null, confidence: 0.85, reaction_token: "love" },
+  // Enjoyed it.
+  { re: /\b(loved|was (great|amazing|excellent|perfect|wonderful|fantastic|lovely)|worth it|good call|great call|nice (one|find)|enjoyed)\b/i,
+    disposition: "positive", reason: null, confidence: 0.8, reaction_token: "up" },
+  // Already consumed — not a rejection of the topic, a "stop surfacing this one".
+  { re: /\b(already (saw|seen|read|did|been|booked|have)|saw it|read it|been there already)\b/i,
+    disposition: "visited", reason: "already_seen", confidence: 0.8 },
+  // Soft no.
+  { re: /\b(not (for me|my thing|interested)|didn't (like|enjoy)|wasn't (great|good|for me)|meh|rather not|no thanks)\b/i,
+    disposition: "negative", reason: "explicit_no", confidence: 0.8 },
+];
+
+function applyMultiRules(t) {
+  for (const r of MULTI_RULES) {
+    if (r.re.test(t)) return { ...r, source: "rule_scoped" };
+  }
+  return null;
+}
+
+/** Standard rules first, then the multi-mode-only looseners. */
+function classifySegment(t) {
+  return applyRules(t) || applyMultiRules(t);
+}
+
+// ---------------------------------------------------------------------------
 // 3. Gemma fallback for ambiguous messages. Strict JSON output. Returns null
 //    when Ollama is down or the model returns garbage — defaulting to
 //    "no reaction" is safer than fabricating one.
 // ---------------------------------------------------------------------------
 async function gemmaClassify(t, ping) {
-  const system = `You classify a single message the user sent to his AI assistant.
-Most messages are NEW commands. Some are reactions to a recent suggestion the AI sent him about ${ping.lane} (subject: ${ping.display}).
+  const system = `You classify a single message ${OWNER} sent to their AI assistant.
+Most messages are NEW commands. Some are reactions to a recent suggestion the AI sent them about ${ping.lane} (subject: ${ping.display}).
 Decide: is this message a reaction to that suggestion?
 Respond with JSON only: {"is_reaction": true|false, "disposition": "positive"|"negative"|"visited"|"snoozed"|"deferred"|"neutral", "reason": "price"|"already_seen"|"cuisine_mismatch"|"timing"|"not_interested_topic"|"explicit_no"|"duplicate"|null, "confidence": 0.0-1.0}
 If is_reaction=false, set disposition="neutral", reason=null, confidence=0.
 Default to is_reaction=false unless the message clearly references the suggestion or carries a reaction word ("love", "no", "expensive", "already saw", "later").`;
   const user = `Recent suggestion: ${ping.display}
-the user's message: ${t}
+${OWNER}'s message: ${t}
 JSON:`;
   let out;
   try {
@@ -190,36 +353,245 @@ JSON:`;
 }
 
 // ---------------------------------------------------------------------------
-// 4. Main path.
+// 3b. Jev primary, legacy (rules → Gemma) shadow. Every classification below
+//     goes through classifyReply(); the result shape is the same either way:
+//     { is_reaction, disposition, reason, reaction_token, confidence, source }.
 // ---------------------------------------------------------------------------
-const ping = findRecentAdvisoryPing();
-if (!ping) {
-  debug("no recent advisory ping; treating as fresh command");
-  process.exit(1);
-}
-debug("recent advisory ping:", ping.subject_key, "lane=", ping.lane);
+const JEV_SITE = "suggestion-classify";
+// Health rule: replies to health / exercise pings are about the user's body —
+// no external model sees them.
+const JEV_EXCLUDED_LANES = new Set(["health", "exercise"]);
 
-let result = applyRules(text);
-if (!result) {
-  // Short messages with reaction-shaped tokens that didn't match a rule
-  // (e.g. "ok cool, maybe later") deserve a Gemma read. Long messages are
-  // almost always commands; skip Gemma to save latency.
-  if (text.length > 200) {
-    debug("long message, skipping gemma");
+/**
+ * Legacy's answer when the chat moved on after a GUESSED ping (recency, nothing
+ * named): no verdict, so the reply is left to the chat agent.
+ *
+ * The rules and Gemma read a reply as though it came straight after the ping;
+ * neither is shown said_since. When the assistant has spoken in between, that
+ * reading was wrong every time it was measured: of the 11 replies the legacy
+ * rules filed as reactions over five weeks, 8 came after the
+ * assistant had said something else and all 8 answered THAT (a "Yes" to the
+ * assistant's follow-up filed as a positive on an unrelated deadline ping; a
+ * "No" to "Do you want me to move it up?" filed as explicit_no on an unrelated
+ * heads-up). The other 3, with no
+ * message in between, were all right. Jev, which IS shown said_since, still
+ * decides at its threshold; this only stops the blind fallback from deciding
+ * under it. Conversation structure, not interpretation (Rule #0b): nothing here
+ * reads the user's words.
+ */
+const MOVED_ON = { is_reaction: false, source: "legacy_moved_on" };
+
+/** Legacy single-message path, unchanged in behavior: rules, then Gemma. */
+async function legacySingle(t, ping) {
+  const r = applyRules(t);
+  if (r) return { is_reaction: true, disposition: r.disposition, reason: r.reason, reaction_token: r.reaction_token || null, confidence: r.confidence, source: "rule" };
+  // Long messages are almost always commands; the legacy path skips Gemma on them.
+  if (t.length > 200) return { is_reaction: false, source: "rule_long_skip" };
+  const g = await gemmaClassify(t, ping);
+  if (!g) return { is_reaction: false, source: "gemma_unavailable" };
+  if (!g.is_reaction || g.confidence < 0.6) return { is_reaction: false, source: "gemma", confidence: g.confidence };
+  return { is_reaction: true, disposition: g.disposition, reason: g.reason, reaction_token: null, confidence: g.confidence, source: "gemma" };
+}
+
+/** Legacy segment path (multi-answer mode): rules only, as before. */
+async function legacySegment(t) {
+  const r = classifySegment(t);
+  if (!r?.disposition) return { is_reaction: false, source: "rule_no_match" };
+  return { is_reaction: true, disposition: r.disposition, reason: r.reason, reaction_token: r.reaction_token || null, confidence: r.confidence, source: r.source };
+}
+
+function jevInterpret(a) {
+  const isR = boolOf(a.is_reaction);
+  const cR = answerConfidence(a.is_reaction);
+  if (!isR) return { value: { is_reaction: false, source: "jev" }, confidence: cR };
+  const disp = a.disposition?.choice || null;
+  const reason = a.reason?.choice && a.reason.choice !== "none" ? a.reason.choice : null;
+  const strength = a.strength?.choice;
+  const token = disp === "positive" && (strength === "love" || strength === "up") ? strength : null;
+  const confidence = Math.min(cR, answerConfidence(a.disposition));
+  return { value: { is_reaction: true, disposition: disp, reason, reaction_token: token, source: "jev", confidence }, confidence };
+}
+
+// Agreement = same reaction/non-reaction call and, for reactions, the same
+// disposition. reason and love/up are secondary detail: logged, not compared.
+function sameReaction(j, l) {
+  if (!j || !l) return false;
+  if (!!j.is_reaction !== !!l.is_reaction) return false;
+  return !j.is_reaction || j.disposition === l.disposition;
+}
+
+/**
+ * @param {string} t        the message (or segment) text
+ * @param {object} ping     {lane, display}
+ * @param {"single"|"segment"} mode
+ * @param {string|null} [said]  saidSince() — what the assistant said after the ping
+ * @param {boolean} [guessed]   the ping was picked by recency, not named or threaded
+ */
+async function classifyReply(t, ping, mode, said = null, guessed = false) {
+  // Memoized so the shadow run and the fallback share ONE Gemma call.
+  let memo = null;
+  const legacy = () => (memo ||= (mode === "segment" ? legacySegment(t)
+    : said && guessed ? Promise.resolve(MOVED_ON)
+    : legacySingle(t, ping)));
+  // --dry-run keeps its old contract: no side effects — so no Jev call, no
+  // shadow log, no disagreement page, no shadow-window stamp (from a code
+  // review). JEV_DRY_RUN=1 opts a dry run back into Jev (tests, debugging).
+  if (dryRun && process.env.JEV_DRY_RUN !== "1") return legacy();
+  const { value } = await decide({
+    // Health/exercise-lane replies never reach Jev; everything else is screened
+    // on-device for health/bank content first ("my knee is killing me" to a
+    // dining ping).
+    skipJev: privacyOn() && JEV_EXCLUDED_LANES.has(ping.lane) ? "health-excluded" : undefined,
+    privacyScreen: true,
+    site: JEV_SITE,
+    id: messageId || null,
+    // said_since is added only when the chat moved on after the ping, so every
+    // other state is byte-identical to before.
+    state: { lane: ping.lane || null, suggestion: ping.display || "", message: t, mode, ...(said ? { said_since: said } : {}) },
+    interpret: jevInterpret,
+    legacy,
+    // Shadow comparison must not count "Ollama was down" as a legacy verdict.
+    shadow: () => legacy().then((v) => {
+      if (v.source === "gemma_unavailable") throw new Error("gemma unavailable");
+      return v;
+    }),
+    same: sameReaction,
+  });
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Main path.
+//
+// Threaded replies win over recency. When the user tapped Reply on a
+// specific message, `--reply-to` carries that message's id and pins the target
+// exactly — the 6h "most recent open ping" heuristic above is precisely the
+// mis-attribution the reply feature exists to kill. Two outcomes:
+//   - the parent IS a hum ping → classify against THAT ping, however old.
+//   - the parent is NOT a hum ping → the user is replying to something else entirely;
+//     exit rather than silently crediting the newest ping with the user's words.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 4a. Multi-answer catch-up. The same situation that stacks pings up (the user was
+//     driving) produces the reply that answers several of them at once:
+//     "Loved the wine bar. Skip the museum thing. Yes to that show."
+//     Filing that whole text against one ping gives that ping a disposition
+//     drawn from a sentence about something else, and leaves the others open to
+//     re-ask. So when the segmenter can attribute parts of the message to two
+//     DIFFERENT open items, classify and record each part separately.
+//
+//     Each segment goes through classifyReply(mode "segment"): Jev primary
+//     (cheap and ~0.5s, so a per-segment fan-out is fine), with the legacy
+//     rules-only path (standard RULES + MULTI_RULES, never Gemma — a per-segment
+//     Gemma fan-out was too slow) as shadow/fallback. Segments neither classifies
+//     are left for the agent, which sees the same roster in its prompt and can
+//     attribute semantically.
+// ---------------------------------------------------------------------------
+// Attribution options: its own decision id (so its Jev shadow row never shadows
+// the reaction row for this message), and no Jev on a plain --dry-run — the
+// same no-side-effects contract classifyReply keeps.
+const ATTR = { id: messageId ? `${messageId}:attr` : null, jev: !dryRun || process.env.JEV_DRY_RUN === "1" };
+const multi = await splitMultiAnswer(text, openHumItems(), ATTR);
+if (multi && !dryRun) {
+  let wrote = 0;
+  for (const { item, segments } of multi) {
+    const segText = segments.join(" ");
+    const pingRow = item.ping_id ? pingFromFeedbackRow(item.ping_id) : null;
+    const r = await classifyReply(segText, { lane: pingRow?.lane || item.lane || null, display: pingRow?.display || item.subject || "" }, "segment");
+    if (!r?.is_reaction || !r.disposition) {
+      debug(`no classification for segment on ${item.key}; leaving it to the agent`);
+      continue;
+    }
+    try {
+      appendResponse({
+        ping_id: item.ping_id || null,
+        lane: pingRow?.lane || item.lane || null,
+        subject: item.subject || null,
+        subject_key: pingRow?.subject_key || null,
+        ping_text: pingRow?.display || item.subject || null,
+        // The SEGMENT, not the whole message — this is the attribution.
+        reply_text: segText,
+        disposition: r.disposition,
+        source: `phone_${r.source}_multi`,
+      });
+      wrote++;
+    } catch (e) {
+      console.error(`suggestion-classify: multi capture failed for ${item.key}: ${e.message}`);
+    }
+    if (pingRow?.subject_key) {
+      try {
+        appendReaction({
+          subject_key: pingRow.subject_key,
+          disposition: r.disposition,
+          reaction_token: r.reaction_token || null,
+          reason: r.reason,
+          reason_detail: segText.slice(0, 240),
+          source: `phone_${r.source}_multi`,
+          evidence: segText.slice(0, 240),
+          message_id: messageId || null,
+        });
+      } catch (e) {
+        console.error(`suggestion-classify: multi appendReaction failed for ${item.key}: ${e.message}`);
+      }
+    }
+  }
+  console.error(`suggestion-classify: multi-answer reply — attributed ${wrote}/${multi.length} segment(s) to distinct hum items`);
+  process.exit(wrote > 0 ? 0 : 1);
+}
+if (multi && dryRun) {
+  const targets = [];
+  for (const { item, segments } of multi) {
+    const pingRow = item.ping_id ? pingFromFeedbackRow(item.ping_id) : null;
+    const r = await classifyReply(segments.join(" "), { lane: pingRow?.lane || item.lane || null, display: pingRow?.display || item.subject || "" }, "segment");
+    targets.push({
+      item: item.key, subject: item.subject, route: item.route,
+      segments, disposition: r?.is_reaction ? (r.disposition ?? null) : null, source: r?.source ?? null,
+    });
+  }
+  console.log(JSON.stringify({ _dry_run: true, _multi_answer: true, targets }, null, 2));
+  process.exit(0);
+}
+
+let ping;
+let said = null;
+let guessed = false;
+if (replyTo) {
+  const target = resolveHumTarget(replyTo);
+  if (!target || (target.kind !== "ping" && target.kind !== "approval")) {
+    debug("threaded reply to a non-ping message; not a hum reaction");
     process.exit(1);
   }
-  const g = await gemmaClassify(text, ping);
-  if (!g) { debug("no rule match, gemma unavailable / unclear → skip"); process.exit(1); }
-  if (!g.is_reaction || g.confidence < 0.6) {
-    debug("gemma says not a reaction (conf=", g.confidence, ")");
+  ping = pingFromFeedbackRow(target.ping_id);
+  if (!ping) {
+    debug("threaded reply resolved to ping", target.ping_id, "but its row is unreadable");
     process.exit(1);
   }
-  result = {
-    disposition: g.disposition,
-    reason: g.reason,
-    confidence: g.confidence,
-    source: "gemma",
-  };
+  debug("threaded reply pins ping:", ping.ping_id, "lane=", ping.lane);
+} else {
+  // Not threaded. If the message names exactly ONE open item, that beats
+  // recency — "the cave tour was too expensive" is about the cave-tour ping even when a
+  // news ping landed since. Same mis-attribution as the multi case, one answer
+  // instead of several. A reply that names nothing (a bare "yes", a tapback
+  // word) still falls through to the recency heuristic, unchanged.
+  const sole = await soleTarget(text, openHumItems(), ATTR);
+  const named = sole?.ping_id && pingFromFeedbackRow(sole.ping_id);
+  ping = named || findRecentOpenPing();
+  if (!ping) {
+    debug("no recent open ping; treating as fresh command");
+    process.exit(1);
+  }
+  guessed = !named;
+  debug(sole?.ping_id ? `named exactly one item: ${ping.ping_id}` : `recent open ping: ${ping.ping_id}`,
+        "lane=", ping.lane);
+  // Threaded replies pin their ping, so only the guessed target needs this.
+  said = await saidSince(ping, messageId);
+  if (said) debug("the assistant spoke after the ping:", said.slice(0, 80));
+}
+
+const result = await classifyReply(text, ping, "single", said, guessed);
+if (!result?.is_reaction) {
+  debug("not a reaction (source=", result?.source, ")");
+  process.exit(1);
 }
 
 if (!result.disposition) {
@@ -238,6 +610,11 @@ if (!result.disposition) {
 const event = {
   subject_key: ping.subject_key,
   disposition: result.disposition,
+  // Carry the raw token forward so the hum-improvement-loop's weighted score
+  // can distinguish love (2×) from up (1×). Rules and Jev set this; the
+  // Gemma fallback path doesn't, so appendReaction's normalizer defaults to
+  // freeform_pos / freeform_neg (1× weight, no love multiplier).
+  reaction_token: result.reaction_token || null,
   reason: result.reason,
   reason_detail: text.length <= 240 ? text : text.slice(0, 240) + "…",
   source: `phone_${result.source}`,
@@ -250,12 +627,39 @@ if (dryRun) {
   process.exit(0);
 }
 
+// Canonical capture: every classified reply to ANY open ping lands in
+// hum-responses.jsonl so the overnight `hum-consolidate` job can fold a durable
+// preference/fact into the general wiki. This is the path that fixes the
+// "I answered and hum re-asked" problem for non-advisory lanes. Best-effort —
+// a capture failure must not block the suggestion-history write below.
 try {
-  appendReaction(event);
+  appendResponse({
+    ping_id: ping.ping_id || null,
+    lane: ping.lane,
+    subject: ping.display || null,
+    subject_key: ping.subject_key || null,
+    ping_text: ping.display || null,
+    reply_text: text,
+    disposition: result.disposition,
+    source: `phone_${result.source}`,
+  });
 } catch (e) {
-  console.error(`suggestion-classify: appendReaction failed: ${e.message}`);
-  process.exit(3);
+  console.error(`suggestion-classify: response capture failed: ${e.message}`);
 }
 
-console.error(`suggestion-classify: wrote ${result.disposition} reaction (reason=${result.reason || "-"}, src=${result.source}, conf=${result.confidence}) for ${ping.subject_key}`);
+// Suggestion-history reaction (recall + pre-send dedup) needs a key. Advisory
+// lanes always have a subject_key; other lanes use the derived dedup_key. When
+// the ping carried neither, skip this write — the hum-responses capture above
+// is the durable record either way.
+if (ping.subject_key) {
+  try {
+    appendReaction(event);
+  } catch (e) {
+    console.error(`suggestion-classify: appendReaction failed: ${e.message}`);
+    process.exit(3);
+  }
+  console.error(`suggestion-classify: wrote ${result.disposition} reaction (reason=${result.reason || "-"}, src=${result.source}, conf=${result.confidence}) for ${ping.subject_key}`);
+} else {
+  console.error(`suggestion-classify: captured ${result.disposition} reply to ${ping.lane} ping (no subject_key — hum-responses only)`);
+}
 process.exit(0);

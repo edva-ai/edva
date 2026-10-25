@@ -1,0 +1,134 @@
+#!/usr/bin/env node
+// email-inbound-run — answer one email to the agent's address from an allowlisted sender in a
+// stateless one-off `claude -p`, instead of a turn in the shared ops session.
+//
+// Spawned (detached) by the supervisor's /email-inbound route AFTER the code
+// gate (lib/email-inbound-gate.mjs: DKIM alignment, sender allowlist,
+// Message-ID dedup, reply-to-Merlin lookup) has passed the message.
+//
+// Tool grant — explicit, and the whole of it (see jobs/email-inbound.md § Tool
+// grant): built-in tools OFF (--tools ""), --strict-mcp-config to ONE server,
+// agent/tools-mcp/email-inbound.mjs: read-only wiki/recall/travel/calendar
+// plus two hand-offs (escalate_to_ops, mkt_apply). No shell, files, Gmail,
+// browser or send. The reply is sent HERE, in code, and only to the sender.
+//
+// Never drops an email: no valid decision, a crash, or a claimed-but-unrecorded
+// hand-off all fall back to escalating to the ops agent — exactly the pre-
+// 2026-10-04 path.
+//
+// Usage: email-inbound-run --payload <file>    ({"email": {...}, "context": {...}};
+//                                              the supervisor writes it, we delete it)
+//        email-inbound-run < payload.json
+//        email-inbound-run --dry-run < …   (decide, print the plan, send nothing,
+//                                           and hand-off tools are NOT wired)
+// Log: data/email-inbound-oneshot-log.jsonl (metadata + outcome, no body).
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { makeStatelessExecutor } from "../agent/core/stateless-executor.mjs";
+import {
+  ROOT, systemPrompt, untrustedEmailBlock, escalationTask, postToOps, parseDecision, planAction,
+} from "../lib/email-inbound-oneshot.mjs";
+
+const exec = promisify(execFile);
+const DRY = process.argv.includes("--dry-run");
+const PAYLOAD_ARG = (() => { const i = process.argv.indexOf("--payload"); return i > 0 ? process.argv[i + 1] : null; })();
+const readInput = () => fs.readFileSync(PAYLOAD_ARG || 0, "utf8");
+const LOG = path.join(ROOT, "data/email-inbound-oneshot-log.jsonl");
+const TOOL_NAMES = ["wiki_search", "wiki_read", "wiki_list", "recall", "travel_where", "travel_list", "calendar_list", "escalate_to_ops", "mkt_apply"];
+const DRY_TOOL_NAMES = TOOL_NAMES.filter((t) => t !== "escalate_to_ops" && t !== "mkt_apply");
+
+const log = (rec) => { try { fs.appendFileSync(LOG, JSON.stringify({ ts: new Date().toISOString(), ...rec }) + "\n"); } catch {} };
+
+async function sendReply(email, body) {
+  const subj = String(email.subject || "");
+  const subject = subj.toLowerCase().startsWith("re:") ? subj : `Re: ${subj || "your note"}`;
+  const file = path.join(os.tmpdir(), `email-inbound-reply-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(file, body);
+  const args = ["--to", String(email.from), "--subject", subject, "--body-file", file];
+  if (email.message_id) {
+    args.push("--in-reply-to", email.message_id, "--references", [email.references, email.message_id].filter(Boolean).join(" "));
+  }
+  try { await exec(path.join(ROOT, "bin/email-send"), args, { timeout: 60_000 }); }
+  finally { fs.rmSync(file, { force: true }); }
+}
+
+async function main() {
+  const { email, context } = JSON.parse(readInput());
+  if (!email || !email.from) throw new Error("payload missing email.from");
+  const meta = { from: String(email.from).toLowerCase(), subject: email.subject || "", message_id: email.message_id || null };
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "email-inbound-"));
+  const stateFile = path.join(tmp, "state.json");
+  const payloadFile = path.join(tmp, "payload.json");
+  fs.writeFileSync(stateFile, "{}");
+  fs.writeFileSync(payloadFile, JSON.stringify({ email, context }));
+  const mcpConfig = path.join(tmp, "mcp.json");
+  fs.writeFileSync(mcpConfig, JSON.stringify({
+    mcpServers: {
+      "email-inbound": {
+        command: process.execPath,
+        args: [path.join(ROOT, "agent/tools-mcp/email-inbound.mjs")],
+        env: {
+          EMAIL_INBOUND_STATE: stateFile, EMAIL_INBOUND_PAYLOAD: payloadFile,
+          HOME: os.homedir(), PATH: process.env.PATH,
+        },
+      },
+    },
+  }));
+
+  let decision = null, state = {}, err = null;
+  try {
+    const grant = DRY ? DRY_TOOL_NAMES : TOOL_NAMES;
+    const run = makeStatelessExecutor({
+      model: "claude-sonnet-5-5",
+      effort: "medium",
+      cwd: tmp,                // no CLAUDE.md / .mcp.json / project settings to auto-discover
+      tools: "",               // no built-in tools at all
+      mcpConfig,
+      strictMcpConfig: true,   // and no other MCP server
+      allowedTools: grant.map((t) => `mcp__email-inbound__${t}`),
+      timeoutMs: 8 * 60 * 1000,
+    });
+    const { text } = await run({
+      system: systemPrompt(),
+      messages: [{ role: "user", content: untrustedEmailBlock(email, context) }],
+    });
+    decision = parseDecision(text);
+    try { state = JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch {}
+  } catch (e) {
+    err = e;
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const plan = planAction({ decision, state });
+  if (DRY) { console.log(JSON.stringify({ decision, plan }, null, 2)); log({ ...meta, outcome: "dry-run", plan: plan.kind }); return; }
+
+  if (plan.kind === "reply") { await sendReply(email, plan.body); log({ ...meta, outcome: "answered", chars: plan.body.length }); return; }
+  if (plan.kind === "none") { log({ ...meta, outcome: "no-reply" }); return; }
+  if (plan.kind === "escalated" || plan.kind === "mkt-applied") { log({ ...meta, outcome: plan.kind, instruction: state.instruction || null }); return; }
+
+  // fallback-escalate: hand the whole email to the ops agent, the old path.
+  await postToOps({ task: escalationTask({ email, context, instruction: null, why: plan.reason }), source: "email-inbound" });
+  log({ ...meta, outcome: "fallback-escalated", reason: err ? `error: ${err.message}` : plan.reason });
+}
+
+main().then(() => { if (PAYLOAD_ARG && !DRY) fs.rmSync(PAYLOAD_ARG, { force: true }); }).catch(async (e) => {
+  // Last line of defence: try once more to put the email in front of ops.
+  try {
+    const raw = PAYLOAD_ARG ? fs.readFileSync(PAYLOAD_ARG, "utf8") : null;
+    if (raw) {
+      const { email, context } = JSON.parse(raw);
+      await postToOps({ task: escalationTask({ email, context, instruction: null, why: `runner error: ${e.message}` }), source: "email-inbound" });
+      log({ outcome: "error-escalated", error: e.message });
+      return;
+    }
+  } catch {}
+  log({ outcome: "error", error: e.message });
+  console.error(`email-inbound-run: ${e.message}`);
+  process.exit(1);
+});

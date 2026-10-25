@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Cost Efficiency Review — daily at 02:37 local.
+
+  Reviews where the Max-subscription budget actually went in the last 24h:
+  the cost split by token type, the measured context floor per supervisor, the
+  working window above it, and the compact/rotate churn that follows when the
+  window closes. Files cuts through the unified self-improvement pipeline.
+
+  02:37 is not hand-picked — it came from `merlin-cron-slots request` (name
+  cost-efficiency-review, duration 15, cadence daily; flags omitted here
+  because a double hyphen is not allowed inside an XML comment), which owns collision
+  avoidance and is registered in data/cron-slots.json. It lands after the
+  day boundary (so the 24h window is a whole day), inside the sleep window (so
+  it never competes with a user-facing job), and 23 minutes clear of the 03:00
+  improvement-review — two Opus sessions must not overlap on a RAM-constrained host.
+
+  launchd USER agent, not crontab — a `claude -p` under cron cannot unlock the
+  login keychain holding the Max credentials, prints "Not logged in", exits 0.
+  Same constraint as ai.claude.system-issue-review / improvement-review.
+
+  The trigger gates hard before spending anything: it pre-fetches the report and
+  exits when the window holds fewer than 20 dispatches (fresh restart, quiet
+  day), because each run is an Opus 5 run.
+
+  Install:
+    agent/launch-agents/install.sh ai.claude.cost-efficiency-review
+    (renders __MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__, then launchctl bootstrap)
+  Pause without uninstalling:
+    touch ~/Dev/merlin/data/.cost-efficiency-review-pause
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.cost-efficiency-review</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__MERLIN_TOOLS__/agent/scripts/trigger-cost-efficiency-review.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>37</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/cost-efficiency-review-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/cost-efficiency-review-launchd.log</string>
+</dict>
+</plist>

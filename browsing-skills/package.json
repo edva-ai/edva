@@ -1,0 +1,15 @@
+{
+  "name": "merlin-browsing-skills",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Merlin's internal registry of browser actions, complementing the public browsing-skills library.",
+  "bin": {
+    "browsing-skills-validate": "tools/validate-skill.js",
+    "browsing-skills-run": "tools/run-action.js",
+    "browsing-skills-health": "tools/skill-health.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

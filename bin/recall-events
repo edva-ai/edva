@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+// recall-events — CLI over the events_fts recall index (lib/event-fts.mjs).
+//
+// The supervisor tees every event into events_fts live (EventLog.append), so
+// under normal operation no indexing step is needed. This CLI is for:
+//   - search : ad-hoc "what did Merlin do about X?" from the terminal (the
+//              same primitive the agent gets via the recall_events MCP tool)
+//   - recent : newest N events (what the handoff digest reads)
+//   - rebuild: drop + re-ingest from the JSONL source of truth (after a schema
+//              change, or to backfill history logged before the tee shipped)
+//   - prune  : retention hygiene (the index is derived + rebuildable)
+//   - stats  : row count, kind histogram, time range
+//
+// Usage:
+//   recall-events search "weekly review" [--source X] [--kind K] [--agent ops] [--since ISO] [-k N] [--json]
+//   recall-events recent [-k N] [--agent ops] [--json]
+//   recall-events rebuild [file ...]          # defaults to all supervisor-*/events.ndjson
+//   recall-events prune [--days 30]
+//   recall-events stats [--json]
+
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
+import {
+  searchEvents,
+  searchEventsHybrid,
+  recentEvents,
+  rebuildFromFiles,
+  pruneOlderThan,
+  embedPending,
+  embeddingStats,
+  stats as ftsStats,
+} from "../lib/event-fts.mjs";
+import { localLlmEmbed } from "../lib/local-llm.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const HOME = os.homedir();
+const LOG_ROOT = installTools("agent/logs");
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") out.json = true;
+    else if (a === "--hybrid") out.hybrid = true;
+    else if (a === "-k" || a === "--limit") out.k = Number(argv[++i]);
+    else if (a === "--source") out.source = argv[++i];
+    else if (a === "--kind") out.kind = argv[++i];
+    else if (a === "--agent") out.agent = argv[++i];
+    else if (a === "--since") out.since = argv[++i];
+    else if (a === "--days") out.days = Number(argv[++i]);
+    else out._.push(a);
+  }
+  return out;
+}
+
+function defaultEventFiles() {
+  // All supervisor-*/events.ndjson under the log root.
+  if (!fs.existsSync(LOG_ROOT)) return [];
+  return fs
+    .readdirSync(LOG_ROOT)
+    .filter((d) => d.startsWith("supervisor-"))
+    .map((d) => path.join(LOG_ROOT, d, "events.ndjson"))
+    .filter((p) => fs.existsSync(p));
+}
+
+const cmd = process.argv[2];
+const flags = parseFlags(process.argv.slice(3));
+
+if (cmd === "search") {
+  const query = flags._.join(" ");
+  if (!query) { console.error("usage: recall-events search <query>"); process.exit(1); }
+  const opts = {
+    limit: flags.k || 20,
+    source: flags.source || null,
+    kind: flags.kind || null,
+    agent: flags.agent || null,
+    since: flags.since || null,
+  };
+  // --hybrid fuses BM25 with semantic KNN (degrades to FTS if Ollama is down).
+  const rows = flags.hybrid
+    ? await searchEventsHybrid(query, { ...opts, embedQuery: (t) => localLlmEmbed(t) })
+    : searchEvents(query, opts);
+  if (flags.json) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+  if (!rows.length) { console.log("(no matches)"); process.exit(0); }
+  for (const r of rows) {
+    console.log(`${r.ts}  [${r.agent || "?"}] ${r.kind || "?"}${r.source ? " · " + r.source : ""}`);
+    console.log(`   ${r.snippet}`);
+  }
+} else if (cmd === "recent") {
+  const rows = recentEvents({ limit: flags.k || 40, agent: flags.agent || null });
+  if (flags.json) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+  for (const r of rows) {
+    console.log(`${r.ts}  [${r.agent || "?"}] ${r.kind || "?"}${r.source ? " · " + r.source : ""}`);
+  }
+} else if (cmd === "rebuild") {
+  const files = flags._.length ? flags._ : defaultEventFiles();
+  if (!files.length) { console.error("rebuild: no events.ndjson files found under " + LOG_ROOT); process.exit(1); }
+  const res = rebuildFromFiles(files);
+  console.log(JSON.stringify(res, null, 2));
+} else if (cmd === "prune") {
+  const removed = pruneOlderThan(flags.days || 30);
+  console.log(`pruned ${removed} row(s) older than ${flags.days || 30}d`);
+} else if (cmd === "embed") {
+  // Backfill semantic embeddings for high-value events (opt-in / cron; never on
+  // the append hot path). Degrades gracefully — bails after a few failures if
+  // Ollama is down. Loop in batches until nothing is pending or --limit is hit.
+  const batch = flags.k || 200;
+  const res = await embedPending({ embedFn: (t) => localLlmEmbed(t), limit: batch });
+  console.log(JSON.stringify(res, null, 2));
+} else if (cmd === "stats") {
+  const s = ftsStats();
+  s.embeddings = embeddingStats();
+  console.log(JSON.stringify(s, null, 2));
+} else {
+  console.error("usage: recall-events <search [--hybrid]|recent|rebuild|prune|embed|stats> [...]");
+  process.exit(1);
+}

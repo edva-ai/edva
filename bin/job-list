@@ -1,0 +1,57 @@
+#!/usr/bin/env node
+// job-list — visibility into every job launched via job-run (see
+// lib/job-runner.mjs). Reads the registry directly; no daemon needed.
+//
+// Usage:
+//   job-list                 all jobs, newest first
+//   job-list --running       only status=="running" or "starting"
+//   job-list --json          machine-readable
+
+import { listJobs } from "../lib/job-runner.mjs";
+
+const args = process.argv.slice(2);
+const runningOnly = args.includes("--running");
+const asJson = args.includes("--json");
+
+let jobs = listJobs();
+if (runningOnly) jobs = jobs.filter((j) => j.status === "running" || j.status === "starting");
+
+if (asJson) {
+  console.log(JSON.stringify(jobs, null, 2));
+  process.exit(0);
+}
+
+if (jobs.length === 0) {
+  console.log(runningOnly ? "(no jobs running)" : "(no jobs recorded)");
+  process.exit(0);
+}
+
+function fmtDuration(startIso, endIso) {
+  const start = new Date(startIso).getTime();
+  const end = endIso ? new Date(endIso).getTime() : Date.now();
+  const ms = Math.max(0, end - start);
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return `${Math.round(ms / 1000)}s`;
+  if (mins < 60) return `${mins}m`;
+  return `${Math.floor(mins / 60)}h${mins % 60}m`;
+}
+
+const STATUS_LABEL = {
+  starting: "starting",
+  running: "running",
+  done: "done",
+  failed: "FAILED",
+  canceled: "canceled",
+  lost: "LOST",
+};
+
+for (const j of jobs) {
+  const dur = fmtDuration(j.started_at, j.finished_at);
+  const status = STATUS_LABEL[j.status] || j.status;
+  const notif = j.on_complete ? (j.notified ? "" : " [notify pending]") : "";
+  // "done" only means the process exited on its own, not that exit_code==0
+  // (some scripts use multi-value exit codes) — surface it so a no-op vs a
+  // real send isn't ambiguous at a glance.
+  const exitInfo = j.status === "done" && j.exit_code !== 0 ? ` (exit ${j.exit_code})` : "";
+  console.log(`${j.id}  ${status.padEnd(9)} ${dur.padStart(6)}  ${j.name}${exitInfo}${notif}`);
+}

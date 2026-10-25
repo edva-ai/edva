@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # memory-snapshot — commit + push the auto-memory dir to its private backup repo.
 #
-# The memory dir at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/ is its
-# own git repo (separate from the merlin code repo) tracking ${MERLIN_BACKUP_REPO}.
+# The memory dir at ~/.claude/projects/<project-slug>/memory/ is its
+# own git repo (separate from the merlin code repo) tracking the private personal-memory repo.
 # This script is the auto-commit driver: every N minutes (cron-driven), it stages
 # everything, commits if there are changes, and pushes to origin.
 #
@@ -19,7 +19,10 @@
 
 set -euo pipefail
 
-MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/-Users-mraccah-Dev-merlin/memory}"
+# Claude Code's project slug: the session start path (~/Dev/merlin) with every
+# non-alphanumeric character turned into "-" (lib/instance.cjs claudeMemoryDir).
+PROJECT_SLUG="$(printf '%s' "${MERLIN_PROJECT_DIR:-$HOME/Dev/merlin}" | tr -c 'A-Za-z0-9' '-')"
+MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/$PROJECT_SLUG/memory}"
 
 PUSH=1
 QUIET=0

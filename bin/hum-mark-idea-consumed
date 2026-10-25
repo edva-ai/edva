@@ -8,13 +8,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { installTools } from "../lib/root.cjs";
 const [ideaId, pingId] = process.argv.slice(2);
 if (!ideaId || !pingId) {
   console.error("usage: hum-mark-idea-consumed <idea-id> <ping-id>");
   process.exit(2);
 }
 
-const file = path.join(os.homedir(), "dev/merlin/data/hum-ideas.jsonl");
+const file = installTools("data/hum-ideas.jsonl");
 const record = {
   id: ideaId,
   consumed: true,

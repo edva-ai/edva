@@ -5,18 +5,74 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createClient } from "@supabase/supabase-js";
-import { sendApnsPush } from "../../lib/apns-push.mjs";
-import { localLlmChat } from "../../lib/local-llm.mjs";
+import { sendApnsPush, sendClearPush } from "../../lib/apns-push.mjs";
+import { writeFileAtomic } from "../../lib/atomic-write.js";
+import { autoRecallBlock, useWarmJudge } from "../../lib/auto-recall.mjs";
+import { WarmClaude } from "../../lib/warm-claude.mjs";
+import { spoolEvent } from "../../lib/hum-events.mjs";
+import { displayableDraft } from "../../lib/reply-stream.mjs";
+import { composeReply } from "../../lib/reply-file.mjs";
+import { recordSuperseded } from "../../lib/superseded-replies.mjs";
+import { ShareBundler, laterTimestamp } from "./share-bundle.mjs";
+import { loadHook } from "../../lib/ext-hooks.mjs";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { installTools } from "../../lib/root.cjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../../lib/load-env.js");
+const { instance, localConfig } = require("../../lib/instance.cjs");
 
-const SUPABASE_URL = "https://${MERLIN_SUPABASE_PROJECT}.supabase.co";
+// Who this installation serves (lib/instance.cjs).
+const INSTANCE = instance();
+// The operator's name as the agent reads it ("the user" in a fresh install);
+// OWNER_LABEL starts a sentence or a transcript line.
+const OWNER = INSTANCE.owner_name;
+const OWNER_LABEL = OWNER.charAt(0).toUpperCase() + OWNER.slice(1);
+// Hum lanes a location edge fans out to (agent/local/config/location-lanes.json).
+const LOCATION_LANES = localConfig("location-lanes", {
+  arrival: ["nearby", "location_context", "dining", "situation"],
+  departure: ["location_context", "situation", "calendar"],
+});
+// Typed-reply hints for an installation's own card kinds:
+// phone-channel/_ext/reply-hints.mjs exports `cardHints = { <kind>: (choices) => text }`.
+// Fail-open: a broken hook never keeps the channel from starting.
+let REPLY_HINTS = {};
+try {
+  REPLY_HINTS = (await loadHook(path.dirname(fileURLToPath(import.meta.url)), "reply-hints"))?.cardHints || {};
+} catch (e) {
+  console.error(`[phone-channel] reply-hints hook failed to load: ${e?.message || e}`);
+}
 
 // Load .env first — service_role key must come from env, not source code.
 loadEnv();
+
+const SUPABASE_URL = INSTANCE.supabase_project
+  ? `https://${INSTANCE.supabase_project}.supabase.co`
+  : (process.env.SUPABASE_URL || "");
+
+// ── Single-instance guard (a rogue duplicate once caused an outage). A 2nd
+// phone-channel double-processes the channel + Supabase Realtime/acks and can
+// saturate the DB compute. The legit instance is spawned by the chat supervisor's
+// MCP config (supervisor/chat-mcp-config.json), which sets MERLIN_PHONE_PRIMARY=1.
+// FAIL-SAFE: exit ONLY when this is an unblessed launch (env flag unset — e.g.
+// spawned by Claude Desktop or by hand) AND another phone-channel is already
+// running. A sole instance, or the blessed primary, always proceeds — so a missing
+// env var can never take the channel down.
+if (process.env.MERLIN_PHONE_PRIMARY !== "1") {
+  try {
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("pgrep", ["-f", "phone-channel/index.mjs"], { encoding: "utf8" });
+    const others = out.split("\n").map((s) => parseInt(s, 10)).filter((p) => p && p !== process.pid);
+    if (others.length > 0) {
+      console.error(`[phone-channel] refusing to start: another phone-channel (pid ${others.join(",")}) is already running and this is not the supervisor's primary (MERLIN_PHONE_PRIMARY unset). Exiting to avoid a duplicate Supabase subscriber.`);
+      process.exit(0);
+    }
+  } catch {
+    // pgrep unavailable / errored → fail-open (do not block startup).
+  }
+}
 
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_KEY) {
@@ -26,7 +82,7 @@ if (!SUPABASE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // --- Persistent cursor for sweep ---
-const CURSOR_PATH = path.join(process.env.HOME, "dev/merlin/data/phone-channel-cursor.json");
+const CURSOR_PATH = installTools("data/phone-channel-cursor.json");
 const CURSOR_FALLBACK_MS = 30 * 60 * 1000;
 
 function loadCursor() {
@@ -52,12 +108,86 @@ let _cachedUserTz = null; // skip redundant timezone writes when unchanged
 
 // Instance ID for tracing which phone-channel process handles what
 const INSTANCE_ID = `pc-${process.pid}`;
-const ACK_LOG = process.env.HOME + "/dev/merlin/agent/logs/ack-trace.log";
+const ACK_LOG = installTools("agent/logs/ack-trace.log");
 const log = (msg) => {
   const line = `${new Date().toISOString()} [${INSTANCE_ID}] ${msg}\n`;
   console.error(line.trim());
   fs.appendFileSync(ACK_LOG, line);
 };
+
+// ─── Release gate for chat-agent replies: send first, correct in place ─────
+//
+// Rule #2 (agent/CLAUDE.md): every message into the chat must be checked
+// for truth, and chat-agent replies are not exempt — an
+// answer composed in-turn may still repeat a stale state claim from a stored
+// idea, wiki page or old email. A reply is SOLICITED, so the gate can only
+// ever rewrite it, never withhold it; that is what makes it safe to run after
+// the reply has landed and correct the same row if it says rewrite. The app
+// already renders in-place updates (that is how the ack becomes the reply).
+//
+// Fire-and-forget: it never delays or fails a reply. The deadline is wider than
+// the old 12s inline budget because nobody is waiting on it now, but still
+// bounded so a correction cannot arrive minutes after the user has moved on.
+const REPLY_GATE_DEADLINE_MS = 45_000;
+
+// The exchange a reply answers, handed to the gate's claim extractor as
+// "<user>: …" / "Merlin: …" lines, oldest first. Read alone, a reply cannot
+// be told apart from a stale status: a reply confirming a name or address the
+// user had just given gets re-checked against stored data and "corrected"
+// away from the user's own words.
+// It reaches the extractor only (see checkFreshness). Fail-soft: on any error,
+// just the user's message, or nothing.
+const REPLY_EXCHANGE_ROWS = 4;
+
+async function replyExchange(rowId, repliedTo) {
+  const fallback = repliedTo ? `${OWNER_LABEL}: ${String(repliedTo).slice(0, 500)}` : "";
+  try {
+    const { data, error } = await supabase
+      .from("merlin_messages")
+      .select("id, role, content, metadata")
+      .eq("channel", "chat")
+      .neq("id", rowId)
+      .order("created_at", { ascending: false })
+      .limit(REPLY_EXCHANGE_ROWS * 2);
+    if (error || !Array.isArray(data)) return fallback;
+    const rows = data
+      .filter((m) => m?.metadata?.is_ack !== "1" && typeof m.content === "string" && m.content.trim())
+      .slice(0, REPLY_EXCHANGE_ROWS)
+      .reverse();
+    if (!rows.length) return fallback;
+    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : "Merlin"}: ${m.content.slice(0, 500)}`).join("\n");
+  } catch {
+    return fallback;
+  }
+}
+
+async function correctReplyInPlace(rowId, text, repliedTo = null) {
+  try {
+    const { checkFreshness } = await import("../../lib/claim-freshness.mjs");
+    const conversation = await replyExchange(rowId, repliedTo);
+    const fresh = await checkFreshness(
+      { text, solicited: true, conversation },
+      { deadlineMs: REPLY_GATE_DEADLINE_MS },
+    );
+    if (fresh.verdict !== "rewrite" || !fresh.corrected_text) return;
+    // Keep the text being replaced BEFORE the overwrite — the chat row only
+    // ever holds the corrected version (lib/superseded-replies.mjs; otherwise
+    // the original draft exists in no log).
+    recordSuperseded({
+      row_id: rowId, original: text, replacement: fresh.corrected_text,
+      reason: "freshness_rewrite", source: "phone-channel",
+      details: { reasons: fresh.reasons || [], claims: fresh.claims || [] },
+    });
+    const { error } = await supabase
+      .from("merlin_messages")
+      .update({ content: fresh.corrected_text, metadata: { freshness_rewritten: "1" } })
+      .eq("id", rowId);
+    if (error) throw new Error(error.message);
+    console.error(`[phone-channel] freshness rewrite (in place, ${rowId}): ${fresh.reasons?.[0] || "stale premise attributed"}`);
+  } catch (e) {
+    console.error(`[phone-channel] freshness gate skipped: ${e?.message || e}`);
+  }
+}
 
 const mcp = new Server(
   { name: "phone-channel", version: "1.0.0" },
@@ -67,13 +197,17 @@ const mcp = new Server(
       tools: {},
       logging: {},
     },
-    instructions: `You are monitoring mobile messages from the user via the Merlin app.
+    instructions: `You are monitoring mobile messages from ${OWNER} via the Merlin app.
 
-CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to the user. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; the user never sees it. Every Merlin message you receive MUST end with at least one reply tool call. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
+CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Merlin message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
 
-If you have nothing to say (e.g. a tool failed, you're standing by), still call reply with a one-line acknowledgement rather than ending the turn silently. The chat-supervisor has a safety net that auto-posts orphaned text — but that's a recovery path for bugs, not the design; never rely on it.
+THREADED REPLIES: ${OWNER_LABEL} often reads Merlin in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
 
-Keep responses concise — the user is on their phone.`,
+If you have nothing to say (e.g. a tool failed), still call reply with a one-line acknowledgement rather than ending the turn silently. The chat-supervisor has a safety net that auto-posts orphaned text — but that's a recovery path for bugs, not the design; never rely on it.
+
+RESTARTS: never tell ${OWNER} you're up, back or standing by. Restarts and recoveries belong to the system channel, and only the watchdog writes those.
+
+Keep responses concise — ${OWNER} is on their phone.`,
   }
 );
 
@@ -84,7 +218,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "reply",
       description:
-        "Send a response back to the user via the Merlin mobile app. " +
+        "Send a response back to " + OWNER + " via the Merlin mobile app. " +
         "For any reply longer than ~80 characters, or that contains structured/multi-section content " +
         "(digests, briefings, lists), you MUST provide a short `summary` — this becomes the push " +
         "notification body (e.g. 'Weekend events ready', 'P1 email: draft ready'). " +
@@ -94,7 +228,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           message: {
             type: "string",
-            description: "The full message body to insert into the Merlin chat.",
+            description: "The full message body to insert into the Merlin chat. With `message_file`, an optional short lead-in placed above the file's text.",
+          },
+          message_file: {
+            type: "string",
+            description:
+              "Path to a finished message a tool already wrote (a tool's `message_file` output). " +
+              "Sent exactly as written, so you don't retype it — use it whenever a tool hands you one. " +
+              "Must be a file under data/reply-files/.",
           },
           summary: {
             type: "string",
@@ -103,14 +244,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               "Describes what the message is about, not a copy of its content. " +
               "Required when message is long or structured.",
           },
+          time_sensitive: {
+            type: "boolean",
+            description:
+              "Default false. Set TRUE only when this is a direct answer " + OWNER + " is ACTIVELY WAITING FOR and likely can't look at the screen — above all when they voice-summoned Merlin hands-free (\"Hey Siri, Summon Merlin\") or is otherwise driving. True marks the push time-sensitive so it pierces Driving/DND Focus and gets read aloud over AirPods/CarPlay. NEVER set true for anything proactive or ambient (digests, hum pings, ideas, suggestions, FYIs, reminders they didn't just ask about) — those must not interrupt them while driving. Rare genuine urgency (a real P1 they need now) may also use true.",
+          },
         },
-        required: ["message"],
+        // One of message / message_file — checked in the handler.
+        required: [],
       },
     },
     {
       name: "get_location",
       description:
-        "Request the user's current location from their phone",
+        "Request " + OWNER + "'s current location from their phone",
       inputSchema: {
         type: "object",
         properties: {},
@@ -121,34 +268,73 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "reply") {
-    const message = request.params.arguments.message;
+    let message;
+    try {
+      message = composeReply(request.params.arguments || {});
+    } catch (err) {
+      return { content: [{ type: "text", text: `Reply not sent: ${err.message}` }], isError: true };
+    }
     const summary = request.params.arguments.summary;
-    console.error(`[phone-channel] Sending reply: ${message.slice(0, 200)}`);
+    // Time-sensitive = "interrupt even while driving" (pierces Driving/DND Focus
+    // + read aloud). Reserved for direct answers the user is actively awaiting
+    // (esp. voice-summoned / driving); never for proactive/ambient messages.
+    const timeSensitive = request.params.arguments.time_sensitive === true;
+    console.error(`[phone-channel] Sending reply${timeSensitive ? " (time-sensitive)" : ""}: ${message.slice(0, 200)}`);
 
     // Find the most recent pending message for profiling
     const profMsgId = [...pendingMessages.keys()].pop();
     if (profMsgId) profLog(profMsgId, "t3_replyCall");
 
+    // The release gate (is this still TRUE?) runs AFTER the reply lands — see
+    // correctReplyInPlace below. It used to run here, before the insert, and
+    // was the single largest share of chat latency (p50 ~23s on the reply
+    // tool), because a reply carries no provenance,
+    // so every one is "undated" and pays a Sonnet extraction + memory re-check
+    // + adjudication. A solicited reply can only ever be rewritten, never
+    // withheld, so nothing is lost by sending first and correcting the same
+    // row in place (send-then-correct, the user's choice).
+    const deliveredMessage = message;
+
     // Stop the ack refresh interval. If we have an ack row, UPDATE it in place
     // with the real reply — that keeps a single stable message row in the
     // chat UI (ack → real reply) instead of a delete+insert flicker.
     const pendingEntry = profMsgId ? pendingMessages.get(profMsgId) : null;
+    // Tells a still-in-flight ack (generated off the critical path, see
+    // startAck) that the reply beat it, so it must not land after the answer.
+    if (pendingEntry) pendingEntry.replied = true;
     if (pendingEntry?.ackInterval) {
       clearInterval(pendingEntry.ackInterval);
       pendingEntry.ackInterval = null;
     }
 
-    const reuseAckId = pendingEntry?.ackMsgId;
+    let reuseAckId = pendingEntry?.ackMsgId;
     // Null out on the pending entry so the refresh-interval's in-flight tick
     // (which checks pending.ackMsgId) skips its own update and doesn't race.
     if (pendingEntry) pendingEntry.ackMsgId = null;
+
+    // If this reply was streaming into a row, finish THAT row. Its last partial
+    // write must land before the final one, so wait for it. An ack the stream
+    // didn't claim (the stream had to insert its own row) is now redundant.
+    const streamed = takeStreamRow(message);
+    if (streamed) {
+      await streamed.chain.catch(() => {});
+      if (streamed.rowId) {
+        if (reuseAckId && reuseAckId !== streamed.rowId) {
+          supabase.from("merlin_messages").delete().eq("id", reuseAckId)
+            .then(({ error }) => { if (error) log(`superseded ack delete error: ${error.message}`); });
+        }
+        reuseAckId = streamed.rowId;
+      }
+    }
 
     try {
       let inserted;
       if (reuseAckId) {
         const { data, error } = await supabase
           .from("merlin_messages")
-          .update({ content: message, read: false })
+          // Clear is_ack — this row is now a real reply and SHOULD be visible
+          // to the next message's ack-history window.
+          .update({ content: deliveredMessage, read: false, metadata: {} })
           .eq("id", reuseAckId)
           .select("id")
           .single();
@@ -163,7 +349,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!inserted) {
         ({ data: inserted, error } = await supabase.from("merlin_messages").insert({
           role: "assistant",
-          content: message,
+          content: deliveredMessage,
           read: false,
         }).select("id").single());
       }
@@ -183,6 +369,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Delay push to allow foreground apps to mark as read via realtime
       const msgId = inserted?.id;
+      // A message_file reply was composed by a tool (a recommendation CLI, …) from the source
+      // of record seconds ago — it IS the live evidence, so the freshness gate has nothing to
+      // re-check; and a rewrite would replace the whole row with prose (e.g. a poster list cut
+      // to 1,200 chars, with "as of when I looked" hedges on live data).
+      if (msgId && !request.params.arguments?.message_file) correctReplyInPlace(msgId, message, pendingEntry?.text || null);
       setTimeout(async () => {
         try {
           if (msgId) {
@@ -196,9 +387,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
               return;
             }
           }
+          // The push goes out before the freshness gate finishes, so it previews
+          // the reply as written; a later correction updates the chat row only.
           const body = summary
-            || (message.length > 100 ? message.slice(0, 100) + "…" : message);
-          await sendApnsPush(supabase, { body, messageId: msgId });
+            || (deliveredMessage.length > 100 ? deliveredMessage.slice(0, 100) + "…" : deliveredMessage);
+          // A reply is SOLICITED — the user asked and is waiting. The motion
+          // gate (which parks non-urgent alerts while the user is walking or driving)
+          // is for proactive traffic only; holding an answer the user is waiting on
+          // would be the same failure Rule #2 forbids, one layer down. Note this
+          // is separate from `urgent`: that still decides whether the reply
+          // pierces Focus and gets read aloud, and stays narrow by design.
+          await sendApnsPush(supabase, {
+            body, messageId: msgId, urgent: timeSensitive, skipMotionGate: true,
+          });
         } catch (err) {
           console.error(`[phone-channel] Push failed: ${err.message}`);
         }
@@ -321,30 +522,17 @@ function profSummary(msgId) {
 // Short conversational messages that don't need an ack.
 const SKIP_ACK = /^(ok|okay|thanks|thank you|thx|ty|yep|yup|yeah|yes|no|nah|nope|cool|nice|got it|k|lol|haha|sure|👍|❤️|🙏)\s*[.!?]*$/i;
 
-// Long enough to absorb a Gemma cold-load (~7s on this Mac mini). A 2s
-// timeout would AbortController.abort() the fetch mid-load, which Ollama
-// treats as "client disconnect → cancel model load" — and the next call's
-// 2s timeout would do the same thing, deathlocking the runner. With 8s
-// the cold-load completes, the model becomes resident, and every ack
-// after that hits a warm model in ~1.5s. Steady-state UX is unchanged.
-const ACK_TIMEOUT_MS = 8000;
 // Stop refreshing the ack after this many updates per conversation. At the
 // 5s cadence below this is ~1 minute — a stuck chat-agent can't flood the
 // UI with updates for one message.
 const ACK_REFRESH_MAX_COUNT = 12;
 const ACK_REFRESH_INTERVAL_MS = 5_000;
-// How many prior messages to feed Gemma for ack generation. Both the initial
-// ack and the 5s refresh ack get the same window so a status like "Looking
-// up Jon Barr…" stays accurate when the user says "actually try gmail" two
-// turns later. 20 is well within Gemma's 8K num_ctx (each chat line is
-// typically 50-200 tokens).
-const ACK_HISTORY_LIMIT = 20;
-// Rotating fallback copy used when the local LLM can't produce an ack
-// (Ollama down, timeout, empty completion). Keeps the visual "still working"
-// signal moving so the user doesn't see a frozen "On it…" while ops does heavy
-// work. State-only: each line describes what's happening *right now*; none
-// promise a response is imminent, since we don't know when (or whether) the
-// real reply will land while the ack layer is degraded.
+// The "working" status line is CANNED ONLY (a user decision). A local 1B
+// model writing a one-line status from the conversation produced false facts
+// and junk lines that the sanitizer let through. A status line must never
+// state a fact, and fixed copy cannot. State-only: each line says Merlin is
+// still working; none promises a reply is imminent.
+const ACK_INITIAL_MESSAGE = "On it…";
 const CANNED_REFRESH_MESSAGES = [
   "Still on it…",
   "Working…",
@@ -353,90 +541,119 @@ const CANNED_REFRESH_MESSAGES = [
   "Looking into it…",
 ];
 
-const ACK_MAX_WORDS = 10;
-const ACK_MAX_CHARS = 90;
+/// Threaded replies. The user often reads Merlin in between other
+/// things, so several pings stack up before an answer. The app lets
+/// the user tap Reply on a specific bubble, which sets `reply_to` on the message.
+/// Without this block the agent reads the reply against the newest message in
+/// the "Recent conversation" tail — exactly the misfire the feature exists to
+/// prevent — and the parent is often outside that 10-message window anyway.
+const REPLY_QUOTE_MAX_CHARS = 1200;
 
-const ACK_SYSTEM_PROMPT = `You are generating a ONE-LINE process status for Merlin (a personal AI assistant for the user). This status appears in the chat UI while the real Claude agent prepares the actual reply.
-
-This is NOT the reply. Do not answer the user's request. Do not include dates, times, names, places, decisions, recommendations, or facts unless they are explicitly in the latest user message. When context is thin, stay generic.
-
-Output exactly one short phrase (under 10 words) ending with "…" that describes the process Merlin is using before replying.
-
-Examples:
-- "tell me about Jon Barr" → "Searching messages before replying…"
-- "any good sushi near me?" → "Checking location and food context…"
-- "turn off the living room lights" → "Routing the home action…"
-- "what's on my calendar tomorrow" → "Checking calendar before replying…"
-- "review this memory page" → "Reading the wiki context…"
-- "for tomorrow at noon" → "Using prior context before replying…"
-
-STRICT RULES — violating any of these is wrong:
-- Output ONLY the status phrase — no other text
-- NEVER ask a question
-- NEVER express confusion or ask for clarification
-- NEVER respond as if you are the assistant answering the request
-- NEVER provide the answer, even if it seems obvious
-- NEVER invent dates, times, names, places, or outcomes
-- Always end with "…"
-- Prefer process words: checking, searching, reading, routing, comparing, drafting`;
-
-function sanitizeAckOutput(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  let s = raw
-    .split(/\r?\n/)[0]
-    .replace(/^["'`]+|["'`]+$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!s) return null;
-  if (s.includes("?")) return null;
-  if (s.length > ACK_MAX_CHARS) return null;
-  const words = s.replace(/…$/, "").trim().split(/\s+/).filter(Boolean);
-  if (words.length > ACK_MAX_WORDS) return null;
-
-  // Reject answer-shaped text. The ack is only allowed to describe process.
-  if (/\b(yes|no|sure|okay|ok|done|fixed|found|it is|it's|you should|i think|i recommend|the answer|that means)\b/i.test(s)) {
-    return null;
+/**
+ * Hum routing for the agent prompt: which hum item a threaded reply answers,
+ * plus — when the message plausibly answers several — the roster of open items
+ * and the rule that each part must be filed against the item it answers.
+ *
+ * Runs for EVERY inbound message, not just threaded ones: the catch-up reply
+ * that answers three pings at once is frequently not threaded at all. The lib
+ * decides when the roster is warranted so it stays off the ~95% of messages
+ * that are fresh commands. Fail-soft — a routing hint is never worth losing
+ * the message over.
+ */
+async function buildHumBlock(row, text) {
+  try {
+    const { humRoutingBlock, humStateBlock } = await import("../../lib/hum-reply-target.mjs");
+    // [Hum state]: the pending question / last-ping windows / open
+    // ideas ping / canary, precomputed so the agent's Hum Inbound steps don't
+    // read three files and do clock math by hand on every message.
+    return humRoutingBlock({ replyTo: row.reply_to, text }) + humStateBlock();
+  } catch (err) {
+    console.error(`[phone-channel] hum routing hint failed: ${err.message}`);
+    return "";
   }
-  if (!/…$/.test(s)) s = s.replace(/[.!]*$/, "") + "…";
-  return s;
 }
 
-async function generateAck(text, recentHistory = []) {
-  const messages = [];
-  for (const m of recentHistory) {
-    messages.push({ role: m.role === "user" ? "user" : "assistant", content: m.content });
+/**
+ * Improvement-card context for the agent prompt. An improvement
+ * card's "Chat" action anchors a thread on a message representing that card;
+ * this resolves the LIVE row behind the anchor so the answer is grounded in the
+ * card's current status and actual files, not in the one-line summary frozen
+ * into the anchor's text. Empty string for every other reply. Fail-soft — a
+ * missing hint is never worth losing the message over.
+ */
+async function buildImprovementBlock(row) {
+  if (!row?.reply_to) return "";
+  try {
+    const { improvementRoutingBlock } = await import("../../lib/improvement-reply-target.mjs");
+    return await improvementRoutingBlock({ replyTo: row.reply_to });
+  } catch (err) {
+    console.error(`[phone-channel] improvement routing hint failed: ${err.message}`);
+    return "";
   }
-  messages.push({ role: "user", content: text });
+}
 
-  const llm = localLlmChat({
-    system: ACK_SYSTEM_PROMPT,
-    messages,
-    maxTokens: 40,
-    timeoutMs: ACK_TIMEOUT_MS,
-    // Acks are one short status phrase. Reasoning adds latency for no gain.
-    think: false,
-  }).catch(err => {
-    console.error(`[phone-channel] Gemma ack error: ${err.message}`);
-    return null;
-  });
-
-  const timeout = new Promise(resolve =>
-    setTimeout(() => resolve(null), ACK_TIMEOUT_MS)
-  );
-
-  const result = await Promise.race([llm, timeout]);
-  const ack = sanitizeAckOutput(result);
-  if (ack) {
-    console.error(`[phone-channel] Gemma ack: "${ack}"`);
-    return ack;
+/**
+ * A typed reply to a decision card (hum `decisions` lane, bin/decision-ask)
+ * — an exact tap never gets here, choice-reply.mjs files it in code. Tells the
+ * agent which decision it answers and how to file it, so the user's words reach the
+ * planner / cost review instead of only this conversation. Structured fields
+ * only (our own metadata); what the user meant is the agent's reading.
+ */
+function decisionReplyHint(parent) {
+  try {
+    const raw = parent?.metadata?.choices;
+    const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+    // An installation's own card kind (REPLY_HINTS, from _ext/reply-hints.mjs):
+    // the user's typed answer is the agent's reading; the hint only names the
+    // ref and how to file it. The kernel's decision card is never overridden.
+    const extHint = p?.kind !== "decision" && p?.ref ? REPLY_HINTS[p.kind] : null;
+    if (typeof extHint === "function") return extHint(p) || "";
+    if (p?.kind !== "decision" || !p.ref) return "";
+    const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
+    return `[Decision card ${p.ref}] That message was a decision Merlin asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/merlin/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
+  } catch {
+    return "";
   }
+}
 
-  if (result) {
-    console.error(`[phone-channel] Gemma ack rejected: "${result}"`);
-  } else {
-    console.error(`[phone-channel] Gemma timed out, using fallback`);
+async function buildReplyBlock(row, tz) {
+  if (!row?.reply_to) return "";
+  try {
+    const { data: parent } = await supabase
+      .from("merlin_messages")
+      .select("role, content, created_at, metadata")
+      .eq("id", row.reply_to)
+      .single();
+    if (!parent) return "";
+    const decisionHint = decisionReplyHint(parent);
+
+    let when = "";
+    try {
+      if (tz && tz !== "unknown") {
+        when = new Date(parent.created_at).toLocaleString("en-US", {
+          timeZone: tz,
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: true,
+        });
+      }
+    } catch {}
+
+    const body = (parent.content || "").length > REPLY_QUOTE_MAX_CHARS
+      ? parent.content.slice(0, REPLY_QUOTE_MAX_CHARS) + "…[truncated]"
+      : (parent.content || "");
+    const whose = parent.role === "user"
+      ? "their own earlier message"
+      : "an earlier message of yours";
+
+    return `[Threaded reply] ${OWNER_LABEL} replied directly to ${whose}${when ? ` from ${when}` : ""}, not to the newest message in the conversation above:\n"""\n${body}\n"""\nRead their message below as an answer to THAT, and answer in that context.\n\n${decisionHint}`;
+  } catch (err) {
+    console.error(`[phone-channel] Reply-parent fetch failed: ${err.message}`);
+    return "";
   }
-  return "On it…";
 }
 
 // --- Realtime subscription ---
@@ -445,7 +662,25 @@ async function generateAck(text, recentHistory = []) {
 let lastSeenAt = loadCursor();
 let currentChannel = null;
 
+// The cursor is the acknowledgement the sweep reads, so it only ever moves
+// forward (share-bundle.mjs § laterTimestamp: moving it back re-dispatches an
+// already-answered message).
+function advanceCursor(ts) {
+  const next = laterTimestamp(lastSeenAt, ts);
+  if (next === lastSeenAt) return;
+  lastSeenAt = next;
+  saveCursor(lastSeenAt);
+}
+
+// A share-sheet send is several rows; they reach the agent as one message
+// (share-bundle.mjs). Typed messages never wait in here.
+const shareBundler = new ShareBundler({
+  onFlush: (merged) => handleIncomingMessage(merged)
+    .catch((err) => console.error(`[phone-channel] share bundle dispatch failed: ${err.message}`)),
+});
+
 async function handleIncomingMessage(row) {
+  if (!row.shareBundleIds && shareBundler.add(row)) return;
   const msgId = row.id;
   const text = row.content;
   const metadata = row.metadata || {};
@@ -454,13 +689,22 @@ async function handleIncomingMessage(row) {
   const createdAt = new Date(row.created_at).getTime();
 
   if (pendingMessages.has(msgId)) return; // already processing
+  // Anything new the user sends goes after a share still being collected.
+  if (!row.shareBundleIds) shareBundler.flush();
   pendingMessages.set(msgId, { text, t0_created: createdAt });
+  ensureStreamPoll();
 
   // Persist the user's current timezone for trigger scripts (pulse sleep-window check).
-  if (tz && tz !== "unknown" && tz !== _cachedUserTz) {
+  //
+  // Only from a message the PHONE sent — one carrying a device location fix.
+  // A synthetic user message (e.g. a latency benchmark) carrying a default
+  // timezone and no location would otherwise flip the stored zone while the
+  // user is abroad and shift every local time that follows by hours.
+  const fromDevice = metadata.latitude != null && metadata.longitude != null;
+  if (fromDevice && tz && tz !== "unknown" && tz !== _cachedUserTz) {
     _cachedUserTz = tz;
     try {
-      const tzPath = path.join(process.env.HOME, "dev/merlin/data/user-timezone.json");
+      const tzPath = installTools("data/user-timezone.json");
       const tmp = tzPath + ".tmp." + process.pid;
       fs.writeFileSync(tmp, JSON.stringify({ timezone: tz, utc_offset: utcOffset, updated_at: new Date().toISOString() }));
       fs.renameSync(tmp, tzPath);
@@ -470,133 +714,86 @@ async function handleIncomingMessage(row) {
   log(`handleIncomingMessage: "${text.slice(0, 80)}"`);
 
   // Fire-and-forget the suggestion classifier. If the user's message is a
-  // reaction to a recent advisory hum ping (e.g. free-text "ridiculously
-  // overpriced" or "why again?"), it writes a structured `reaction` event
+  // reaction to a recent advisory hum ping (e.g. free-text "too pricey
+  // for me" or "this again?"), it writes a structured `reaction` event
   // to suggestion-history.jsonl so the next dining/music/art lane scout
   // sees the rejection. Tapback reactions take a separate path via
   // `recordHumReaction` / `merlin hum feedback` and don't double-count
   // (the classifier dedups by appending only when its rule/Gemma judgment
   // adds new info, and the deriveState fold keeps the most-specific reason).
-  classifySuggestionReply(msgId, text);
-
-  // Quick ack via local Gemma (Ollama); falls back to canned patterns.
-  let ackMsgId = null;
-  let ackHistoryOrdered = [];
-  if (!SKIP_ACK.test(text.trim())) {
-    const { data: ackHistory } = await supabase
-      .from("merlin_messages")
-      .select("role, content")
-      .lt("created_at", row.created_at)
-      .order("created_at", { ascending: false })
-      .limit(ACK_HISTORY_LIMIT);
-    ackHistoryOrdered = (ackHistory || []).reverse();
-    const ackMsg = await generateAck(text, ackHistoryOrdered);
-    if (ackMsg) {
-      log(`ack: "${ackMsg}"`);
-      const { data: ackRow, error: ackErr } = await supabase
-        .from("merlin_messages")
-        .insert({ role: "assistant", content: ackMsg, read: false })
-        .select("id")
-        .single();
-      if (ackErr) {
-        log(`ack insert error: ${ackErr.message || ackErr.code || JSON.stringify(ackErr)}`);
-      } else {
-        ackMsgId = ackRow?.id;
-        log(`ack inserted id=${ackMsgId}`);
-      }
+  // Tapped a multiple-choice answer? Resolve it here and stop.
+  //
+  // The tap is deliberately an ordinary user message (that is what makes the
+  // choice UX generic), but that also put it on the full dispatch path: one tap
+  // cost a Sonnet turn re-reading a ~146k prefix and ~45s of "Working…" to say
+  // "Saved —". Everything needed is already in the prompt's metadata, so act on
+  // it in code. Fails OPEN — anything unrecognised continues to ack+dispatch
+  // exactly as before, so a typed answer is unaffected.
+  try {
+    const { handleChoiceReply } = await import("../../lib/choice-reply.mjs");
+    const outcome = await handleChoiceReply(supabase, row, text);
+    if (outcome.handled) {
+      // A null reply is a silent tick (a checklist box): the app's checkmark is the confirmation.
+      if (outcome.reply) await supabase.from("merlin_messages").insert({
+        role: "assistant", content: outcome.reply, read: true,
+        channel: row.channel || "chat", reply_to: row.id,
+      });
+      // ADVANCE THE CURSOR. Every other success branch ends with
+      // `advanceCursor(row.created_at)`, and the failure branch
+      // documents why ("Do NOT advance lastSeenAt — sweep will retry this
+      // message"): the cursor IS the acknowledgement. This early return
+      // originally skipped it, so the sweep — which selects on `read=false AND
+      // created_at > lastSeenAt` — re-selected the same tap every couple of
+      // minutes and answered it again, forever (two taps produced hundreds of
+      // duplicate "Saved — …" messages). A fast path that answers without acknowledging is not a
+      // shortcut, it is a loop.
+      advanceCursor(row.created_at);
+      pendingMessages.delete(msgId);
+      profLog(msgId, "t2_choice_fastpath", `${outcome.kind} — no agent turn`);
+      log(`choice fast-path: ${outcome.reply ?? outcome.kind}`);
+      return;
     }
+  } catch (err) {
+    console.error(`[phone-channel] choice fast-path error, dispatching normally: ${err.message}`);
   }
-  // Store ackMsgId so the reply handler can delete it
-  const pending = pendingMessages.get(msgId);
-  pending.ackMsgId = ackMsgId;
 
-  // Refresh the ack with a new Gemma status message while waiting for the
-  // real reply. Capped per-conversation by ACK_REFRESH_MAX_COUNT.
-  if (ackMsgId) {
-    let refreshCount = 0;
-    pending.ackInterval = setInterval(async () => {
-      if (refreshCount >= ACK_REFRESH_MAX_COUNT) {
-        clearInterval(pending.ackInterval);
-        pending.ackInterval = null;
-        console.error(`[phone-channel] Ack refresh cap reached (${ACK_REFRESH_MAX_COUNT}); stopping for msg ${msgId}`);
-        return;
-      }
-      refreshCount++;
+  classifySuggestionReply(msgId, text, row.reply_to);
 
-      let updated = null;
-      let usedLlm = false;
-      try {
-        // Fetch active tools from supervisor to give Gemma context on what's happening.
-        let toolContext = "";
-        const base = process.env.MERLIN_DISPATCH_URL?.replace(/\/dispatch$/, "");
-        if (base) {
-          try {
-            const health = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.json());
-            const tools = health.activeTools || [];
-            if (tools.length > 0) {
-              const friendly = tools.map(t => t.replace(/^mcp__\w+__/, "").replace(/_/g, " "));
-              toolContext = `\nCurrently using tools: ${friendly.join(", ")}`;
-            }
-          } catch {}
-        }
+  // Everything the agent turn needs starts NOW, in parallel.
+  // Run strictly after the ack (then a local-model call, ~1.5s
+  // warm, up to 8s on a cold load) and then one after another, a message would spend ~3–10s in this
+  // process before the agent ever saw it. The ack is a UI placeholder; nothing
+  // in the dispatch depends on it, so it now runs alongside (startAck below).
+  const recallP = withCap(autoRecallBlock(text).catch(() => ""), AUTO_RECALL_CAP_MS, "");
+  // "Recent conversation" is THIS channel's thread, the same scope the ack
+  // history already uses (startAck). Unscoped, the 10-row window mixed in
+  // `system` alerts and `improvements` cards the user never saw in Chat, and on a
+  // busy evening (several Jev disagreement notes in two hours) they crowd the
+  // actual conversation out of the agent's context.
+  const historyP = supabase
+    .from("merlin_messages")
+    .select("id, role, content")
+    .eq("channel", row.channel || "chat")
+    .order("created_at", { ascending: false })
+    .limit(10);
+  const replyBlockP = buildReplyBlock(row, tz);
+  const humBlockP = buildHumBlock(row, text);
+  const improvementBlockP = buildImprovementBlock(row);
 
-        const refreshMessages = ackHistoryOrdered.map((m) => ({
-          role: m.role === "user" ? "user" : "assistant",
-          content: m.content,
-        }));
-        refreshMessages.push({ role: "user", content: text });
-
-        updated = await localLlmChat({
-          system: `You are generating a brief process status update (under 10 words). The user sent a message and is waiting for the real Claude agent to reply. This is update #${refreshCount}.${toolContext}
-
-This is NOT the reply. Do not answer the user's request. Do not include dates, times, names, places, decisions, recommendations, or facts unless they are explicitly in the latest user message or listed as an active tool. When context is thin, stay generic and describe the process.
-
-Rules:
-- Output ONLY the status message, nothing else
-- Always end with "…" (ellipsis)
-- NEVER ask a question
-- NEVER provide the answer, even if it seems obvious
-- If tools are listed, mention what they're doing (e.g. "Reading messages…", "Searching emails…")
-- Prefer process words: checking, searching, reading, routing, comparing, drafting
-- Each update should describe process, not final content`,
-          messages: refreshMessages,
-          maxTokens: 40,
-          timeoutMs: ACK_TIMEOUT_MS,
-          think: false, // acks are short status lines; reasoning adds latency
-        });
-        updated = sanitizeAckOutput(updated);
-        usedLlm = true;
-      } catch (err) {
-        console.error(`[phone-channel] Ack refresh error: ${err.message}`);
-        updated = null;
-      }
-
-      // Gemma unavailable or failed → rotate through a programmatic status line
-      // so the user still sees the indicator moving.
-      if (!updated) {
-        updated = CANNED_REFRESH_MESSAGES[(refreshCount - 1) % CANNED_REFRESH_MESSAGES.length];
-      }
-
-      if (!pending.ackMsgId) return; // real reply already landed, skip update
-
-      await supabase
-        .from("merlin_messages")
-        .update({ content: updated })
-        .eq("id", pending.ackMsgId);
-      console.error(`[phone-channel] Ack refresh #${refreshCount}${usedLlm ? "" : " (canned)"}: "${updated}"`);
-    }, ACK_REFRESH_INTERVAL_MS);
-  }
+  // Fire-and-forget; see the header on startAck for the race with the reply.
+  startAck(msgId, row, text).catch((err) => log(`ack task error: ${err.message}`));
 
   try {
-    // Fetch recent conversation history for context (last 10, lighter payload)
-    const { data: history } = await supabase
-      .from("merlin_messages")
-      .select("role, content")
-      .order("created_at", { ascending: false })
-      .limit(10);
+    // Auto-recall: relevant long-term memory + recent chat for
+    // THIS message, prepended below so the agent has it in context without
+    // deciding to call the recall tool. Bounded + fail-soft (→ "").
+    const { data: history } = await historyP;
 
-    const convoLines = (history || []).reverse().map((m) => {
-      const who = m.role === "user" ? "User" : "You";
+    // A share's other rows are in the new message itself; don't repeat them
+    // above it as if the user had sent them earlier.
+    const otherShareRows = new Set((row.shareBundleIds || []).filter((id) => id !== msgId));
+    const convoLines = (history || []).filter((m) => !otherShareRows.has(m.id)).reverse().map((m) => {
+      const who = m.role === "user" ? OWNER_LABEL : "You";
       return `${who}: ${m.content}`;
     });
 
@@ -631,7 +828,16 @@ Rules:
       locationLine = `\n[Location: ${metadata.latitude}, ${metadata.longitude} (accuracy: ${metadata.location_accuracy || "unknown"}m)]`;
     }
 
-    const builtContent = `${convoBlock}New message from the user:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}`;
+    // Sent from the iOS/macOS share sheet (client/MerlinShare), not typed: a
+    // photo arrives as its own bare merlin-attachments URL row, the note and
+    // shared text/links as the following row; shareBundler has already joined
+    // them into this one message, photos first.
+    const shareLine = metadata.source === "share" ? "\n[Shared into Merlin from another app via the share sheet]" : "";
+
+    const [recallBlock, replyBlock, humBlock, improvementBlock] =
+      await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP]);
+    profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
+    const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
     const DISPATCH_URL = process.env.MERLIN_DISPATCH_URL;
 
     if (DISPATCH_URL) {
@@ -645,8 +851,7 @@ Rules:
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         profLog(msgId, "t2_notified", "via HTTP dispatch");
-        lastSeenAt = row.created_at;
-        saveCursor(lastSeenAt);
+        advanceCursor(row.created_at);
       } catch (httpErr) {
         console.error(`[phone-channel] HTTP dispatch failed (${httpErr.message}), falling back to MCP notification`);
         await mcp.notification({
@@ -654,8 +859,7 @@ Rules:
           params: { content: builtContent, meta: { source: "merlin", ts: new Date().toISOString(), timezone: tz, _profMsgId: msgId } },
         });
         profLog(msgId, "t2_notified", "via MCP fallback");
-        lastSeenAt = row.created_at;
-        saveCursor(lastSeenAt);
+        advanceCursor(row.created_at);
       }
     } else {
       // Legacy mode: MCP channel notification (interactive Claude only).
@@ -667,12 +871,238 @@ Rules:
         },
       });
       profLog(msgId, "t2_notified");
-      lastSeenAt = row.created_at;
-      saveCursor(lastSeenAt);
+      advanceCursor(row.created_at);
     }
   } catch (err) {
     // Do NOT advance lastSeenAt — sweep will retry this message.
     console.error(`[phone-channel] Failed to send notification: ${err.message}`);
+  }
+}
+
+// Hard ceiling on how long auto-recall may hold a dispatch. autoRecallBlock
+// bounds retrieval (1.2s) and its judge (Jev 2.5s → Sonnet 4s) itself; this is
+// the backstop so no future change inside it can stall the chat again.
+const AUTO_RECALL_CAP_MS = 6_000;
+
+function withCap(p, ms, fallback) {
+  let timer;
+  return Promise.race([
+    p.finally(() => clearTimeout(timer)),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); }),
+  ]);
+}
+
+/**
+ * The "On it…" placeholder + its 5s refresh, off the dispatch critical path.
+ *
+ * RACE WITH THE REPLY. The ack used to be inserted before dispatch, so it
+ * always existed by the time the agent replied. Now the reply can in principle
+ * win. The reply handler sets `pending.replied = true` and reads
+ * `pending.ackMsgId` in one synchronous step; this function sets ackMsgId and
+ * checks `replied` in one synchronous step right after its insert resolves.
+ * JS runs each of those blocks atomically, so exactly one of two things
+ * happens: the ack registered first (the reply reuses the row and clears the
+ * interval), or the reply landed first (this deletes its now-orphaned row).
+ */
+async function startAck(msgId, row, text) {
+  const pending = pendingMessages.get(msgId);
+  if (!pending) return;
+  // Canned ack only — see ACK_INITIAL_MESSAGE.
+  let ackMsgId = null;
+  if (!SKIP_ACK.test(text.trim())) {
+    const ackMsg = ACK_INITIAL_MESSAGE;
+    if (ackMsg) {
+      log(`ack: "${ackMsg}"`);
+      const { data: ackRow, error: ackErr } = await supabase
+        .from("merlin_messages")
+        // is_ack marks this row as placeholder copy so the next message's ack
+        // history skips it. Cleared when the real reply overwrites the row.
+        .insert({ role: "assistant", content: ackMsg, read: false, metadata: { is_ack: "1" } })
+        .select("id")
+        .single();
+      if (ackErr) {
+        log(`ack insert error: ${ackErr.message || ackErr.code || JSON.stringify(ackErr)}`);
+      } else {
+        ackMsgId = ackRow?.id;
+        log(`ack inserted id=${ackMsgId}`);
+      }
+    }
+  }
+  // Must stay synchronous from here through setInterval — see the header.
+  // A reply already streaming into its own row also wins (see streamTick).
+  if (pending.replied || pending.streaming) {
+    if (ackMsgId) {
+      log(`ack ${ackMsgId} lost the race to the reply; removing it`);
+      supabase.from("merlin_messages").delete().eq("id", ackMsgId)
+        .then(({ error }) => { if (error) log(`orphan ack delete error: ${error.message}`); });
+    }
+    return;
+  }
+  // Store ackMsgId so the reply handler can replace it in place
+  pending.ackMsgId = ackMsgId;
+
+  // Refresh the ack with the next canned line while waiting for the real
+  // reply. Capped per-conversation by ACK_REFRESH_MAX_COUNT.
+  if (ackMsgId) {
+    let refreshCount = 0;
+    pending.ackInterval = setInterval(async () => {
+      if (refreshCount >= ACK_REFRESH_MAX_COUNT) {
+        clearInterval(pending.ackInterval);
+        pending.ackInterval = null;
+        console.error(`[phone-channel] Ack refresh cap reached (${ACK_REFRESH_MAX_COUNT}); stopping for msg ${msgId}`);
+        return;
+      }
+      refreshCount++;
+
+      // Rotate through the canned lines so the indicator keeps moving.
+      const updated = CANNED_REFRESH_MESSAGES[(refreshCount - 1) % CANNED_REFRESH_MESSAGES.length];
+
+      if (!pending.ackMsgId) return; // real reply already landed, skip update
+
+      await supabase
+        .from("merlin_messages")
+        .update({ content: updated })
+        .eq("id", pending.ackMsgId);
+      console.error(`[phone-channel] Ack refresh #${refreshCount}: "${updated}"`);
+    }, ACK_REFRESH_INTERVAL_MS);
+  }
+}
+
+// --- Reply streaming ---
+//
+// The reply text is a `reply` tool argument, and the supervisor sees it arrive
+// chunk by chunk (claude -p --include-partial-messages; lib/reply-stream.mjs).
+// While a message is outstanding we poll its GET /reply-draft and paint the
+// text into the chat row, so a long answer starts appearing about a second
+// after the agent begins writing it instead of when it finishes.
+//
+// This process owns every write to the row, so the orderings that matter are
+// in-process, not races between two writers:
+//   - the first stream write claims the "On it…" row: stops its refresh timer
+//     and takes it off the pending entry, so the refresh can't overwrite text;
+//     with no ack row yet, the stream inserts its own and startAck deletes its
+//     late ack (pending.streaming);
+//   - writes for one row go through one promise chain, and the reply handler
+//     waits on it before the final write, so a partial never lands last;
+//   - each reply tool call streams into its own row (keyed by tool_use id), and
+//     the reply handler picks the row whose streamed text is a prefix of its
+//     message.
+// Streamed writes never push; the reply handler's push is the only one. The
+// truth gate still runs on the final text only (send-then-correct).
+const STREAM_ENABLED = process.env.CHAT_REPLY_STREAM !== "0";
+const STREAM_POLL_MS = 400;
+// Short replies finish in about a second; streaming them only adds a flicker.
+const STREAM_MIN_CHARS = 60;
+const streamRows = new Map();      // tool_use id → { rowId, shown, raw, chain }
+const finishedDrafts = new Set();  // tool_use ids a reply call already delivered
+const recentReplies = [];          // { text, at } — guards a draft seen after its own reply
+let streamPollTimer = null;
+let streamTickBusy = false;
+
+function ensureStreamPoll() {
+  if (!STREAM_ENABLED || !process.env.MERLIN_DISPATCH_URL || streamPollTimer) return;
+  streamPollTimer = setInterval(() => {
+    streamTick().catch((err) => log(`stream tick error: ${err.message}`));
+  }, STREAM_POLL_MS);
+}
+
+// Called by the reply handler. Returns the stream entry for this message (and
+// retires it), or null when the reply wasn't streamed.
+function takeStreamRow(message) {
+  recentReplies.push({ text: message, at: Date.now() });
+  while (recentReplies.length > 20) recentReplies.shift();
+  for (const [id, entry] of streamRows) {
+    if (message.startsWith(entry.raw)) {
+      streamRows.delete(id);
+      finishedDrafts.add(id);
+      return entry;
+    }
+  }
+  return null;
+}
+
+async function streamTick() {
+  if (streamTickBusy) return;
+  streamTickBusy = true;
+  try {
+    const base = process.env.MERLIN_DISPATCH_URL.replace(/\/dispatch$/, "");
+    let draft;
+    try {
+      draft = await fetch(`${base}/reply-draft`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json());
+    } catch {
+      return; // supervisor busy/restarting; next tick retries
+    }
+    const now = Date.now();
+    while (recentReplies.length && now - recentReplies[0].at > 120_000) recentReplies.shift();
+
+    for (const d of draft.drafts || []) {
+      if (finishedDrafts.has(d.id) || typeof d.text !== "string") continue;
+      const shown = displayableDraft(d.text);
+      let entry = streamRows.get(d.id);
+      if (!entry) {
+        // Don't start a stream for a reply that's already complete or already
+        // delivered — the final write is moments away.
+        if (d.done || shown.length < STREAM_MIN_CHARS) continue;
+        if (recentReplies.some((r) => r.text.startsWith(d.text))) { finishedDrafts.add(d.id); continue; }
+        // Claim synchronously (no await between the checks above and here), so
+        // the reply handler always finds this entry once it exists.
+        entry = { rowId: null, shown, raw: d.text, chain: null };
+        streamRows.set(d.id, entry);
+        const pendingKey = [...pendingMessages.keys()].pop();
+        const pending = pendingKey ? pendingMessages.get(pendingKey) : null;
+        if (pending) {
+          pending.streaming = true;
+          if (pending.ackInterval) { clearInterval(pending.ackInterval); pending.ackInterval = null; }
+        }
+        const ackId = pending?.ackMsgId || null;
+        if (pending) pending.ackMsgId = null;
+        entry.chain = (ackId
+          ? supabase.from("merlin_messages").update({ content: shown }).eq("id", ackId).then(({ error }) => {
+              if (error) throw error;
+              entry.rowId = ackId;
+            })
+          : supabase.from("merlin_messages")
+              // is_ack keeps it out of the next ack's history until it's final.
+              .insert({ role: "assistant", content: shown, read: false, metadata: { is_ack: "1" } })
+              .select("id").single().then(({ data, error }) => {
+                if (error) throw error;
+                entry.rowId = data?.id || null;
+              })
+        ).catch((err) => log(`stream start error: ${err.message || err}`));
+        log(`stream: reply ${d.id.slice(-8)} → ${ackId ? `ack ${ackId}` : "new row"}`);
+        continue;
+      }
+      entry.raw = d.text;
+      if (shown === entry.shown) continue;
+      entry.shown = shown;
+      entry.chain = entry.chain.then(() => {
+        if (!entry.rowId) return;
+        return supabase.from("merlin_messages").update({ content: entry.shown }).eq("id", entry.rowId)
+          .then(({ error }) => { if (error) log(`stream write error: ${error.message}`); });
+      });
+    }
+
+    if (!draft.turnActive) {
+      // A streamed reply whose tool call never completed: the text was written
+      // for the user, so leave it standing as a real message.
+      for (const [id, entry] of streamRows) {
+        streamRows.delete(id);
+        finishedDrafts.add(id);
+        entry.chain.then(() => entry.rowId && supabase.from("merlin_messages")
+          .update({ content: entry.raw, metadata: {} }).eq("id", entry.rowId))
+          .catch(() => {});
+        log(`stream: reply ${id.slice(-8)} ended without a reply call; kept its text`);
+      }
+      if (pendingMessages.size === 0) {
+        clearInterval(streamPollTimer);
+        streamPollTimer = null;
+      }
+    }
+    if (finishedDrafts.size > 200) {
+      for (const id of [...finishedDrafts].slice(0, 100)) finishedDrafts.delete(id);
+    }
+  } finally {
+    streamTickBusy = false;
   }
 }
 
@@ -685,8 +1115,8 @@ const REACTION_EMOJI = {
 // Hum feedback log path — we resolve tapback reactions back to the ping_id by
 // scanning this file for a matching `message_id` (captured at ping-send time
 // via `merlin-send-curl --capture-id`, see jobs/hum.md step 3).
-const HUM_FEEDBACK_PATH = path.join(process.env.HOME, "dev/merlin/data/hum-feedback.jsonl");
-const HUM_CLI = path.join(process.env.HOME, "dev/merlin/bin/merlin");
+const HUM_FEEDBACK_PATH = installTools("data/hum-feedback.jsonl");
+const HUM_CLI = installTools("bin/merlin");
 
 /// Look up the hum ping_id for a reacted-to merlin_messages.id. Returns null
 /// if the message isn't a hum ping (or the ping pre-dates message_id capture).
@@ -732,11 +1162,15 @@ function recordHumReaction(pingId, reactionToken) {
 // user message; it self-decides whether the message is a reaction to the
 // most-recent advisory hum ping. Latency-bounded by its own internal
 // timeouts (rules are sync, Gemma fallback is 4s) so it never blocks here.
-const SUGGESTION_CLASSIFY = path.join(process.env.HOME, "dev/merlin/bin/suggestion-classify");
+const SUGGESTION_CLASSIFY = installTools("bin/suggestion-classify");
 
-function classifySuggestionReply(messageId, text) {
+function classifySuggestionReply(messageId, text, replyTo) {
   import("node:child_process").then(({ spawn }) => {
-    const child = spawn(SUGGESTION_CLASSIFY, ["--message-id", String(messageId || ""), "--text", text], {
+    const argv = ["--message-id", String(messageId || ""), "--text", text];
+    // Threaded reply: pin the ping instead of letting the classifier guess by
+    // recency — that guess is the mis-attribution the Reply feature kills.
+    if (replyTo) argv.push("--reply-to", String(replyTo));
+    const child = spawn(SUGGESTION_CLASSIFY, argv, {
       stdio: "ignore",
       detached: true,
     });
@@ -747,6 +1181,35 @@ function classifySuggestionReply(messageId, text) {
   }).catch((err) => {
     console.error(`[phone-channel] suggestion-classify import failed: ${err.message}`);
   });
+}
+
+// Read on one device → clear its banner on the others (sendClearPush in
+// lib/apns-push.mjs). merlin_messages has default replica identity, so
+// payload.old carries no `read`: any UPDATE of a read row queues, and
+// `readCleared` keeps a message from clearing twice. The 3 s window batches a
+// scroll that marks several rows and lets a push that is still going out get
+// its recipients recorded before we look them up.
+const readCleared = new Set();
+const readClearPending = new Set();
+let readClearTimer = null;
+
+function queueReadClear(messageId) {
+  if (!messageId || readCleared.has(messageId)) return;
+  readCleared.add(messageId);
+  if (readCleared.size > 2000) readCleared.delete(readCleared.values().next().value);
+  readClearPending.add(messageId);
+  if (readClearTimer) return;
+  readClearTimer = setTimeout(async () => {
+    readClearTimer = null;
+    const ids = [...readClearPending];
+    readClearPending.clear();
+    try {
+      const r = await sendClearPush(supabase, ids);
+      if (r.sent) console.error(`[phone-channel] Cleared ${ids.length} read banner(s) on ${r.ok}/${r.sent} device(s)`);
+    } catch (err) {
+      console.error(`[phone-channel] Read-clear push failed: ${err.message}`);
+    }
+  }, 3000);
 }
 
 function subscribeToMessages() {
@@ -768,14 +1231,15 @@ function subscribeToMessages() {
         const oldRow = payload.old || {};
         const newRow = payload.new || {};
         if (newRow.role !== "assistant") return;
+        if (newRow.read === true) queueReadClear(newRow.id);
         if (oldRow.reaction === newRow.reaction) return;
 
         const reaction = newRow.reaction;
         const emoji = reaction ? (REACTION_EMOJI[reaction] || reaction) : null;
         const snippet = (newRow.content || "").slice(0, 160);
         const content = reaction
-          ? `The user reacted ${emoji} to your previous message:\n\n"${snippet}${newRow.content?.length > 160 ? "…" : ""}"\n\nThis is a quality signal from the user about that response. No reply is required — acknowledge internally and use it to calibrate future messages. Do not respond unless the user has also sent a follow-up message.`
-          : `The user removed their reaction from your previous message:\n\n"${snippet}${newRow.content?.length > 160 ? "…" : ""}"\n\nNo reply required.`;
+          ? `${OWNER_LABEL} reacted ${emoji} to your previous message:\n\n"${snippet}${newRow.content?.length > 160 ? "…" : ""}"\n\nThis is a quality signal from ${OWNER} about that response. No reply is required — acknowledge internally and use it to calibrate future messages. Do not respond unless ${OWNER} has also sent a follow-up message.`
+          : `${OWNER_LABEL} removed their reaction from your previous message:\n\n"${snippet}${newRow.content?.length > 160 ? "…" : ""}"\n\nNo reply required.`;
 
         // If the reacted-to row is a hum ping (has a matching message_id in
         // hum-feedback.jsonl), route the reaction through `merlin hum
@@ -833,9 +1297,9 @@ function subscribeToMessages() {
 }
 
 // One-shot sweep at startup catches messages that arrived while MCP was
-// down. Steady-state delivery is realtime-only — the 1Hz fallback poll
-// burned the Supabase free-tier egress budget (~86k SELECTs/day plus 402
-// retries kept the meter spinning even after lockout). Worst-case Realtime
+// down. Steady-state delivery is realtime-only — a 1Hz fallback poll is a
+// SELECT every second, all day, enough to exhaust a database plan's egress
+// budget (and its 402 retries keep the meter spinning after lockout). Worst-case Realtime
 // push delay is ~7s on this table; the proactive 2-min re-subscribe below
 // covers silent websocket drops.
 async function sweepMissedMessages() {
@@ -915,30 +1379,41 @@ function subscribeToLocationEdges() {
     });
 }
 
-// Location edge → pulse engine. GPS is a signal, not a decision. The edge
-// event triggers a focused hum tick; Sonnet decides (with full context —
-// memory, calendar, conversation, habits, weather) whether to ask, what to
-// ask, or stay silent. Phone-channel does NOT craft questions itself.
-const OPS_WEBHOOK_URL = "http://localhost:9092";
-const OPS_WEBHOOK_TOKEN_PATH = process.env.HOME + "/dev/merlin/secrets/webhook-token";
-const LOCATION_EDGE_SEEN = process.env.HOME + "/dev/merlin/data/location-edge-seen.json";
-const HUM_PENDING = process.env.HOME + "/dev/merlin/data/hum-pending-question.json";
-
-let _opsWebhookToken = null;
-function opsWebhookToken() {
-  if (_opsWebhookToken !== null) return _opsWebhookToken;
-  try { _opsWebhookToken = fs.readFileSync(OPS_WEBHOOK_TOKEN_PATH, "utf8").trim(); }
-  catch { _opsWebhookToken = ""; }
-  return _opsWebhookToken;
-}
+// Location edge → the hum event bus. GPS is a signal, not a decision. The edge
+// becomes an event; the gate (lib/hum-events.mjs) decides whether it
+// earns an agent turn; Sonnet then decides — with full context: memory,
+// calendar, conversation, habits, weather — whether to ask, what to ask, or
+// stay silent. Phone-channel does NOT craft questions itself and does not
+// dispatch the webhook itself either.
+const LOCATION_EDGE_SEEN = installTools("data/location-edge-seen.json");
+const HUM_PENDING = installTools("data/hum-pending-question.json");
+// Telemetry only since the hum-sense engine took over dispatch: the
+// authoritative "when did hum last fire" now lives in hum-sense-state.json.
+// Kept because it is a cheap, human-readable marker of the last realtime edge
+// this process saw, which is the first thing to check when the realtime
+// subscription is suspected of having gone quiet.
+const SITUATIONAL_TRIGGER_STATE = installTools("data/last-situational-trigger-at.json");
 
 function readJsonSafe(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fallback; }
 }
 
+// The user's current timezone, from the phone-reported value this process itself
+// persists to user-timezone.json (see handleIncomingMessage). Falls back to the
+// instance zone (lib/instance.cjs) when the file is missing/unreadable. Keeps the sleep-window gate below keyed
+// to the user's ACTUAL local wall-clock when traveling, matching its name.
+function userTz() {
+  try {
+    const tzPath = installTools("data/user-timezone.json");
+    const tz = JSON.parse(fs.readFileSync(tzPath, "utf8"))?.timezone;
+    if (tz && Intl.DateTimeFormat("en-US", { timeZone: tz })) return tz;
+  } catch {}
+  return INSTANCE.tz;
+}
+
 function inLocalSleepWindow() {
   const hour = parseInt(new Date().toLocaleTimeString("en-US", {
-    timeZone: "America/New_York", hour: "2-digit", hour12: false,
+    timeZone: userTz(), hour: "2-digit", hour12: false,
   }), 10);
   return hour >= 1 && hour < 9;
 }
@@ -953,8 +1428,8 @@ function edgeRecentlyDispatched(edgeKey) {
 // Per-session lock: when the user is walking through several stops in quick
 // succession (a wandering session), each visit row gets its own dedup_key,
 // so the per-edge gate fires every single time. This collapses any new edge
-// within 30 min of the LAST edge to noise — a session in progress.
-// Documented in the 2026-04-29 review (10 dispatches in 13 min).
+// within 30 min of the LAST edge to noise — a session in progress
+// (otherwise a wander can produce ~10 dispatches in a few minutes).
 const SESSION_COOLDOWN_MS = 30 * 60 * 1000;
 function sessionInProgress() {
   const seen = readJsonSafe(LOCATION_EDGE_SEEN, {});
@@ -975,7 +1450,17 @@ function markEdgeDispatched(edgeKey) {
   for (const k of Object.keys(seen)) {
     if (new Date(seen[k]).getTime() < cutoff) delete seen[k];
   }
-  try { fs.writeFileSync(LOCATION_EDGE_SEEN, JSON.stringify(seen, null, 2)); } catch {}
+  try { writeFileAtomic(LOCATION_EDGE_SEEN, JSON.stringify(seen, null, 2)); } catch {}
+}
+
+// Records that the realtime subscription saw a real situational edge just now.
+// Nothing gates on this any more (the hum-sense engine owns that decision) —
+// it survives as the cheapest possible answer to "is the location realtime
+// subscription still alive?", which can silently die.
+function markSituationalTrigger(type) {
+  try {
+    writeFileAtomic(SITUATIONAL_TRIGGER_STATE, JSON.stringify({ ts: new Date().toISOString(), type }, null, 2));
+  } catch {}
 }
 
 function pendingQuestionActive() {
@@ -983,6 +1468,35 @@ function pendingQuestionActive() {
   if (!p || p === "null") return false;
   if (p.expires_at && new Date(p.expires_at).getTime() < Date.now()) return false;
   return true;
+}
+
+// Location edge → the hum event bus.
+//
+// POSTing the ops webhook directly would mean phone-channel making the
+// "is this worth interrupting the user" decision itself, in parallel
+// with the cron, with its own private copies of the quiet-window / dedup /
+// pending-question rules. All four of those rules live in ONE place — the
+// gate in lib/hum-events.mjs — so this function's job is only:
+// notice the edge, describe it, hand it over.
+//
+// The local quiet/session gates below are kept as a cheap pre-filter (no point
+// spooling an event at 04:00 that the gate will only drop), but they are no
+// longer the authority; the gate re-checks all of them.
+// A departure is announced only once the raw trace shows the user elsewhere
+// (bin/ask-gate --mode departure). A row's departed_at alone is not
+// proof: a quiet stretch of a stay the user never left can be written with an
+// end time and read as "Left <place>". Held edges are
+// not marked dispatched — the hum location sensor re-checks and emits once
+// proof arrives. Fail-open: an error lets the departure through as before.
+function departureProven(rowId) {
+  return new Promise((resolve) => {
+    const { execFile } = require("node:child_process");
+    const bin = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "..", "bin", "ask-gate");
+    execFile(bin, ["--visit", String(rowId), "--mode", "departure", "--json"], { timeout: 30000 }, (err, stdout) => {
+      if (err) return resolve(true);
+      try { resolve(JSON.parse(String(stdout).trim().split("\n").pop()).ask !== false); } catch { resolve(true); }
+    });
+  });
 }
 
 async function dispatchLocationEdge(event, row) {
@@ -996,80 +1510,76 @@ async function dispatchLocationEdge(event, row) {
   if (sessionInProgress()) return;
   // Gate 3: don't interrupt an active hum question
   if (pendingQuestionActive()) return;
+  // Gate 4: a departure needs proof the user left (see departureProven).
+  if (event === "departure" && !(await departureProven(row.id))) {
+    console.error(`[phone-channel] location departure held for row=${row.id}: no point away from it yet`);
+    return;
+  }
 
-  // Payload hints to the ops-agent that this tick was location-triggered.
-  // jobs/hum.md reads `trigger` for telemetry and can weight the
-  // location_context candidate higher when trigger === "location-edge".
-  const payload = {
-    job: "hum",
-    trigger: "location-edge",
-    source: "location-edge",
-    edge: {
-      event,
+  const place = row.place_name || null;
+  // The dedup_key MUST match the one hum-sensors/location.mjs derives from the
+  // same row, so whichever path notices the edge first wins and the other is
+  // swallowed by the gate's cooldown instead of producing a second ping.
+  const spooled = spoolEvent({
+    sensor: "location",
+    type: `location.${event}`,
+    subject: place || (event === "arrival" ? "a new place" : "somewhere"),
+    summary: event === "arrival"
+      ? `Arrived at ${place || "a new place"}`
+      : `Left ${place || "somewhere"}`,
+    salience: place ? 0.62 : 0.5,
+    lanes: event === "arrival"
+      ? LOCATION_LANES.arrival
+      : LOCATION_LANES.departure,
+    dedup_key: `location:visit:${row.id}:${event}`,
+    ttl_min: 25,
+    cooldown_min: 30,
+    // This is the FAST path — realtime, seconds after the row changes — so it
+    // is the one that most deserves to jump the dispatch queue. Keep in step
+    // with hum-sensors/location.mjs, which emits the same events as a backstop.
+    perishable: true,
+    data: {
       row_id: row.id,
-      place_name: row.place_name || null,
+      place,
       lat: row.latitude,
       lon: row.longitude,
       arrived_at: row.arrived_at,
       departed_at: row.departed_at,
+      source: "realtime",
     },
-  };
-  const headers = { "content-type": "application/json" };
-  const token = opsWebhookToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  try {
-    const resp = await fetch(OPS_WEBHOOK_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) {
-      console.error(`[phone-channel] ops webhook ${event} ${row.id}: HTTP ${resp.status}`);
-      return;
-    }
-    markEdgeDispatched(edgeKey);
-    console.error(`[phone-channel] Dispatched hum/${event} for row=${row.id}`);
-  } catch (err) {
-    console.error(`[phone-channel] ops webhook dispatch failed (${err.message})`);
+  }, "location");
+
+  if (!spooled) {
+    console.error(`[phone-channel] failed to spool location ${event} for row=${row.id}`);
+    return;
   }
+  markEdgeDispatched(edgeKey);
+  markSituationalTrigger(`location-edge:${event}`);
+  console.error(`[phone-channel] Emitted hum event location.${event} for row=${row.id}`);
 }
 
 // Only monitor incoming messages when running under a supervisor (MERLIN_DISPATCH_URL is set).
 // When loaded standalone (e.g. Claude Desktop), only the reply/get_location tools are available.
 if (process.env.MERLIN_DISPATCH_URL) {
-  // Warmup runs BEFORE realtime subscription so the first incoming ack hits
-  // a hot Gemma. Without this, a real message arriving in the first ~7s of
-  // process life would race the cold-load, AbortController would fire at
-  // ACK_TIMEOUT_MS, Ollama would cancel the load, and every subsequent ack
-  // would re-trigger the same cancel-load deathlock until the runner was
-  // manually warmed by an unaborted call. Tick interval is 60s (down from
-  // 4min) so we recover faster if Ollama restarts mid-day.
-  const WARMUP_INTERVAL_MS = 60 * 1000;
-  async function warmupLocalLlm() {
-    try {
-      await localLlmChat({
-        user: "hi",
-        maxTokens: 1,
-        timeoutMs: 15_000,
-        think: false,
-      });
-    } catch (err) {
-      console.error(`[phone-channel] Gemma warmup error: ${err.message}`);
-    }
+  // Warm auto-recall judge: one resident tool-less `claude -p`
+  // instead of a fork per message, so the judgment in front of every chat
+  // message costs API latency, not CLI startup. Prewarmed here so the first
+  // message after a restart is already warm. Kill switch: CHAT_WARM_JUDGE=0.
+  if (process.env.CHAT_WARM_JUDGE !== "0") {
+    const warm = new WarmClaude({ model: "claude-sonnet-5-5" });
+    warm.prewarm();
+    useWarmJudge(warm);
+    process.on("exit", () => warm.close());
   }
-  await warmupLocalLlm();
-  setInterval(warmupLocalLlm, WARMUP_INTERVAL_MS);
-
   subscribeToMessages();
   subscribeToLocationEdges();
   // Immediate sweep on startup to catch messages that arrived while MCP was down.
   setTimeout(sweepMissedMessages, 2000);
 
   // Every 2 minutes: (a) always run sweepMissedMessages — the channel state
-  // can report "joined" while the websocket is functionally dead (observed
-  // 2026-04-30: messages stopped arriving for 2h while heartbeats kept firing
-  // and state stayed "joined"), so we can't trust state alone to detect a
+  // can report "joined" while the websocket is functionally dead (messages
+  // can stop arriving for hours while heartbeats keep firing and state stays
+  // "joined"), so we can't trust state alone to detect a
   // stalled subscription; the sweep is a cheap REST fallback that catches
   // any user message the realtime path silently dropped. (b) Re-subscribe
   // only when state isn't healthy. Sweep + handleIncomingMessage are deduped

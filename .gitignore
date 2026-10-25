@@ -1,166 +1,85 @@
-# Credentials & secrets
+# ─── Credentials & secrets ───────────────────────────────────────────────
 .env
-.env
+**/.env.bak*
 credentials/
 secrets/
-
-# ─── Public/private overlay system ───────────────────────────────────────
-# See docs/architecture-public-private.md.
-#
-# `local/` is the root-level personal overlay drop. Anything you keep here
-# stays out of the public repo — most importantly `local/CLAUDE.md` (personal
-# agent rules) and `local/<dir>/` mirror trees. Loaders explicitly check this
-# path in addition to the public kernel paths.
-local/
-# `_ext/` is the per-extension-point drop. Each kernel loader (hum harvesters,
-# ops-agent jobs, MCP tools) globs files under its own `_ext/` subdir at run
-# time. The `_ext/` dirs themselves ship as empty placeholders (`.gitkeep`
-# inside) so contributors see the extension surface without us having to
-# document each one. Everything written into them is, by construction,
-# personal-overlay content and never gets committed.
-**/_ext/*
-!**/_ext/.gitkeep
-# Personal overlay scratch outside the well-known dirs — never tracked.
-*.local.md
-*.local.json
-
-# Private rebuild recipe — never publish. Lives in this private repo's working tree
-# only, intentionally untracked so it can't leak via reset/checkout/force-push.
-merlin-migration/rebuild-guide.md
-# Runtime state — everything under data/ is mutated by running processes
-# (DBs, ndjson logs, cursors, state files). Should never be tracked.
-data/
-# Plus per-process logs at the top-level logs/
-logs/
-# Legacy specifics kept for documentation:
-data/resy-auth.json
-data/gmail-push-token.json
-tools/firebase/.firebaserc
-client/fastlane/asc-api-key.json
-.mcp.json
-
-# Data files (local state)
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/flights.json
-data/.firebase-token-cache
-data/.triage-restart-cooldown
-data/.watchdog-last-alert
-
-# Memory backup tarballs (pre-reindex defense in depth — git is primary backup)
-data/memory-snapshots/
-
-# Wiki DB hot snapshots (hourly VACUUM INTO — local-only defense in depth)
-data/memory-db-snapshots/
-
-# Wiki access log (runtime state — feeds the nightly pin auditor)
-data/wiki-access.jsonl
-
-# Runtime state — append-only or frequently-mutated files written by running
-# processes on the mac mini. Tracking these in git means any `git reset
-# --hard`, `git checkout .`, or force-push-and-reset sequence wipes live
-# data back to whenever the file was last committed. 2026-04-16 incident:
-# a reset-after-force-push wiped today's 5 hum tick traces and bounced
-# hum-state.json back to 2026-04-14, causing hum-daily to report an empty
-# day. These files must live on the mac mini's filesystem only.
-#
-# Hum runtime:
-data/hum-feedback.jsonl
-data/hum-interests-state.json
-data/hum-learnings.jsonl
-data/hum-runs.jsonl
-data/memory-retrieval.jsonl
-data/outbound-precheck-log.jsonl
-data/hum-seen.json
-data/hum-state.json
-data/hum-ideas.jsonl
-data/hum-pending-question.json
-data/hum-cache/
-data/.cache/
-# Supervisor session state (turn count, cost, session id — mutated every turn):
-agent/supervisor/state/chat/session.json
-agent/supervisor/state/ops/session.json
-# Email pipeline (append-only or cursor-style):
-data/email-inbound-dropped.jsonl
-data/email-inbound-handled.jsonl
-data/merlin-sent-mail.jsonl
-data/last-history-id.json
-# Phone channel cursors + counters:
-data/last-merlin-message-at.json
-data/phone-channel-cursor.json
-data/phone-channel-haiku-counter.json
-# Location enrichment queue (mutated as visits close):
-data/location-pending-enrich.json
-# Location edge-detection dedup (written every tick by merlin CLI):
-data/location-edge-seen.json
-# Hum ideation scorecard (mutated per run):
-data/hum-ideas-scorecard.json
-# Hum watchlist approval pointer (4h TTL, written per discover run):
-data/hum-pending-approval.json
-# Concert watcher dedup state (written every run):
-data/concert-watcher-seen.json
-# Watchdog cooldown + state markers:
-data/.gh-auth-last-alert
-data/.gog-auth-last-alert
-data/.gmail-action-last-at
-data/.hookdeck-restart-cooldown
-data/.hookdeck-disconnect-active
-data/.ollama-last-alert
-data/.ollama-restart-cooldown
-data/.phone-audio-wake-at
-data/.gmail-watch-last-alert
-data/.watchdog-push-gap-log
-data/.watchdog-issues-key
-data/gmail-watch-last.json
-# Runtime state added 2026-04-24 — see CLAUDE.md philosophy above:
-# Pulse + P1 resolution audit logs (same append-only shape as hum-runs.jsonl):
-data/pulse-runs.jsonl
-data/p1-resolutions.jsonl
-# Hum canary 48h TTL pointer:
-data/hum-canary-pending.json
-# Reclassification digest TTL state:
-data/reclassification-pending.json
-# FindMy account blob — contains plaintext credential, NEVER commit:
-data/findmy-account.json
-
-# Python bytecode:
-bin/__pycache__/
-# Editor/crash artifacts that should never land in history:
-*.bak
-*.bak.*
-osxphotos_crash.log
-
-# Logs
-logs/
-agent/logs/
-
-# Node
-node_modules/
-
-# Xcode
-client/SourcePackages/
-tools/SourcePackages/
-
-# Ruby / Bundler
-client/vendor/
-client/.bundle/
-
-# Fastlane artifacts
-client/fastlane/report.xml
-
-# External projects (have their own git repos)
-tools/gtasks-mcp/
-tools/home-control/
-
-# OS
-.DS_Store
-data/photo-thumbs/
-
-# Claude Code local state (per-workspace lock files + user-local settings)
-.claude/
-
 # Never commit Firebase admin SDK / service-account keys
 *service-account*.json
 *-adminsdk-*.json
 *service_account*.json
+# Project-scope MCP configs are per host (they can name machine paths and
+# accounts). The ops-light and ops-haiku tiers ship placeholder-only configs
+# (${VAR} expanded from the environment process-manager loads from .env); the
+# ops tier's own lives at agent/ops-agent/.mcp.json, copied from
+# examples/mcp/ops-agent.mcp.example.json.
+.mcp.json
+!agent/ops-light-agent/.mcp.json
+!agent/ops-haiku-agent/.mcp.json
+
+# ─── Per-installation overlay ────────────────────────────────────────────
+# See docs/architecture-public-private.md.
+#
+# agent/local/ holds this installation's identity (instance.json), its own
+# agent rules (shared.md, chat.md, ops.md, jobs/<job>.md, prompts/), its
+# values (config/<name>.json) and its registry entries (tasks.json, ...).
+# The kernel reads it through lib/instance.cjs, lib/registry.cjs and the
+# supervisors; it never belongs in the public tree. `merlin overlay add`
+# links it in from a private repo.
+agent/local/
+# Legacy root-level overlay dir (pre agent/local/).
+/local/
+# `_ext/` dirs are the hook and drop points next to the kernel code that loads
+# them (lib/_ext/, agent/supervisor/_ext/, agent/ops-agent/jobs/_ext/, ...).
+# Each ships only its `.gitkeep`, which documents that point's contract;
+# everything placed in them is the installation's own.
+**/_ext/*
+!**/_ext/.gitkeep
+# Agent-authored capability modules approved on this host (agent/ext/README.md)
+# and their staging area.
+agent/ext/*
+!agent/ext/README.md
+# The operator's own browsing skills (the kernel ships the runner, not skills).
+browsing-skills/skills/
+# Host registry for `merlin whereami` (hostnames + hardware UUIDs);
+# template: examples/hosts.example.json.
+system/hosts.json
+# Personal scratch outside the well-known dirs.
+*.local.md
+*.local.json
+
+# ─── Runtime state ───────────────────────────────────────────────────────
+# Everything under data/ is mutated by running processes (DBs, ndjson logs,
+# cursors, state files, snapshots). Tracking any of it means a `git reset
+# --hard` or checkout can roll live state back to an old commit, so the whole
+# directory stays on the host. Seed/config examples live under examples/.
+data/
+# Per-process logs.
+logs/
+agent/logs/
+# Per-agent supervisor state (turn counts, rotation markers, session ids) —
+# rewritten every turn; code handles its absence.
+agent/supervisor/state/
+# Job-local logs and agent scratch.
+agent/ops-agent/jobs/*.log
+agent/ops-light-agent/.ideation-*.json
+# WhatsApp channel auth state.
+agent/whatsapp-channel/wa-auth/
+
+# ─── Build / tool artifacts ──────────────────────────────────────────────
+node_modules/
+__pycache__/
+.DS_Store
+# Xcode / Ruby artifacts from the companion apps
+apps/**/SourcePackages/
+apps/**/vendor/
+apps/**/.bundle/
+apps/**/fastlane/report.xml
+apps/**/build/
+apps/telemetry/.vercel/
+# Claude Code local state (per-workspace lock files + user-local settings)
+.claude/
+# Stray temp/backup files left by jobs and editors.
+/tmp/
+*.bak
+*.bak.*
+*.json.tmp

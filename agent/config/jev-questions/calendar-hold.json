@@ -1,0 +1,15 @@
+{
+  "_doc": "agent/scripts/hum-sensors/calendar.mjs classifyLongEvent — asked only about a busy, timed calendar event longer than three hours that is on now or starts within the hour: is it something the user is ATTENDING (hum holds its check-ins) or a CONTAINER for the day (hum may speak)? Releasing is the risky direction: `container` releases only when the Claude ladder also says container and Jev's top answer is container. Kernel definition; an installation's own data/jev-questions/calendar-hold.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.85,
+  "questions": {
+    "kind": {
+      "type": "choice",
+      "instructions": "The user's calendar has a busy entry longer than three hours. `title` is what the entry is called; the other fields describe it. The assistant holds back its check-in messages while the user is in something. Is this a specific thing they are taking part in for that time, or a block that only marks how their day is planned, during which they are out and about and a well-timed suggestion is welcome? If you cannot tell, pick unclear.",
+      "criteria": {
+        "attending": "a specific thing they take part in: a flight or other travel, a wedding or ceremony, a conference, class or workshop, a concert, show or game, a meal or gathering, an appointment, a work session",
+        "container": "a block that only marks how the day is planned: a day trip or a day in a city, a free-form outing, a holiday or public-event marker",
+        "unclear": "the entry does not clearly say which"
+      }
+    }
+  }
+}

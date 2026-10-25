@@ -1,0 +1,15 @@
+# Per-instance script hooks. Each is optional; a plain install has none.
+#
+# watchdog-checks.sh — the instance's own watchdog checks (scripts/watchdog.sh).
+#   Sourced near the top of watchdog.sh, so it only defines functions:
+#     _ext_incident_label <key>  echo a label for one of its incident keys and
+#                                return 0; return 1 for any other key
+#     _ext_watchdog_checks       run once per tick, after the weekly-review
+#                                check; everything watchdog.sh defines
+#                                (incident_*, notify, log, ISSUES) is in scope
+#
+# context-sync-tick.sh — the instance's own work that rides the context-sync
+#   tick (scripts/trigger-context-sync.sh): executed before the sync, capped at
+#   2 min, output discarded, never fatal.
+#
+# Modules here belong to this installation, not to the kernel.

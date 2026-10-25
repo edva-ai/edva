@@ -3,15 +3,13 @@
 # Uses copytruncate so open file descriptors in ManagedProcess (createWriteStream)
 # and launchd (StandardErrorPath) keep writing to the same path without reopen.
 #
-# Cron: 0 3 * * * ${MERLIN_HOME_USER}/dev/merlin/agent/scripts/rotate-agent-logs.sh
+# Cron: 0 3 * * * $HOME/Dev/merlin/agent/scripts/rotate-agent-logs.sh
 #
 # Replaces the pre-process-manager tmux pipe-pane rotation (was rotating
 # chat-agent.log / ops-agent.log that no longer exist).
 
 set -u
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
-
-LOGDIR="${MERLIN_HOME}/agent/logs"
+LOGDIR="$HOME/Dev/merlin/agent/logs"
 KEEP_DAYS=14
 DATE=$(date '+%Y-%m-%d')
 
@@ -19,7 +17,6 @@ DATE=$(date '+%Y-%m-%d')
 FILES=(
   "$LOGDIR/ops-supervisor.log"
   "$LOGDIR/chat-supervisor.log"
-  "$LOGDIR/hookdeck.log"
   "$LOGDIR/claude-launchagent.err.log"
   "$LOGDIR/claude-launchagent.log"
   "$LOGDIR/watchdog.log"

@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+// self-improve-retry — ask the production host to retry a self-improvement approval whose
+// APPLY step failed (status=apply_failed). No new Face ID: the row already
+// carries a verified owner signature — that's how it reached `approved` in the
+// first place, before the mechanical write/commit itself threw (a git-hook
+// conflict, a transient error, a bad payload someone then fixed). Retrying
+// isn't a fresh authorization decision, so it just flags the row and lets
+// `self-improve-approval-poll`'s next tick re-run the apply.
+//
+// Usage:
+//   self-improve-retry list       — apply_failed rows awaiting retry
+//   self-improve-retry <id>       — flag one for retry
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
+
+const store = {
+  async getApproval(id) {
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${id}&select=*&limit=1`, { headers: H });
+    const d = r.ok ? await r.json() : []; return d[0] || null;
+  },
+  async updateApproval(id, patch) {
+    await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${id}`, { method: "PATCH", headers: H, body: JSON.stringify(patch) });
+  },
+};
+
+const u = createUnifiedApproval({ store, deviceKeys: { getKey: async () => null }, postSuggestion: null, applyItem: async () => ({ ok: false }) });
+
+const [cmd] = process.argv.slice(2);
+
+if (!cmd) {
+  console.error("usage: self-improve-retry list | <id>");
+  process.exit(64);
+}
+
+if (cmd === "list") {
+  const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?status=eq.apply_failed&select=id,summary,result,created_at&order=created_at.desc&limit=10`, { headers: H });
+  const rows = r.ok ? await r.json() : [];
+  if (!rows.length) { console.log("No failed applies waiting on retry."); process.exit(0); }
+  for (const row of rows) {
+    console.log(`${row.id}\n  ${row.summary}\n  error: ${row.result?.error || "(unknown)"}\n  failed ${new Date(row.created_at).toLocaleString()}\n`);
+  }
+  process.exit(0);
+}
+
+const res = await u.requestRetry(cmd);
+if (!res.ok) { console.error(`✗ ${res.reason}`); process.exit(1); }
+console.log(`✓ Retry requested for ${cmd} — ${createRequire(import.meta.url)("../lib/instance.cjs").instanceValue("host_label")} will re-apply on its next check.`);

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Merlin · Live</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --fg:#e6e9ef; --muted:#8b93a3;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --border:#262b36;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --panel2:#f0f2f5; --fg:#1a1d24; --muted:#5b636f;
+            --border:#e2e6ec; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); padding:24px; }
+  header { display:flex; align-items:baseline; gap:14px; margin-bottom:20px; flex-wrap:wrap; }
+  h1 { font-size:20px; margin:0; font-weight:650; }
+  .conn { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .dot.live { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent); }
+  .dot.dead { background:var(--bad); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px; }
+  .card h2 { font-size:15px; margin:0 0 4px; display:flex; align-items:center; gap:8px; }
+  .card .sub { font-size:12px; color:var(--muted); margin-bottom:14px; }
+  .pill { font-size:11px; font-weight:600; padding:2px 8px; border-radius:20px; text-transform:uppercase; letter-spacing:.03em; }
+  .pill.ok { background:color-mix(in srgb,var(--ok) 18%,transparent); color:var(--ok); }
+  .pill.warn { background:color-mix(in srgb,var(--warn) 18%,transparent); color:var(--warn); }
+  .pill.bad { background:color-mix(in srgb,var(--bad) 18%,transparent); color:var(--bad); }
+  .rows { display:grid; grid-template-columns:auto 1fr; gap:6px 16px; }
+  .rows .k { color:var(--muted); }
+  .rows .v { text-align:right; font-variant-numeric:tabular-nums; font-weight:550; }
+  .v.warn { color:var(--warn); } .v.bad { color:var(--bad); } .v.ok { color:var(--ok); }
+  footer { margin-top:22px; font-size:12px; color:var(--muted); }
+  code { background:var(--panel2); padding:1px 5px; border-radius:5px; font-size:12px; }
+  .task { padding:10px 0; border-top:1px solid var(--border); }
+  .task:first-child { border-top:0; }
+  .task .who { font-weight:600; font-size:13px; }
+  .task .status { color:var(--accent); font-size:13px; margin:2px 0; }
+  .todo { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  .todo .mark { width:14px; text-align:center; }
+  .todo.done { text-decoration:line-through; opacity:.6; }
+  .todo.doing { color:var(--fg); font-weight:550; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Merlin · Live</h1>
+    <span class="conn"><span id="dot" class="dot"></span><span id="connText">connecting…</span></span>
+  </header>
+  <div class="grid">
+    <section class="card" id="card-ops">
+      <h2>ops <span id="ops-pill" class="pill">—</span></h2>
+      <div class="sub">triage · finance · hum · crons</div>
+      <div class="rows" id="ops-rows"></div>
+    </section>
+    <section class="card" id="card-chat">
+      <h2>chat <span id="chat-pill" class="pill">—</span></h2>
+      <div class="sub">phone-channel conversation · Conway substrate (loop mode)</div>
+      <div class="rows" id="chat-rows"></div>
+    </section>
+  </div>
+  <section class="card" id="card-tasks" style="margin-top:16px; display:none;">
+    <h2>live tasks <span class="pill ok" id="tasks-count"></span></h2>
+    <div class="sub">status line + checklist streamed by running tasks (WP13)</div>
+    <div id="tasks"></div>
+  </section>
+  <footer>WP12/13 live dashboard · read-only · updates over SSE (<code>/_stream</code>) · last: <span id="ts">—</span></footer>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const fmtCost = (n) => n == null ? "—" : "$" + Number(n).toFixed(2);
+  const fmtAge = (ms) => ms == null ? "—" : (ms < 1000 ? ms + "ms" : Math.round(ms/1000) + "s");
+
+  function row(k, v, cls) { return `<div class="k">${k}</div><div class="v ${cls||""}">${v ?? "—"}</div>`; }
+
+  function statusPill(h) {
+    if (!h || !h.ok) return { cls:"bad", txt: h?.error ? "unreachable" : "down" };
+    if (h.restartCount > 3) return { cls:"warn", txt:"restarting" };
+    if (h.queueAlarmActive) return { cls:"warn", txt:"backlog" };
+    return { cls:"ok", txt:"healthy" };
+  }
+
+  function renderOps(h) {
+    const p = statusPill(h); const pill = $("ops-pill"); pill.className = "pill "+p.cls; pill.textContent = p.txt;
+    $("ops-rows").innerHTML = !h || !h.ok
+      ? row("error", h?.error || "no data", "bad")
+      : row("child alive", h.childAlive ? "yes" : "no", h.childAlive?"ok":"bad")
+        + row("queue depth", h.queueDepth, h.queueDepth>10?"warn":"")
+        + row("restarts", h.restartCount, h.restartCount>3?"warn":"")
+        + row("turns", h.totalTurns)
+        + row("cost", fmtCost(h.totalCostUsd))
+        + row("last event", fmtAge(h.lastEventAgeMs));
+  }
+
+  function renderChat(h) {
+    const p = statusPill(h); const pill = $("chat-pill"); pill.className = "pill "+p.cls; pill.textContent = p.txt;
+    $("chat-rows").innerHTML = !h || !h.ok
+      ? row("error", h?.error || "no data", "bad")
+      : row("substrate", h.substrateMode, h.substrateMode==="loop"?"ok":"")
+        + row("agent", h.chatAgentStatus)
+        + row("child alive", h.childAlive ? "yes":"no", h.childAlive?"ok":"bad")
+        + row("queue depth", h.queueDepth, h.queueDepth>4?"warn":"")
+        + row("restarts", h.restartCount, h.restartCount>3?"warn":"")
+        + row("tools", h.chatToolCount)
+        + row("snip vectors", h.snipVectors)
+        + row("pending approvals", h.pendingApprovals, h.pendingApprovals>0?"warn":"")
+        + row("check-later", h.checkLaterPending);
+  }
+
+  const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
+
+  function renderTasks(list) {
+    list = Array.isArray(list) ? list : [];
+    const card = $("card-tasks");
+    if (!list.length) { card.style.display = "none"; return; }
+    card.style.display = "";
+    $("tasks-count").textContent = list.length;
+    $("tasks").innerHTML = list.map((t) => {
+      const todos = (t.todos || []).map((td) => {
+        const cls = td.status === "completed" ? "done" : td.status === "in_progress" ? "doing" : "";
+        const mark = td.status === "completed" ? "✓" : td.status === "in_progress" ? "▸" : "○";
+        const label = td.status === "in_progress" && td.activeForm ? td.activeForm : td.content;
+        return `<div class="todo ${cls}"><span class="mark">${mark}</span><span>${esc(label)}</span></div>`;
+      }).join("");
+      const status = t.statusLine ? `<div class="status">${esc(t.statusLine)}</div>` : "";
+      return `<div class="task"><div class="who">${esc(t.agentId)}</div>${status}${todos}</div>`;
+    }).join("");
+  }
+
+  function apply(s) {
+    renderOps(s.ops); renderChat(s.chat); renderTasks(s.telemetry);
+    $("ts").textContent = new Date(s.ts || Date.now()).toLocaleTimeString();
+  }
+
+  function connect() {
+    const es = new EventSource("/_stream");
+    es.addEventListener("snapshot", (e) => { try { apply(JSON.parse(e.data)); } catch {} });
+    es.onopen = () => { $("dot").className = "dot live"; $("connText").textContent = "live"; };
+    es.onerror = () => { $("dot").className = "dot dead"; $("connText").textContent = "reconnecting…"; };
+  }
+  connect();
+</script>
+</body>
+</html>

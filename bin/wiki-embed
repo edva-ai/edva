@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+// wiki-embed — CLI over the wiki page-embedding layer (lib/wiki-embed.mjs).
+//
+// The wiki's lexical search (wiki_search / `wiki search`) is always live and
+// needs no indexing step. This CLI drives the OPTIONAL semantic layer that
+// powers hybrid recall (wiki_search mode:"hybrid"):
+//   - embed  : (re)embed active pages that are new or changed since last embed.
+//              Idempotent; run from the nightly cron or by hand. Degrades
+//              gracefully — bails after a few failures if Ollama is down.
+//   - search : ad-hoc hybrid search from the terminal (the same primitive the
+//              agent gets via wiki_search mode:"hybrid"). --fts for pure BM25.
+//   - stats  : how many pages are embedded / still pending.
+//
+// Usage:
+//   wiki-embed embed [--limit N] [--triggers [--no-sonnet]]
+//   wiki-embed search "<query>" [--fts] [--type T] [-k N] [--json]
+//   wiki-embed stats [--json]
+
+import {
+  embedPendingPages,
+  searchPagesHybrid,
+  embeddingStats,
+} from "../lib/wiki-embed.mjs";
+import { localLlmEmbed } from "../lib/local-llm.mjs";
+import { localRung, sonnetRung } from "../lib/model-ladder.mjs";
+
+// Rule #0b ladder for the trigger-cue tier: local rung first, Sonnet only when
+// the local one fails validation (embedPendingPages caps how often that runs).
+// Both are Merlin's own models — on-device Ollama and the Max-authenticated
+// session (tool-less `claude -p`, lib/jev-claude.mjs) — so a health or
+// finance page is safe on either rung. The Sonnet rung only works where the
+// Max login is readable: the nightly launchd agent (ai.claude.wiki-assoc-nightly),
+// not cron. From cron it returns "" and the page keeps its structural cues.
+const triggerLocal = localRung({ maxTokens: 500, timeoutMs: 45000 });
+const triggerSonnet = sonnetRung({ timeoutMs: 120000 });
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") out.json = true;
+    else if (a === "--fts") out.fts = true;
+    else if (a === "--no-sonnet") out.noSonnet = true;
+    else if (a === "--triggers" || a === "--aspects") out.triggers = true;
+    else if (a === "-k" || a === "--limit") out.k = Number(argv[++i]);
+    else if (a === "--type") out.type = argv[++i];
+    else out._.push(a);
+  }
+  return out;
+}
+
+const cmd = process.argv[2];
+const flags = parseFlags(process.argv.slice(3));
+
+if (cmd === "embed") {
+  // Loop a few batches so a large backlog drains in one run without a giant
+  // single query; embedPendingPages bails early if Ollama is down.
+  const batch = flags.k || 300;
+  let total = { embedded: 0, cued: 0, triggered: 0, sonnet_calls: 0, pruned: 0, remaining: 0, errors: [] };
+  for (let i = 0; i < 6; i++) {
+    const res = await embedPendingPages({
+      embedFn: (t) => localLlmEmbed(t),
+      limit: batch,
+      triggers: !!flags.triggers,
+      triggerChatFn: flags.triggers ? triggerLocal : null,
+      triggerEscalateFn: flags.triggers && !flags.noSonnet ? triggerSonnet : null,
+    });
+    total.embedded += res.embedded;
+    total.cued += res.cued;
+    total.triggered += res.triggered;
+    total.sonnet_calls += res.sonnet_calls || 0;
+    total.pruned += res.pruned;
+    total.remaining = res.remaining;
+    if (res.errors?.length) total.errors.push(...res.errors);
+    // A pass that neither embedded nor cued anything has stalled (or drained).
+    if ((res.embedded === 0 && res.cued === 0) || res.remaining === 0) break;
+  }
+  console.log(JSON.stringify(total, null, 2));
+} else if (cmd === "search") {
+  const query = flags._.join(" ");
+  if (!query) {
+    console.error('usage: wiki-embed search "<query>" [--fts] [--type T] [-k N]');
+    process.exit(1);
+  }
+  const opts = { limit: flags.k || 10, type: flags.type || null };
+  // --fts forces pure lexical; default is hybrid (which itself degrades to FTS
+  // when Ollama is down or nothing is embedded).
+  const rows = flags.fts
+    ? await searchPagesHybrid(query, opts) // embedQuery omitted → FTS path
+    : await searchPagesHybrid(query, { ...opts, embedQuery: (t) => localLlmEmbed(t) });
+  if (flags.json) {
+    console.log(JSON.stringify(rows, null, 2));
+    process.exit(0);
+  }
+  if (!rows.length) {
+    console.log("(no matches)");
+    process.exit(0);
+  }
+  for (const r of rows) {
+    const via = r.via ? `[${r.via}]` : "";
+    const flagsStr = (r.pinned ? "📌 " : "") + (r.status === "active" ? "" : `(${r.status}) `);
+    console.log(`${via} ${flagsStr}${r.id} — ${r.title || ""}`);
+    if (r.snippet) console.log(`   ${r.snippet}`);
+    // Why this row is here — the two things that are non-obvious about a hit
+    // now that recall has more than one way to reach a page.
+    if (r.cue) console.log(`   ↳ cue (${r.cue_kind}): ${r.cue}`);
+    if (r.expanded_from) console.log(`   ↳ linked from: ${r.expanded_from}`);
+  }
+  console.log(`\n${rows.length} result${rows.length === 1 ? "" : "s"} (${rows[0]?.via || "fts"})`);
+} else if (cmd === "stats") {
+  const s = embeddingStats();
+  console.log(JSON.stringify(s, null, 2));
+} else {
+  console.error('usage: wiki-embed <embed|search|stats> [...]');
+  process.exit(1);
+}

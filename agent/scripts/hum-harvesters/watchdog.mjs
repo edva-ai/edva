@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, stampRun } from "./_common.mjs";
 
+import { installTools } from "../../../lib/root.cjs";
 const { situation: sit, context } = await readStdinJson(); void sit; void context;
-const LOG = path.join(os.homedir(), "dev/merlin/agent/logs/watchdog.log");
+const LOG = installTools("agent/logs/watchdog.log");
 
 let issues = [];
 try {

@@ -11,9 +11,10 @@
 //            injects them, so agents never explicitly fetch them).
 //
 // Usage:
-//   wiki-audit                  # apply changes + email the user on changes
-//   wiki-audit --dry-run        # report only, no DB or email writes
-//   wiki-audit --no-email       # apply changes, skip email
+//   wiki-audit                  # apply changes + log them to the Improvements channel
+//   wiki-audit --dry-run        # report only, no DB or Improvements writes
+//   wiki-audit --no-log         # apply changes, skip the Improvements row
+//                               # (--no-email is kept as an alias)
 //   wiki-audit --window-days N  # change the lookback window (default 7)
 //   wiki-audit --pin-threshold N  # default 5
 //   wiki-audit --json           # machine-readable summary
@@ -26,6 +27,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const ws = require("../lib/wiki-store.js");
 
+const { installTools } = require("../lib/root.cjs");
 const args = process.argv.slice(2);
 function flag(name, def = undefined) {
   const i = args.indexOf(`--${name}`);
@@ -36,12 +38,11 @@ function flag(name, def = undefined) {
 }
 
 const DRY_RUN = Boolean(flag("dry-run", false));
-const NO_EMAIL = Boolean(flag("no-email", false));
+const NO_LOG = Boolean(flag("no-log", false) || flag("no-email", false));
 const AS_JSON = Boolean(flag("json", false));
 const WINDOW_DAYS = Number(flag("window-days", 7));
 const PIN_THRESHOLD = Number(flag("pin-threshold", 5));
 const TENURE_DAYS = Number(flag("tenure-days", 7));
-const EMAIL_TO = String(flag("email-to", "${MERLIN_OWNER_EMAIL}"));
 
 const sinceMs = Date.now() - WINDOW_DAYS * 24 * 3600 * 1000;
 
@@ -119,12 +120,12 @@ function applyChanges(report) {
 
 function fmtList(items, key = "id") {
   if (!items.length) return "  (none)\n";
-  return items.map((p) => `  - ${p[key]} (hits=${p.hits}) — ${p.title || ""}`).join("\n") + "\n";
+  return items.map((p) => `  - ${p[key]} (hits=${p.hits}): ${p.title || ""}`).join("\n") + "\n";
 }
 
 function buildText(report) {
   const lines = [];
-  lines.push(`Wiki pin audit — ${new Date().toISOString().slice(0, 10)}`);
+  lines.push(`Wiki pin audit: ${new Date().toISOString().slice(0, 10)}`);
   lines.push("");
   lines.push(
     `Window: last ${report.window_days}d. ${report.access_summary.entries} log entries, ${report.access_summary.hits} page hits (MCP only).`,
@@ -139,68 +140,36 @@ function buildText(report) {
   lines.push(fmtList(report.unpin_now));
   lines.push(`Pinned, still active (${report.stay_pinned.length}):`);
   lines.push(fmtList(report.stay_pinned));
-  lines.push(`Pinned, locked — skipped from auto-unpin (${report.skipped_locked.length}):`);
+  lines.push(`Pinned, locked, skipped from auto-unpin (${report.skipped_locked.length}):`);
   lines.push(fmtList(report.skipped_locked));
   lines.push(`Pinned, idle but too fresh to unpin (${report.too_fresh.length}):`);
   lines.push(fmtList(report.too_fresh));
   return lines.join("\n");
 }
 
-function buildHtml(report) {
-  const esc = (s) =>
-    String(s ?? "").replace(/[&<>"']/g, (c) => ({
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    })[c]);
-  const li = (items) =>
-    items.length
-      ? `<ul>${items
-          .map(
-            (p) =>
-              `<li><code>${esc(p.id)}</code> <small>(hits=${p.hits})</small> — ${esc(p.title || "")}</li>`,
-          )
-          .join("")}</ul>`
-      : `<p style="color:#999;margin:4px 0 0">(none)</p>`;
-
-  return `<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:14px;color:#222;max-width:680px;line-height:1.5">
-<h2 style="margin:0 0 4px">Wiki pin audit — ${new Date().toISOString().slice(0, 10)}</h2>
-<p style="color:#666;margin:0 0 16px">Window: last ${report.window_days}d. ${report.access_summary.entries} log entries, ${report.access_summary.hits} page hits (MCP only).
-By tool: ${esc(Object.entries(report.access_summary.by_tool).map(([k, v]) => `${k}=${v}`).join(", ") || "(none)")}.</p>
-
-<h3 style="color:#0a8a1d">📌 Pinned (${report.pin_now.length})</h3>
-${li(report.pin_now)}
-
-<h3 style="color:#a83d2c">📍 Unpinned (${report.unpin_now.length})</h3>
-${li(report.unpin_now)}
-
-<details><summary>Pinned, still active (${report.stay_pinned.length})</summary>${li(report.stay_pinned)}</details>
-<details><summary>Pinned, locked (${report.skipped_locked.length})</summary>${li(report.skipped_locked)}</details>
-<details><summary>Pinned, too fresh to unpin (${report.too_fresh.length})</summary>${li(report.too_fresh)}</details>
-
-<p style="color:#999;font-size:12px;margin-top:24px">Auditor: <code>bin/wiki-audit</code> — pin if &ge; ${report.pin_threshold} hits in ${report.window_days}d, unpin if 0 hits and pinned &ge; ${report.tenure_days}d (skipped if pin_locked=1).</p>
-</body></html>`;
-}
-
-function sendEmail(report) {
-  const dataDir = path.join(process.env.MERLIN_HOME || path.join(os.homedir(), "Dev/merlin"), "data");
-  fs.mkdirSync(dataDir, { recursive: true });
-  const tmp = path.join(dataDir, `.wiki-audit-${Date.now()}.html`);
-  fs.writeFileSync(tmp, buildHtml(report));
-  const ymd = new Date().toISOString().slice(0, 10);
-  const subj = `Wiki pin audit — ${report.pin_now.length}↑ ${report.unpin_now.length}↓ (${ymd})`;
+// Applied pin moves are low-risk and automatic, so they land in the app's
+// Improvements channel as a green-check row (display only) instead of an email.
+// Silent on no-op nights: this is only called when something changed.
+function logToImprovements(report) {
+  const ids = (items) => items.map((p) => `${p.id} (${p.hits})`).join(", ");
+  const parts = [];
+  if (report.pin_now.length) parts.push(`${report.pin_now.length} pinned`);
+  if (report.unpin_now.length) parts.push(`${report.unpin_now.length} unpinned`);
+  const summary = `Wiki pinned set retuned: ${parts.join(", ")}`;
+  const rationale = [
+    `Last ${report.window_days}d of agent lookups (${report.access_summary.hits} page hits).`,
+    report.pin_now.length ? `Pinned (hits >= ${report.pin_threshold}): ${ids(report.pin_now)}.` : "",
+    report.unpin_now.length
+      ? `Unpinned (0 hits, pinned >= ${report.tenure_days}d, not locked): ${ids(report.unpin_now)}.`
+      : "",
+  ].filter(Boolean).join(" ");
   const r = spawnSync(
-    path.join(os.homedir(), "dev/merlin/bin/email-send"),
-    ["--to", EMAIL_TO, "--subject", subj, "--body-file", tmp, "--html"],
+    installTools("bin/self-improve-feed-log"),
+    ["--type", "code-fix", "--risk", "low", "--summary", summary, "--rationale", rationale, "--status", "applied"],
     { stdio: "inherit" },
   );
-  try {
-    fs.unlinkSync(tmp);
-  } catch {}
   if (r.status !== 0) {
-    console.error("wiki-audit: email-send failed (continuing)");
+    console.error("wiki-audit: self-improve-feed-log failed (changes already applied; continuing)");
   }
 }
 
@@ -216,10 +185,10 @@ if (AS_JSON) {
 const hasChanges = report.pin_now.length || report.unpin_now.length;
 
 if (DRY_RUN) {
-  if (!AS_JSON) console.log("\n(dry-run: no changes applied, no email sent)");
+  if (!AS_JSON) console.log("\n(dry-run: no changes applied, nothing logged)");
 } else if (hasChanges) {
   applyChanges(report);
-  if (!NO_EMAIL) sendEmail(report);
+  if (!NO_LOG) logToImprovements(report);
 }
 
 ws.closeDb();

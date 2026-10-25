@@ -25,15 +25,76 @@
 //   5  feedback append failed after send (row lost, send cannot be undone)
 //   7  refused: headline finding has a blocking disposition in suggestion-history
 //      (e.g. the user already rejected this restaurant). No send, no row.
+//   8  refused: cross-send duplicate — the headline dedup_key was already sent
+//      within HUM_DEDUP_WINDOW_H hours (default 24) and this isn't a high-urgency
+//      (score >= 0.9) or protected-lane (PROTECTED_LANES in hum-vetoes.mjs) resend. No send, no row.
+//      Added after one ping fired 3× in 19h because the ranker's fuzzy "don't
+//      repeat" guard missed a non-date-stamped dedup_key. This is the
+//      deterministic backstop.
+//   9  refused: semantic near-duplicate — the headline restates (cosine >=
+//      HUM_NOVELTY_THRESHOLD, default 0.93; 0.90 for the `nearby` lane) a ping sent within HUM_NOVELTY_WINDOW_H
+//      hours (default 72), even though its dedup_key differs. Same carve-outs as
+//      exit 8 (score >= 0.9 or protected-lane bypass). No send, no row. This is the
+//      semantic sibling of exit 8, motivated by the LLM-homogenization paper
+//      (Moon/Green/Kushlev 2025). Fails OPEN — a down embedder disables the gate,
+//      never blocks. See lib/hum-novelty.mjs.
+//  10  refused: retrospective-ask daily cap — this is a "were you at X?" style
+//      confirmation question and HUM_LOCATION_ASK_CAP (default 3) of them have
+//      already shipped today. No send, no row; the stop stays queued in
+//      location-ask-queue (pending row stays asked:false) and surfaces in the
+//      next morning's daily-summary "Corrections & follow-ups" block via
+//      resolve-day's loadUnaskedPendingEnrich → unknown_stops[].
+//      Added after dozens of such asks landed in a week (~2/3 of them
+//      unanswered) while the `nearby` value lane published zero times.
+//  11  refused: daily ping budget — 6 pings already today, or the last one went
+//      out less than 45 minutes ago (lib/ping-budget.mjs; HUM_MAX_PINGS_PER_DAY
+//      / HUM_MIN_PING_INTERVAL_MIN override). Same carve-outs as exit 8 (score >= 0.9
+//      or protected lane). No send, no row. Added because the documented cap
+//      had been switched off in hum-state.json and nothing in this path read it
+//      (nine pings in a day, three inside 22 minutes).
+//
+//  12  not sent: resolved first — merlin-send-curl's resolve-first gate found
+//      that Merlin's own records already answer what this ping asks or leaves
+//      open, and the answer added nothing worth sending (bin/
+//      hum-resolve-first). No row. The answer is kept so it is not re-asked; a
+//      reservoir idea behind it is retired and a queued location ask dropped.
+//      When the answer IS worth sending, the gate rewrites the ping into a
+//      short FYI (or into just the remaining gap) and this exits 0 as a normal
+//      send, with `resolve` on the feedback row.
+//
+//  13  refused: local explanation out of range — a `nearby` (local-history)
+//      ping is delivered only while the user's NEWEST fix is within 300 m of the
+//      subject and no older than 30 min (lib/local-history-ledger.mjs).
+//      No send, no row (a local explanation is only worth floating while the
+//      user is still near the point). A local explanation already told (same QID / page / OSM id, or
+//      the same spot within 30 m) exits 8 from the identity ledger.
+//
+//   Exit 8 on a STICKY key (nearby:*) checks HUM_STICKY_DEDUP_WINDOW_D days
+//   (default 180), not 24h, and the score carve-out does not apply — a place
+//   fact is told once (one landmark was once sent three days running under one key).
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { canonicalKey, canonicalDisplay, canonicalAttrs } from "../lib/suggestion-key.mjs";
 import { shouldFilter } from "../lib/suggestion-recall.mjs";
 import { appendSurfaced } from "../lib/suggestion-history.mjs";
+import * as novelty from "../lib/hum-novelty.mjs";
+import { evidenceAsOf as resolveEvidenceAsOf } from "../lib/claim-freshness.mjs";
+import { recallMedia, mediaUrls } from "../lib/ping-media.mjs";
+import {
+  isProtectedIntent, isRetrospectiveAsk, deriveDedupKey,
+  findRecentDedupSend, countRetrospectiveAsksToday, askCap, dedupWindowFor,
+  dedupBypassable,
+} from "../lib/hum-vetoes.mjs";
+import { checkPingBudget, isLocalHistoryRow } from "../lib/ping-budget.mjs";
+import { alreadyTold, deliveryVerdict, latestFix, recordTold, rememberPending, PROXIMITY_M } from "../lib/local-history-ledger.mjs";
+import { readSidecar } from "../lib/hum-resolve-first.mjs";
+import { optionalBin } from "../lib/ext-hooks.mjs";
 
+import { installTools } from "../lib/root.cjs";
 const args = process.argv.slice(2);
 function flag(name, hasValue = true) {
   const i = args.indexOf(name);
@@ -54,6 +115,13 @@ const noPush = flag("--no-push", false);
 const pushBody = flag("--push-body");
 let message = flag("--message");
 const fromStdin = flag("--message-from-stdin", false);
+// Intent label forwarded to merlin-send-curl so the outbound-precheck
+// reasoner has caller context (e.g. "hum:<lane>:<branch>"). Added after
+// diagnosing systematic suppression of protected-lane pings — precheck
+// couldn't tell a playbook-protected nudge from a generic dedup-candidate
+// message. With --intent set, the precheck's prompt treats a protected lane's
+// intents as protected (see bin/outbound-precheck.mjs § PROTECTED INTENTS).
+const intent = flag("--intent");
 
 if (!pingId) die("hum-ping: --ping-id is required");
 if (scoreRaw === undefined) die("hum-ping: --score is required");
@@ -120,21 +188,336 @@ if (findings && findings.length > 0) {
 }
 
 // ---------------------------------------------------------------------------
+// 0b-bis. Local explanations (exit 8 / exit 13).
+//     A `nearby` ping is a local-history factoid. Two rules from the user,
+//     enforced here at the last moment before it reaches the user:
+//       - never the same subject twice — checked against the identity ledger
+//         (Wikidata QID / Wikipedia page / OSM id, or the same spot within
+//         30 m), which a model-worded dedup_key cannot fake its way past;
+//       - only while the user is within 300 m of it — the NEWEST fix, not the one
+//         the harvester saw; a fix too old to know counts as away.
+//     Both fail CLOSED: an explanation that cannot be placed is not sent.
+// ---------------------------------------------------------------------------
+const headlineForPool = (findings && findings[0]) || null;
+const isLocalHistoryPing = lane === "nearby" || isLocalHistoryRow(headlineForPool);
+let localSubject = null;
+if (isLocalHistoryPing) {
+  localSubject = headlineForPool?.supporting_data?.subject
+    || recallMedia(headlineForPool?.dedup_key)?.subject
+    || null;
+  const told = localSubject ? alreadyTold(localSubject) : { told: false };
+  if (told.told) {
+    console.error(`hum-ping: REFUSED (exit 8) — local explanation already told: ${told.reason}. Identity ledger.`);
+    process.exit(8);
+  }
+  const verdict = deliveryVerdict({ subject: localSubject, fix: await latestFix() });
+  if (!verdict.ok) {
+    console.error(`hum-ping: REFUSED (exit 13) — local explanation of "${localSubject?.title || "?"}" not delivered: ${verdict.reason} (rule: within ${PROXIMITY_M}m).`);
+    process.exit(13);
+  }
+  console.error(`hum-ping: local explanation in range — ${verdict.reason}`);
+}
+
+// ---------------------------------------------------------------------------
 // 1. Send the ping via merlin-send-curl --capture-id.
 // ---------------------------------------------------------------------------
 const HOME = os.homedir();
-const SEND_BIN = path.join(HOME, "dev/merlin/bin/merlin-send-curl");
-const FEEDBACK_PATH = path.join(HOME, "dev/merlin/data/hum-feedback.jsonl");
-const LOCK_PATH = path.join(HOME, "dev/merlin/data/.hum-feedback.lock");
+const SEND_BIN = installTools("bin/merlin-send-curl");
+const FEEDBACK_PATH = installTools("data/hum-feedback.jsonl");
+// An installation's own CLI for a lane hum-ping closes out (a retrospective
+// location ask): bin/_ext/<name> or bin/<name> when present, else skipped.
+function runOptionalBin(name, args) {
+  const bin = optionalBin(installTools("bin"), name);
+  if (bin) spawnSync(bin, args, { encoding: "utf8" });
+}
+const LOCK_PATH = installTools("data/.hum-feedback.lock");
+
+// ---------------------------------------------------------------------------
+// 0c. dedup_key enforcement + cross-send dedup gate (from a hum-review: ask
+//     more and don't hold back — but one ping fired 3× in 19h, which is pure
+//     noise that erodes trust in *every* ping). Two parts:
+//       (1) Proposal 2 — guarantee the headline finding carries a stable
+//           dedup_key. 10 pings/week shipped with a null key, making any dedup
+//           impossible. Derive `<topic>:<sha8(signal)>` when missing.
+//       (2) Proposal 1 — deterministic cross-send gate. If the headline
+//           dedup_key already landed (per hum-feedback.jsonl) within
+//           HUM_DEDUP_WINDOW_H hours, REFUSE (exit 8) — unless this is a
+//           genuine high-urgency resend (score >= 0.9) or a protected
+//           lane (PROTECTED_LANES), which own their cadence. This is the
+//           backstop the Haiku ranker's fuzzy "don't repeat RECENT RUNS" guard
+//           failed to be. "Send more" means more *distinct* signal, never the
+//           same headline three times.
+// ---------------------------------------------------------------------------
+// The scan logic itself lives in lib/hum-vetoes.mjs —
+// shared with hum-harvest-all's PRE-RANK filter, which now drops a doomed
+// candidate before the ranker can pick it. This is the send-time backstop.
+if (findings && findings.length > 0) {
+  const headline = findings[0];
+  if (!headline.dedup_key) {
+    headline.dedup_key = deriveDedupKey(headline, lane, message);
+    console.error(`hum-ping: headline lacked dedup_key; derived ${headline.dedup_key}`);
+  }
+  const protectedIntent = isProtectedIntent(intent);
+  const DEDUP_WINDOW_H = dedupWindowFor(headline.dedup_key);
+  if ((!protectedIntent && score < 0.9) || !dedupBypassable(headline.dedup_key)) {
+    const dup = findRecentDedupSend(headline.dedup_key, { feedbackPath: FEEDBACK_PATH, windowH: DEDUP_WINDOW_H });
+    if (dup) {
+      console.error(`hum-ping: REFUSED (exit 8) — dedup_key ${headline.dedup_key} already sent at ${dup.sent_at} (ping_id=${dup.ping_id}) within ${DEDUP_WINDOW_H}h; score ${score} < 0.9 and not a protected lane. Cross-send dedup gate.`);
+      process.exit(8);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0c-bis. Retrospective-ask daily cap (exit 10).
+//
+//     A "were you at X?" / "did you actually stop?" question is a different
+//     animal from everything else hum sends: the user was physically there, so
+//     the information gap is Merlin's, not the user's, and the interrupt buys us
+//     data rather than buying the user anything.
+//
+//     In one week dozens of them reached the user (up to ten a day), roughly
+//     two thirds unanswered, against zero publishes from the `nearby` lane that
+//     exists to tell the user something useful. Answers come in batches when
+//     they come at all (a few short "<where>" replies together) — which is the
+//     shape of a nightly digest, not of nine interrupts.
+//
+//     So: at most HUM_LOCATION_ASK_CAP live asks a day. The rest stay
+//     asked:false and land in the next daily-summary's "Corrections &
+//     follow-ups" block (resolve-day loadUnaskedPendingEnrich → unknown_stops[]),
+//     where a batch answer costs one email instead of nine interruptions.
+//     (location-daily is on-demand only — it is NOT the overflow surface.)
+//
+//     This lives in code, not in playbook prose, deliberately. The prose cap
+//     ("One message per run") is exactly what produced 46 asks in a week — a
+//     per-run limit with no per-day limit is not a limit.
+// ---------------------------------------------------------------------------
+const ASK_CAP = askCap();
+const headlineIsRetrospectiveAsk = Boolean(findings && findings[0] && isRetrospectiveAsk(findings[0]));
+if (headlineIsRetrospectiveAsk && ASK_CAP > 0) {
+  const sentToday = countRetrospectiveAsksToday({ feedbackPath: FEEDBACK_PATH });
+  if (sentToday >= ASK_CAP) {
+    console.error(`hum-ping: REFUSED (exit 10) — ${sentToday} retrospective location asks already sent today (cap ${ASK_CAP}). The stop stays queued (asked:false) and surfaces in the next daily-summary's Corrections & follow-ups block. Retrospective-ask cap.`);
+    process.exit(10);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0c-ter. Daily ping budget (exit 11). 6 a day, 45 minutes
+//     apart, shared with location-ambient — see lib/ping-budget.mjs for
+//     the counter and why it is code rather than a hum-state.json field.
+//     Carve-outs as exit 8. Fail-open: a read error never refuses.
+// ---------------------------------------------------------------------------
+{
+  const budgetBypass = isProtectedIntent(intent) || score >= 0.9;
+  let budget = { ok: true };
+  try { budget = checkPingBudget({ bypass: budgetBypass, feedbackPath: FEEDBACK_PATH, pool: isLocalHistoryPing ? "local_history" : "shared" }); }
+  catch (e) { console.error(`hum-ping: ping-budget check failed (${e.message}) — failing open`); }
+  // A location ask is perishable — the user wants these while they are still
+  // there — so the 45-min spacing never holds one. It still counts
+  // and the daily cap still applies (plus its own exit-10 ask cap).
+  if (!budget.ok && budget.gate === "min_interval" && headlineIsRetrospectiveAsk) budget = { ok: true };
+  if (!budget.ok) {
+    console.error(`hum-ping: REFUSED (exit 11) — ${isLocalHistoryPing ? "local-history pool " : ""}${budget.gate}: ${budget.detail}; score ${score} < 0.9 and not a protected lane. Daily ping budget.`);
+    process.exit(11);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0d. Semantic novelty gate (exit 9) — the semantic sibling of exit-8.
+//     Exit-8 blocks an *exact* dedup_key repeat; this blocks a *different*
+//     subject that restates something already surfaced recently. Motivated by
+//     the LLM-homogenization paper (Moon/Green/Kushlev 2025): LLM outputs add
+//     little new collective diversity as they pile up. We embed the headline's
+//     substantive text and refuse if its max cosine to a ping sent within the
+//     novelty window crosses the threshold.
+//
+//     - Same carve-outs as exit-8: protected lanes and
+//       high-urgency (score >= 0.9) bypass the block.
+//     - FAILS OPEN: if the embedder is unavailable, noveltyVec is null and we
+//       send anyway. A down Ollama disables the gate, never silences the hum.
+//     - We embed + score for EVERY ping (even bypassed ones) so the corpus
+//       stays complete and novelty_max_sim is logged on every feedback row for
+//       later threshold calibration. Only the *block* respects the carve-outs.
+//     See lib/hum-novelty.mjs.
+// ---------------------------------------------------------------------------
+let noveltyVec = null;
+let noveltyMaxSim = null;
+let noveltyNearestPingId = null;
+if (findings && findings.length > 0) {
+  const headline = findings[0];
+  const text = novelty.signalText(headline, message);
+  noveltyVec = await novelty.embed(text); // null on empty text / embedder failure
+  if (noveltyVec) {
+    const rows = novelty.recentVectors();
+    const { maxSim, nearest } = novelty.nearestDuplicate(noveltyVec, rows);
+    noveltyMaxSim = Number(maxSim.toFixed(4));
+    noveltyNearestPingId = nearest?.ping_id || null;
+    const noveltyProtected = isProtectedIntent(intent);
+    // Lane-aware, so this send-time backstop agrees with the
+    // pre-rank filter. `nearby` is tuned to 0.90; see THRESHOLD_BY_LANE in
+    // lib/hum-novelty.mjs for the evidence.
+    // headline.topic first, matching preRankFilter's `c.topic` and the
+    // `f.topic || lane` idiom used twice elsewhere in this file. Keying off the
+    // --lane flag alone would silently revert to the global threshold on the
+    // one path this backstop exists for: a send that skipped hum-harvest-all
+    // and may carry no --lane at all.
+    const noveltyThreshold = novelty.thresholdFor((headline && headline.topic) || lane);
+    if (!noveltyProtected && score < 0.9 && maxSim >= noveltyThreshold) {
+      console.error(`hum-ping: REFUSED (exit 9) — headline is a semantic near-duplicate of ping ${noveltyNearestPingId} (cosine ${noveltyMaxSim} >= ${noveltyThreshold}) within ${novelty.WINDOW_H}h; score ${score} < 0.9 and not a protected lane. Novelty gate.`);
+      process.exit(9);
+    }
+  } else {
+    console.error(`hum-ping: novelty gate skipped (embedder unavailable or empty text) — failing open`);
+  }
+}
 
 const captureFile = path.join(os.tmpdir(), `hum-ping-capture.${process.pid}.${Date.now()}`);
 const sendArgs = ["--capture-id", captureFile];
 if (suppressHook) sendArgs.push("--suppress-hook");
 if (noPush) sendArgs.push("--no-push");
 if (pushBody) sendArgs.push("--push-body", pushBody);
+// The forwarded intent ALWAYS starts with `hum:` — it is what routes the ping
+// through merlin-send-curl's resolve-first gate and tells the
+// precheck it is a hum lane. A caller's own `hum:<lane>:<branch>` passes as
+// is; a missing one becomes `hum:<lane>`, and a non-hum label is nested under
+// the lane rather than dropped. (Previously an unknown lane sent no
+// intent at all, which would have skipped the gate.)
+const sendIntent = intent && intent.startsWith("hum:") ? intent
+  : intent ? `hum:${lane}:${intent}`
+  : `hum:${lane}`;
+sendArgs.push("--intent", sendIntent);
+// What the ping is about, for the resolve-first gate: the headline finding
+// carries the facts the lane started from (dates, ids) and the dedup_key the
+// gate files its answer under. A temp file, removed after the send.
+const humContextFile = path.join(os.tmpdir(), `hum-ping-context.${process.pid}.${Date.now()}.json`);
+try {
+  fs.writeFileSync(humContextFile, JSON.stringify({
+    kind: "ping", lane, ping_id: pingId,
+    dedup_key: (findings && findings[0] && findings[0].dedup_key) || null,
+    finding: (findings && findings[0]) || null,
+  }));
+  sendArgs.push("--hum-context", humContextFile);
+} catch { /* the gate runs without it */ }
+// ─── Provenance for the freshness gate ───────────────────────────────────
+//
+// The gate (lib/claim-freshness.mjs, via outbound-precheck) needs to know
+// WHEN the evidence behind this ping was observed, because that is what decides
+// whether its stateful claims get re-checked and how far back the mailbox is
+// searched. Without it the ping is "undated": still checked, but over a blind
+// 14-day window instead of the thread's real date.
+//
+// Reservoir ideas are exactly the population that needs this — they surface
+// hours-to-days after they are written, which is how a reservoir ping once
+// shipped a two-day-old status claim as current. The idea's own record
+// carries the answer, so look it up rather than making the caller pass it.
+//
+// Only lanes PROVEN to compose from a live read this very tick — a GPS fix, a
+// weather/calendar/task API call, a health query — get the free "live" stamp.
+// Leaving those undated was never neutral: the gate treats undated as stale and
+// (at one time) told its models the evidence was exactly 14 days old, so a
+// ping written from a GPS fix seconds earlier was adjudicated as a fortnight-old
+// claim and dropped. That is the free path in claim-freshness's own design
+// ("a message composed from evidence observed minutes ago exits at Stage 0
+// having spent nothing") which had simply never been wired up.
+//
+// Everything NOT on that list defaults to a real evidence-date lookup (or
+// undated, which is checked, not undated, which is exempted) — the previous
+// rule was "not a reservoir idea -> live", which silently exempted every other
+// lane from re-verification too, including ones built entirely from STORED
+// records. `email_followups` is exactly that: its whole purpose is surfacing a
+// days-old P1 email, and its Sonnet-synthesized ping is what actually reads a
+// stale record (e.g. a pinned wiki status page) and restates it as new. Rule
+// #2's own header names this precisely: "Surfacing something stored -- a
+// reservoir idea, a wiki page, a cached email? ... Do NOT pass 'live'."
+// (Incident: a hum ping re-asserted a third party's pending approval a full
+// day after it had been granted, because this lane's finding was
+// blanket-stamped `live` and claim-freshness exited at Stage 0 without ever
+// re-checking memory. See system/changelog.md.)
+const RESERVOIR_PREFIX = "idea-";
+// Genuinely "read the world right now and report it" — no stale intermediate
+// record for the finding to be wrong about. An installation adds its own with
+// extend_live_lanes in agent/local/config/hum-lanes.json.
+const LIVE_LANES = new Set(createRequire(import.meta.url)("../lib/instance.cjs").localConfig("hum-lanes", {
+  live_lanes: [
+    "location_context", "nearby", "health", "exercise", "dining", "music",
+    "weather", "situation", "calendar", "tasks", "family", "watchdog",
+    "secret_failures", "screen",
+  ],
+}).live_lanes);
+const evidenceFlag = flag("--evidence-as-of");
+let evidenceStamp = evidenceFlag || null;
+const headlineKeyForEvidence = String((findings && findings[0] && findings[0].dedup_key) || "");
+if (!evidenceStamp) {
+  const key = headlineKeyForEvidence;
+  if (key.startsWith(RESERVOIR_PREFIX)) {
+    try {
+      const ideasFile = installTools("data/hum-ideas.jsonl");
+      // Collapse by id — the reservoir is append-only, so later rows win.
+      let idea = null;
+      for (const line of fs.readFileSync(ideasFile, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let row; try { row = JSON.parse(line); } catch { continue; }
+        if (row && row.id === key) idea = { ...(idea || {}), ...row };
+      }
+      const at = idea ? resolveEvidenceAsOf(idea) : null;
+      if (at) evidenceStamp = at.iso;
+    } catch {}
+  } else if (LIVE_LANES.has(lane)) {
+    // A lane proven to compose from this tick's own harvest. Declaring it is
+    // both the honest answer and the cheap one: the gate exits at stage 0.
+    evidenceStamp = "live";
+  } else {
+    // Not a reservoir idea, not a known-live lane (email_followups, crossref,
+    // lanes built from stored records, news, art, or anything new that
+    // hasn't earned a place in LIVE_LANES yet). Try to find a real evidence
+    // date on the finding itself; if none exists, leave it undated rather than
+    // exempting it — undated is checked (over a wide window), which is the
+    // safe default, not "live", which is a claim nothing here has verified.
+    try {
+      const headline = findings && findings[0];
+      const at = headline ? resolveEvidenceAsOf(headline) : null;
+      if (at) evidenceStamp = at.iso;
+    } catch {}
+  }
+}
+if (evidenceStamp) sendArgs.push("--evidence-as-of", evidenceStamp);
+
+// ─── Media the headline finding brought with it ──────────────────────────
+//
+// Hum's `nearby` pings are often seen after the fact, when the user no longer
+// knows what they refer to. A harvester that
+// knows its subject also knows what it looks like and where it is, so it may
+// attach a picture and a map — `supporting_data.media.{image_url,map_url}`,
+// both already-public URLs it composed itself.
+//
+// Forwarded rather than appended here, because `merlin-send-curl` is the only
+// place downstream of BOTH rewriting gates (outbound-precheck's `modify` and
+// claim-freshness's vintage rewrite). Appending at this level would put the
+// URLs inside the text those gates are free to replace wholesale.
+//
+// Deliberately generic: any lane can populate `media` and get this behaviour.
+// Deliberately headline-only: the ping is about one thing, and a bubble with
+// four maps in it explains less than one with a single map.
+// The passed value wins; the harvester's own stash is the fallback for when
+// the turn composed a findings array without it (lib/ping-media.mjs
+// explains why that is the expected case rather than a bug).
+const headline0 = (findings && findings[0]) || null;
+const headlineMedia = (headline0 && headline0.supporting_data && headline0.supporting_data.media)
+  || recallMedia(headline0 && headline0.dedup_key)
+  || null;
+// Image first, map second — what it looks like, then where it is. Reading order
+// matches the question the user actually asks ("what is this?" then "where?").
+for (const url of mediaUrls(headlineMedia)) sendArgs.push("--media", url);
+// A location question rides as a tappable card (ChoicePrompt subject + options).
+if (headlineMedia && headlineMedia.choice) sendArgs.push("--choices-json", JSON.stringify(headlineMedia.choice));
+
 sendArgs.push(message);
 
 const sendResult = spawnSync(SEND_BIN, sendArgs, { encoding: "utf8" });
+try { fs.unlinkSync(humContextFile); } catch {}
+// What the resolve-first gate did, if anything (null when it left the message alone).
+const resolveSidecar = readSidecar(captureFile);
 if (sendResult.status !== 0) {
   try { fs.unlinkSync(captureFile); } catch {}
   console.error(`hum-ping: send failed (exit ${sendResult.status})`);
@@ -145,6 +528,7 @@ if (sendResult.status !== 0) {
 
 let messageId = null;
 let suppressedByPrecheck = false;
+let resolvedFirst = false;
 let suppressReason = "";
 try {
   const captureRaw = fs.readFileSync(captureFile, "utf8").trim();
@@ -157,7 +541,10 @@ try {
     try {
       const parsed = JSON.parse(captureRaw);
       if (parsed && parsed.suppressed === true) {
-        suppressedByPrecheck = true;
+        // Two gates write this sentinel: the outbound precheck, and the
+        // resolve-first gate (tagged by: hum-resolve-first).
+        if (parsed.by === "hum-resolve-first") resolvedFirst = true;
+        else suppressedByPrecheck = true;
         suppressReason = (parsed.reason || "").toString();
       }
     } catch {}
@@ -182,6 +569,40 @@ if (suppressedByPrecheck) {
   process.exit(0);
 }
 
+if (resolvedFirst) {
+  // The records already answered it and the answer was not worth a message.
+  // The gate kept the answer (data/hum-resolve-first.jsonl) and the
+  // pre-rank filter now vetoes this dedup_key as `resolved_first`; here the
+  // thing that would bring it back is retired too: the reservoir idea behind
+  // it, or the queued location ask. (A location ask's pending row stays
+  // asked:false on purpose, so the daily summary can still confirm the stop.)
+  const key = String((findings && findings[0] && findings[0].dedup_key) || "");
+  if (key.startsWith(RESERVOIR_PREFIX)) {
+    spawnSync(installTools("bin/hum-reservoir-prune"),
+      ["--expire", key, "--reason", `resolved before asking (${resolveSidecar?.decision_id || "hum-resolve-first"})`], { encoding: "utf8" });
+  }
+  if (headlineIsRetrospectiveAsk) {
+    const visitId = findings[0]?.supporting_data?.visit_id || key.replace(/^location_ask:/, ""); // lang-regex-ok: strips a machine dedup_key prefix
+    if (visitId) runOptionalBin("location-ask-queue", ["drop", visitId]);
+  }
+  console.error(`hum-ping: not sent — resolved first (${suppressReason}); no feedback row written (exit 12)`);
+  process.exit(12);
+}
+
+// A retrospective ask that actually landed is now the user's to answer, so it leaves
+// the queue and the underlying pending row is marked asked. Doing this HERE
+// (rather than in the enrich job, which used to mark-asked at compose time)
+// is the point of routing asks through the ranker: a composed question that
+// lost its tick was never asked, and must stay askable.
+if (headlineIsRetrospectiveAsk) {
+  const visitId = findings[0]?.supporting_data?.visit_id
+    || String(findings[0]?.dedup_key || "").replace(/^location_ask:/, "");
+  if (visitId) {
+    runOptionalBin("location-ask-queue", ["drop", visitId]);
+    runOptionalBin("findme", ["mark-asked", visitId]);
+  }
+}
+
 const entry = {
   ping_id: pingId,
   sent_at: new Date().toISOString(),
@@ -193,6 +614,32 @@ const entry = {
 };
 if (messageId) entry.message_id = messageId;
 else entry.capture_id_missing = true;
+if (isLocalHistoryPing) {
+  entry.budget_pool = "local_history";
+  // Told, so never again — and remembered by message id so ping-flush can
+  // withdraw it if the motion gate parked the alert and the user walked on.
+  try { recordTold({ ping_id: pingId, message_id: messageId, subject: localSubject, sent_at: entry.sent_at }); }
+  catch (e) { console.error(`hum-ping: WARNING — local-history ledger write failed: ${e.message}`); }
+  try { rememberPending({ message_id: messageId, ping_id: pingId, subject: localSubject }); } catch { /* best effort */ }
+}
+// The resolve-first gate rewrote what went out: into a short FYI (the records
+// answered it) or into just the remaining gap. hum-review reads this.
+if (resolveSidecar && resolveSidecar.action === "rewrite") {
+  entry.resolve = {
+    decision_id: resolveSidecar.decision_id, verdict: resolveSidecar.verdict,
+    still_question: Boolean(resolveSidecar.still_question),
+  };
+}
+// Exploration sends (hum-explore-run) are tagged so their cadence can be
+// counted; their reactions feed hum-engagement exactly like any other ping.
+if (String(intent || "").startsWith("hum:explore")) entry.explore = true;
+// Novelty-gate observability: log the max cosine to the recent-ping corpus and
+// the nearest ping id on every send. This is what calibrates HUM_NOVELTY_THRESHOLD
+// against the user's actual positive/negative reactions.
+if (noveltyMaxSim !== null) {
+  entry.novelty_max_sim = noveltyMaxSim;
+  entry.novelty_nearest_ping_id = noveltyNearestPingId;
+}
 
 // ---------------------------------------------------------------------------
 // 2. Append the feedback row under an advisory lock. The lock defends the
@@ -261,6 +708,23 @@ try {
   console.error(`hum-ping: read-back verify failed: ${e.message}`);
   // Don't exit non-zero for this — the write succeeded, only the verify
   // couldn't read the file. Surface the warning and continue.
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Cache the headline's embedding in the novelty sidecar so future sends
+//     can detect a near-restatement of THIS ping. Only reached after a
+//     confirmed send (suppressed-by-precheck exited earlier). Best-effort —
+//     a caching failure never affects the send that already happened.
+// ---------------------------------------------------------------------------
+if (noveltyVec) {
+  novelty.record({
+    ping_id: pingId,
+    lane,
+    sent_at: entry.sent_at,
+    dedup_key: (findings && findings[0] && findings[0].dedup_key) || null,
+    signal: novelty.signalText(findings && findings[0], message).slice(0, 200),
+    vec: noveltyVec,
+  });
 }
 
 // ---------------------------------------------------------------------------

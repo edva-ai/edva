@@ -206,8 +206,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     // Lock both iPhone and iPad to portrait at runtime. The iPad Info.plist
     // entry declares all four orientations because App Store Connect rejects
-    // iPad apps with a narrower set ("must support iPad multitasking" — the
-    // 2026-05-16 TestFlight upload was bounced for exactly this). Enforcing
+    // iPad apps with a narrower set ("must support iPad multitasking" — a
+    // TestFlight upload is bounced for exactly this). Enforcing
     // the lock here keeps the iPad app portrait-only at runtime without
     // failing validation.
     func application(

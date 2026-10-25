@@ -9,7 +9,7 @@
 //   wiki backfill [--dry-run]
 //   wiki verify [--json]
 //   wiki list [--type t] [--status s] [--pinned]
-//   wiki read <id>           (id = "user_food_taste" or "user_food_taste.md")
+//   wiki read <id>           (id = "user_profile" or "user_profile.md")
 //   wiki render <id>         (print raw_md to stdout)
 //   wiki render-all <dir>    (write every page to <dir>; backup target)
 //   wiki stats
@@ -66,6 +66,8 @@ Commands:
   stats                           Counts by type/status, link counts, dangling
   link-audit [--id ID] [--apply]  Suggest/apply missing concept wikilinks
   search "<q>" [--k N] [--mode fts|page] [--type T] [--json]
+  map [<type>] [--prefix P] [--json]  Table of contents: overview -> type -> prefix -> page
+  recent [--days N] [--limit N] [--json]  Pages updated recently (drives memory-consolidation harvest)
   links <id> [--json]             Outgoing links from <id>
   backlinks <id> [--json]         Incoming links to <id>
 
@@ -146,7 +148,7 @@ function cmdList() {
 
 function cmdRead() {
   const id = positional()[0];
-  if (!id) die("read: need a page id, e.g. `wiki read user_food_taste`");
+  if (!id) die("read: need a page id, e.g. `wiki read user_profile`");
   const row = ws.getPage(id);
   if (!row) die(`read: no page with id ${id}`);
   ws.logAccess({ tool: "wiki_read", page_ids: [row.id] });
@@ -284,6 +286,61 @@ function cmdLinkAudit() {
   process.exitCode = 1;
 }
 
+function cmdRecent() {
+  const days = flag("days", null);
+  const sinceDays = days != null ? Number(days) : null;
+  const limit = Number(flag("limit", 200));
+  const asJson = Boolean(flag("json", false));
+  const rows = ws.recentlyUpdated({ limit, status: "active", sinceDays });
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+  if (!rows.length) {
+    console.log("(no pages updated in window)");
+    return;
+  }
+  for (const r of rows) {
+    console.log(`${r.updated_at}  ${String(r.type || "").padEnd(9)} ${r.id}${r.title ? " — " + r.title : ""}`);
+  }
+  console.log(`\n${rows.length} page${rows.length === 1 ? "" : "s"}${sinceDays != null ? ` updated in last ${sinceDays}d` : ""}`);
+}
+
+function cmdMap() {
+  const pos = positional();
+  const type = pos[0] || flag("type", null);
+  const typeArg = typeof type === "string" ? type : null;
+  const prefixRaw = flag("prefix", null);
+  const prefix = typeof prefixRaw === "string" ? prefixRaw : null;
+  const asJson = Boolean(flag("json", false));
+  const map = ws.pageMap({ type: typeArg, prefix });
+  if (asJson) {
+    console.log(JSON.stringify(map, null, 2));
+    return;
+  }
+  if (map.level === "overview") {
+    console.log(`${map.total} active pages\n`);
+    for (const t of map.types) {
+      console.log(`${String(t.type).padEnd(12)} ${t.count}`);
+      for (const s of t.samples) {
+        console.log(`   ${s.id}${s.description ? " — " + s.description : ""}`);
+      }
+    }
+    console.log(`\ndrill: wiki map <type> [--prefix P]`);
+    return;
+  }
+  if (map.tooMany) {
+    console.log(`${map.type}: ${map.count} pages — too many to list. Prefixes:\n`);
+    for (const p of map.prefixes) console.log(`   ${String(p.prefix).padEnd(28)} ${p.count}`);
+    console.log(`\ndrill: wiki map ${map.type} --prefix <prefix>`);
+    return;
+  }
+  console.log(`${map.type}${map.prefix ? " / " + map.prefix : ""}: ${map.count} pages\n`);
+  for (const p of map.pages) {
+    console.log(`${p.pinned ? "📌 " : ""}${p.id}${p.description ? " — " + p.description : ""}`);
+  }
+}
+
 function cmdSearch() {
   const pos = positional();
   const query = pos.join(" ").trim();
@@ -359,8 +416,8 @@ function cmdBacklinks() {
 // contradictions with existing memory. Fail-open: any error lets the write
 // proceed. Skip for episodic pages (day/week/month) and when --no-precheck
 // flag is passed or when the caller is a bulk-ingest op (editedBy=cli:backfill).
-// Added 2026-05-16 per the user's request: "programmatic framework to ensure
-// memory is always consulted before saving new information."
+// Added at the user's request: a programmatic framework to ensure
+// memory is always consulted before saving new information.
 const PRECHECK_BIN = path.resolve(path.dirname(process.argv[1]), "memory-write-precheck.mjs");
 
 function runWritePrecheck(id, body) {
@@ -519,19 +576,17 @@ function cmdShowRev() {
 function cmdPinDefaults() {
   // Curated initial subset — the always-on slice. Keep small (~10): more
   // means less room for retrieval. The agent fetches everything else on
-  // demand via wiki_search / wiki_read.
-  const DEFAULT_PINS = [
-    "user_moshik",
-    "user_pari",
-    "user_daily_schedule",
-    "user_residences",
-    "user_food_taste",
-    "user_tv_pacing",
-    "feedback_no_shorthand",
-    "feedback_pulse_proactive",
-    "feedback_check_calendar_before_suggesting",
-    "project_scamper",
-  ];
+  // demand via wiki_search / wiki_read. Generic pages here; an installation
+  // names its own list (the owner's and family's pages, a project) in
+  // agent/local/config/wiki.json `default_pins`.
+  const { localConfig } = require("../lib/instance.cjs");
+  const DEFAULT_PINS = localConfig("wiki", {
+    default_pins: [
+      "user_profile",
+      "user_preferences",
+      "user_schedule",
+    ],
+  }).default_pins;
   const dryRun = Boolean(flag("dry-run", false));
   const results = [];
   for (const id of DEFAULT_PINS) {
@@ -636,6 +691,12 @@ try {
       break;
     case "search":
       cmdSearch();
+      break;
+    case "map":
+      cmdMap();
+      break;
+    case "recent":
+      cmdRecent();
       break;
     case "links":
       cmdLinks();

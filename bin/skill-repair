@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+// skill-repair — CLI over the same-day repair queue (lib/skill-repair.mjs).
+//
+//   skill-repair list                                  pending + last 10 finished
+//   skill-repair request --skill S --action A --error E [--diagnostic D] [--url U] [--action-file F] [--producer P] [--no-kick]
+//   skill-repair next                                  claim the next pending item (JSON), or exit 3 when empty
+//   skill-repair done <id> --outcome repaired|not_repairable|transient|failed [--note N] [--commit SHA]
+//
+// The skill-repair job (jobs/skill-repair.md) uses next / done. Producers in
+// code import requestRepair() directly; `request` is for scripts and by-hand use.
+
+import { loadQueue, saveQueue, requestRepair, claimNext, finish, releaseStale } from "../lib/skill-repair.mjs";
+
+const argv = process.argv.slice(2);
+const opt = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null; };
+const cmd = argv[0];
+
+if (cmd === "list") {
+  const q = loadQueue();
+  console.log(JSON.stringify({ pending: q.pending, recent: q.history.slice(-10) }, null, 2));
+} else if (cmd === "request") {
+  const id = requestRepair({
+    skill: opt("--skill"), action: opt("--action"), error: opt("--error"), diagnostic: opt("--diagnostic"),
+    url: opt("--url"), action_file: opt("--action-file"), producer: opt("--producer") || "manual",
+  }, { kick: !argv.includes("--no-kick") });
+  console.log(id || "not queued");
+  process.exit(id ? 0 : 2);
+} else if (cmd === "next") {
+  const q = loadQueue();
+  releaseStale(q);
+  const item = claimNext(q);
+  saveQueue(q);
+  if (!item) process.exit(3);
+  console.log(JSON.stringify(item, null, 2));
+} else if (cmd === "done") {
+  const id = argv[1];
+  const outcome = opt("--outcome");
+  if (!id || !["repaired", "not_repairable", "transient", "failed"].includes(outcome)) {
+    console.error("usage: skill-repair done <id> --outcome repaired|not_repairable|transient|failed [--note N] [--commit SHA]");
+    process.exit(64);
+  }
+  const q = loadQueue();
+  const done = finish(q, id, outcome, opt("--note") || "", opt("--commit"));
+  if (!done) { console.error(`no pending item ${id}`); process.exit(2); }
+  saveQueue(q);
+  console.log(JSON.stringify(done));
+} else {
+  console.error("usage: skill-repair list | request ... | next | done <id> --outcome ...");
+  process.exit(64);
+}

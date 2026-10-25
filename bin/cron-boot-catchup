@@ -1,0 +1,73 @@
+#!/bin/bash
+# cron-boot-catchup — on boot, replay crons missed during system downtime.
+# Triggered by ~/Library/LaunchAgents/com.merlin.cron-boot-catchup.plist
+# (RunAtLoad=true). Waits 300s for daemons + network to settle, then computes
+# the outage window from cron-runs.jsonl (preferred) or `last reboot` (fallback)
+# and invokes cron-catchup --execute if the gap is meaningful (>5 min).
+
+set -u
+# The installation (MERLIN_INSTALL_TOOLS) and the node to run (MERLIN_NODE).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
+LOG="$MERLIN_INSTALL_TOOLS/agent/logs/cron-boot-catchup.log"
+mkdir -p "$(dirname "$LOG")"
+exec >> "$LOG" 2>&1
+
+echo "===== $(date) boot-catchup check ====="
+
+# Wait for the system to settle (network, process-manager, supervisors)
+sleep 300
+
+RUNS_LOG="$MERLIN_INSTALL_TOOLS/data/cron-runs.jsonl"
+NOW_FMT=$(date "+%Y-%m-%d %H:%M")
+NOW_S=$(date +%s)
+
+START_FMT=""
+START_S=""
+
+# Source of truth: last cron-run end timestamp
+if [ -s "$RUNS_LOG" ]; then
+  LAST_ISO=$(tail -200 "$RUNS_LOG" | /usr/bin/python3 -c "
+import json, sys
+ends = []
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try:
+        e = json.loads(l).get('end')
+        if e: ends.append(e)
+    except: pass
+print(max(ends) if ends else '', end='')
+" 2>/dev/null)
+  if [ -n "$LAST_ISO" ]; then
+    # ISO 2026-05-26T08:43:00.000Z → strip fractional + Z for date parsing
+    CLEAN=$(echo "$LAST_ISO" | sed -E 's/\.[0-9]+Z?$//; s/Z$//')
+    START_FMT=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$CLEAN" "+%Y-%m-%d %H:%M" 2>/dev/null || true)
+    START_S=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$CLEAN" "+%s" 2>/dev/null || true)
+    [ -n "$START_FMT" ] && echo "Source: cron-runs.jsonl last end = $LAST_ISO"
+  fi
+fi
+
+# Fallback: previous reboot timestamp from `last`
+if [ -z "$START_FMT" ]; then
+  LASTLINE=$(last reboot | awk 'NR==2 {print $4, $5, $6, $7}')
+  if [ -n "$LASTLINE" ]; then
+    START_FMT=$(date -j -f "%a %b %d %H:%M" "$LASTLINE" "+%Y-%m-%d %H:%M" 2>/dev/null || true)
+    START_S=$(date -j -f "%a %b %d %H:%M" "$LASTLINE" "+%s" 2>/dev/null || true)
+    [ -n "$START_FMT" ] && echo "Source: last reboot fallback = $LASTLINE"
+  fi
+fi
+
+if [ -z "$START_FMT" ] || [ -z "$START_S" ]; then
+  echo "Cannot determine outage window — skipping catchup"
+  exit 0
+fi
+
+GAP_MIN=$(( (NOW_S - START_S) / 60 ))
+if [ "$GAP_MIN" -le 5 ]; then
+  echo "Gap only ${GAP_MIN}m — no catchup needed"
+  exit 0
+fi
+
+echo "Outage window: $START_FMT → $NOW_FMT (${GAP_MIN}m). Running cron-catchup..."
+exec "${MERLIN_NODE:-node}" "$MERLIN_INSTALL_TOOLS/bin/cron-catchup" \
+  --start "$START_FMT" --end "$NOW_FMT" --execute

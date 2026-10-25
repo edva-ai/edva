@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// self-improve-skip — mark an improvement card as "we're not implementing this",
+// or reverse that decision.
+//
+// The user's primary path is the card's own right-click/long-press menu in the app
+// (Skip / Unskip). This CLI is the break-glass equivalent, and — more
+// importantly — the read surface every improvement-authoring job MUST consult
+// before proposing anything: a skip that gets re-proposed next Tuesday is not a
+// skip, it's a snooze. `self-improve-skip list` is that roster.
+//
+// Skip is deliberately NOT a `status` value: it rides its own boolean so the
+// lifecycle underneath is preserved and unskip restores it exactly (a card
+// skipped out of `apply_failed` comes back retryable, not back to square one).
+// See data/migrations/20260728-self-improve-skip.sql.
+//
+// Usage:
+//   self-improve-skip list              — every skipped card (the do-not-repropose roster)
+//   self-improve-skip <id>              — skip it
+//   self-improve-skip --undo <id>       — unskip it (re-arms a pending card's TTL)
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!K) { console.error("self-improve-skip: no SUPABASE_SERVICE_ROLE_KEY"); process.exit(1); }
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
+
+const store = {
+  async getApproval(id) {
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}&select=*&limit=1`, { headers: H });
+    const d = r.ok ? await r.json() : []; return d[0] || null;
+  },
+  async updateApproval(id, patch) {
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}`, { method: "PATCH", headers: H, body: JSON.stringify(patch) });
+    if (!r.ok) throw new Error(`update ${r.status}: ${await r.text()}`);
+  },
+};
+
+const u = createUnifiedApproval({ store, deviceKeys: { getKey: async () => null }, postSuggestion: null, applyItem: async () => ({ ok: false }) });
+
+const args = process.argv.slice(2);
+const undo = args.includes("--undo");
+const id = args.find((a) => !a.startsWith("--"));
+
+if (!id) {
+  console.error("usage: self-improve-skip list | <id> | --undo <id>");
+  process.exit(64);
+}
+
+if (id === "list") {
+  const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?skipped=is.true&select=id,item_type,summary,status,skipped_at&order=skipped_at.desc&limit=50`, { headers: H });
+  const rows = r.ok ? await r.json() : [];
+  if (!rows.length) { console.log("No skipped improvements."); process.exit(0); }
+  console.log(`${rows.length} skipped improvement(s) — do NOT re-propose these:\n`);
+  for (const row of rows) {
+    console.log(`${row.id}  [${row.item_type}, was ${row.status}]`);
+    console.log(`  ${row.summary}`);
+    console.log(`  skipped ${row.skipped_at ? new Date(row.skipped_at).toISOString() : "(unknown)"}\n`);
+  }
+  process.exit(0);
+}
+
+const res = await u.setSkipped(id, !undo);
+if (!res.ok) { console.error(`✗ ${res.reason}`); process.exit(1); }
+if (res.already) { console.log(`= ${id} was already ${undo ? "un-skipped" : "skipped"} — no change.`); process.exit(0); }
+console.log(undo
+  ? `✓ Un-skipped ${id} — back to ${res.status}${res.status === "pending" ? " with a fresh 24h approval window" : ""}.`
+  : `✓ Skipped ${id} (was ${res.status}) — it will not be applied or re-proposed.`);

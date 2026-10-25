@@ -18,13 +18,11 @@ At https://supabase.com:
 - Service-role key → Settings → API → `service_role` (this is the secret one).
 - Anon key → Settings → API → `anon` `public`.
 
-Add to `.env`:
+Record the project in `agent/local/instance.json` (`"supabase_project": "<ref>"` — `merlin init` asks for it; `MERLIN_SUPABASE_PROJECT` in `.env` overrides), the public anon key in `agent/local/config/supabase.json` (`{"anon_key": "..."}`), and the secret in `.env`:
 
 ```
-SUPABASE_URL=https://<ref>.supabase.co
-MERLIN_SUPABASE_PROJECT=<ref>
-SUPABASE_ANON_KEY=eyJ...
-SUPABASE_SERVICE_ROLE_KEY=eyJ...
+SUPABASE_SERVICE_ROLE_KEY=...
+# SUPABASE_URL defaults to https://<supabase_project>.supabase.co; set it only for a custom domain.
 ```
 
 For the MCP server's Management-API access (creating/inspecting projects via the agent):
@@ -99,14 +97,14 @@ Start the agent (`./bin/merlin up`), check the logs:
 [phone-channel] ready
 ```
 
-If you see `FATAL: SUPABASE_SERVICE_ROLE_KEY not set in .env`, the env var didn't propagate — check that `.env` is in `${MERLIN_HOME}/.env` (not somewhere else) and that `process-manager.mjs` loaded it (look for `[process-manager]` startup log lines).
+If you see `FATAL: SUPABASE_SERVICE_ROLE_KEY not set in .env`, the env var didn't propagate — check that `.env` sits at `$MERLIN_HOME/.env` and that `process-manager.mjs` loaded it (it logs a warning when it cannot).
 
 ## 4. Companion app pairing
 
 For the iOS/macOS companion app at `apps/companion/`:
 
 1. Build per [`apps/companion/CODE-SIGNING.md`](../../apps/companion/CODE-SIGNING.md).
-2. In the app's `SupabaseManager.swift`, fill in your `SUPABASE_URL` + `SUPABASE_ANON_KEY`.
+2. The app sources carry placeholders, not a project: replace `${MERLIN_SUPABASE_PROJECT}` and `${MERLIN_SUPABASE_ANON_KEY}` in `apps/companion/Merlin/SupabaseManager.swift` (and, for Trainer, `apps/trainer/Trainer/Services/TrainerSupabase.swift` plus the `SupabaseURL` / `SupabaseAnonKey` keys in `apps/trainer/Trainer/Info.plist`) with your project ref and anon key in your local build — or inject them at build time — and don't commit the filled-in values (`.tools/sanitize-guard.py` flags a committed JWT).
 3. Run the app, sign in (Google Sign-In is the default; the app exchanges the Google credential for a Supabase session).
 4. The app subscribes to `merlin_messages` and posts new user messages there. The phone-channel daemon on your host sees them via Realtime and routes them to the chat-supervisor.
 
@@ -132,13 +130,6 @@ create policy "users can insert their own messages"
 
 A typical chat-only deployment fits in Supabase's free tier (500 MB DB + 50 MB file storage + 2 GB egress + unlimited Realtime). If you also enable health-data sync (10+ tables, 10k+ rows/day depending on Apple Health activity), you'll need the Pro plan ($25/month).
 
-## Migrating off a personal project
+## A dedicated project for the agent
 
-If you previously had a Supabase project tied to a personal account (the original gandalf source did), the cleanest migration is:
-
-1. Create a fresh Supabase project under a dedicated service-identity email.
-2. Apply the schema above.
-3. Update `.env` with the new credentials.
-4. Optionally bulk-import historical message rows via SQL editor.
-
-This pattern (separate Supabase identity for the agent's operational data, distinct from your personal Supabase account) is what we run — see the original [§ 4.2 in the rebuild guide](../../system/architecture.md). It keeps token scope minimal and rotation simple.
+Give the agent's operational data its own Supabase project (and, ideally, its own account identity) rather than reusing a personal one: token scope stays minimal, rotation stays simple, and nothing else breaks when you reset it.

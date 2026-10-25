@@ -8,15 +8,13 @@
 # Usage: runs via launchd on a schedule, auto-removes itself after 2 days.
 
 set -euo pipefail
-: "${MERLIN_HOME:=${HOME}/Dev/merlin}"
 
-
-TMUX=tmux
+TMUX=/opt/homebrew/bin/tmux
 SESSION=claude
-LOGDIR="${MERLIN_HOME}/agent/logs"
+LOGDIR="$HOME/Dev/merlin/agent/logs"
 LOG="$LOGDIR/resilience-test.log"
 PLIST="$HOME/Library/LaunchAgents/ai.claude.resilience-test.plist"
-MERLIN="${MERLIN_HOME}/bin/merlin-send-curl"
+MERLIN="$HOME/Dev/merlin/bin/merlin-send-curl"
 
 # Auto-expire: remove ourselves after 2 days from first run
 CREATED_FILE="$LOGDIR/.resilience-test-created"

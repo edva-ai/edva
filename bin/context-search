@@ -6,9 +6,6 @@
 //   context-search stats                      — show entry counts per source
 
 import { createRequire } from "node:module";
-const path = require("node:path");
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
-
 const require = createRequire(import.meta.url);
 const cm = require("../lib/context-memory");
 
@@ -25,7 +22,7 @@ const READ_HINTS = {
   notes: (id) => `notes_read "${id}"`,
   imsg: (id) => `imsg_read "${id}"`,
   email: () => `email_mem_search`,
-  files: (id) => `Read ${MERLIN_HOME}/${id}`,
+  files: (id) => `Read ~/Dev/merlin/${id}`,
   docs: (id) => `Read ~/${id}`,
   gdrive: (id, meta) => meta?.webViewLink || `Google Drive file ${id}`,
   wiki: (id) => `wiki_read "${id}"`,

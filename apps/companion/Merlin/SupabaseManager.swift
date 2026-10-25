@@ -11,7 +11,7 @@ import UIKit
 enum SupabaseManager {
     static let url = URL(string: "https://${MERLIN_SUPABASE_PROJECT}.supabase.co")!
     // Supabase anon JWT — intentionally public (RLS enforces access, not secrecy).
-    static let anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zem93cmtqaGZzdHB0bnNzcnprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMDU2NjAsImV4cCI6MjA5MTg4MTY2MH0.seXkEaAFoc5Zw-MTj1dNKMR5hSnGvf1ijjv3o5WAs20"
+    static let anonKey = "${MERLIN_SUPABASE_ANON_KEY}"
 
     // OAuth redirect — must match a CFBundleURLScheme in Info.plist and the
     // Supabase Auth "Redirect URLs" allowlist (Dashboard → Auth → URL Configuration).

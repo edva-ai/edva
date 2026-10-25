@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // memory — hybrid (FTS5 + semantic) retrieval over auto-memory files.
 //
-// Auto-memory lives at ~/.claude/projects/-Users-mraccah-Dev-merlin/memory/*.md
+// Auto-memory lives at ~/.claude/projects/<project-slug>/memory/*.md
 // and is loaded into every Claude Code conversation via MEMORY.md. This CLI
 // adds the retrieval/ranking/logging layer — use it when the agent needs
 // paraphrase-tolerant search over the profile, feedback rules, projects, etc.
@@ -22,12 +22,10 @@ const path = require("node:path");
 const os = require("node:os");
 const ms = require("../lib/memory-store.js");
 const mlint = require("../lib/memory-lint.js");
+const { installTools } = require("../lib/root.cjs");
 
 const HOME = os.homedir();
-const DEFAULT_EVAL_CASES = path.join(
-  HOME,
-  "dev/merlin/data/memory-eval-cases.json",
-);
+const DEFAULT_EVAL_CASES = installTools("data/memory-eval-cases.json");
 
 const args = process.argv.slice(2);
 const [cmd, ...rest] = args;
@@ -102,7 +100,7 @@ function preReindexTarball() {
   if (Boolean(flag("no-snapshot", false))) return;
   if (process.env.MEMORY_SKIP_SNAPSHOT === "1") return;
   const snapshotDir = process.env.MEMORY_SNAPSHOT_DIR ||
-    path.join(HOME, "Dev/merlin/data/memory-snapshots");
+    installTools("data/memory-snapshots");
   try {
     fs.mkdirSync(snapshotDir, { recursive: true });
     const ts = new Date()
@@ -251,7 +249,7 @@ function cmdList() {
 
 function cmdShow() {
   const file = positional()[0];
-  if (!file) die("show: need a memory filename, e.g. `memory show user_food_taste.md`");
+  if (!file) die("show: need a memory filename, e.g. `memory show user_profile.md`");
   const rows = ms.listEntries({ file });
   if (!rows.length) die(`show: no indexed chunks for ${file}`);
 

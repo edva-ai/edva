@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// p1-sender — manage the P1 sender allowlist (data/p1-senders.json).
+//
+// A sender on this list is ALWAYS P1, no matter what any fast-path, the local
+// classifier, or an LLM judgment would otherwise say. It is the programmatic
+// answer to "always treat mail from X as urgent" — the alternative was a new
+// prose rule in email-triage-rules.md plus a regex in local-triage-rules.json,
+// i.e. two homes for one fact and no way to remove it later.
+//
+// Consumers: lib/local-triage.mjs (local classifier — never auto-P3 one
+// of these) and agent/supervisor/gmail-source.mjs (intake cascade —
+// stamps `p1` + star before any fast-path can swallow the message).
+//
+// Usage:
+//   p1-sender add <pattern> [--label <label>] [--reason <text>] [--regex]
+//   p1-sender remove <pattern>
+//   p1-sender list [--json]
+//   p1-sender check --sender <email> [--json]
+//
+// check exit codes: 0 = P1 sender, 3 = no match, 1 = usage/error.
+// (0/3 mirrors `gmail-action reply-to-me`, so intake can treat both the same.)
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { triageLog } = require("../lib/triage-log.js");
+
+const HOME = process.env.HOME || "";
+const FILE = path.join(HOME, "Dev/merlin/data/p1-senders.json");
+const SPAM_FILE = path.join(HOME, "Dev/merlin/data/spam-blocklist.json");
+
+function load() {
+  try {
+    const data = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    if (!Array.isArray(data.senders)) data.senders = [];
+    return data;
+  } catch {
+    return { senders: [] };
+  }
+}
+
+function save(data) {
+  const tmp = FILE + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
+  fs.renameSync(tmp, FILE);
+}
+
+// Match against the address only — a spoofed display name must not be able to
+// buy itself a P1. Callers may pass either a full From header or a bare address.
+export function extractAddr(from) {
+  if (!from) return "";
+  const m = String(from).match(/<([^>]+)>/);
+  return (m ? m[1] : String(from)).trim().toLowerCase();
+}
+
+export function matchP1Sender(from, data, subject = "") {
+  const addr = extractAddr(from);
+  if (!addr) return null;
+  for (const e of (data || load()).senders) {
+    let hit = false;
+    if (e.pattern_re) { try { hit = new RegExp(e.pattern_re, "i").test(addr); } catch {} }
+    else if (e.pattern) hit = addr.includes(String(e.pattern).toLowerCase());
+    if (!hit) continue;
+    // Two optional subject conditions, both narrow by design. A sender needing
+    // more than one of each is a content rule, not a list entry.
+    //
+    // `only_subject_re` — the sender is P1 ONLY for this subject shape, and
+    // classified normally otherwise (today: DocuSign, where a request for a
+    // signature is urgent and a completion notice is not). Fails CLOSED: an
+    // unreadable regex means no P1, because the sender is not urgent by default.
+    //
+    // `unless_subject_re` — the sender is P1 EXCEPT for this subject shape
+    // (today: a vendor's `[Sandbox]` test artifacts, which have their own
+    // deliberate P3 intake-skip rule this list would otherwise override). Fails
+    // OPEN: an unreadable regex leaves the P1 in place, because the sender IS
+    // urgent by default. Both directions fail toward the sender's own default.
+    if (e.only_subject_re) {
+      let included = false;
+      try { included = new RegExp(e.only_subject_re, "i").test(subject || ""); } catch {}
+      if (!included) continue;
+    }
+    if (e.unless_subject_re) {
+      try { if (new RegExp(e.unless_subject_re, "i").test(subject || "")) continue; } catch {}
+    }
+    return e;
+  }
+  return null;
+}
+
+function parseArgs(args) {
+  const out = { _: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--sender" && args[i + 1]) out.sender = args[++i];
+    else if (a === "--label" && args[i + 1]) out.label = args[++i];
+    else if (a === "--reason" && args[i + 1]) out.reason = args[++i];
+    else if (a === "--subject" && args[i + 1]) out.subject = args[++i];
+    else if (a === "--unless-subject" && args[i + 1]) out.unlessSubject = args[++i];
+    else if (a === "--only-subject" && args[i + 1]) out.onlySubject = args[++i];
+    else if (a === "--regex") out.regex = true;
+    else if (a === "--json") out.json = true;
+    else out._.push(a);
+  }
+  return out;
+}
+
+function usage() {
+  console.log(`p1-sender — senders that are ALWAYS P1
+
+  p1-sender add <pattern> [--label <label>] [--reason <text>] [--regex]
+                          [--only-subject <regex>] [--unless-subject <regex>]
+  p1-sender remove <pattern>
+  p1-sender list [--json]
+  p1-sender check --sender <email> [--subject <text>] [--json]
+
+<pattern> is a substring of the sender's email address (e.g. "@irs.gov"),
+matched case-insensitively against the address only — never the display name.
+--regex stores it as a JS regex instead.
+
+--only-subject makes the sender P1 for that subject shape ONLY (classified
+normally otherwise); --unless-subject carves one shape back out of an
+otherwise-P1 sender. Use both sparingly — a sender needing several wants a
+content rule in local-triage-rules.json instead.
+
+--label is the topical label hint (${LABELS.join(" | ")}).
+Triage still assigns the final label; intake stamps
+priority only.
+
+Changes take effect on the next email — no restart. The spam blocklist still
+wins (email-triage-rules.md Step 0b).`);
+}
+
+// Topical labels a P1 sender may carry: the triage taxonomy minus spam.
+const LABELS = require("../lib/triage-labels.cjs").LABELS.filter((l) => l !== "spam");
+const cmd = process.argv[2];
+const opts = parseArgs(process.argv.slice(3));
+const today = new Date().toISOString().slice(0, 10);
+
+if (!cmd || cmd === "help" || cmd === "--help") {
+  usage();
+
+} else if (cmd === "add") {
+  const pattern = (opts.sender || opts._[0] || "").trim().toLowerCase();
+  if (!pattern) { console.error("Usage: p1-sender add <pattern> [--label <label>] [--reason <text>]"); process.exit(1); }
+  if (opts.label && !LABELS.includes(opts.label)) {
+    console.error(`Unknown label "${opts.label}". One of: ${LABELS.join(", ")}`); process.exit(1);
+  }
+  if (opts.regex) { try { new RegExp(pattern); } catch (e) { console.error(`Invalid regex: ${e.message}`); process.exit(1); } }
+  if (opts.unlessSubject) { try { new RegExp(opts.unlessSubject); } catch (e) { console.error(`Invalid --unless-subject regex: ${e.message}`); process.exit(1); } }
+  if (opts.onlySubject) { try { new RegExp(opts.onlySubject); } catch (e) { console.error(`Invalid --only-subject regex: ${e.message}`); process.exit(1); } }
+  const data = load();
+  const key = opts.regex ? "pattern_re" : "pattern";
+  if (data.senders.some((e) => (e.pattern_re || e.pattern) === pattern)) {
+    console.log(`Already P1: ${pattern}`); process.exit(0);
+  }
+  // A sender cannot be both spam-blocked and P1 — the blocklist wins at Step 0b,
+  // so the entry would silently never fire. Say so rather than write a dead rule.
+  try {
+    const spam = JSON.parse(fs.readFileSync(SPAM_FILE, "utf8"));
+    const hit = (spam.blocklist?.senders || []).find((s) => pattern.includes(s.pattern));
+    if (hit) console.log(`⚠ warning: "${pattern}" also matches spam blocklist "${hit.pattern}" — the blocklist wins at intake. Run: spam-filter unblock --sender ${hit.pattern}`);
+  } catch {}
+  const entry = { [key]: pattern, added: today };
+  if (opts.label) entry.label = opts.label;
+  if (opts.reason) entry.reason = opts.reason;
+  if (opts.onlySubject) entry.only_subject_re = opts.onlySubject;
+  if (opts.unlessSubject) entry.unless_subject_re = opts.unlessSubject;
+  data.senders.push(entry);
+  save(data);
+  triageLog("P1-SENDER-ADD", { pattern, label: opts.label || "", reason: opts.reason || "" });
+  console.log(`P1 sender added: ${pattern}${opts.label ? ` [${opts.label}]` : ""}${opts.reason ? ` (${opts.reason})` : ""}`);
+
+} else if (cmd === "remove" || cmd === "rm") {
+  const pattern = (opts.sender || opts._[0] || "").trim().toLowerCase();
+  if (!pattern) { console.error("Usage: p1-sender remove <pattern>"); process.exit(1); }
+  const data = load();
+  const idx = data.senders.findIndex((e) => (e.pattern_re || e.pattern) === pattern);
+  if (idx === -1) { console.log(`Not on the P1 sender list: ${pattern}`); process.exit(0); }
+  data.senders.splice(idx, 1);
+  save(data);
+  triageLog("P1-SENDER-REMOVE", { pattern });
+  console.log(`P1 sender removed: ${pattern}`);
+
+} else if (cmd === "list") {
+  const data = load();
+  if (opts.json) { console.log(JSON.stringify(data.senders, null, 2)); process.exit(0); }
+  if (!data.senders.length) { console.log("(no P1 senders)"); process.exit(0); }
+  console.log(`P1 senders (${data.senders.length}) — always urgent:\n`);
+  for (const e of data.senders) {
+    const pat = e.pattern_re ? `/${e.pattern_re}/` : e.pattern;
+    const only = e.only_subject_re ? `  [ONLY subject /${e.only_subject_re}/]` : "";
+    const unless = e.unless_subject_re ? `  [except subject /${e.unless_subject_re}/]` : "";
+    console.log(`  ${pat.padEnd(28)} ${(e.label || "-").padEnd(14)} ${e.reason || ""}${only}${unless}${e.added ? `  (added ${e.added})` : ""}`);
+  }
+
+} else if (cmd === "check") {
+  const from = opts.sender || opts._[0];
+  if (!from) { console.error("Usage: p1-sender check --sender <email>"); process.exit(1); }
+  const hit = matchP1Sender(from, null, opts.subject || "");
+  if (opts.json) console.log(JSON.stringify(hit ? { p1: true, ...hit } : { p1: false }));
+  else if (hit) console.log(`P1: ${extractAddr(from)} matches "${hit.pattern_re || hit.pattern}"${hit.reason ? ` (${hit.reason})` : ""}`);
+  else console.log(`NO-MATCH: ${extractAddr(from)} is not a P1 sender`);
+  process.exit(hit ? 0 : 3);
+
+} else {
+  console.error(`Unknown command: ${cmd}`);
+  usage();
+  process.exit(1);
+}

@@ -1,0 +1,17 @@
+{
+  "_comment": "This installation's own scheduled tasks. Copy to agent/local/tasks.json (gitignored). lib/registry.cjs merges it with system/tasks.json: an entry with a new `name` is added, an entry whose `name` is a kernel task overrides only the fields it lists (so { \"name\": \"hum-review\", \"paused\": true } pauses a kernel task). `merlin tasks pause|resume` and `merlin doctor --repair` write here, never to the kernel file. The same merge applies to agent/local/services.json, agent/local/job-routing.json (key: jobs.<job>) and agent/local/chrome-jobs.json.",
+  "tasks": [
+    {
+      "name": "weekly-report",
+      "schedule": "30 8 * * 1",
+      "schedule_human": "Mondays 08:30",
+      "trigger_script": null,
+      "webhook_url": "http://localhost:9082",
+      "webhook_task": "WEEKLY REPORT",
+      "job": "weekly-report",
+      "delivers_to": "email",
+      "phrases": ["weekly report", "monday report"],
+      "description": "Summarize last week's calendar and closed tasks. Playbook: agent/ops-agent/jobs/_ext/weekly-report.md."
+    }
+  ]
+}

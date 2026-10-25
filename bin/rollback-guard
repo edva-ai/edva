@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+// rollback-guard — Claude Code PreToolUse hook (matcher "Bash") for
+// Merlin's own sessions: snapshot uncommitted work to
+// refs/merlin/pre-destructive/<stamp> before a destructive git command, or
+// block it (exit 2) when the snapshot fails. Logic and rationale:
+// lib/rollback-guard.mjs. Wired in by the supervisors' --settings
+// (lib/rollback-guard-settings.mjs) and the fork launchers.
+//
+//   echo '{"tool_name":"Bash","tool_input":{"command":"git checkout ."},"cwd":"/repo"}' | rollback-guard
+//   rollback-guard --list      # the saved snapshots in this repo
+//   rollback-guard --settings-json ['<base settings json>']
+//       # prints the base settings with this hook merged in, for a fork
+//       # launcher's single --settings argument (run-ephemeral-opus.sh & co.)
+
+import { runHook, REF_PREFIX } from "../lib/rollback-guard.mjs";
+import { gitGuardHooks } from "../lib/rollback-guard-settings.mjs";
+import { execFileSync } from "node:child_process";
+
+const si = process.argv.indexOf("--settings-json");
+if (si >= 0) {
+  const base = process.argv[si + 1] ? JSON.parse(process.argv[si + 1]) : {};
+  const hooks = { ...(base.hooks || {}) };
+  hooks.PreToolUse = [...(hooks.PreToolUse || []), ...gitGuardHooks().PreToolUse];
+  process.stdout.write(JSON.stringify({ ...base, hooks }));
+  process.exit(0);
+}
+
+if (process.argv.includes("--list")) {
+  try {
+    process.stdout.write(execFileSync("git", ["for-each-ref", "--sort=-creatordate",
+      "--format=%(creatordate:iso8601) %(refname) %(subject)", REF_PREFIX], { encoding: "utf8" }));
+  } catch (e) { process.stderr.write(String(e.message) + "\n"); process.exit(1); }
+  process.exit(0);
+}
+
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => { input += c; });
+process.stdin.on("end", () => {
+  const r = runHook(input);
+  if (r.stdout) process.stdout.write(r.stdout + "\n");
+  if (r.stderr) process.stderr.write(r.stderr + "\n");
+  process.exit(r.code);
+});

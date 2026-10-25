@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+"use strict";
+// doctor-preflight-check — shared pre-flight `merlin doctor` step for job
+// playbooks. Log-and-continue ONLY: never pings the user on any channel.
+//
+// Why this exists (2026-07-15): ~20 job playbooks each hand-rolled the same
+// "run merlin doctor, ping the user on failure" pre-flight step. The agent's
+// own sandboxed Bash tool masks localhost connections (see the SessionStart
+// host-identity banner), so a healthy machine routinely looks broken from
+// inside a job-scoped turn — this fired repeated false "supervisors
+// unreachable" alerts (2026-07-10/11/12, then again via morning-digest and
+// event-watcher style playbooks on 2026-07-15). Per
+// agent/CLAUDE.md § System Channel, only watchdog.sh (which probes
+// from outside the sandbox) is authorized to author infra alerts — a
+// job-scoped turn must log and move on, never diagnose-and-page.
+//
+// Usage:
+//   doctor-preflight-check <job-slug>
+//
+// Runs `merlin doctor --json`, and on any failing check appends one line to
+// data/logs/<job-slug>-doctor.log. Always exits 0 — playbooks can call
+// this unconditionally with no failure handling of their own. Never calls
+// merlin-send-curl / merlin-notify / any outbound channel.
+
+const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
+
+const { installTools } = require("../lib/root.cjs");
+const HOME = process.env.HOME || os.homedir();
+const MERLIN_BIN = installTools("bin/merlin");
+const LOG_DIR = installTools("data/logs");
+
+function main() {
+  const jobSlug = process.argv[2];
+  if (!jobSlug) {
+    process.stderr.write("usage: doctor-preflight-check <job-slug>\n");
+    process.exit(0); // still exit 0 — pre-flight steps must never block a job
+  }
+
+  const r = spawnSync(MERLIN_BIN, ["doctor", "--json"], { encoding: "utf8", timeout: 30_000 });
+  if (r.status !== 0 || !r.stdout) {
+    // doctor itself failed to run — log and move on, don't guess why.
+    appendLog(jobSlug, `doctor-preflight-check: merlin doctor did not run cleanly (exit ${r.status}); ${(r.stderr || "").slice(0, 300)}`);
+    process.exit(0);
+  }
+
+  let checks;
+  try { checks = JSON.parse(r.stdout); } catch { checks = null; }
+  if (!Array.isArray(checks)) {
+    appendLog(jobSlug, "doctor-preflight-check: merlin doctor --json produced unparseable output");
+    process.exit(0);
+  }
+
+  const failing = checks.filter(c => !c.ok);
+  if (failing.length > 0) {
+    const summary = failing.map(c => `${c.name}: ${c.detail || "failed"}`).join(" | ");
+    appendLog(jobSlug, `${failing.length}/${checks.length} checks failing — ${summary}`);
+  }
+  // Silent on success — nothing to log, nothing to ping.
+  process.exit(0);
+}
+
+function appendLog(jobSlug, message) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const logPath = path.join(LOG_DIR, `${jobSlug}-doctor.log`);
+    fs.appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`);
+  } catch {
+    // Logging is best-effort — never let a log-write failure become a
+    // reason to do anything else (like pinging the user).
+  }
+}
+
+main();
