@@ -8,12 +8,15 @@
 //   merlin-notify --urgent "Leave now — tunnel is backing up"     (pierces Focus)
 
 import { createClient } from "@supabase/supabase-js";
-import { sendApnsPush } from "../lib/apns-push.mjs";
 import { createRequire } from "node:module";
+import { sendApnsPush } from "../lib/apns-push.mjs";
+
+const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv();
 
 // This installation's Supabase project (agent/local/instance.json) and
 // its public anon key (agent/local/config/supabase.json anon_key).
-const { instance, supabaseAnonKey } = createRequire(import.meta.url)("../lib/instance.cjs");
+const { instance, supabaseAnonKey } = require("../lib/instance.cjs");
 const SUPABASE_URL = `https://${instance().supabase_project}.supabase.co`;
 const SUPABASE_ANON_KEY = supabaseAnonKey();
 
@@ -39,7 +42,14 @@ if (!body) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// The push path reads device_tokens, merlin_messages and location_history.
+// Those tables are closed to the anon role, so use the service-role key from
+// .env; the anon key is only a fallback for a host without it.
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("merlin-notify: SUPABASE_SERVICE_ROLE_KEY not set in .env; falling back to the anon key");
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 try {
   const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent });
