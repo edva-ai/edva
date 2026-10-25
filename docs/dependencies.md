@@ -72,6 +72,8 @@ The shipped workflows (`.github/workflows/ios-testflight.yml`, `.github/workflow
 - **Use GitHub-hosted runners**: change `runs-on:` to `macos-latest` in both workflow files. Slower; you may need to add a `setup-xcode` step depending on which Xcode version you target.
 - **Set up a self-hosted runner**: dedicate a Mac (mini, laptop, anything) per [GitHub's docs](https://docs.github.com/en/actions/hosting-your-own-runners). Tag with the labels above. The runner config script generates a LaunchAgent automatically.
 
+**Keep a self-hosted runner off a public repo.** A runner attached to a public fork can be made to run other people's workflow code on that Mac, with access to its keychain and everything Merlin keeps on it. Attach the runner only to a private fork; if your fork is public, use GitHub-hosted runners.
+
 **Required GitHub Actions secrets** (set under Settings → Secrets and variables → Actions):
 
 | Secret | What |
