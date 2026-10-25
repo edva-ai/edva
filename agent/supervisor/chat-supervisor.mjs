@@ -183,6 +183,11 @@ const MAX_SESSION_TURNS_DEFAULT = 250;
 // Crash-loop recovery still runs off `consecutiveZeroTurns` (num_turns === 0).
 const NO_OP_DURATION_MS = 1500;
 
+// A usage-limit outage saved in session.json is picked up by the next process
+// while its hold is running or ended less than this long ago (_restoreQuotaState).
+const QUOTA_STATE_TTL_MS = 6 * 3_600_000;
+const QUOTA_RESTORE_MAX_HOLD_MS = 8 * 86_400_000;   // = dispatcher.mjs RATE_LIMIT_MAX_HOLD_MS
+
 // Context-size guard (added 2026-06-06). A long-lived --resume'd chat session grows
 // past the 200k standard window; Claude Code then auto-escalates to the 1M context
 // window, which on the Max subscription hits "Usage credits required for 1M context"
@@ -324,12 +329,16 @@ class ChatSupervisor {
     this.authErrorCount = 0;
     // Usage-limit hold (see _onQuotaRefusal). The deadline
     // lives here, not on the dispatcher, so it survives the dispatcher swap a
-    // restart does. One plain line to the user per outage.
+    // restart does. One plain line to the user per outage, and at most one
+    // "set aside" line. The outage is also saved in session.json, so a new
+    // supervisor process keeps the hold and does not announce it again.
     this.quotaHoldUntil = 0;
     this._quotaHoldTimer = null;
     this.quotaInfo = null;
     this.quotaOutage = false;
     this.quotaNoticeSent = false;
+    this.quotaDroppedNoticeSent = false;
+    this._restoreQuotaState();
     attachClaudeMdWatcher(this, {
       claudeMdPath: path.join(MERLIN_ROOT, this.cfg.cwd, "CLAUDE.md"),
       logPrefix: "[chat-supervisor]",
@@ -562,7 +571,7 @@ class ChatSupervisor {
         }
       }
       if (quota && t.source === "merlin") {
-        if (quota.dropped) this._quotaNotice(chatQuotaDroppedNotice({ info: quota.info, tz: userTz(), several: quota.merged > 0 }));
+        if (quota.dropped) this._maybeQuotaDroppedNotice({ info: quota.info, several: quota.merged > 0 });
         else if (quota.requeued || !t.replyCalled) this._maybeQuotaNotice({ requeued: quota.requeued });
       } else if (quota) {
         // A background turn (a wake, init, the context guard's /compact) hit the
@@ -574,6 +583,8 @@ class ChatSupervisor {
         this.eventLog.append({ kind: "quota_cleared", source: t.source });
         this.quotaOutage = false;
         this.quotaNoticeSent = false;
+        this.quotaDroppedNoticeSent = false;
+        this._saveQuotaState();
       }
       if (SUBSTRATE_RECORD && t) {
         try {
@@ -1131,7 +1142,52 @@ class ChatSupervisor {
     const what = requeued ? "put back at the front of the queue" : dropped ? "refused again on its one retry, so it is dropped" : "hit the limit mid-turn after doing work, so it is NOT re-run";
     console.error(`[chat-supervisor] QUOTA REFUSED: ${t.source} (${item?.id?.slice(0, 6) || "------"}) ${what}; holding dispatch until ${new Date(until).toISOString()} (${info.rateLimitType || "unknown"} window, queue=${this.dispatcher?.queue.length ?? 0})`);
     this.eventLog.append({ kind: "quota_refused", source: t.source, itemId: item?.id, requeued, dropped, inferred: !!info.inferred, rateLimitType: info.rateLimitType || null, resetsAt: info.resetsAt ?? null, holdUntil: new Date(until).toISOString() });
+    this._saveQuotaState();
     return { info, until, requeued, dropped, noWork, merged: (item?.mergedCount || 0) + (item?.quotaSeveral ? 1 : 0) };
+  }
+
+  // The outage, as session.json keeps it: the hold, the limit info and which
+  // lines the user already has. Written on every change, removed when the limit
+  // clears. A failed write costs only the restart guarantee, never the turn.
+  _saveQuotaState() {
+    try {
+      if (this.quotaOutage) {
+        this.state.data.quotaOutage = {
+          holdUntil: this.quotaHoldUntil, info: this.quotaInfo,
+          noticeSent: this.quotaNoticeSent, droppedNoticeSent: this.quotaDroppedNoticeSent,
+          savedAt: new Date().toISOString(),
+        };
+      } else {
+        delete this.state.data.quotaOutage;
+      }
+      this.state.save();
+    } catch (err) {
+      console.error(`[chat-supervisor] quota state not saved: ${err.message}`);
+    }
+  }
+
+  // A supervisor process started mid-outage picks the outage up where the last
+  // one left it: the hold is re-armed, and the lines already sent are not sent
+  // again. An outage whose hold ended more than QUOTA_STATE_TTL_MS ago is
+  // stale and dropped; one that ended more recently is kept without a hold, so
+  // the first good turn clears it as usual and a refusal before that adds no
+  // second line.
+  _restoreQuotaState() {
+    const saved = this.state.data.quotaOutage;
+    if (!saved) return;
+    const holdUntil = Number(saved.holdUntil) || 0;
+    if (holdUntil < Date.now() - QUOTA_STATE_TTL_MS) {
+      delete this.state.data.quotaOutage;
+      return;
+    }
+    this.quotaOutage = true;
+    this.quotaInfo = saved.info || null;
+    this.quotaNoticeSent = !!saved.noticeSent;
+    this.quotaDroppedNoticeSent = !!saved.droppedNoticeSent;
+    // Never longer than any hold rateLimitHoldUntil can set, whatever the file says.
+    if (holdUntil > Date.now()) this._holdForQuota(Math.min(holdUntil, Date.now() + QUOTA_RESTORE_MAX_HOLD_MS));
+    console.error(`[chat-supervisor] quota outage restored from session.json (hold until ${new Date(holdUntil).toISOString()}, notice ${this.quotaNoticeSent ? "already sent" : "not sent"}, set-aside notice ${this.quotaDroppedNoticeSent ? "already sent" : "not sent"})`);
+    this.eventLog.append({ kind: "quota_restored", holdUntil: new Date(holdUntil).toISOString(), noticeSent: this.quotaNoticeSent, droppedNoticeSent: this.quotaDroppedNoticeSent });
   }
 
   _holdForQuota(until) {
@@ -1154,7 +1210,21 @@ class ChatSupervisor {
   _maybeQuotaNotice({ requeued = true } = {}) {
     if (this.quotaNoticeSent) return;
     this.quotaNoticeSent = true;
+    this._saveQuotaState();
     this._quotaNotice(chatQuotaNotice({ info: this.quotaInfo, until: this.quotaHoldUntil, tz: userTz(), requeued }));
+  }
+
+  // At most one "set aside" line per outage. A later message refused on its
+  // retry in the same outage is still set aside, and logged, but not announced.
+  _maybeQuotaDroppedNotice({ info, several }) {
+    if (this.quotaDroppedNoticeSent) {
+      console.error(`[chat-supervisor] set-aside notice already sent this outage — not sending another`);
+      this.eventLog.append({ kind: "quota_notice_suppressed", which: "dropped" });
+      return;
+    }
+    this.quotaDroppedNoticeSent = true;
+    this._saveQuotaState();
+    this._quotaNotice(chatQuotaDroppedNotice({ info, tz: userTz(), several }));
   }
 
   _quotaNotice(text) {

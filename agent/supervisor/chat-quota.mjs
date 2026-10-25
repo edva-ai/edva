@@ -41,8 +41,9 @@ function parts(info, tz, now) {
 }
 
 /**
- * The one line the user gets per outage. `requeued` false means the limit landed
- * partway through a turn that had already done work, which is not re-run.
+ * The one line the user gets per outage, kept across a supervisor restart.
+ * `requeued` false means the limit landed partway through a turn that had
+ * already done work, which is not re-run.
  */
 export function chatQuotaNotice({ info, until, tz, now = Date.now(), requeued = true }) {
   const { which, reset } = parts(info, tz, now);
@@ -56,7 +57,8 @@ export function chatQuotaNotice({ info, until, tz, now = Date.now(), requeued = 
 }
 
 /**
- * A message refused again on its one retry is set aside, and the user is told so.
+ * A message refused again on its one retry is set aside, and the user is told so,
+ * once per outage (the supervisor's _maybeQuotaDroppedNotice).
  * `several`: messages the user sent during the hold merged into that retry.
  */
 export function chatQuotaDroppedNotice({ info, tz, now = Date.now(), several = false }) {

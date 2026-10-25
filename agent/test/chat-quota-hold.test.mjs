@@ -7,6 +7,9 @@
 // the real chat supervisor against a fake CLI that refuses in exactly that
 // shape, under a throwaway HOME with no Supabase key and a fake
 // merlin-send-curl, so nothing can reach the real chat or system channel.
+// The sandbox holds whatever the caller exports: MERLIN_HOME, which outranks
+// HOME in lib/root.cjs, is removed from the child's environment, and
+// SUPABASE_URL points at a closed local port (see the "never posts" test).
 //
 // Also here, because it shares the harness: a retry on a resumed session keeps
 // its safety net through the resume handshake's zero-work result.
@@ -225,7 +228,9 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     tmp = null;
   });
 
-  async function boot(claudeArgs, env = {}) {
+  // The throwaway installation: one per test, shared by every supervisor
+  // process the test starts in it.
+  function sandbox() {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "chat-quota-"));
     const root = path.join(tmp, "Dev/merlin/tools");
     for (const d of ["bin", "data", "agent/chat-agent", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
@@ -234,19 +239,29 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     fs.writeFileSync(path.join(root, "data/user-timezone.json"), JSON.stringify({ timezone: "Africa/Nairobi" }));
     const mock = path.join(tmp, "quota-claude.mjs");
     fs.writeFileSync(mock, QUOTA_CLAUDE);
-    const record = path.join(tmp, "record.log");
+    const stateDir = path.join(tmp, "state");
+    fs.mkdirSync(stateDir, { recursive: true });
+    return { mock, record: path.join(tmp, "record.log"), stateDir };
+  }
+
+  async function boot(claudeArgs, env = {}) {
+    return start(sandbox(), claudeArgs, env);
+  }
+
+  async function start(box, claudeArgs, env = {}) {
+    const { mock, record, stateDir } = box;
     const port = nextPort; nextPort += 3;
-    const cfg = path.join(tmp, "agents.json");
+    const cfg = path.join(tmp, `agents-${port}.json`);
     fs.writeFileSync(cfg, JSON.stringify({ agents: { "test-chat": {
       model: "mock", cwd: "agent/chat-agent", runtime: "supervisor", devChannels: [], permissionMode: "bypassPermissions",
       allowedTools: ["Bash"], remoteControlPrefix: "test-chat", supervisor: { healthPort: port },
     } } }));
-    const stateDir = path.join(tmp, "state");
-    fs.mkdirSync(stateDir, { recursive: true });
+    const childEnv = { ...process.env, HOME: tmp, SUPABASE_SERVICE_ROLE_KEY: "", SUPABASE_URL: "http://127.0.0.1:9", CHAT_SUBSTRATE: "loop", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env };
+    // Never the caller's installation, even when a test passes one in.
+    delete childEnv.MERLIN_HOME;
     proc = spawn(NODE, [CHAT_SUPERVISOR, "--agent", "test-chat", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--record", record, ...claudeArgs])], {
-      cwd: stateDir, stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, HOME: tmp, SUPABASE_SERVICE_ROLE_KEY: "", CHAT_SUBSTRATE: "loop", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env },
+      cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env: childEnv,
     });
     const stderr = [];
     proc.stderr.on("data", (b) => stderr.push(b.toString()));
@@ -258,7 +273,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     const NOTICE = /quota notice to [^:]+: (.*)$/;
     const notices = () => log().split("\n").map((l) => l.match(NOTICE)).filter(Boolean).map((m) => m[1]);
     const dispatch = (content, msgId, source = "merlin", priority = "high") => httpJson("POST", port, "/dispatch", { content, source, priority, msgId });
-    return { port, log, sent, notices, dispatch };
+    return { port, log, sent, notices, dispatch, box };
   }
 
   // Old code: the raw string went to the user as their answer and the turn was done.
@@ -317,6 +332,67 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     await sleep(1500);
     assert.equal(sent().length, 2, "tried twice, never a third time");
     assert.equal((await httpJson("GET", port, "/health")).queueDepth <= 1, true, "only a held init may remain");
+  });
+
+  it("sets aside a second message refused in the same outage without a second set-aside line", async () => {
+    const { log, sent, notices, dispatch } = await boot(["--mode", "noreset", "--refusals", "9"], { DISPATCHER_RATE_LIMIT_FALLBACK_HOLD_MS: "800" });
+    await dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
+    assert.ok(await waitFor(() => notices().length >= 2, 12000), `no set-aside line: ${log().slice(-2000)}`);
+    await dispatch("QUOTA-TEST and call the plumber", "m2");
+    const drops = () => log().split("\n").filter((l) => l.includes("refused again on its one retry, so it is dropped")).length;
+    assert.ok(await waitFor(() => drops() >= 2, 15000), `second message never set aside: ${log().slice(-2500)}`);
+    await sleep(300);
+    assertNoRawRelay(log());
+    assert.equal(notices().length, 2, `one hold line and one set-aside line: ${notices().join(" | ")}`);
+    assert.ok(notices()[1].startsWith("Sorry, I tried your message again"));
+    assert.ok(log().includes("set-aside notice already sent this outage"));
+    assert.equal(sent().length, 4, "each message tried twice, never a third time");
+  });
+
+  it("a new supervisor process started mid-outage keeps the hold and sends no second line", async () => {
+    const first = await boot(["--mode", "reset"]);
+    await first.dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
+    assert.ok(await waitFor(async () => (await httpJson("GET", first.port, "/health")).rateLimitHoldUntil), `never held: ${first.log().slice(-2000)}`);
+    const { rateLimitHoldUntil } = await httpJson("GET", first.port, "/health");
+    assert.equal(first.notices().length, 1);
+    proc.kill("SIGTERM");
+    await new Promise((r) => proc.on("exit", r));
+
+    const second = await start(first.box, ["--mode", "reset"]);
+    assert.ok(second.log().includes("quota outage restored from session.json"), second.log().slice(-1500));
+    assert.equal((await httpJson("GET", second.port, "/health")).rateLimitHoldUntil, rateLimitHoldUntil, "the same hold, carried across processes");
+    await second.dispatch("QUOTA-TEST and a second thought", "m2");
+    await sleep(3500); // past the new process's init timer
+    assert.deepEqual(second.notices(), [], "the new process does not announce the outage again");
+    assert.equal(second.sent().length, 1, "nothing reaches the CLI while held");
+  });
+
+  it("never posts to a real chat, even when the caller's environment names an installation with a key", async () => {
+    // A caller that exports MERLIN_HOME (a scratch copy of the repo, say)
+    // would otherwise make the child read that installation's .env and
+    // post the test's notices for real. A decoy installation with a key and a
+    // local stand-in for the Supabase endpoint show whether anything goes out.
+    const posts = [];
+    const sink = http.createServer((req, res) => {
+      let b = ""; req.on("data", (c) => (b += c));
+      req.on("end", () => { posts.push({ url: req.url, body: b }); res.writeHead(201, { "content-type": "application/json" }); res.end("[]"); });
+    });
+    await new Promise((r) => sink.listen(0, "127.0.0.1", r));
+    const decoy = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "chat-quota-decoy-"));
+    try {
+      for (const d of ["data", "agent/chat-agent", "agent/logs"]) fs.mkdirSync(path.join(decoy, "tools", d), { recursive: true });
+      fs.writeFileSync(path.join(decoy, ".env"), "SUPABASE_SERVICE_ROLE_KEY=decoy-key\n");
+      const { log, notices, dispatch } = await boot(["--mode", "reset"], { MERLIN_HOME: decoy, SUPABASE_URL: `http://127.0.0.1:${sink.address().port}` });
+      await dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
+      assert.ok(await waitFor(() => notices().length === 1, 8000), `no notice: ${log().slice(-2000)}`);
+      await sleep(500);
+      assert.deepEqual(posts, [], "nothing was posted");
+      assert.ok(log().includes("SUPABASE_SERVICE_ROLE_KEY not available"), "the notice had no key to post with");
+    } finally {
+      sink.closeAllConnections?.();
+      await new Promise((r) => sink.close(r));
+      fs.rmSync(decoy, { recursive: true, force: true });
+    }
   });
 
   it("tells the user once when a background turn hits the limit while their message waits behind it", async () => {
