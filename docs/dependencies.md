@@ -86,7 +86,7 @@ The shipped workflows (`.github/workflows/ios-testflight.yml`, `.github/workflow
 | `ASC_ISSUER_ID` | ASC API key issuer ID |
 | `ASC_PRIVATE_KEY` | ASC API key contents (the `.p8` file) |
 
-Plus the repo **variable** `MAC_INSTALLER_IDENTITY` — the full name of the "3rd Party Mac Developer Installer: … (TEAMID)" identity in the runner's keychain, used to sign the macOS package.
+Plus the secret `MAC_INSTALLER_IDENTITY` — the full name of the "3rd Party Mac Developer Installer: … (TEAMID)" identity in the runner's keychain, used to sign the macOS package. It is a secret, not a variable, because it names the developer and public repos have public build logs.
 
 See [Apple's docs](https://developer.apple.com/documentation/appstoreconnectapi/creating_api_keys_for_app_store_connect_api) for generating the ASC API key.
 
