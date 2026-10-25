@@ -6,7 +6,7 @@ project:
 | URL                                   | What hits it                                      |
 | ------------------------------------- | ------------------------------------------------- |
 | `GET  /px[/anything]?r=<tag>`         | The README tracking pixel (and any docs pixels).  |
-| `POST /install`                       | First-run install ping from `bin/merlin install`. |
+| `POST /install`                       | First-run install ping from `merlin init`.        |
 | `GET  /stats`                         | Aggregate, anonymous install counters (JSON).     |
 | `GET\|POST /usage`                    | Private Claude usage/cost rollup (token-gated).   |
 
@@ -83,7 +83,7 @@ merlin-cost-report --since 2d --push
 Read the rollup (default last 30 days, `?days=N` to widen):
 
 ```bash
-curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$(op read 'op://Dev/Merlin Telemetry Upstash KV/STATS_TOKEN')"
+curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$MERLIN_USAGE_TOKEN"
 ```
 
 ```jsonc
@@ -108,7 +108,7 @@ curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$(op read 'op:/
 - Anything from clients that send `DNT: 1` or set `MERLIN_NO_TELEMETRY=1` in
   their environment (handled by the CLI, not the server).
 - Anything the CLI didn't choose to send — there is no user-content collection,
-  no environment dump, no path enumeration. Look at `bin/merlin` to verify.
+  no environment dump, no path enumeration. Look at `bin/cli.d/_telemetry.mjs` to verify.
 
 ## Reality check on the README pixel
 
@@ -159,8 +159,8 @@ After the first deploy:
 1. Take the printed URL (e.g. `https://merlin-telemetry.vercel.app`).
 2. Insert it as `![](https://<url>/px?r=readme)` near the bottom of the root
    `README.md`.
-3. Set `MERLIN_TELEMETRY_URL=https://<url>/install` in the `bin/merlin install`
-   defaults (see `bin/merlin`).
+3. Point `DEFAULT_TELEMETRY_URL` in `bin/cli.d/_telemetry.mjs` at `https://<url>/install`
+   (or set `MERLIN_TELEMETRY_URL` per host).
 
 The URL is the only thing the public Merlin clones learn about your telemetry
 setup. Everything else is opaque to them.

@@ -1,0 +1,16 @@
+{
+  "_doc": "Jev question for bin/claim-check stage 2 — does a candidate (hum ping, reservoir idea, question) contradict known facts, or raise something the user already settled? Ported from that file's adjudicator prompt. Jev acts alone on pass/drop; rewrite always takes Claude's corrected text. See docs/jev.md. Kernel definition; an installation's own data/jev-questions/claim-check.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "notes": "Asymmetric risk: a wrong 'pass' re-asks something the user already settled — the most irritating failure; a wrong 'drop' removes a candidate before outbound-precheck ever sees it, leaving no trace in that gate's log. Hence 0.9, and while the site is in shadow a Claude 'drop' overrides a Jev 'pass'. Ground truth for a disagreement: do {{owner_id}}_said / other_memory actually ANSWER or CONTRADICT the candidate, or are they merely on the same subject? Two known classifier failure shapes this wording guards against: (1) claim-facts pairs every place with every date in the text, so bare 'SAME METRO: NO' lines for places the message only mentions read as contradictions — bin/claim-check renders Jev's copy of the facts with asserted vs mentioned places for that reason; (2) a candidate that AGREES with a settlement (repeats the new date the user gave and builds on it) can be misread as re-raising it.",
+  "questions": {
+    "verdict": {
+      "type": "choice",
+      "instructions": "A candidate message is about to be sent to the user. Decide ONLY whether it contradicts known facts or raises something the user has already settled. authoritative_facts are ground truth; a line saying 'SAME METRO: YES' is already correct — never drop or rewrite for a location mismatch it marks YES (a neighbourhood, borough, airport or suburb of the same metro is YES by design). {{owner_id}}_said is the user's own dated words: if they already answer, handle, or say not to raise this again, drop — re-asking a settled thing is the worst failure. A memory hit that is merely on the same subject is NOT grounds to drop; only an actual answer, decision or contradiction is. Pass is the default. A NO line contradicts the candidate only when the message itself puts the user in that place on that date, or needs them to be there; a place it only talks about (a property while they are away, an airport they connect through, where something is bought or used), or a NO for a date the message ties to a different fact, is not a contradiction. Agreeing with the user is not re-asking them. A candidate that repeats what their own words already decided (the new date, the plan they chose) and builds on it as settled is CONSISTENT with {{owner_id}}_said, and that agreement is never grounds to drop. Drop for a settled thing only when the candidate asks the user to decide, confirm or do again what their words already decided or handled, or still carries a premise they corrected.",
+      "criteria": {
+        "pass": "nothing contradicts it and nothing settles it — the default",
+        "rewrite": "still worth sending, but one premise is stale (e.g. the wrong city or a passed date) and must be corrected",
+        "drop": "the user already answered, handled, or asked not to raise it; or its core premise is false per the facts"
+      }
+    }
+  }
+}

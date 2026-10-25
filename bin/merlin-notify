@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+// merlin-notify — Send a push notification about Merlin messages (no DB write).
+// Usage:
+//   merlin-notify "Your morning briefing for Apr 5 is ready"
+//   merlin-notify --message-id <uuid> "P1 email ready for review"
+//   merlin-notify --title "Merlin" "Short summary body"
+//   merlin-notify --channel system "Watchdog: Ollama restarted"  (no badge)
+//   merlin-notify --urgent "Leave now — tunnel is backing up"     (pierces Focus)
+
+import { createClient } from "@supabase/supabase-js";
+import { sendApnsPush } from "../lib/apns-push.mjs";
+import { createRequire } from "node:module";
+
+// This installation's Supabase project (agent/local/instance.json) and
+// its public anon key (agent/local/config/supabase.json anon_key).
+const { instance, supabaseAnonKey } = createRequire(import.meta.url)("../lib/instance.cjs");
+const SUPABASE_URL = `https://${instance().supabase_project}.supabase.co`;
+const SUPABASE_ANON_KEY = supabaseAnonKey();
+
+const args = process.argv.slice(2);
+let messageId = null;
+let title = "Merlin";
+let channel = "chat";
+let urgent = false;
+const positional = [];
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--message-id" || a === "-m") messageId = args[++i];
+  else if (a === "--title" || a === "-t") title = args[++i];
+  else if (a === "--channel" || a === "-c") channel = args[++i];
+  else if (a === "--urgent" || a === "-u") urgent = true;
+  else positional.push(a);
+}
+
+const body = positional.join(" ").trim();
+if (!body) {
+  console.error("Usage: merlin-notify [--message-id <uuid>] [--title <title>] <body>");
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+try {
+  const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent });
+  if (res?.held) console.log(`Push held (${res.reason}) — ping-flush will deliver it.`);
+  else console.log("Push notification sent.");
+} catch (e) {
+  console.error(`Push failed: ${e.message}`);
+  process.exit(1);
+}
+process.exit(0);

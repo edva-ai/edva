@@ -1,56 +1,63 @@
 #!/usr/bin/env python3
 """
-sanitize-guard — pre-commit guard that refuses to land personal-identifier
-content in the public merlin tree.
+sanitize-guard — refuse to land personal-identifier content in the public
+Merlin tree.
 
-This is the *commit-time* counterpart to the gandalf→merlin migration's
-`scan.py` (which classifies the whole tree at publish time). The migration
-scanner lives in the private gandalf repo and runs as a one-off; this guard
-runs on every merlin commit and is the durable boundary.
+Runs as a pre-commit hook (staged files), in CI (`--all`, see
+.github/workflows/sanitize-guard.yml) and from `merlin audit`.
 
-What it does
+Patterns
+--------
+Two sets are matched, case-insensitively, against every line:
+
+1. Generic detectors, defined below (tokens and keys whose shape gives them
+   away, e.g. a JWT such as a Supabase anon key, whose base64 payload names
+   the project even when no plain-text project ref appears).
+2. The operator's identity patterns — their names, handles, homes, project
+   refs, hosts, addresses. That list is itself personal data, so it is never
+   committed. It is loaded at run time from, in order:
+       $MERLIN_SANITIZE_PATTERNS_JSON   the JSON itself (e.g. a CI secret)
+       $MERLIN_SANITIZE_PATTERNS        a path to the JSON file
+       agent/local/sanitize-patterns.json   (gitignored)
+   The JSON is an object of {"<pattern_name>": "<python regex>"}. Only the
+   regexes are private; the names are public, because baseline entries are
+   keyed `<name>:<line>` and every reported hit prints its name (in CI, in a
+   public log). So a name says what KIND of identifier the pattern catches
+   and never spells what it matches: `project_homepage`, `repo_url`,
+   `companion_app_name`, `owner_handle`, `address_1`, `org_2` — not a
+   brand, domain, handle, person, pet or place. Keep names stable too:
+   renaming one means rewriting the baseline keys (and the CI secret) to match.
+   Without it the guard still runs the generic set and says so on stderr.
+
+What it skips
+-------------
+Overlay surfaces by construction (agent/local/, legacy local/, any `_ext/`,
+data/, secrets/, credentials/, .env), lockfiles, symlinks, files over 2 MB,
+and this tool's own directory. Content only — file paths are not judged.
+
+Line markers
 ------------
-1. Walk the staged files (or, with --all, every tracked file).
-2. Skip paths that are overlay surfaces by construction: `local/`,
-   `**/_ext/`, `data/`, `secrets/`, `credentials/`, `.env*`, anything
-   in `.gitignore`'d locations that somehow got staged.
-3. For each surviving file, grep for the PERSONAL_PATTERNS below.
-4. If any hit, print a clean report and exit 1 (blocks the commit).
-
-What it does NOT do
--------------------
-- It does not classify files into copy-clean / copy-sanitize buckets — that's
-  scan.py's job in the private repo.
-- It does not look at file *paths* (only content). Putting a file under a
-  personal-sounding directory doesn't make it personal; what matters is
-  whether the content names a real person/place/credential.
-- It does not gate on the brand word "gandalf" (which appears legitimately in
-  the kernel's docs about the companion app). Only on identity-coupled
-  patterns.
-
-Usage
------
-    .tools/sanitize-guard.py              # check git staged files (pre-commit)
-    .tools/sanitize-guard.py --all        # check every tracked file
-    .tools/sanitize-guard.py path/to/file # check specific files
-    .tools/sanitize-guard.py --baseline   # snapshot current hits as accepted baseline
-    .tools/sanitize-guard.py --list-patterns
+A line carrying `sanitize-guard-ok: <reason>` is exempt. So is a line carrying
+`kernel-guard-ok: <reason>`: kernel files are synced from an upstream
+installation whose own guard already reviewed and exempted that line.
 
 Baseline ratchet
 ----------------
-The kernel inherently contains a small set of intentional public references
-(e.g. README points at `silo.co/merlin` as the marketing URL, SECURITY.md
-links to the public repo). To accept those without blocking commits, we keep
-a baseline snapshot at `.tools/sanitize-guard-baseline.json`. The guard
-rejects only hits *not* present in the baseline. Add a new accepted hit via
-`--baseline` and commit the updated baseline file alongside the kernel
-change that introduces it — the diff is the audit trail.
+Intentional public references that match an identity pattern (none today —
+the baseline is empty) are accepted in .tools/sanitize-guard-baseline.json
+— relpath → sorted `<pattern>:<line snippet>` keys (no line numbers, so edits
+that only move a line keep it accepted). Only hits not in the baseline fail.
+`--baseline` rewrites it from the current hits; review that diff like code.
 
-Exit codes
-----------
-    0 — clean (no new hits beyond baseline)
-    1 — at least one new personal-identifier hit
-    2 — invocation/env error (no git, etc.)
+Usage
+-----
+    .tools/sanitize-guard.py              # staged files (pre-commit)
+    .tools/sanitize-guard.py --all        # every tracked + untracked, non-ignored file
+    .tools/sanitize-guard.py FILE...      # specific files
+    .tools/sanitize-guard.py --baseline   # snapshot current hits as accepted
+    .tools/sanitize-guard.py --list-patterns [--json]
+
+Exit codes: 0 clean · 1 new hit(s) · 2 invocation/config error
 """
 
 from __future__ import annotations
@@ -64,124 +71,123 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = Path(__file__).resolve().parent / "sanitize-guard-baseline.json"
+DEFAULT_OVERLAY = ROOT / "agent" / "local" / "sanitize-patterns.json"
 
-# ─── Personal-identifier patterns (sync'd with gandalf scan.py) ─────────────
-# These are the patterns that, if found in any file destined for the public
-# tree, mean the commit MUST be sanitized (or moved into the overlay) before
-# it can land.
-#
-# Update this list when you add a new identity coupling in your personal
-# overlay that the kernel would have no business referencing.
-PERSONAL_PATTERNS: dict[str, str] = {
-    "owner_firstname":  r"\bmoshik\b",
-    "owner_handle":     r"\bmraccah(?:2)?\b",
-    "owner_partner":    r"\bpari\b",
-    "owner_pet_rico":   r"\brico\b",
-    "owner_pet_oscar":  r"\boscar\b",
-    "domain_silo":      r"\bsilo\.co\b|@silo\.co\b",
-    "prop_villa_b":     r"villa\s*biscayne|biscayne\s*park|845[\s_-]*NE[\s_-]*116",
-    "prop_villa_t":     r"villa\s*tropical|936[\s_-]*NE[\s_-]*128",
-    "prop_casa":        r"casa\s*miami|351[\s_-]*NE[\s_-]*117",
-    "prop_chelsea":     r"chelsea\s*home",
-    "prop_mansfield":   r"\bmansfield\b",
-    "prop_cleveland":   r"cleveland\s*118|118th\s*st.*cleveland",
-    "brand_scamper":    r"\bscamper\b",
-    "brand_listo":      r"\blisto\b",
-    "brand_allwhere":   r"\ballwhere\b",
-    "brand_pamper":     r"\bpamperhomes\b",
-    "brand_schwab":     r"\bschwab\b",
-    "brand_spotter":    r"\bspotter\b",
-    "ios_bundle_id":    r"com\.mraccah\.[Gg]andalf",
-    "supabase_proj":    r"mszowrkjhfstptnssrzk|wmchpoddwdiabdobdpgh",
-    "gcp_proj":         r"eminent-wording-489203-t2",
-    "firebase_rtdb":    r"openclaw-heartbeat",
-    "hookdeck_host":    r"hkdk\.events",
-    "mac_user_path":    r"/Users/(?:moshikraccah|mraccah)\b",
-    "owner_email":      r"mraccah@gmail\.com",
-    "personal_repo":    r"mraccah2/(?:gandalf|gandalf-personal)",
-    "host_mini":        r"moshiks-mac-mini",
-    "tripit_inbound":   r"plans@tripit\.com",
+# ─── Generic detectors (safe to publish) ────────────────────────────────────
+BUILTIN_PATTERNS: dict[str, str] = {
+    # A JSON Web Token: header.payload, both base64url JSON objects.
+    "jwt_token": r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}",
+    # Supabase secret keys in their prefixed form.
+    "supabase_secret_key": r"\bsb_secret_[A-Za-z0-9_-]{16,}",
 }
 
-COMPILED = {k: re.compile(v, re.IGNORECASE) for k, v in PERSONAL_PATTERNS.items()}
+LINE_MARKERS = ("sanitize-guard-ok:", "kernel-guard-ok:")
+
+
+def _overlay_source() -> tuple[str, str | None]:
+    """→ (description, json text or None when absent)."""
+    inline = os.environ.get("MERLIN_SANITIZE_PATTERNS_JSON", "").strip()
+    if inline:
+        return "$MERLIN_SANITIZE_PATTERNS_JSON", inline
+    explicit = os.environ.get("MERLIN_SANITIZE_PATTERNS", "").strip()
+    path = Path(explicit) if explicit else DEFAULT_OVERLAY
+    try:
+        return str(path), path.read_text()
+    except FileNotFoundError:
+        if explicit:
+            print(f"sanitize-guard: MERLIN_SANITIZE_PATTERNS points at a missing file: {path}", file=sys.stderr)
+            sys.exit(2)
+        return str(path), None
+    except OSError as e:
+        print(f"sanitize-guard: cannot read {path}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def load_overlay_patterns() -> tuple[str, dict[str, str]]:
+    where, text = _overlay_source()
+    if text is None:
+        return where, {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"sanitize-guard: identity patterns in {where} are not valid JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        print(f"sanitize-guard: {where} must be a JSON object of name -> regex strings", file=sys.stderr)
+        sys.exit(2)
+    return where, {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+OVERLAY_WHERE, OVERLAY_PATTERNS = load_overlay_patterns()
+PERSONAL_PATTERNS: dict[str, str] = {**BUILTIN_PATTERNS, **OVERLAY_PATTERNS}
+try:
+    COMPILED = {k: re.compile(v, re.IGNORECASE) for k, v in PERSONAL_PATTERNS.items()}
+except re.error as e:
+    print(f"sanitize-guard: a pattern does not compile: {e}", file=sys.stderr)
+    sys.exit(2)
 
 # ─── Path-level skips ────────────────────────────────────────────────────────
-# These are overlay surfaces by definition — personal content is the entire
-# point. The .gitignore should already keep them out of git, but if they end
-# up staged anyway (`git add -f`) we still don't want the guard to flag the
-# content, since it's not headed for the public push.
 SKIP_PREFIXES = (
+    "agent/local/",
     "local/",
     "data/",
     "secrets/",
     "credentials/",
     "node_modules/",
-    # The guard's own working dir contains the patterns themselves (in the
-    # script source, in --list-patterns output, and in the baseline JSON which
-    # stores each accepted hit verbatim). Scanning it would always flag itself.
+    # The baseline stores each accepted hit verbatim; this script names the
+    # generic patterns. Scanning the directory would flag itself.
     ".tools/",
-    # The PR template + the architecture doc reference pattern names in
-    # examples and section headers — that's meta-content describing this
-    # boundary, not actual personal coupling. Skip them so the guard doesn't
-    # trip on its own documentation.
-    ".github/pull_request_template.md",
-    "docs/architecture-public-private.md",
 )
-SKIP_PATH_CONTAINS = (
-    "/_ext/",                      # any extension drop
-)
+SKIP_PATH_CONTAINS = ("/_ext/", "/node_modules/")
 SKIP_SUFFIXES = (
-    ".env", ".env.example",        # env templates are documented separately
+    ".env",
     ".gitkeep",
-    "PORT-DELTA-2026-05-23.md",    # auto-generated audit report
-    "package-lock.json",           # generated; would hit on transitive package names
+    "package-lock.json",   # generated; transitive package names
 )
-
-# Files larger than this are skipped — binary blobs and lockfiles aren't where
-# leaks happen, and scanning them is slow.
 MAX_BYTES = 2 * 1024 * 1024
 
 
 def is_skipped(rel: str) -> bool:
-    if any(rel.startswith(p) for p in SKIP_PREFIXES):
-        return True
-    if any(p in rel for p in SKIP_PATH_CONTAINS):
-        return True
-    if any(rel.endswith(s) for s in SKIP_SUFFIXES):
-        return True
-    return False
+    return (
+        rel.startswith(SKIP_PREFIXES)
+        or rel.startswith("_ext/")
+        or any(p in rel for p in SKIP_PATH_CONTAINS)
+        or rel.endswith(SKIP_SUFFIXES)
+    )
 
 
-def staged_files() -> list[str]:
+def _git(*args: str) -> list[str]:
     try:
-        out = subprocess.check_output(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            cwd=ROOT, text=True,
-        )
+        out = subprocess.check_output(["git", *args], cwd=ROOT, text=True)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"sanitize-guard: not a git repo or git missing: {e}", file=sys.stderr)
+        print(f"sanitize-guard: git failed ({' '.join(args)}): {e}", file=sys.stderr)
         sys.exit(2)
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
-def all_tracked_files() -> list[str]:
-    out = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True)
-    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+def staged_files() -> list[str]:
+    return _git("diff", "--cached", "--name-only", "--diff-filter=ACMR")
+
+
+def all_files() -> list[str]:
+    # Tracked plus untracked-but-not-ignored: what the next `git add -A` would
+    # publish. In CI the two are the same.
+    return sorted(set(_git("ls-files")) | set(_git("ls-files", "--others", "--exclude-standard")))
 
 
 def scan_one(path: Path) -> list[tuple[str, int, str]]:
-    """Return [(pattern_name, lineno, context_snippet), ...]."""
     try:
-        if path.stat().st_size > MAX_BYTES:
+        if path.is_symlink() or path.stat().st_size > MAX_BYTES:
             return []
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return []
     hits: list[tuple[str, int, str]] = []
     for i, line in enumerate(text.splitlines(), 1):
+        if any(m in line for m in LINE_MARKERS):
+            continue
         for name, regex in COMPILED.items():
-            m = regex.search(line)
-            if m:
+            if regex.search(line):
                 snippet = line.strip()
                 if len(snippet) > 100:
                     snippet = snippet[:100] + "…"
@@ -190,10 +196,6 @@ def scan_one(path: Path) -> list[tuple[str, int, str]]:
 
 
 def read_baseline() -> dict[str, list[str]]:
-    """Baseline maps relpath → sorted list of `<pattern>:<line-snippet>` keys
-    that are pre-accepted. Line numbers are deliberately NOT in the key —
-    edits that shift line numbers without changing personal content don't
-    invalidate the baseline."""
     try:
         return json.loads(BASELINE_PATH.read_text())
     except FileNotFoundError:
@@ -204,12 +206,11 @@ def read_baseline() -> dict[str, list[str]]:
 
 
 def hit_key(name: str, snippet: str) -> str:
-    """Stable key for a hit independent of line number — just <pattern>:<snippet>."""
     return f"{name}:{snippet}"
 
 
 def collect_hits(files: list[str]) -> list[tuple[str, list[tuple[str, int, str]]]]:
-    out: list[tuple[str, list[tuple[str, int, str]]]] = []
+    out = []
     for rel in files:
         if is_skipped(rel):
             continue
@@ -222,75 +223,78 @@ def collect_hits(files: list[str]) -> list[tuple[str, list[tuple[str, int, str]]
     return out
 
 
-def write_baseline(flagged: list[tuple[str, list[tuple[str, int, str]]]]) -> None:
-    baseline: dict[str, list[str]] = {}
-    for rel, hits in flagged:
-        baseline[rel] = sorted({hit_key(n, s) for n, _, s in hits})
+def write_baseline(flagged) -> None:
+    baseline = {rel: sorted({hit_key(n, s) for n, _, s in hits}) for rel, hits in flagged}
     BASELINE_PATH.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
 
 
 def main(argv: list[str]) -> int:
     if "--list-patterns" in argv:
+        if "--json" in argv:
+            print(json.dumps({"overlay_loaded": bool(OVERLAY_PATTERNS), "overlay_source": OVERLAY_WHERE,
+                              "patterns": PERSONAL_PATTERNS}, indent=2))
+            return 0
         width = max(len(k) for k in PERSONAL_PATTERNS)
         for k, v in PERSONAL_PATTERNS.items():
-            print(f"  {k.ljust(width)}  {v}")
+            tag = "generic " if k in BUILTIN_PATTERNS else "identity"
+            print(f"  {k.ljust(width)}  [{tag}]  {v}")
+        if not OVERLAY_PATTERNS:
+            print(f"  (no identity patterns loaded: {OVERLAY_WHERE} not found)")
         return 0
 
     explicit = [a for a in argv[1:] if not a.startswith("--")]
-    write_baseline_mode = "--baseline" in argv
-    use_all = "--all" in argv or write_baseline_mode
-
+    write_mode = "--baseline" in argv
     if explicit:
         files = explicit
-    elif use_all:
-        files = all_tracked_files()
+    elif "--all" in argv or write_mode:
+        files = all_files()
     else:
         files = staged_files()
-
     if not files:
         return 0
 
+    if not OVERLAY_PATTERNS:
+        print("sanitize-guard: warning: no identity patterns loaded (set MERLIN_SANITIZE_PATTERNS or "
+              "create agent/local/sanitize-patterns.json); checking generic patterns only", file=sys.stderr)
+
     flagged = collect_hits(files)
 
-    if write_baseline_mode:
+    if write_mode:
+        if not OVERLAY_PATTERNS:
+            print("sanitize-guard: refusing to write a baseline without the identity patterns — "
+                  "it would drop every accepted identity hit", file=sys.stderr)
+            return 2
         write_baseline(flagged)
         total = sum(len(h) for _, h in flagged)
-        print(f"sanitize-guard: wrote baseline ({len(flagged)} files, {total} hits) "
-              f"to {BASELINE_PATH.relative_to(ROOT)}")
+        print(f"sanitize-guard: wrote baseline ({len(flagged)} files, {total} hits) to "
+              f"{BASELINE_PATH.relative_to(ROOT)}")
         return 0
 
-    # Filter against baseline — only NEW hits count.
     baseline = read_baseline()
-    new_flagged: list[tuple[str, list[tuple[str, int, str]]]] = []
+    new_flagged = []
     for rel, hits in flagged:
         accepted = set(baseline.get(rel, []))
         new_hits = [(n, ln, s) for (n, ln, s) in hits if hit_key(n, s) not in accepted]
         if new_hits:
             new_flagged.append((rel, new_hits))
-
     if not new_flagged:
         return 0
 
     total_new = sum(len(h) for _, h in new_flagged)
-    print("", file=sys.stderr)
-    print(f"sanitize-guard: {total_new} NEW personal-identifier hit(s) in "
-          f"{len(new_flagged)} file(s) beyond the accepted baseline:", file=sys.stderr)
-    print("", file=sys.stderr)
+    err = sys.stderr
+    print(f"\nsanitize-guard: {total_new} new hit(s) in {len(new_flagged)} file(s) beyond the accepted baseline:\n", file=err)
     for rel, hits in new_flagged:
-        print(f"  {rel}", file=sys.stderr)
+        print(f"  {rel}", file=err)
         for name, lineno, snippet in hits:
-            print(f"    line {lineno}: [{name}] {snippet}", file=sys.stderr)
-        print("", file=sys.stderr)
-    print("Resolve by either:", file=sys.stderr)
-    print("  • removing/genericizing the identifier in the file, or", file=sys.stderr)
-    print("  • moving the file into your personal overlay (see", file=sys.stderr)
-    print("    docs/architecture-public-private.md), or", file=sys.stderr)
-    print("  • if this hit is intentional public content, accept it into the", file=sys.stderr)
-    print("    baseline:  .tools/sanitize-guard.py --baseline", file=sys.stderr)
-    print("    (and commit the updated baseline file).", file=sys.stderr)
-    print("", file=sys.stderr)
-    print("To inspect the pattern set: .tools/sanitize-guard.py --list-patterns",
-          file=sys.stderr)
+            print(f"    line {lineno}: [{name}] {snippet}", file=err)
+        print("", file=err)
+    print("Resolve by one of:", file=err)
+    print("  • removing or genericizing the identifier,", file=err)
+    print("  • moving the content into your private overlay (agent/local/ or an _ext/ dir;", file=err)
+    print("    see docs/architecture-public-private.md),", file=err)
+    print("  • marking a deliberate line with `sanitize-guard-ok: <reason>`, or", file=err)
+    print("  • for intentional public content, accepting it: .tools/sanitize-guard.py --baseline", file=err)
+    print("    (and committing the baseline change with a reason in the PR).", file=err)
     return 1
 
 

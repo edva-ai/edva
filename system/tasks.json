@@ -1,14 +1,14 @@
 {
   "$schema": "./tasks.schema.json",
-  "_comment": "Registry of all scheduled tasks in the Merlin system. Single source of truth for chat-agent delegation + cron reference. Edit this file, then run 'merlin doctor' to verify cron + playbook alignment. The set below ships as reference patterns — replace, extend, or delete to fit your own automation.",
+  "_comment": "Registry of the kernel's automated tasks. Single source of truth for chat-agent delegation + cron reference. This installation's own tasks (and any field it overrides on a kernel task) live in agent/local/tasks.json, same shape; every reader sees the two merged by lib/registry.cjs (`node lib/registry.cjs tasks`). Edit, then run 'merlin doctor' to verify cron + playbook alignment.",
   "tasks": [
     {
       "name": "morning-digest",
-      "schedule": "55 7 * * *",
-      "schedule_human": "Daily at 8:00 AM",
+      "schedule": "0 8 * * *",
+      "schedule_human": "Daily at 8:00 AM local",
       "trigger_script": "agent/scripts/trigger-morning-digest.sh",
-      "webhook_url": "http://localhost:9092",
-      "webhook_task": "MORNING DIGEST",
+      "webhook_url": null,
+      "webhook_task": null,
       "ops_playbook_section": "Morning Digest",
       "delivers_to": "merlin",
       "phrases": [
@@ -19,8 +19,44 @@
         "daily digest",
         "morning digest"
       ],
-      "description": "Reference job. Compile calendar, tasks, news headlines, and weather; deliver via long-form-rule (HTML email + phone pointer + APNs push). The canonical template for any cron-driven content job.",
+      "description": "Compile calendar, tasks, news headlines, and weather; send to Merlin.",
       "job": "morning-digest"
+    },
+    {
+      "name": "context-sync",
+      "schedule": "*/30 * * * *",
+      "schedule_human": "Every 30 minutes",
+      "trigger_script": "agent/scripts/trigger-context-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "context-db",
+      "phrases": [
+        "context sync",
+        "sync context",
+        "reindex",
+        "rebuild context",
+        "context index"
+      ],
+      "description": "Re-index Apple Notes, iMessage, email memories, and project files into the context search database."
+    },
+    {
+      "name": "skill-repair",
+      "schedule": "47 * * * *",
+      "schedule_human": "On demand the moment a repair is queued; hourly at :47 as a safety net",
+      "trigger_script": "agent/scripts/trigger-skill-repair.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "skill-repair",
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "skill repair",
+        "repair browser action",
+        "broken scraper",
+        "site changed its layout"
+      ],
+      "description": "Same-day repair of a read-only browser action or page parser that stopped reading its site (queued by an installation's ingest job on a source's first bad run and by skill-health on the first failure day; lib/skill-repair.mjs). Reads the live page, rewrites the one action with the same output shape, verifies rows return, lands via self-improve-auto-apply. Silent. Queue: bin/skill-repair list. See ops-agent/jobs/skill-repair.md.",
+      "job": "skill-repair"
     },
     {
       "name": "hum",
@@ -39,7 +75,7 @@
         "hum check",
         "hum run"
       ],
-      "description": "Every 20 minutes, fan out to the configured harvesters (weather, news, calendar, tasks, watchdog, serendipity by default — extend with your own), rank candidates with a Sonnet subagent, optionally surface one as a chat ping. Most ticks exit silently via the bash gates in the trigger script. See agent/ops-agent/jobs/hum.md for the playbook.",
+      "description": "Every 20 minutes, evaluates the user's current situation (location, calendar, messages, git commits, audio context, weather) and decides whether to surface useful information, ask a context-building question, or stay silent. Most ticks exit silently via bash gates. Questions with answers grow memory files under ~/.claude/projects/.../memory/ for better future context. Replaces the old lane-rotation pulse.",
       "job": "hum"
     },
     {
@@ -63,20 +99,111 @@
       "job": "hum-review"
     },
     {
+      "name": "hum-consolidate",
+      "schedule": "10 3 * * *",
+      "schedule_human": "Daily at 3:10 AM local",
+      "trigger_script": "agent/scripts/trigger-hum-consolidate.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "HUM CONSOLIDATE",
+      "ops_playbook_section": null,
+      "delivers_to": "file",
+      "phrases": [
+        "hum consolidate",
+        "consolidate hum replies",
+        "fold hum answers into wiki",
+        "remember my hum answers"
+      ],
+      "description": "Nightly fold of the day's replies-to-hum-pings (hum-responses.jsonl) into the general wiki, so hum stops re-asking things the user already answered. Durable preferences/facts become linked, deduped wiki pages via wiki save; transient resolutions are skipped. Trigger gates on un-consolidated rows; silent (no email/ping/push). Replaced hum-answer's old realtime subsection routing (2026-06-28).",
+      "job": "hum-consolidate"
+    },
+    {
+      "name": "hum-daily",
+      "schedule": "0 23 * * *",
+      "schedule_human": "Daily at 11:00 PM local",
+      "trigger_script": "agent/scripts/trigger-hum-daily.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": "Hum Daily",
+      "delivers_to": "email",
+      "phrases": [
+        "hum daily",
+        "hum digest",
+        "daily hum",
+        "hum summary",
+        "hum log"
+      ],
+      "description": "Chronicle of the last 24h of hum ticks — what harvesters discovered, what pings/questions were sent and why. Email (personal, starred) + short phone pointer. Direct script, no agent turn (bin/hum-daily-run, 2026-10-04).",
+      "job": "hum-daily"
+    },
+    {
+      "name": "hum-ideation",
+      "schedule": "0 6,11,14,19 * * *",
+      "schedule_human": "4× daily at 6:00 AM, 11:00 AM, 2:00 PM, 7:00 PM local",
+      "trigger_script": "agent/scripts/trigger-hum-ideation.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "HUM IDEATION",
+      "ops_playbook_section": "Hum Ideation",
+      "delivers_to": "file",
+      "phrases": [
+        "hum ideation",
+        "generate pulse ideas",
+        "refill ideas reservoir",
+        "pulse ideation"
+      ],
+      "description": "Twice-daily proactive idea generation for hum. Reads calendar, tasks, gmail, trip-history, recent reactions. Builds a reinforcement-biased mix (exploit top categories, explore untested, retry failed with variation). Writes 8-15 new ideas to hum-ideas.jsonl + rebuilds the reaction scorecard. Never pings, never emails — ideas surface through the normal hum tick via the `ideas` harvester.",
+      "job": "hum-ideation"
+    },
+    {
+      "name": "nightly-review",
+      "schedule": "0 5 * * 2",
+      "schedule_human": "Weekly Tuesday at 5:00 AM — after the 4:00 AM daily summary it reads, moved from 3:00 AM on 2026-10-22 (launchd agent ai.claude.improvement-review, NOT cron — cron can't reach the in-session Max keychain; also runs on ephemeral Opus 5, not the webhook-dispatched ops supervisor, since 2026-07-28)",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-nightly-review.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "NIGHTLY REVIEW",
+      "ops_playbook_section": "nightly-review",
+      "delivers_to": "merlin",
+      "phrases": [
+        "self improvement review",
+        "weekly review",
+        "system review"
+      ],
+      "description": "Weekly holistic system self-assessment and improvement memo, covering the prior 7 days. Job/script names retain the historical 'nightly-review' label. Chains improvement-plan on a clean exit.",
+      "job": "nightly-review"
+    },
+    {
+      "name": "improvement-plan",
+      "schedule": "30 10 * * 2",
+      "schedule_human": "Chained by nightly-review on a clean exit; launchd agent ai.claude.improvement-plan (Tue 10:30 AM, past the review's 05:00 start plus both runs' caps) is a safety-net slot only, guarded against re-running on a stale report",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-improvement-plan.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "improvements",
+      "phrases": [
+        "improvement plan",
+        "turn the review into cards",
+        "improvement cards"
+      ],
+      "description": "Acts on every ACTION ITEM of the weekly Self Improvement Review: safe changes land on their own through self-improve-auto-apply (green check in Improvements), complex or high-blast-radius ones become Face-ID cards (rubric schema v4, 2026-09-29), questions go to the next review. Runs on ephemeral Opus 5 via run-ephemeral-opus.sh. Cards capped at 5 unsigned total.",
+      "job": "improvement-plan"
+    },
+    {
       "name": "wiki-audit",
       "schedule": "30 3 * * *",
-      "schedule_human": "Daily at 3:30 AM",
+      "schedule_human": "Daily at 3:30 AM local",
       "trigger_script": "agent/scripts/trigger-wiki-audit.sh",
       "webhook_url": null,
       "webhook_task": null,
       "ops_playbook_section": null,
-      "delivers_to": "email",
+      "delivers_to": "improvements",
       "phrases": [
         "wiki audit",
         "pin audit",
         "rebalance pins"
       ],
-      "description": "Nightly re-evaluation of the wiki pinned-page subset. Reads data/wiki-access.jsonl (last 7 days, MCP caller only), pins any unpinned page hit ≥ 5 times, unpins any pinned page with 0 hits AND pinned for ≥ 7 days AND not pin_locked. Emails the user a digest only when something changes (silent on no-op nights). Direct script — no webhook, no Anthropic API.",
+      "description": "Nightly re-evaluation of the wiki pinned-page subset. Reads `data/wiki-access.jsonl` (last 7 days, MCP caller only), pins any unpinned page hit ≥ 5 times, unpins any pinned page with 0 hits AND pinned for ≥ 7 days AND not pin_locked. Logs the moves to the Improvements channel (green-check row) only when something changes (silent on no-op nights); no email since 2026-10-07. Direct script — no webhook, no Anthropic API.",
       "job": null
     },
     {
@@ -89,7 +216,33 @@
       "ops_playbook_section": null,
       "delivers_to": "none",
       "phrases": [],
-      "description": "Auto-commit + push the auto-memory dir to its private backup repo (${MERLIN_BACKUP_REPO}). Idempotent on no-changes. Primary backup layer for the memory corpus — pre-reindex tarballs in data/memory-snapshots/ are belt-and-suspenders.",
+      "description": "Auto-commit + push the auto-memory dir to its private backup repo. Idempotent on no-changes. Primary backup layer — protects against rm/corruption/bad-merge of the 80+ .md files at ~/.claude/projects/<project-slug>/memory/. Pre-reindex tarballs in data/memory-snapshots/ are belt-and-suspenders.",
+      "job": null
+    },
+    {
+      "name": "wiki-db-snapshot",
+      "schedule": "7 * * * *",
+      "schedule_human": "Hourly at :07",
+      "trigger_script": "agent/scripts/trigger-wiki-db-snapshot.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Hourly hot snapshot of data/memory-index.db via SQLite VACUUM INTO. Rotates to the last 24 copies under data/memory-db-snapshots/. Defense-in-depth backup for the wiki layer (`pages` / `page_links` / `page_revisions` / `pages_fts` and the legacy `memory_chunks` index) — protects against DB corruption (e.g. the 2026-05-02 FTS5 incident). Restore = `cp memory-db-snapshots/memory-index-<ts>.db data/memory-index.db`. Direct script — no webhook, no Anthropic API.",
+      "job": null
+    },
+    {
+      "name": "wiki-cloud-sync",
+      "schedule": "*/5 * * * *",
+      "schedule_human": "Every 5 minutes",
+      "trigger_script": "agent/scripts/trigger-wiki-cloud-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Off-box copy of the wiki. Reconciles Supabase wiki_pages / wiki_page_links / wiki_page_revisions (merlin project) to data/memory-index.db via `bin/wiki-cloud-sync push` — stateless row-hash diff for pages+links, rowid cursor for revisions (data/wiki-cloud-sync.json). Pages 3 failures in a row via merlin-notify --channel system. Restore = `wiki-cloud-sync restore --db <new-file>` then swap in + re-run wiki-embed. Check = `wiki-cloud-sync verify`. Direct script — no webhook, no Anthropic API.",
       "job": null
     },
     {
@@ -106,40 +259,175 @@
       "job": null
     },
     {
-      "name": "context-sync",
-      "schedule": "*/30 * * * *",
-      "schedule_human": "Every 30 minutes",
-      "trigger_script": "agent/scripts/trigger-context-sync.sh",
+      "name": "hum-explore",
+      "schedule": "30 12,17 * * *",
+      "schedule_human": "Daily at 12:30 PM and 5:30 PM local (clock-jobs.json); sends at most 2 a week",
+      "trigger_script": "agent/scripts/trigger-hum-explore.sh",
       "webhook_url": null,
       "webhook_task": null,
-      "ops_playbook_section": null,
-      "delivers_to": "context-db",
+      "ops_playbook_section": "hum-explore",
+      "delivers_to": "merlin",
       "phrases": [
-        "context sync",
-        "sync context",
-        "reindex",
-        "rebuild context",
-        "context index"
+        "borderline pick",
+        "hum explore",
+        "hum exploration"
       ],
-      "description": "Re-index your wired-in sources (notes, messages, email memories, project files) into the context search database."
+      "description": "Hum exploration (replaced the weekly canary 2026-10-07): at most twice a week, 48h apart, sends the best fresh held-back discretionary item in a lane where hum is still guessing, as an ordinary 'Borderline pick:' ping through hum-ping (budget/dedup refusals apply), with one line on what it is and why it was sent, and the item's link. The user's reaction calibrates the lane via hum-engagement. Direct script, no agent turn: since 2026-10-15 the cron trigger kicks launchd agent ai.claude.hum-explore, whose run-hum-explore.sh checks the Max login (so the resolve-first gate and precheck can run) and then runs bin/hum-explore-run; no verified login means the pick is held.",
+      "job": "hum-explore"
     },
     {
       "name": "usage-push",
-      "schedule": "15 4 * * *",
-      "schedule_human": "Daily at 4:15 AM",
+      "schedule": "25 4 * * *",
+      "schedule_human": "Daily at 4:25 AM local",
       "trigger_script": "agent/scripts/trigger-usage-push.sh",
       "webhook_url": null,
       "webhook_task": null,
       "ops_playbook_section": null,
-      "delivers_to": "telemetry",
+      "delivers_to": "none",
       "phrases": [
         "usage push",
         "push usage",
         "cost push",
         "push cost report"
       ],
-      "description": "Push per-day Claude usage/cost rollups (from job-costs.ndjson via 'merlin-cost-report --push') to the hosted apps/telemetry /usage endpoint for central, durable monitoring across hosts. Runs after midnight over a 2-day window; idempotent per (host, day). Requires MERLIN_USAGE_TOKEN (or STATS_TOKEN) in .env. Direct script — no webhook, no Anthropic API. Non-fatal when there are no cost rows.",
+      "description": "Push per-day model-weighted Claude usage/cost rollups (from merlin-cost-report --push, unioning the ops/-light/-haiku ledgers) to the hosted /usage telemetry endpoint for central, durable monitoring across hosts. Sends the real metered weighted cost, not the SDK phantom estimate. Runs after midnight over a 2-day window; idempotent per (host, day). Requires MERLIN_USAGE_TOKEN (or STATS_TOKEN) in .env. Direct script — no webhook, no Anthropic API. Non-fatal when there are no cost rows. NOTE: confirm the cron slot via merlin-cron-slots on the host.",
       "job": null
+    },
+    {
+      "name": "recall-events-embed",
+      "schedule": "35 2 * * *",
+      "schedule_human": "Daily 2:35 AM local",
+      "trigger_script": "agent/scripts/trigger-recall-events-embed.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Backfill local Ollama (nomic-embed-text) embeddings for high-value events in the events_fts recall index, powering recall_events mode:hybrid. Direct script — no webhook, no Anthropic API. Degrades gracefully (recall stays FTS-only if Ollama is down). Added 2026-07-08 with the semantic-recall feature.",
+      "job": null
+    },
+    {
+      "name": "wiki-embed",
+      "schedule": "8 4 * * *",
+      "schedule_human": "Daily 4:08 AM local",
+      "trigger_script": "agent/scripts/trigger-wiki-embed.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [],
+      "description": "Backfill local Ollama (nomic-embed-text) embeddings for new/changed wiki pages (pages -> page_embeddings in memory-index.db), powering wiki_search mode:hybrid. Re-embeds a page when its body_hash changes; prunes embeddings for deleted pages. Direct script — no webhook, no Anthropic API. Degrades gracefully (wiki_search stays FTS-only if Ollama is down). Added 2026-07-19 to extend hybrid recall from the event log to the curated wiki.",
+      "job": null
+    },
+    {
+      "name": "wiki-assoc",
+      "schedule": "20 4 * * *",
+      "schedule_human": "Daily 4:20 AM local (after wiki-embed); the model half runs in the launchd agent ai.claude.wiki-assoc-llm it kicks",
+      "trigger_script": "agent/scripts/trigger-wiki-assoc.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "ops_playbook_section": null,
+      "delivers_to": "none",
+      "phrases": [
+        "associative memory",
+        "memory associations",
+        "hebbian",
+        "wiki facts",
+        "trigger cues"
+      ],
+      "description": "Nightly writers for associative memory (system/wiki-architecture.md § Associative recall). Under cron, no model: `wiki-assoc nightly` folds new auto-recall judge rows into page_coactivation (pages kept together for the same message, decayed Hebbian weights), writes data/wiki-link-candidates.json (strong co-used pairs with no link, read by wiki-link-weave Step 5.5), and rebuilds page_activation (ACT-R base-level activation from judge-kept recalls and deliberate wiki_read/episode_get reads, never search hits). Then it kicks the on-demand launchd agent ai.claude.wiki-assoc-llm (run-wiki-assoc-llm.sh, behind max-auth-guard): typed fact extraction into page_facts and trigger cues into page_cues, each through the local → Sonnet ladder with a verbatim-evidence check and a per-run Sonnet cap. Silent; log agent/logs/wiki-assoc.log. Added 2026-10-24.",
+      "job": null
+    },
+    {
+      "name": "system-issue-review",
+      "schedule": "27 4 * * *",
+      "schedule_human": "Daily at 4:27 AM local (launchd agent ai.claude.system-issue-review, NOT cron — cron can't reach the in-session Max keychain; also runs on ephemeral Opus 5, not the webhook-dispatched ops supervisor, since 2026-07-28)",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-system-issue-review.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "SYSTEM ISSUE REVIEW",
+      "ops_playbook_section": "system-issue-review",
+      "delivers_to": "improvements",
+      "phrases": [
+        "system issue review",
+        "review the system channel",
+        "root cause the alerts",
+        "why does that alert keep firing",
+        "fix the recurring errors"
+      ],
+      "description": "Nightly root-cause pass over Merlin's own system channel. Clusters the last 14 days of alerts into distinct issues (by condition, not wording), correlates recovery messages, closes out verified fixes, then works two lanes: up to 3 fix attempts and up to 3 cheaper review-only passes. Every issue is reviewed even if it healed itself (2026-07-25) -- a recovery closes the incident, never the issue, and nothing reaches a terminal status without a recorded root cause. Low/moderate fixes are implemented + critic-reviewed + committed autonomously and shown as a green-check card in the Improvements channel; high-risk fixes are staged as one Face-ID card per night. A review concluding no code change is warranted is recorded silently (status reviewed / resolution reviewed-no-fix) and surfaces in the weekly nightly-review roundup.",
+      "job": "system-issue-review"
+    },
+    {
+      "name": "system-issue-review-critical",
+      "schedule": "52 * * * *",
+      "schedule_human": "Hourly at :52 (--critical-only; dispatches only on a NEW critical alert). launchd agent ai.claude.system-issue-review-critical, NOT cron — cron can't reach the in-session Max keychain; also runs on ephemeral Opus 5, not the webhook-dispatched ops supervisor, since 2026-07-28",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-system-issue-review.sh",
+      "webhook_url": "http://localhost:9092",
+      "webhook_task": "SYSTEM ISSUE REVIEW (critical escalation)",
+      "ops_playbook_section": "system-issue-review",
+      "delivers_to": "improvements",
+      "phrases": [
+        "critical system alert review",
+        "escalate the critical alert",
+        "review that outage now"
+      ],
+      "description": "Same-day escalation lane for system-issue-review, added 2026-07-25 so a capability-down issue does not wait up to 24h for the nightly pass. Runs hourly but dispatches ONLY when a genuinely new critical-marker alert landed in the system channel; warnings, recoveries, and repeats of an issue already in flight all wait for the nightly run. Deduplication lives in lib/system-issue-gate.mjs and is the whole point: in a real 14-day window most critical alerts were repeats of one or two conditions, so a naive gate would have fired over a dozen heavy dispatches in one night for one already-carded issue (heavy tier = the ops supervisor, which runs claude-sonnet-5; an escalation turn is one of the most expensive turns it runs). When it does dispatch, the job scopes to a single cluster on a ~15-minute budget.",
+      "trigger_args": "--critical-only",
+      "job": "system-issue-review"
+    },
+    {
+      "name": "cost-efficiency-review",
+      "schedule": "37 2 * * *",
+      "schedule_human": "Daily at 2:37 AM local (launchd agent ai.claude.cost-efficiency-review, NOT cron — cron can't reach the in-session Max keychain; runs on ephemeral Opus 5 like the rest of the improvement family). Slot reserved via merlin-cron-slots.",
+      "scheduler": "launchd",
+      "trigger_script": "agent/scripts/trigger-cost-efficiency-review.sh",
+      "webhook_task": "COST EFFICIENCY REVIEW",
+      "ops_playbook_section": "cost-efficiency-review",
+      "delivers_to": "improvements",
+      "phrases": [
+        "cost efficiency review",
+        "what is merlin spending",
+        "where is my budget going",
+        "why is merlin using so much budget",
+        "context floor",
+        "cost overhead",
+        "what's eating the budget",
+        "how much did merlin cost today"
+      ],
+      "description": "Daily review of WHERE the Max budget actually went in the last 24h — not which job spent the most, but whether the spend bought WORK or bought CONTEXT. Reads a pre-fetched `merlin-cost-report --efficiency --json` (the trigger fetches it un-sandboxed) and compares against the 2026-08-06 baseline: cost split by token type, the measured context FLOOR per supervisor, the working window above it, and the compact/rotate churn that follows when that window closes. Flags a regression when overhead rises >5 points, a floor grows >5k, a working window drops under 40k, or 24h spend exceeds 1.4x the 7d median — then attributes it to a specific change (a new always-loaded CLAUDE.md section, an added MCP server, a gate that stopped gating, a job that got heavier) and files cuts through the unified self-improvement pipeline: low/moderate auto-apply with a green-check card, high risk (model tier, output quality, capability removal) as a Face-ID card it can never self-approve. Silent when nothing regressed. Exists because a single day can burn a large share of the weekly cap, most of it cache traffic, and nightly-review's weekly job-shaped cost lens could not see it.",
+      "job": "cost-efficiency-review"
+    },
+    {
+      "name": "inbox-mem-sync",
+      "schedule": "*/20 * * * *",
+      "schedule_human": "Every 20 minutes",
+      "trigger_script": "agent/scripts/trigger-inbox-mem-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "none",
+      "phrases": [
+        "inbox memory sync",
+        "index my email into memory",
+        "inbox mem"
+      ],
+      "description": "Pull recent mail into the inbox memory channel (FTS + embeddings in memory-index.db) so `recall` — and the release freshness gate that asks it — can see what the mailbox already knows. Silent; no user output."
+    },
+    {
+      "name": "inbox-mem-sync-deep",
+      "schedule": "10 6 * * *",
+      "schedule_human": "Daily at 6:10 AM local",
+      "trigger_script": "agent/scripts/trigger-inbox-mem-sync.sh",
+      "webhook_url": null,
+      "webhook_task": null,
+      "delivers_to": "none",
+      "phrases": [
+        "inbox memory deep sync",
+        "reindex email memory"
+      ],
+      "description": "Nightly wide-window inbox re-index + prune. Repairs whatever the 20-minute short window missed (outage, burst past --max) and bounds index growth at 120 days.",
+      "trigger_args": "--deep"
     }
   ]
 }

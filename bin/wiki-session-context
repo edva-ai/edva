@@ -1,0 +1,270 @@
+#!/usr/bin/env node
+// wiki-session-context — emit the SessionStart memory bundle for the hook.
+//
+// Claude Code's SessionStart hook expects a JSON object with a
+// `hookSpecificOutput.additionalContext` string field. We assemble the bundle
+// and print it. The hook is registered in settings.json (see
+// system/architecture.md § Auto-memory).
+//
+// Push→pull rebalance (2026-07-19). The old bundle injected the FULL BODY of
+// every pinned page (~10 pages) on every session start. That's a "push" cost
+// that grows with the pinned set and, as the corpus scales, forces the
+// consolidation/compaction treadmill to keep squeezing to fit a fixed budget.
+// The rebalance makes session-start cost bounded and roughly constant:
+//
+//   1. Host-identity banner (unchanged).
+//   2. IDENTITY CORE — pages the pin auditor `pin_locked`'d (who the user and household
+//      are, daily schedule, residences, the load-bearing feedback rules).
+//      These are genuinely needed every turn, so they're injected in FULL.
+//   3. PINNED MENU — pages the auditor auto-pinned by access frequency
+//      (`pinned=1, pin_locked=0`) are rendered as a compact one-line menu
+//      (title + description + `wiki_read` pointer), NOT full bodies. The agent
+//      pulls the body on demand — cheap and accurate now that hybrid recall
+//      exists (wiki_search mode:"hybrid"). Menu size is O(titles), not O(bodies).
+//   4. RECENT DAYS — last 3 `day_*` summaries (unchanged).
+//   5. MEMORY MAP — a constant-size "here's what's queryable" footer: active
+//      page counts by type + the recall affordances. This is what lets a 100×
+//      corpus stay reachable without injecting more.
+//
+// Net effect: the always-on footprint no longer scales with the corpus — only
+// the identity core (fixed) is full-body; everything else is pulled on demand.
+// Set WIKI_SESSION_FULL_PINNED=1 to revert to full-body for every pinned page.
+//
+// Failure mode: print (at least) the host banner rather than erroring; the
+// agent must never crash because the wiki is unavailable.
+
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const ws = require("../lib/wiki-store.js");
+const OWNER_NAME = require("../lib/instance.cjs").instanceValue("owner_name");
+
+const FULL_PINNED = process.env.WIKI_SESSION_FULL_PINNED === "1";
+
+// Host identity is resolved fresh on every run (cheap, never cached) and
+// prepended to the bundle so each session immediately knows whether it's on
+// the production host or a dev box. Loaded defensively — a missing/broken
+// module must never break the SessionStart hook.
+const hostIdentity = (() => {
+  try { return require("../lib/host-identity.js"); }
+  catch { return null; }
+})();
+function safeHostBanner() {
+  try { return hostIdentity ? hostIdentity.hostBanner() : ""; }
+  catch { return ""; }
+}
+
+const CACHE_PATH = path.join(os.tmpdir(), "merlin-wiki-session-context.json");
+
+// Hash of THIS script's own source, folded into the cache key.
+//
+// Without it the key covered only page CONTENT — so any edit to the bundle's
+// own wording (the memory map, the recall affordances, the section framing)
+// was silently ignored on every host until some unrelated page happened to
+// change. Caught 2026-08-09: the routing guidance sending episodic questions
+// to `episode_search` was committed, deployed, verified present in the file on
+// disk — and the hook kept emitting the previous text, because the pinned set
+// had not moved. A deploy that reports success and changes nothing is worse
+// than one that fails loudly.
+//
+// Deliberately the file's CONTENT, not its mtime: a `git checkout` that
+// restores an older revision moves mtime forward while moving the text
+// backward, which is exactly when a stale bundle would be most confusing.
+const SELF_HASH = (() => {
+  try {
+    return require("node:crypto")
+      .createHash("sha1")
+      .update(fs.readFileSync(__filename))
+      .digest("hex")
+      .slice(0, 12);
+  } catch {
+    // Unreadable own source: fall back to a value that never hits cache, so a
+    // stale bundle can never outlive a code change even in the odd case.
+    return `nocache-${process.pid}`;
+  }
+})();
+
+function cacheKey(coreRows, menuRows, recentRows, mapSig) {
+  const core = coreRows
+    .map((row) => `${row.id}:${row.updated_at || ""}:${row.body_hash || ""}:${row.pinned_at || ""}`)
+    .join("|");
+  const menu = menuRows
+    .map((row) => `${row.id}:${row.description || ""}`)
+    .join("|");
+  const recent = recentRows
+    .map((row) => `${row.id}:${row.updated_at || ""}:${row.body_hash || ""}`)
+    .join("|");
+  return `v[${SELF_HASH}]core[${core}]menu[${menu}]recent[${recent}]map[${mapSig}]`;
+}
+
+// Full-body render of the identity core.
+function buildCore(rows) {
+  if (!rows.length) return "";
+  const sections = rows.map((row) => {
+    const header = row.title ? `## ${row.title}` : `## ${row.id}`;
+    const desc = row.description ? `_${row.description}_\n\n` : "";
+    return `${header}\n${desc}${row.body_md.trim()}`;
+  });
+  const preamble = [
+    "# Long-term context — identity core (always loaded)",
+    "",
+    "The pages below are the always-loaded core. Everything else is pulled on demand — see the pinned menu and memory map below, and use the `wiki_*` MCP tools.",
+  ].join("\n");
+  return `${preamble}\n\n${sections.join("\n\n---\n\n")}\n`;
+}
+
+// Compact one-line-per-page menu of the auto-pinned (frequency-pinned) set.
+// Title + description + the id to pull. No bodies — that's the whole point.
+function buildMenu(rows) {
+  if (!rows.length) return "";
+  const lines = rows.map((row) => {
+    const title = row.title || row.id;
+    const desc = row.description ? ` — ${row.description}` : "";
+    return `- **${title}**${desc}  ·  \`wiki_read ${row.id}\``;
+  });
+  const preamble = [
+    "## Pinned menu (frequently used — pull the body on demand)",
+    "",
+    "These come up often but aren't injected in full. `wiki_read <id>` for the body.",
+  ].join("\n");
+  return `${preamble}\n\n${lines.join("\n")}\n`;
+}
+
+// Most-recent N day pages (descending), summarized — full narratives stay
+// in the wiki and are one `wiki_read day_YYYY-MM-DD` away. Goal is to
+// answer "what did the user do yesterday / the day before?" without any
+// tool call. Budget: ~1 KB per day, capped at 3 days.
+function buildRecentDaysSection(days) {
+  if (!days || !days.length) return "";
+  const summaries = days.map((p) => {
+    const date = p.id.slice(4);
+    const header = p.title ? `### ${date} — ${p.title}` : `### ${date}`;
+    const desc = p.description ? `_${p.description}_` : "";
+    const body = String(p.body_md || "");
+    const paras = body
+      .split(/\n\s*\n/)
+      .filter((para) => para.trim() && !para.startsWith("#"))
+      .slice(0, 2)
+      .join("\n\n");
+    const snippet = paras.length > 400 ? paras.slice(0, 400).trimEnd() + "…" : paras;
+    return [header, desc, snippet, `For full narrative: \`wiki_read ${p.id}\``]
+      .filter(Boolean)
+      .join("\n");
+  });
+  const preamble = [
+    "## Recent days (most recent first)",
+    "",
+    "Snapshot of the last few `day_*` wiki pages — use these for \"what did I do yesterday?\" without a tool call. `wiki_read day_YYYY-MM-DD` for the full narrative; `wiki_search` / `episode_search` for older / paraphrased lookups.",
+  ].join("\n");
+  return `${preamble}\n\n${summaries.join("\n\n")}\n`;
+}
+
+// Constant-size footer: what's in memory + how to reach it. This is the piece
+// that keeps a 100× corpus navigable without injecting more — the agent sees
+// the shape of what it can pull and the tools to pull it.
+function buildMemoryMap(byType, total) {
+  const counts = (byType || [])
+    .filter((t) => t.type && t.n)
+    .map((t) => `${t.type} ${t.n}`)
+    .join(", ");
+  const lines = [
+    "## Memory map — everything else is pulled on demand",
+    "",
+    total
+      ? `Long-term memory holds ${total} active pages${counts ? ` (${counts})` : ""}. Only the identity core above is always in context; retrieve the rest:`
+      : "Retrieve long-term memory on demand:",
+    "",
+    "- `wiki_map()` — table of contents (types + counts); `wiki_map(type)` to drill. Use it to see what's in memory when you don't know the exact page to search for.",
+    "- **\"where/when did we…\" about something that HAPPENED → `episode_search(query)`, not `wiki_search`.** Measured 2026-08-09 over 14 real questions: `episode_search` 79% hit@5, `wiki_search` hybrid 64%. It scopes to day pages, so the other ~800 pages stop competing. Then `wiki_read day_YYYY-MM-DD` for the full narrative.",
+    `- \`wiki_search(query, mode:"hybrid")\` — paraphrase-tolerant search for what ${OWNER_NAME} IS or PREFERS or DECIDED (profile, feedback rules, projects, references). \`type:\` to scope. Reach for \`episode_search\` instead for anything that happened on a day.`,
+    "- `wiki_read <id>` — full body of any page (ids appear in the pinned menu and in search hits), plus its typed facts.",
+    "- `wiki_associate(ids:[...])` — everything tied to a page or several (people ↔ the days they appear in, a day ↔ the day before/after, pages often recalled together), each result saying how it was reached. For \"what else happened when…\" and the bridge between two things.",
+    "- `recall_events(query)` — search Merlin's own activity stream (what it actually did/decided), not just curated pages.",
+  ];
+  return lines.join("\n") + "\n";
+}
+
+try {
+  const pinnedRows = ws
+    .listPages({ pinned: true, status: "active" })
+    .map((p) => ws.getPage(p.id))
+    .filter(Boolean);
+
+  // Split: pin_locked = identity core (full body); the rest = frequency menu.
+  // Guard: if FULL_PINNED, or nothing is locked (fresh/misconfigured DB), keep
+  // every pinned page full-body so we never accidentally strip the core.
+  let coreRows, menuRows;
+  const anyLocked = pinnedRows.some((r) => r.pin_locked);
+  if (FULL_PINNED || !anyLocked) {
+    coreRows = pinnedRows;
+    menuRows = [];
+  } else {
+    coreRows = pinnedRows.filter((r) => r.pin_locked);
+    menuRows = pinnedRows.filter((r) => !r.pin_locked);
+  }
+
+  const recentDayRows = ws
+    .listPages({ status: "active" })
+    .filter((p) => p.type === "day" && /^day_\d{4}-\d{2}-\d{2}$/.test(p.id))
+    .sort((a, b) => (a.id < b.id ? 1 : -1))
+    .slice(0, 3)
+    .map((p) => ws.getPage(p.id))
+    .filter(Boolean);
+
+  // Memory-map inputs (cheap aggregate; drives the constant-size footer).
+  let byType = [];
+  let total = 0;
+  try {
+    const s = ws.stats();
+    byType = s.byType || [];
+    total = s.total || 0;
+  } catch {}
+  const mapSig = `${total}:${byType.map((t) => `${t.type}=${t.n}`).join(",")}`;
+
+  const key = cacheKey(coreRows, menuRows, recentDayRows, mapSig);
+  let additionalContext = "";
+  try {
+    const cached = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+    if (cached && cached.key === key && typeof cached.additionalContext === "string") {
+      additionalContext = cached.additionalContext;
+    }
+  } catch {}
+  if (!additionalContext) {
+    const parts = [
+      buildCore(coreRows),
+      buildMenu(menuRows),
+      buildRecentDaysSection(recentDayRows),
+      buildMemoryMap(byType, total),
+    ].filter((s) => s && s.trim());
+    additionalContext = parts.join("\n---\n\n");
+    try {
+      fs.writeFileSync(CACHE_PATH, JSON.stringify({ key, additionalContext }));
+    } catch {}
+  }
+  const banner = safeHostBanner();
+  const full = banner ? `${banner}\n\n---\n\n${additionalContext}` : additionalContext;
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: full,
+      },
+    }),
+  );
+} catch (err) {
+  // Emit (at least) the host banner rather than failing the hook — knowing
+  // which machine we're on matters even when the wiki is unavailable.
+  process.stderr.write(`wiki-session-context: ${err.message}\n`);
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: safeHostBanner(),
+      },
+    }),
+  );
+} finally {
+  ws.closeDb();
+}

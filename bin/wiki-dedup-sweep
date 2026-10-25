@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// wiki-dedup-sweep — monthly full-corpus duplicate/staleness sweep over the wiki.
+//
+// The complement to the weekly `memory-consolidation` job, which is diff-mode
+// (recently-changed pages + neighbors) and therefore structurally blind to two
+// duplicate pages written weeks apart. This compares every active curated page
+// against every other one, using the embeddings the nightly `wiki-embed` cron
+// already writes, and asks a model for a verdict only on the handful of
+// clusters that survive the similarity filter.
+//
+//   wiki-dedup-sweep calibrate [--sample N]   score distribution + top pairs
+//   wiki-dedup-sweep run [--email] [...]      the sweep
+//   wiki-dedup-sweep run --dry-run            candidates only, no model calls
+//
+// Options for `run`:
+//   --threshold <f>       cosine floor for a candidate pair (default 0.90)
+//   --rare-jaccard <f>    rare-token overlap floor (default 0.18)
+//   --max-clusters <n>    per-run judging cap (default 25)
+//   --concurrency <n>     parallel judges (default 3)
+//   --model <id>          judge model (default claude-sonnet-5-5)
+//   --email               send the HTML report (silent when nothing actionable)
+//   --dry-run             skip judging entirely; print the candidate clusters
+//   --json                machine-readable result to stdout
+//
+// AUTH: judging forks `claude -p` (Max, API key stripped). That only
+// authenticates inside an already-logged-in GUI session, so this must be
+// launched from an agent turn via `job-run` — NOT straight from cron. See
+// agent/CLAUDE.md § Long-Running Jobs and the job playbook.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import * as dedup from "../lib/wiki-dedup.mjs";
+import { cosine } from "../lib/hybrid-recall.mjs";
+import { runOneShot } from "../agent/core/one-shot.mjs";
+import { installRoot } from "../lib/root.cjs";
+
+const HOME = os.homedir();
+const MERLIN = installRoot();
+const LOG = path.join(MERLIN, "data/logs/wiki-dedup-sweep.log");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0] || "run";
+const flag = (name, dflt) => {
+  const i = argv.indexOf(`--${name}`);
+  return i === -1 ? dflt : argv[i + 1];
+};
+const has = (name) => argv.includes(`--${name}`);
+
+function log(msg) {
+  const line = `${new Date().toISOString()} ${msg}`;
+  console.error(line);
+  try { fs.appendFileSync(LOG, line + "\n"); } catch {}
+}
+
+// --- calibrate --------------------------------------------------------------
+// Prints where the corpus actually sits so the threshold is a measurement, not
+// a guess. Unrelated pages cluster low; the interesting mass is the thin tail.
+if (cmd === "calibrate") {
+  const pages = dedup.loadPages();
+  const df = dedup.documentFrequency(pages);
+  const rare = new Map(pages.map((p) => [p.id, dedup.rareTokens(p, df, pages.length)]));
+
+  // Joint distribution: how many pairs survive each (cosine, rare-Jaccard) grid
+  // point. The whole design question is whether the lexical gate actually kills
+  // the template families without killing real duplicates, so show both axes.
+  const cosSteps = [0.85, 0.90, 0.93, 0.95];
+  const lexSteps = [0, 0.05, 0.10, 0.15, 0.20, 0.30];
+  const grid = new Map();
+  const survivors = [];
+  for (let i = 0; i < pages.length; i++) {
+    for (let j = i + 1; j < pages.length; j++) {
+      const s = cosine(pages[i].vec, pages[j].vec);
+      if (s < cosSteps[0]) continue;
+      const l = dedup.jaccard(rare.get(pages[i].id), rare.get(pages[j].id));
+      for (const c of cosSteps) {
+        for (const lx of lexSteps) {
+          if (s >= c && l >= lx) grid.set(`${c}|${lx}`, (grid.get(`${c}|${lx}`) || 0) + 1);
+        }
+      }
+      if (s >= 0.90 && l >= 0.15) survivors.push({ s, l, a: pages[i], b: pages[j] });
+    }
+  }
+
+  console.log(`pages=${pages.length} pairs=${(pages.length * (pages.length - 1)) / 2}\n`);
+  console.log("pairs surviving both gates — rows: cosine, cols: rare-token Jaccard\n");
+  console.log("cosine  " + lexSteps.map((l) => String(l).padStart(8)).join(""));
+  for (const c of cosSteps) {
+    console.log(String(c).padEnd(8) + lexSteps.map((l) => String(grid.get(`${c}|${l}`) || 0).padStart(8)).join(""));
+  }
+  console.log(`\nsurvivors at cos>=0.90 lex>=0.15 (${survivors.length}):`);
+  for (const t of survivors.sort((x, y) => y.l - x.l).slice(0, 40)) {
+    console.log(`  cos=${t.s.toFixed(3)} lex=${t.l.toFixed(3)}  ${t.a.id}  ||  ${t.b.id}`);
+  }
+  // Exit non-zero when nothing could be judged, so job-run records it as failed
+// rather than as a successful no-op.
+process.exit(0);
+}
+
+if (cmd !== "run") {
+  console.error("usage: wiki-dedup-sweep [run|calibrate] [options]  (see header)");
+  process.exit(2);
+}
+
+// --- run --------------------------------------------------------------------
+const threshold = Number(flag("threshold", dedup.DEFAULT_THRESHOLD));
+const rareJaccard = Number(flag("rare-jaccard", dedup.DEFAULT_RARE_JACCARD));
+const maxClusters = Number(flag("max-clusters", dedup.DEFAULT_MAX_CLUSTERS));
+const concurrency = Number(flag("concurrency", 3));
+const model = flag("model", "claude-sonnet-5-5");
+const dryRun = has("dry-run");
+
+const state = dedup.loadState(fs);
+state.last_run = new Date().toISOString();
+
+if (dryRun) {
+  const pages = dedup.loadPages();
+  const skip = new Set([...dedup.loadResolvedPairs(), ...dedup.suppressedPairs(state, pages)]);
+  const pairs = dedup.findCandidatePairs(pages, { threshold, rareJaccard, skip });
+  const clusters = dedup.clusterPairs(pairs);
+  console.log(`pages=${pages.length} suppressed=${skip.size} pairs (cos>=${threshold}, lex>=${rareJaccard}): ${pairs.length} clusters=${clusters.length}`);
+  for (const c of clusters.slice(0, maxClusters)) {
+    console.log(`\n[${c.topScore.toFixed(3)}]`);
+    for (const m of c.members) console.log(`  ${m.id} — ${m.title || ""} (${m.type || "untyped"})`);
+  }
+  if (clusters.length > maxClusters) console.log(`\n(${clusters.length - maxClusters} more over the cap)`);
+  // Exit non-zero when nothing could be judged, so job-run records it as failed
+// rather than as a successful no-op.
+process.exit(0);
+}
+
+// One fresh `claude -p` context per cluster — the judge never sees the corpus,
+// only its own three-or-so pages, and nothing accumulates between verdicts.
+const runner = async (prompt) => {
+  const { text } = await runOneShot(prompt, {
+    system: dedup.JUDGE_SYSTEM,
+    model,
+    effort: "low",          // mechanical same-or-not judgment, high volume
+    timeoutMs: 120_000,
+  });
+  return text;
+};
+
+log(`starting sweep threshold=${threshold} rareJaccard=${rareJaccard} maxClusters=${maxClusters} concurrency=${concurrency} model=${model}`);
+
+const result = await dedup.sweep({
+  runner,
+  threshold,
+  rareJaccard,
+  maxClusters,
+  concurrency,
+  state,
+  onProgress: (done, total) => log(`judged ${done}/${total}`),
+});
+
+const { stats, actionable } = result;
+log(`done pages=${stats.pages} pairs=${stats.pairs} clusters=${stats.clusters} judged=${stats.judged} actionable=${actionable.length} failed=${stats.failed} dropped=${stats.clustersDropped} suppressed=${stats.suppressed}`);
+
+// A run where the judges never actually ran is a FAILED run, not a clean one.
+// The first live run (2026-07-29) had all 16 judges return "Not logged in" and
+// still printed "Nothing actionable" with exit 0 — indistinguishable from a
+// healthy corpus. Failed verdicts are already excluded from the state file, so
+// nothing is poisoned; this makes the run itself visibly fail.
+const allFailed = stats.judged > 0 && stats.failed === stats.judged;
+if (stats.failed > 0) {
+  log(`WARN ${stats.failed}/${stats.judged} judges failed` +
+      (stats.authFailed ? ` (${stats.authFailed} unauthenticated — \`claude -p\` needs a GUI-session keychain; see jobs/wiki-dedup-sweep.md)` : "") +
+      ` — their clusters were NOT recorded and will be re-judged next run`);
+}
+
+try {
+  fs.writeFileSync(dedup.STATE_PATH, JSON.stringify(result.state, null, 2));
+} catch (err) {
+  log(`WARN could not write state: ${err.message}`);
+}
+
+if (has("json")) {
+  console.log(JSON.stringify({
+    stats,
+    actionable: actionable.map((c) => ({
+      members: c.members.map((m) => ({ id: m.id, title: m.title, type: m.type })),
+      topScore: c.topScore,
+      ...c.verdict,
+    })),
+  }, null, 2));
+} else {
+  console.log(dedup.renderReportText(result));
+}
+
+// Silent on empty — a "nothing to report" email every month is exactly the kind
+// of ping that trains the user to ignore this one.
+if (has("email") && actionable.length > 0 && !allFailed) {
+  const bodyFile = path.join(os.tmpdir(), `wiki-dedup-${Date.now()}.html`);
+  fs.writeFileSync(bodyFile, dedup.renderReportHtml(result));
+  const dupes = actionable.filter((c) => c.verdict.verdict === "duplicate").length;
+  const overlaps = actionable.length - dupes;
+  const subject = `Wiki sweep: ${dupes} duplicate${dupes === 1 ? "" : "s"}, ${overlaps} overlap${overlaps === 1 ? "" : "s"} across ${stats.pages} pages`;
+  const r = spawnSync(path.join(MERLIN, "bin/email-send"), [
+    "--to", createRequire(import.meta.url)("../lib/instance.cjs").instanceValue("owner_email"), "--subject", subject, "--body-file", bodyFile, "--html",
+  ], { encoding: "utf8" });
+  if (r.status !== 0) log(`WARN email-send failed: ${r.stderr || r.stdout}`);
+  else log(`emailed: ${subject}`);
+  try { fs.unlinkSync(bodyFile); } catch {}
+}
+
+// Exit non-zero when nothing could be judged, so job-run records it as failed
+// rather than as a successful no-op.
+process.exit(allFailed ? 4 : 0);

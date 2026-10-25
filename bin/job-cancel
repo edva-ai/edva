@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+// job-cancel — stop a running job launched via job-run.
+//
+// Sends SIGTERM to the job's target command (not the wrapper), waits up to
+// 5s for it to exit, then SIGKILLs if it's still alive. The wrapper's own
+// exit handler records status=canceled (it checks cancel_requested, which
+// this script sets before signaling) — see lib/job-runner-wrapper.mjs.
+//
+// Usage: job-cancel <id>
+
+import { readRegistry, cancelJob, isPidAlive } from "../lib/job-runner.mjs";
+
+const id = process.argv[2];
+if (!id) {
+  process.stderr.write("Usage: job-cancel <id>\n");
+  process.exit(2);
+}
+
+const { job, alreadyTerminal } = cancelJob(id);
+if (alreadyTerminal) {
+  console.log(`job ${id} already terminal (status=${job.status}) — nothing to cancel`);
+  process.exit(0);
+}
+
+console.log(`sent SIGTERM to job ${id} (pid ${job.pid})`);
+
+const deadline = Date.now() + 5000;
+function poll() {
+  const current = readRegistry(id);
+  if (current && current.status !== "running" && current.status !== "starting") {
+    console.log(`job ${id} now status=${current.status}`);
+    process.exit(0);
+  }
+  if (Date.now() >= deadline) {
+    if (job.pid && isPidAlive(job.pid)) {
+      console.log(`job ${id} still alive after grace period — sending SIGKILL`);
+      try { process.kill(job.pid, "SIGKILL"); } catch {}
+    }
+    setTimeout(() => {
+      const finalState = readRegistry(id);
+      console.log(`job ${id} final status=${finalState ? finalState.status : "unknown"}`);
+      process.exit(0);
+    }, 1000);
+    return;
+  }
+  setTimeout(poll, 300);
+}
+poll();

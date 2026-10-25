@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# ci-keychain-lock-audit — prove every macOS-signing repo on the shared CI host is
+# running the SAME ci-keychain-lock.sh, and that none has quietly regressed to
+# an unsynchronized or login-evicting keychain pattern.
+#
+# WHY THIS EXISTS
+# The helper is vendored, not shared — a cross-repo composite action would need
+# private-repo action access wired up in every signing repo, and a broken resolution
+# there breaks signing. Vendoring keeps each repo self-contained; the cost is
+# that copies drift silently. This turns silent drift into a loud failure.
+#
+# It also re-runs the original audit continuously, because the expensive part
+# was never the fix — it was discovering that several workflows across several
+# repos had the same defect. A new repo, or a copy-pasted workflow, reintroduces
+# it for free.
+#
+# Checks, per known signing workflow:
+#   1. the vendored ci-keychain-lock.sh is byte-identical to merlin's canonical
+#   2. the workflow actually SOURCES it (a copy nobody calls is not a fix)
+#   3. no blanket `list-keychains -d user -s "$VAR"` outside a guarded fallback
+#      (that is the login-eviction pattern that took Merlin auth down)
+#
+# Usage:  ci-keychain-lock-audit [--json]
+# Exit:   0 all clean · 1 drift/regression found · 2 could not run (no gh/auth)
+
+set -uo pipefail
+
+CANON="$HOME/Dev/merlin/.github/scripts/ci-keychain-lock.sh"
+# Second shared helper: per-job scoping for provisioning profiles + ASC keys.
+# Same defect class, same vendoring discipline, so it gets the same drift check.
+CANON_SA="$HOME/Dev/merlin/.github/scripts/ci-signing-assets.sh"
+JSON=0
+[ "${1:-}" = "--json" ] && JSON=1
+
+# repo:workflow pairs known to sign on the shared CI host: MERLIN_CI_SIGNING_TARGETS
+# (whitespace-separated), else `targets` in agent/local/config/ci-signing.json.
+# Repos are looked up under the installation's GitHub owner (MERLIN_OWNER,
+# lib/instance.cjs github_owner). No targets → exit 2 (nothing to audit).
+# shellcheck source=/dev/null
+source "$HOME/Dev/merlin/agent/scripts/lib/instance.sh"
+OWNER="${MERLIN_OWNER:-}"
+TARGETS="${MERLIN_CI_SIGNING_TARGETS:-$(node -e 'for (const t of require(process.argv[1]).localConfig("ci-signing", { targets: [] }).targets || []) console.log(t)' "$HOME/Dev/merlin/lib/instance.cjs" 2>/dev/null)}"
+[ -n "$TARGETS" ] || { echo "ci-keychain-lock-audit: no signing targets configured (agent/local/config/ci-signing.json or MERLIN_CI_SIGNING_TARGETS)" >&2; exit 2; }
+[ -n "$OWNER" ] || { echo "ci-keychain-lock-audit: no GitHub owner configured (instance github_owner / MERLIN_OWNER)" >&2; exit 2; }
+
+command -v gh >/dev/null 2>&1 || { echo "ci-keychain-lock-audit: gh not installed" >&2; exit 2; }
+gh auth status >/dev/null 2>&1 || { echo "ci-keychain-lock-audit: gh not authenticated" >&2; exit 2; }
+[ -f "$CANON" ] || { echo "ci-keychain-lock-audit: canonical script missing at $CANON" >&2; exit 2; }
+
+# Hash the canonical file the SAME way downstream content is hashed: through
+# $( ), which strips trailing newlines. Hashing the file directly would include
+# its trailing newline and make byte-identical copies look drifted.
+CANON_SHA=$(printf '%s' "$(cat "$CANON")" | shasum -a 256 | cut -d' ' -f1)
+CANON_SA_SHA=""
+[ -f "$CANON_SA" ] && CANON_SA_SHA=$(printf '%s' "$(cat "$CANON_SA")" | shasum -a 256 | cut -d' ' -f1)
+FAILURES=0
+ROWS=""
+
+# Cache each repo's vendored script sha so we fetch it once, not per workflow.
+# A tempdir, not a shell array: these lookups run inside $( ), and array writes
+# in a subshell evaporate — the array version silently re-fetched every time.
+CACHE=$(mktemp -d)
+trap 'rm -rf "$CACHE"' EXIT
+repo_script_sha() {
+  local repo="$1" script="${2:-ci-keychain-lock.sh}" f content
+  f="$CACHE/$repo.${script}.sha"
+  [ -f "$f" ] && { cat "$f"; return; }
+  content=$(gh api "repos/$OWNER/$repo/contents/.github/scripts/$script" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null)
+  # Test emptiness BEFORE hashing: `shasum` of no input returns the sha of the
+  # empty string, so a MISSING file would otherwise look like a drifted one.
+  if [ -z "$content" ]; then
+    printf 'MISSING' > "$f"
+  else
+    printf '%s' "$content" | shasum -a 256 | cut -d' ' -f1 | tr -d '\n' > "$f"
+  fi
+  cat "$f"
+}
+
+for t in $TARGETS; do
+  repo="${t%%:*}"; wf="${t##*:}"
+  body=$(gh api "repos/$OWNER/$repo/contents/.github/workflows/$wf" --jq '.content' 2>/dev/null \
+         | base64 -d 2>/dev/null)
+  if [ -z "$body" ]; then
+    ROWS="$ROWS$repo/$wf|workflow-unreadable|FAIL\n"; FAILURES=$((FAILURES+1)); continue
+  fi
+
+  # 1. vendored copy matches canonical
+  sha=$(repo_script_sha "$repo")
+  if [ "$sha" = "MISSING" ]; then
+    ROWS="$ROWS$repo/$wf|no-vendored-script|FAIL\n"; FAILURES=$((FAILURES+1))
+  elif [ "$sha" != "$CANON_SHA" ]; then
+    ROWS="$ROWS$repo/$wf|script-DRIFTED|FAIL\n"; FAILURES=$((FAILURES+1))
+  fi
+
+  # 2. the workflow sources it
+  if ! echo "$body" | grep -q 'ci-keychain-lock\.sh'; then
+    ROWS="$ROWS$repo/$wf|does-not-source-helper|FAIL\n"; FAILURES=$((FAILURES+1))
+  fi
+
+  # 2b. signing-assets helper: vendored copy matches, and no glob has returned.
+  # A workflow that never touches profiles/ASC keys legitimately does not source
+  # it, so only the DRIFT and GLOB checks are unconditional.
+  if [ -n "$CANON_SA_SHA" ]; then
+    sa_sha=$(repo_script_sha "$repo" "ci-signing-assets.sh")
+    if echo "$body" | grep -q 'ci-signing-assets\.sh'; then
+      if [ "$sa_sha" = "MISSING" ]; then
+        ROWS="$ROWS$repo/$wf|no-vendored-signing-assets|FAIL\n"; FAILURES=$((FAILURES+1))
+      elif [ "$sa_sha" != "$CANON_SA_SHA" ]; then
+        ROWS="$ROWS$repo/$wf|signing-assets-DRIFTED|FAIL\n"; FAILURES=$((FAILURES+1))
+      fi
+    fi
+  fi
+  # Globs over per-USER signing state delete concurrent jobs' assets.
+  if echo "$body" | grep -qE '^[^#]*rm -[rf]*f?[^#]*(AuthKey_\*|Profiles/\*)'; then
+    ROWS="$ROWS$repo/$wf|DESTRUCTIVE-glob|FAIL\n"; FAILURES=$((FAILURES+1))
+  fi
+
+  # 3. no unguarded blanket replace. A bare `-s "$VAR"` with nothing after it
+  #    replaces the whole list. Indented ones live inside the guarded isolation
+  #    fallback (one project's), which is intentional and stays.
+  blanket=$(echo "$body" | grep -cE '^ {0,10}security list-keychains -d user -s "?\$[A-Za-z_]+"?[[:space:]]*$')
+  if [ "${blanket:-0}" -gt 0 ]; then
+    ROWS="$ROWS$repo/$wf|UNGUARDED-list-replace|FAIL\n"; FAILURES=$((FAILURES+1))
+  fi
+
+  echo "$ROWS" | grep -q "$repo/$wf|" || ROWS="$ROWS$repo/$wf|ok|PASS\n"
+done
+
+if [ "$JSON" = "1" ]; then
+  printf '{"canonical_sha":"%s","failures":%d,"rows":[' "$CANON_SHA" "$FAILURES"
+  first=1
+  printf '%b' "$ROWS" | while IFS='|' read -r name detail status; do
+    [ -z "$name" ] && continue
+    [ "$first" = "0" ] && printf ','
+    printf '{"target":"%s","detail":"%s","status":"%s"}' "$name" "$detail" "$status"
+    first=0
+  done
+  printf ']}\n'
+else
+  printf '%b' "$ROWS" | awk -F'|' 'NF>=3 { printf "  %-38s %-26s %s\n", $1, $2, $3 }'
+  echo
+  if [ "$FAILURES" -eq 0 ]; then
+    echo "  all signing repos in sync (canonical ${CANON_SHA:0:12})"
+  else
+    echo "  $FAILURES problem(s). Re-vendor with:"
+    echo "    cp $CANON <repo>/.github/scripts/ci-keychain-lock.sh"
+  fi
+fi
+
+[ "$FAILURES" -eq 0 ] || exit 1

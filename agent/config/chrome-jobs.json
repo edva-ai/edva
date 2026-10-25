@@ -1,0 +1,6 @@
+{
+  "_comment": "Jobs whose playbook drives Chrome through the ops agent's chrome-devtools MCP (or the REPL's cdp.navigate/cdp.evaluate, which ride on it). Only the ops supervisor loads that MCP, so webhook-auth.sh pins these jobs to ops regardless of job-routing.json. Jobs that drive Chrome through browsing-skills/tools/cdp-runner.mjs or run-action.js from Bash do NOT belong here: the runner talks to localhost:9222 directly and works from any supervisor, or from a cron script with no agent at all. This installation's own Chrome-MCP jobs live in agent/local/chrome-jobs.json (merged by lib/registry.cjs). Kept in sync mechanically by tests/chrome-jobs-sync.test.mjs.",
+  "jobs": [
+    "skill-repair"
+  ]
+}

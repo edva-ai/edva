@@ -1,8 +1,18 @@
-# Personal MCP tools overlay drop.
+# Installation MCP tools.
 #
-# Each file is an ES module exporting `{ tools: [...descriptors], handlers:
-# { tool_name: async (args) => result } }`. Loaded by `agent/tools-mcp/
-# index.mjs` at MCP-server startup and merged into the public tool set.
+# Each `*.mjs` / `*.js` module here exports `tools` (named export,
+# `default.tools`, or the default export): an array of entries shaped like the
+# kernel tools in agent/tools-mcp/index.mjs —
+#   { name, description, schema /* JSON Schema */, run: async (args) => string }
+# — or a function `({ run, exec, BIN, ws })` returning one. Optional `after`:
+# the name of a tool the module's tools follow in the served list (keeps the
+# list, part of every session's cached prompt prefix, in a stable order).
+# Loaded once at server start and served as `mcp__tools__<name>`; a name a
+# kernel tool already has is ignored, a module that fails to import is skipped
+# with a log line.
 #
-# Anything you place under `_ext/` is gitignored — see .gitignore at repo
-# root and docs/architecture-public-private.md.
+# Not the same as agent/ext/ (agent-authored modules approved through the
+# self-improvement gate): `_ext/` is code you wrote.
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

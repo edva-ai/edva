@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+// open-questions — read or settle the ledger of Merlin questions the user has
+// not answered yet (lib/open-questions.mjs; questions are repeated until
+// they're answered).
+//
+// Usage:
+//   open-questions list [--json]          open questions, oldest first
+//   open-questions due [--json]           the ones the open_questions lane would re-ask now
+//   open-questions show <id>              one question, all its asks
+//   open-questions retire <id> --why "<reason>"
+//        no longer relevant (the event passed, the user answered it some other way,
+//        the user said to drop it). Stamps every chat copy closed so the app stops
+//        colouring it. Answers go through `hum-answer <id> "<answer>"`, never this.
+
+import { openQuestions, dueForReask, getQuestion, recordRetired, stampRows } from "../lib/open-questions.mjs";
+
+const [cmd, ...rest] = process.argv.slice(2);
+const json = rest.includes("--json");
+const ago = (iso) => { const h = (Date.now() - Date.parse(iso)) / 3600e3; return h < 48 ? `${Math.round(h)}h ago` : `${Math.round(h / 24)}d ago`; };
+const line = (q) => `${q.id}  [${q.lane || "?"}]  asked ${q.asks}x, first ${ago(q.first_asked_at)}, last ${ago(q.last_asked_at)}${q.relevant_until ? `, until ${q.relevant_until}` : ""}\n    ${String(q.question || "").replace(/\s+/g, " ").slice(0, 220)}`; // lang-regex-ok: whitespace collapse of our own stored question for display
+
+if (cmd === "list" || cmd === "due") {
+  const qs = cmd === "list" ? openQuestions() : dueForReask();
+  console.log(json ? JSON.stringify(qs, null, 2) : qs.length ? qs.map(line).join("\n") : `no ${cmd === "list" ? "open" : "due"} questions`);
+} else if (cmd === "show" && rest[0]) {
+  const q = getQuestion(rest[0]);
+  if (!q) { console.error(`no question ${rest[0]}`); process.exit(2); }
+  console.log(JSON.stringify(q, null, 2));
+} else if (cmd === "retire" && rest[0]) {
+  const i = rest.indexOf("--why");
+  const why = i >= 0 ? rest[i + 1] : null;
+  if (!why) { console.error("retire needs --why \"<reason>\""); process.exit(2); }
+  const q = recordRetired(rest[0], why);
+  if (!q) { console.error(`${rest[0]} is not an open question`); process.exit(3); }
+  const n = await stampRows(q.msg_ids, "closed");
+  console.log(JSON.stringify({ ok: true, retired: q.id, rows_stamped: n }));
+} else {
+  console.error("usage: open-questions list|due [--json] | show <id> | retire <id> --why \"<reason>\"");
+  process.exit(2);
+}

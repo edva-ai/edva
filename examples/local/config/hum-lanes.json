@@ -1,0 +1,7 @@
+{
+  "_comment": "Hum lanes this installation adds. Copy to agent/local/config/hum-lanes.json. Read by agent/scripts/hum-harvest-all.mjs (locality classes) and the hum sensors (which lanes an event wakes). A plain key replaces the kernel's list; `extend_<key>` appends to it. Lane names match your harvester topics (data/hum-interests.json).",
+  "extend_place_bound": ["farmers_market"],
+  "extend_operational": ["package_tracking"],
+  "daypart_lanes": ["situation", "dining", "exercise", "tasks"],
+  "desk_return_lanes": ["situation", "tasks", "watchdog", "package_tracking"]
+}

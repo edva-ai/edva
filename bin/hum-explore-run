@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+// hum-explore-run — send, at most twice a week, the best item hum held back,
+// as an ordinary ping, so the user's reaction calibrates the lane. Replaced the
+// weekly hum canary. Selection + gates: lib/hum-explore.mjs.
+// Playbook: agent/ops-agent/jobs/hum-explore.md.
+//
+// The send goes through hum-ping, so every normal refusal still applies —
+// daily ping budget / 45-min spacing (exit 11), already-rejected subject (7),
+// cross-send dup (8), semantic dup (9). A refusal just means "not now".
+//
+// Usage:
+//   hum-explore-run              gate + select + send
+//   hum-explore-run --dry-run    print the decision, send nothing
+//   hum-explore-run --json       machine-readable decision (implies --dry-run)
+//
+// Env overrides (tests): HUM_RUNS_FILE (read via hum-run-log),
+// HUM_FEEDBACK_FILE, HUM_EXPLORE_PING (send command), HUM_EXPLORE_NOW (ISO).
+
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { laneEvidence } from "../lib/hum-engagement.mjs";
+import {
+  selectCandidates, sentKeysFrom, settledLanes, cadenceGate, momentGate, buildMessage, SENT_LOOKBACK_MS,
+} from "../lib/hum-explore.mjs";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DATA = path.resolve(HERE, "../data");
+const FEEDBACK = process.env.HUM_FEEDBACK_FILE || path.join(DATA, "hum-feedback.jsonl");
+const PING = process.env.HUM_EXPLORE_PING || path.join(HERE, "hum-ping");
+const RUN_LOG = path.join(HERE, "hum-run-log");
+
+function readRuns(nowMs) {
+  const since = new Date(nowMs - 6 * 3600 * 1000).toISOString();
+  const out = execFileSync(process.execPath, [RUN_LOG, "read", "--since", since, "--json"], {
+    encoding: "utf8", env: process.env, maxBuffer: 256 * 1024 * 1024,
+  });
+  return JSON.parse(out).records || [];
+}
+
+function readFeedback(nowMs) {
+  let raw = "";
+  try { raw = fs.readFileSync(FEEDBACK, "utf8"); } catch { return []; }
+  const since = nowMs - SENT_LOOKBACK_MS;
+  const rows = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    try {
+      const r = JSON.parse(line);
+      const t = Date.parse(r.sent_at || r.ts || "");
+      if (Number.isFinite(t) && t >= since) rows.push(r);
+    } catch { /* skip */ }
+  }
+  return rows;
+}
+
+function logRun(rec) {
+  execFileSync(process.execPath, [RUN_LOG, "append"], { input: JSON.stringify(rec), env: process.env });
+}
+
+function pingId(nowMs) {
+  const d = new Date(nowMs);
+  const p = (n) => String(n).padStart(2, "0");
+  return `p-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}-${crypto.randomBytes(2).toString("hex")}`;
+}
+
+export function decide({ records, feedback, nowMs, evidence }) {
+  const cadence = cadenceGate(feedback, nowMs);
+  if (!cadence.ok) return { send: false, reason: cadence.reason };
+  const moment = momentGate(records, nowMs);
+  if (!moment.ok) return { send: false, reason: moment.reason };
+  const settled = settledLanes(evidence);
+  const excludeLanes = new Set([...settled, ...cadence.coolLanes]);
+  const pool = selectCandidates(records, nowMs, { sentKeys: sentKeysFrom(feedback, nowMs), excludeLanes });
+  if (!pool.length) return { send: false, reason: "no fresh held-back item in an unsettled lane", settled: [...settled] };
+  return { send: true, pick: pool[0], settled: [...settled], pool_size: pool.length };
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const known = new Set(["--dry-run", "--json"]);
+  if (args.some((a) => !known.has(a))) {
+    // Refuse anything unrecognised (incl. --help) rather than falling through
+    // to a real send: this tool messages the user.
+    process.stderr.write("usage: hum-explore-run [--dry-run] [--json]\n");
+    process.exit(2);
+  }
+  const json = args.includes("--json");
+  const dry = json || args.includes("--dry-run");
+  const nowMs = process.env.HUM_EXPLORE_NOW ? Date.parse(process.env.HUM_EXPLORE_NOW) : Date.now();
+
+  const d = decide({
+    records: readRuns(nowMs),
+    feedback: readFeedback(nowMs),
+    nowMs,
+    evidence: laneEvidence({ now: nowMs, feedbackPath: FEEDBACK }),
+  });
+  if (json) { process.stdout.write(JSON.stringify(d) + "\n"); return; }
+  if (!d.send) { process.stdout.write(`hum-explore-run: skip — ${d.reason}\n`); return; }
+
+  const text = buildMessage(d.pick);
+  if (dry) { process.stdout.write(`[${d.pick.lane} ${d.pick.score}] ${text}\n`); return; }
+
+  const id = pingId(nowMs);
+  const finding = { topic: d.pick.topic, signal: d.pick.summary, urgency: d.pick.urgency, dedup_key: d.pick.dedup_key };
+  const r = spawnSync(PING, [
+    "--ping-id", id, "--lane", d.pick.lane, "--score", String(d.pick.score),
+    "--findings", JSON.stringify([finding]), "--intent", `hum:explore:${d.pick.lane}`,
+    "--suppress-hook", "--message", text,
+  ], { encoding: "utf8", env: process.env });
+  const ts = new Date(nowMs).toISOString();
+  if (r.status === 0 || r.status === 4) { // 4 = sent, message id not captured (row still written)
+    logRun({ ts, mode: "explore", ping_id: id, lane: d.pick.lane, score: d.pick.score, summary: d.pick.summary, decision: "EXPLORE_SENT" });
+    process.stdout.write(`hum-explore-run: sent ${id} (${d.pick.lane})\n`);
+    return;
+  }
+  if ([7, 8, 9, 10, 11, 12].includes(r.status)) {
+    // A normal hum-ping refusal (budget, spacing, dup, rejected subject) — not
+    // now. 12: the records already answered it (resolve-first gate).
+    logRun({ ts, mode: "explore", lane: d.pick.lane, summary: d.pick.summary, decision: "EXPLORE_REFUSED", hum_ping_exit: r.status });
+    process.stdout.write(`hum-explore-run: hum-ping refused (exit ${r.status}) — not now\n`);
+    return;
+  }
+  throw new Error(`hum-ping failed (exit ${r.status}): ${(r.stderr || "").trim().slice(-200)}`);
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { main(); } catch (e) { process.stderr.write(`hum-explore-run: ${e.message}\n`); process.exit(1); }
+}

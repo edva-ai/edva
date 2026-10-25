@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+// hum-ideas-resolve — the user replied in words to an `ideas` hum ping; close
+// out that idea's whole family (chat-agent CLAUDE.md § Hum Inbound, Step 2.5).
+//
+// The chat agent decides THAT the user's message is a reply to the open ideas ping,
+// and which few words describe the topic (Rule #0b — language is the model's
+// call). Everything after that is bookkeeping the agent used to do by hand
+// with five tool calls:
+//   1. find the ping in hum-feedback.jsonl and its idea in hum-ideas.jsonl;
+//   2. sibling sweep — mark every unconsumed idea sharing its task_id, AND
+//      every one sharing its thread_id (thread_id / legacy gmail_thread_id),
+//      consumed (both sweeps, not whichever field happens to be set — one
+//      incident had four ideas on one thread, one task_id);
+//   3. append a hum-resolved-topics.jsonl row (48h suppression);
+//   4. run hum-reservoir-review on the topic, which retires other unconsumed
+//      ideas ABOUT it by embedding similarity (no word matching). The topic
+//      phrase is --topic (the chat model's words), else the idea's subject.
+//
+// Usage:
+//   hum-ideas-resolve <ping_id> --resolution "<the user's words>" [--topic "<phrase>"] [--dry-run]
+//   (--keywords k1 k2 ... is still accepted and joined into the topic phrase)
+// Prints JSON {ping_id, idea_id, swept:[ids], review}. Exit: 0 ok · 2 usage · 3 ping/idea not found.
+// Env (tests): MERLIN_DATA_DIR.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import { installTools } from "../lib/root.cjs";
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const SUPPRESS_MS = 48 * 3600 * 1000;
+
+function die(msg, code) { process.stderr.write(`hum-ideas-resolve: ${msg}\n`); process.exit(code); }
+function jsonl(p) {
+  try { return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { return []; }
+}
+
+const args = process.argv.slice(2);
+const dry = args.includes("--dry-run");
+const pingId = args[0] && !args[0].startsWith("--") ? args[0] : null;
+const ri = args.indexOf("--resolution");
+const resolution = ri >= 0 ? String(args[ri + 1] || "") : "";
+const ki = args.indexOf("--keywords");
+const keywords = [];
+if (ki >= 0) for (let i = ki + 1; i < args.length && !args[i].startsWith("--"); i++) keywords.push(args[i]);
+const ti = args.indexOf("--topic");
+const topicArg = ti >= 0 ? String(args[ti + 1] || "").trim() : (keywords.length ? keywords.join(" ") : "");
+if (!pingId || ri < 0) die('usage: hum-ideas-resolve <ping_id> --resolution "<text>" [--topic "<phrase>"] [--dry-run]', 2);
+
+const ping = jsonl(path.join(DIR, "hum-feedback.jsonl")).reverse().find((r) => r.ping_id === pingId);
+if (!ping) die(`ping ${pingId} not found in hum-feedback.jsonl`, 3);
+const finding = (ping.findings || [])[0] || {};
+
+const IDEAS = path.join(DIR, "hum-ideas.jsonl");
+const byId = new Map();
+for (const r of jsonl(IDEAS)) if (r.id) byId.set(r.id, { ...(byId.get(r.id) || {}), ...r });
+const ideaId = [finding.dedup_key, finding.supporting_data?.idea_id].find((k) => k && byId.has(k));
+if (!ideaId) die(`no idea in hum-ideas.jsonl for ping ${pingId} (dedup_key ${finding.dedup_key || "?"})`, 3);
+const idea = byId.get(ideaId);
+const sd = idea.supporting_data || {};
+const taskId = sd.task_id || null;
+const threadId = sd.thread_id || sd.gmail_thread_id || null;
+
+const swept = [];
+for (const [id, r] of byId) {
+  if (r.consumed) continue;
+  const rsd = r.supporting_data || {};
+  const sameTask = taskId && rsd.task_id === taskId;
+  const sameThread = threadId && (rsd.thread_id === threadId || rsd.gmail_thread_id === threadId);
+  if (sameTask || sameThread) swept.push(id);
+}
+
+const now = new Date();
+let review = null;
+if (!dry) {
+  for (const id of swept) {
+    fs.appendFileSync(IDEAS, JSON.stringify({ id, consumed: true, consumed_at: now.toISOString(), consume_reason: `sibling-sweep:chat-response:${pingId}` }) + "\n");
+  }
+  fs.appendFileSync(path.join(DIR, "hum-resolved-topics.jsonl"), JSON.stringify({
+    ts: now.toISOString(), source_ping_id: pingId, task_id: taskId, thread_id: threadId,
+    topic: topicArg || idea.subject || null, keywords, resolution: resolution.slice(0, 100),
+    suppress_until: new Date(now.getTime() + SUPPRESS_MS).toISOString(),
+  }) + "\n");
+  const topic = topicArg || idea.subject || "";
+  if (topic) {
+    const r = spawnSync(path.join(HERE, "hum-reservoir-review"), ["--topic", topic, "--reason", `ping-response: ${resolution.slice(0, 100)}`, "--json"], { encoding: "utf8", env: process.env });
+    try { review = JSON.parse(String(r.stdout || "").trim().split("\n").pop()); } catch { review = (r.stdout || r.stderr || "").trim().split("\n").pop() || null; }
+  }
+}
+process.stdout.write(JSON.stringify({ ping_id: pingId, idea_id: ideaId, task_id: taskId, thread_id: threadId, swept, review, dry_run: dry }) + "\n");

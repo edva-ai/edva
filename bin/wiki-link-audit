@@ -1,0 +1,93 @@
+#!/usr/bin/env node
+// wiki-link-audit — suggest/apply missing concept wikilinks in wiki pages.
+//
+// The curated alias map lives in data/wiki-link-concepts.json. This is
+// intentionally deterministic: it only links known aliases to canonical pages,
+// and it skips code, inline code, markdown links, existing wikilinks, and
+// pages already linked to the same target.
+
+"use strict";
+
+const linker = require("../lib/wiki-linker.js");
+const ws = require("../lib/wiki-store.js");
+
+const args = process.argv.slice(2);
+
+function flag(name, def = undefined) {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return def;
+  const next = args[i + 1];
+  if (!next || next.startsWith("--")) return true;
+  return next;
+}
+
+function usage() {
+  console.log(`wiki-link-audit — missing concept wikilink audit
+
+Usage:
+  wiki-link-audit [--id PAGE_ID] [--json]
+  wiki-link-audit --apply [--id PAGE_ID]
+  wiki-link-audit --concepts <path>
+
+Behavior:
+  - Read-only by default; exits non-zero if suggestions exist.
+  - --apply links the first plain-text alias per concept per page.
+  - Alias map: ${linker.DEFAULT_CONCEPTS_PATH}
+`);
+}
+
+if (args.includes("-h") || args.includes("--help")) {
+  usage();
+  process.exit(0);
+}
+
+const id = typeof flag("id") === "string" ? flag("id") : null;
+const conceptsPath =
+  typeof flag("concepts") === "string" ? flag("concepts") : linker.DEFAULT_CONCEPTS_PATH;
+const asJson = Boolean(flag("json", false));
+const apply = Boolean(flag("apply", false));
+
+try {
+  if (apply) {
+    const changed = linker.applySuggestions({ id, conceptsPath, editedBy: "wiki-link-audit" });
+    if (asJson) {
+      console.log(JSON.stringify({ changed }, null, 2));
+      return;
+    }
+    if (!changed.length) {
+      console.log("wiki-link-audit: clean");
+      return;
+    }
+    for (const c of changed) {
+      const links = c.added.map((a) => `${a.alias} -> ${a.target}`).join(", ");
+      console.log(`${c.id}: +${c.added.length}${c.rev ? ` (rev ${c.rev})` : ""}  ${links}`);
+    }
+    console.log(`\nupdated ${changed.length} page${changed.length === 1 ? "" : "s"}`);
+    return;
+  }
+
+  const suggestions = linker.suggestLinks({ id, conceptsPath });
+  const summary = linker.summarize(suggestions);
+  if (asJson) {
+    console.log(JSON.stringify({ summary, suggestions }, null, 2));
+    process.exitCode = summary.total ? 1 : 0;
+    return;
+  }
+  if (!suggestions.length) {
+    console.log("wiki-link-audit: clean");
+    return;
+  }
+  let cur = null;
+  for (const s of suggestions) {
+    if (s.page_id !== cur) {
+      cur = s.page_id;
+      console.log(`\n${s.page_id}`);
+    }
+    console.log(`  ${s.alias} -> [[${s.target}|${s.alias}]]`);
+  }
+  console.log(`\n${summary.total} suggestion(s) across ${summary.pages} page(s)`);
+  console.log("run with --apply to add safe first-occurrence links");
+  process.exitCode = 1;
+} finally {
+  ws.closeDb();
+}

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System Issue Review — nightly full pass (04:27 local) + hourly critical
+  escalation (:52). Both run the same trigger, which gates hard before spending
+  anything: the nightly pass exits when there are no new alerts and nothing due
+  for verification, and the hourly pass exits unless a genuinely NEW critical
+  condition landed (deduped by lib/system-issue-gate.mjs). That gate is
+  why an hourly Opus slot is affordable — a worst-case replay over a real 14-day
+  batch produced 1 escalation and 21 suppressions.
+
+  Two labels rather than one plist with two intervals, because the two lanes take
+  different arguments.
+
+  launchd USER agents, not crontab (keychain / Max auth — see the review plist).
+
+  Install: agent/launch-agents/install.sh ai.claude.system-issue-review
+  ai.claude.system-issue-review-critical (renders the placeholders, then
+  bootstraps each), and remove the two trigger-system-issue-review.sh crontab lines.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.claude.system-issue-review</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__MERLIN_TOOLS__/agent/scripts/trigger-system-issue-review.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__MERLIN_TOOLS__/agent/ops-agent</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>27</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__MERLIN_TOOLS__/agent/logs/system-issue-review-launchd.log</string>
+</dict>
+</plist>

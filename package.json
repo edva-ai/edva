@@ -1,6 +1,13 @@
 {
+  "name": "merlin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Merlin root package: dependencies of the kernel code at the repo root (lib/, bin/cli.d/). Sub-packages under agent/, bin/ and browsing-skills/ carry their own.",
+  "engines": {
+    "node": ">=22.5"
+  },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.88.0",
+    "@anthropic-ai/sdk": "^1.3.0",
     "docx": "^9.6.1",
     "exceljs": "^4.4.0",
     "xlsx": "^0.18.5"

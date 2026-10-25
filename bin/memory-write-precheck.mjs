@@ -4,11 +4,9 @@
 // Before saving new factual content to a wiki page, this script searches
 // existing memory for contradictions and asks Sonnet to adjudicate.
 //
-// Motivating case (generic): an upstream job (email-triage, calendar fuse,
-// etc.) writes a new fact to memory that contradicts something the wiki
-// already says — e.g. memory says "user is in city A solo this week",
-// new write says "user and partner are in city B on day N." Both facts
-// can't be true. The conflict should be surfaced before the write lands.
+// Motivating case: an agent read a fact out of an email and saved it to memory,
+// but an existing reference page already asserted the opposite. Both facts
+// can't be true. The conflict should be resolved before the write lands.
 //
 // Stdin: {page_id?: string, content: string, intent?: string}
 //   page_id  — the wiki page being written/updated (optional, for context)
@@ -26,21 +24,32 @@
 // Better an occasional stale write than a broken pipeline that can't save anything.
 //
 // Usage from an agent or playbook:
-//   echo '{"page_id":"reference_trip_destination","content":"Partner is also flying to the destination on the trip date","intent":"travel-update"}' \
-//     | ${MERLIN_HOME}/bin/memory-write-precheck.mjs
+//   echo '{"page_id":"reference_<page>","content":"<person> is now also flying to <city> on <date>","intent":"travel-update"}' \
+//     | ~/Dev/merlin/bin/memory-write-precheck.mjs
 //   # → {"decision":"conflict","conflicts":[...],"resolution":"...","reason":"..."}
 
 import { spawnSync } from "node:child_process";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
+import os from "node:os";
+import { createRequire } from "node:module";
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
-const WIKI_BIN   = path.resolve(__dir, "wiki");
-const CLAUDE_BIN = "${MERLIN_HOME_USER}/.local/bin/claude";
-const LOG_FILE   = path.resolve(__dir, "..", "data", "memory-write-precheck-log.jsonl");
+// Env overrides exist for tests/jev-memory-write-precheck.test.mjs only.
+const WIKI_BIN   = process.env.MEMORY_PRECHECK_WIKI_BIN || path.resolve(__dir, "wiki");
+const CLAUDE_BIN = process.env.MEMORY_PRECHECK_CLAUDE_BIN || path.join(os.homedir(), ".local/bin/claude");
+const LOG_FILE   = process.env.MEMORY_PRECHECK_LOG || path.resolve(__dir, "..", "data", "memory-write-precheck-log.jsonl");
+// Whose memory this is (agent/local/instance.json owner_name), and this
+// installation's travel/presence search and contradiction example
+// (agent/local/config/memory-write-precheck.json).
+const { instance, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+const OWNER = instance().owner_name;
+const CFG = localConfig("memory-write-precheck", {
+  presence_query: "solo traveling stay",
+  contradiction_example: `memory says "${OWNER} traveling solo" and new content says "${OWNER} and a companion flying together"`,
+  addition_example: `"they also enjoy hiking"`,
+});
 
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj));
@@ -94,10 +103,8 @@ if (keywords.length >= 2) {
   }
 }
 
-// Pass 2: always check current travel/presence status.
-// Tune the keyword list to match the kinds of conflict-prone facts your
-// wiki tracks (travel state, companion presence, project status, etc.).
-const r2 = spawnSync(WIKI_BIN, ["search", "solo traveling stay together", "--limit", "3"], {
+// Pass 2: always check current travel/presence status
+const r2 = spawnSync(WIKI_BIN, ["search", CFG.presence_query, "--limit", "3"], {
   encoding: "utf8", timeout: 8000,
 });
 if (r2.status === 0 && r2.stdout.trim() && !r2.stdout.trim().startsWith("(no matches)")) {
@@ -121,9 +128,9 @@ if (!wikiContext.trim() && !existingPageContent.trim()) {
 }
 
 // ─── Sonnet conflict check ────────────────────────────────────────────────────
-const prompt = `You are reviewing a proposed memory write for the user's personal AI agent. Before the agent saves new facts to its long-term memory, you check whether the new content contradicts any existing memory.
+const prompt = `You are reviewing a proposed memory write for ${OWNER}'s personal AI agent. Before the agent saves new facts to its long-term memory, you check whether the new content contradicts any existing memory.
 
-Your job is to detect FACTUAL CONTRADICTIONS — not just related content. An addition (e.g., "the user also likes Korean food") is not a conflict. A contradiction (e.g., memory says "the user is traveling solo this week" and new content says "the user's partner is flying with them on day N") IS a conflict that must be resolved before writing.
+Your job is to detect FACTUAL CONTRADICTIONS — not just related content. An addition (e.g., ${CFG.addition_example}) is not a conflict. A contradiction (e.g., ${CFG.contradiction_example}) IS a conflict that must be resolved before writing.
 
 Intent of this write: ${intent}
 Page being written/updated: ${pageId || "(new content)"}
@@ -143,7 +150,7 @@ Decide:
    {
      "decision":"conflict",
      "conflicts":[{"page_id":"<id>","snippet":"<quoted contradicting text, ≤150 chars>","explanation":"<≤120 chars: what exactly contradicts>"}],
-     "resolution":"<≤200 chars: what should be done — which source is more authoritative, which page to update, what to ask the user>",
+     "resolution":"<≤200 chars: what should be done — which source is more authoritative, which page to update, what to ask ${OWNER}>",
      "reason":"<≤120 chars: summary>"
    }
 
@@ -151,32 +158,101 @@ A conflict requires BOTH: (a) the existing memory asserts something factual, AND
 
 Reply with ONE LINE of compact JSON, no prose, no markdown fence.`;
 
-let sonnetOut = "";
+// ─── Decision: Jev primary, Sonnet shadow/fallback ───────────────────────────
+// Jev runs as primary with the current mechanism as shadow for one week
+// (docs/jev.md). Jev answers one boolean — does the new content
+// contradict existing memory? — but it cannot WRITE the conflict detail the
+// wiki caller prints (page_id / snippet / explanation / resolution). So:
+//   - Jev "save" (confident)     → save, no Sonnet needed after the shadow week.
+//   - Jev "conflict" (confident) → Sonnet is asked for the detail; the memoized
+//     legacy call means the shadow run is reused, never a second Sonnet turn.
+//     If Sonnet then says save, we save — the prompt's own rule is "if in doubt,
+//     prefer save", and the disagreement is logged + paged for review.
+//   - Jev unavailable / low confidence → Sonnet decides alone, exactly as before.
+// Health/bank content never reaches Jev: the on-device screen (fail-closed)
+// routes a flagged write straight to Sonnet. Fail-open is unchanged: any path
+// that cannot reach a verdict saves.
+const { decide } = await import("../lib/jev-shadow.mjs");
+const { runToolless, parseModelJson } = await import("../lib/jev-claude.mjs");
+const { answerConfidence, boolOf } = await import("../lib/jev.mjs");
+const JEV_SITE = "memory-write-precheck";
+
+// The pre-existing Sonnet check, unchanged in prompt and parsing. Resolves the
+// full result object; THROWS (with the old fail-open reason) when Sonnet could
+// not produce a verdict, so the shadow log records an error, not a fake "save".
+// Async (execFile, not spawnSync) so the shadow Sonnet turn and the Jev call
+// genuinely overlap — a spawnSync here would run Sonnet to completion before
+// the Jev request was even sent.
+// Tool-less, Max-only, off the merlin tree's settings — lib/jev-claude.mjs.
+async function sonnetCheck() {
+  const sonnetOut = await runToolless({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
+  if (!sonnetOut) throw new Error("precheck_sonnet_unavailable");
+  const parsed = parseModelJson(sonnetOut);
+  if (!parsed) throw new Error("precheck_sonnet_no_json");
+  if (parsed.decision === "conflict" && Array.isArray(parsed.conflicts) && parsed.conflicts.length > 0) {
+    return {
+      decision: "conflict",
+      conflicts: parsed.conflicts,
+      resolution: (parsed.resolution || "").toString().slice(0, 300),
+      reason: (parsed.reason || "precheck_conflict").toString().slice(0, 200),
+    };
+  }
+  return { decision: "save", reason: (parsed.reason || "precheck_send").toString().slice(0, 200) };
+}
+let legacyMemo = null;
+const legacyFull = () => (legacyMemo ||= sonnetCheck());
+
+const failOpen = (err) => emit({ decision: "save", reason: String(err?.message || err || "precheck_error").slice(0, 200) });
+
+const jevState = {
+  intent,
+  page_id: pageId || "(new content)",
+  new_content: newContent.slice(0, 1200),
+  current_page: existingPageContent.trim() || "(none)",
+  related_memory: wikiContext || "(none found)",
+};
+
+let r;
 try {
-  const res = spawnSync(CLAUDE_BIN, [
-    "-p", "--model", "sonnet", "--effort", "low",
-    "--allowedTools", "",
-    "--output-format", "text",
-    prompt,
-  ], { encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 });
-  if (res.status === 0 && res.stdout) sonnetOut = res.stdout.trim();
-} catch {}
-
-if (!sonnetOut) emit({ decision: "save", reason: "precheck_sonnet_unavailable" });
-
-const match = sonnetOut.match(/\{[\s\S]*\}/);
-if (!match) emit({ decision: "save", reason: "precheck_sonnet_no_json" });
-
-let parsed;
-try { parsed = JSON.parse(match[0]); } catch { emit({ decision: "save", reason: "precheck_sonnet_bad_json" }); }
-
-if (parsed.decision === "conflict" && Array.isArray(parsed.conflicts) && parsed.conflicts.length > 0) {
-  emit({
-    decision: "conflict",
-    conflicts: parsed.conflicts,
-    resolution: (parsed.resolution || "").toString().slice(0, 300),
-    reason: (parsed.reason || "precheck_conflict").toString().slice(0, 200),
+  r = await decide({
+    site: JEV_SITE,
+    id: pageId || null,
+    state: jevState,
+    interpret: (answers) => {
+      const a = answers.contradiction;
+      const b = boolOf(a);
+      if (b === null) throw new Error("jev: no contradiction answer");
+      return { value: b ? "conflict" : "save", confidence: answerConfidence(a) };
+    },
+    legacy: () => legacyFull().then((x) => x.decision),
+    same: (j, l) => j === l,
+    logInput: { intent, page_id: pageId || null, new_content: newContent.slice(0, 300) },
+    // On-device health/bank screen over exactly jevState (fail-closed); a flagged
+    // write goes to Sonnet alone. Runs only when Jev would.
+    privacyScreen: true,
   });
+} catch (err) { failOpen(err); }
+
+if (r.value === "save") {
+  if (r.used === "jev") {
+    // Shadow week: decide() already awaited the Sonnet shadow. If Sonnet found a
+    // detailed conflict, it wins — a false "save" writes a contradiction into
+    // memory, the costly direction (from a code review). The disagreement is
+    // already logged and paged by decide().
+    if (legacyMemo) {
+      const sh = await legacyMemo.catch(() => null);
+      if (sh && sh.decision === "conflict") emit({ ...sh, reason: `sonnet_shadow_conflict_over_jev_save: ${sh.reason || ""}`.slice(0, 200) });
+    }
+    const p = r.jev?.answers?.contradiction?.probability ?? r.jev?.answers?.contradiction?.noul;
+    emit({ decision: "save", reason: `jev_consistent (p_conflict=${typeof p === "number" ? p.toFixed(3) : "?"})` });
+  }
+  try { emit(await legacyFull()); } catch (err) { failOpen(err); }
 }
 
-emit({ decision: "save", reason: (parsed.reason || "precheck_send").toString().slice(0, 200) });
+// Conflict: the caller needs Sonnet's detail. Reuses the shadow's result.
+let full;
+try { full = await legacyFull(); } catch (err) {
+  emit({ decision: "save", reason: `jev_conflict_undetailed (${String(err?.message || err).slice(0, 80)})` });
+}
+if (full.decision === "conflict") emit(full);
+emit({ decision: "save", reason: `jev_conflict_unconfirmed_by_sonnet: ${full.reason || ""}`.slice(0, 200) });

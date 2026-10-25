@@ -1,5 +1,10 @@
-#!node
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
 // merlin-logs — time-merged view across supervisor + watchdog + event logs.
+// (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
+// string and a comment. cron runs this with a bare PATH that has no node, so
+// `#!/usr/bin/env node` would exit 127; the launcher tries the stable Homebrew
+// and /usr/local paths first, then PATH. Same as lib/root.cjs nodeBin.)
 //
 // Motivation: during the 2026-04-18 5h hum outage, diagnosing required
 // cross-referencing ~6 log files by hand. This CLI reads them all, normalizes
@@ -11,6 +16,7 @@
 //   merlin-logs --since "2026-04-18T20:00:00Z"
 //   merlin-logs --last 30m                 # last 30 minutes
 //   merlin-logs --last 2h                  # last 2 hours
+//   merlin-logs --last 7d                  # last 7 days (reads rotated logs too)
 //   merlin-logs -n 200                     # latest 200 merged lines
 //   merlin-logs --source ops               # only ops-supervisor.log
 //   merlin-logs --source ops,events        # multiple sources
@@ -20,7 +26,6 @@
 // Sources:
 //   ops       ops-supervisor.log          (ISO-prefixed per line after 2026-04-18)
 //   chat      chat-supervisor.log         (ISO-prefixed per line)
-//   hookdeck  hookdeck.log                (unprefixed; best-effort time from file mtime)
 //   launch    claude-launchagent.err.log  (leading "YYYY-MM-DD HH:MM:SS" local)
 //   watchdog  watchdog.log                (leading "YYYY-MM-DD HH:MM:SS" local)
 //   events    supervisor-ops/events.ndjson (ts field, ISO)
@@ -28,15 +33,16 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 
+import { installTools } from "../lib/root.cjs";
 const HOME = process.env.HOME;
-const LOGDIR = path.join(HOME, "dev/merlin/agent/logs");
-const DATA_DIR = path.join(process.env.MERLIN_HOME || path.join(HOME, "Dev/merlin"), "data");
+const LOGDIR = installTools("agent/logs");
+const DATA_DIR = installTools("data");
 
 const SOURCES = {
   ops:      { file: path.join(LOGDIR, "ops-supervisor.log"),          parse: parseIsoPrefixed },
   chat:     { file: path.join(LOGDIR, "chat-supervisor.log"),         parse: parseIsoPrefixed },
-  hookdeck: { file: path.join(LOGDIR, "hookdeck.log"),                parse: parseUnprefixed  },
   launch:   { file: path.join(LOGDIR, "claude-launchagent.err.log"),  parse: parseSpaceDatetime },
   watchdog: { file: path.join(LOGDIR, "watchdog.log"),                parse: parseSpaceDatetime },
   events:   { file: path.join(LOGDIR, "supervisor-ops/events.ndjson"),parse: parseNdjsonTs    },
@@ -48,8 +54,10 @@ function usage() {
 
 Options:
   --since TIME         show lines since TIME (ISO-8601 or local "HH:MM")
-  --last DURATION      show lines in the last DURATION (e.g. 30m, 2h, 45s)
-  -n, --limit N        show only the latest N lines after merging
+  --last DURATION      show lines in the last DURATION (e.g. 45s, 30m, 2h, 7d, 2w)
+  -n, --limit N        latest N lines after merging. NOTE: -n on its own sets no
+                       time window, so it reads the LIVE files only — pair it
+                       with --last/--since to include rotated logs.
   --source NAMES       comma-separated list. Default: all. Known: ${Object.keys(SOURCES).join(", ")}
   --grep REGEX         filter lines whose body matches REGEX (case-insensitive)
   --tail               after printing history, follow new writes
@@ -65,7 +73,17 @@ function parseIsoPrefixed(line) {
   // "2026-04-19T02:45:30.123Z [supervisor] …"
   const m = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(.*)$/);
   if (!m) return null;
-  return { ts: Date.parse(m[1]), body: m[2] };
+  const ts = Date.parse(m[1]);
+  // Shape-matching is not validity: \d{2} accepts month 13 / day 45 / hour 99,
+  // and Date.parse returns NaN for those. (It does NOT for 2026-02-30 — V8
+  // rolls that over to Mar 2 — so "impossible date" is the wrong mental model;
+  // "unparseable" is the right one.) An unvalidated NaN survives every window
+  // comparison, since NaN < since is false, and only surfaces much later at
+  // new Date(NaN).toISOString(). No crash has been observed through THIS
+  // parser; the guard is here because its NDJSON sibling below shipped without
+  // one and that is exactly how the live crash happened.
+  if (!Number.isFinite(ts)) return null;
+  return { ts, body: m[2] };
 }
 
 function parseSpaceDatetime(line) {
@@ -85,18 +103,20 @@ function parseNdjsonTs(line) {
   try {
     const e = JSON.parse(line);
     if (!e.ts) return null;
-    return { ts: Date.parse(e.ts), body: JSON.stringify(e) };
+    const ts = Date.parse(e.ts);
+    // Same guard as parseSpaceDatetime has had all along, and the reason this
+    // one was missing is a live crash: 84 rows in hum-runs.jsonl carry stamps
+    // like "2026-04-25T21:41:21.3NZ", which Date.parse returns NaN for. NaN
+    // passes the `parsed.ts < opts.since` filter (every comparison with NaN is
+    // false), so it reached emit() and threw RangeError: Invalid time value,
+    // killing the whole run AFTER it had already printed most of its output.
+    if (!Number.isFinite(ts)) return null;
+    return { ts, body: JSON.stringify(e) };
   } catch { return null; }
 }
 
-function parseUnprefixed(line) {
-  // No timestamps — skip so hookdeck lines appear via `--source hookdeck`
-  // explicit request only. In the default "all" merge, they'd cluster at t=0.
-  return null;
-}
-
 function parseDuration(s) {
-  const m = String(s).match(/^(\d+)\s*([smh]?)$/);
+  const m = String(s).match(/^(\d+)\s*([smhdw]?)$/);
   if (!m) return null;
   const n = parseInt(m[1], 10);
   switch (m[2]) {
@@ -104,6 +124,8 @@ function parseDuration(s) {
     case "s": return n * 1000;
     case "m": return n * 60_000;
     case "h": return n * 3_600_000;
+    case "d": return n * 86_400_000;
+    case "w": return n * 7 * 86_400_000;
   }
   return null;
 }
@@ -160,16 +182,64 @@ function parseArgs(argv) {
 // ─── reading ─────────────────────────────────────────────────────────────
 
 function readAllLines(file) {
-  try { return fs.readFileSync(file, "utf8").split("\n"); }
-  catch { return []; }
+  try {
+    const buf = fs.readFileSync(file);
+    const text = file.endsWith(".gz") ? zlib.gunzipSync(buf).toString("utf8") : buf.toString("utf8");
+    return text.split("\n");
+  } catch { return []; }
+}
+
+// rotate-agent-logs.sh copytruncates the supervisor/watchdog/launchagent logs
+// nightly into "<stem>-YYYY-MM-DD.log", gzipping the previous day's and keeping
+// 14. The SOURCES table points at the LIVE file only, so the widest answerable
+// window was "since the last rotation": had `--last 7d` merely been accepted,
+// it would have returned byte-identical output to `--last 1d` and `--last 52w`.
+// Any window reaching back past midnight has to read the dated siblings too, or
+// the unit is decoration — and a silently-empty week is worse than a rejected
+// flag, because nightly-review reads a non-empty match as an incident.
+//
+// WHY THE `m[1] < sinceDay` SKIP BELOW IS SAFE. Not because of the per-line
+// filter: that can only discard extra lines, never restore one from a file we
+// declined to open. It rests on the rotation stamp bounding the file's content.
+// Rotation runs `0 0 * * *` on the host's clock, so a file named "<stem>-D.log"
+// is sealed at local midnight, which falls on UTC-date D or earlier in any zone
+// (on a host west of UTC, say at UTC−5: 05:00 UTC on D, holding only lines stamped
+// UTC-date D-1 — the name runs one day AHEAD of its content). So D < sinceDay
+// implies every line in it precedes the start of UTC day sinceDay, hence
+// precedes `since`.
+//
+// THIS INVARIANT IS SCHEDULE-DEPENDENT. Move rotation late enough that it falls
+// on the next UTC date (after ~19:00 on a host at UTC−5) and
+// "<stem>-D.log" starts holding lines stamped UTC-date D+1, at which point this
+// skip silently drops hours of real lines — exactly the blindness this function
+// exists to remove. If the rotation time changes, drop the skip (read every
+// sibling and let the per-line filter do the work) or widen it by a day.
+const ROTATED_SUFFIX = /^-(\d{4}-\d{2}-\d{2})\.log(\.gz)?$/;
+
+function rotatedSiblings(file, sinceMs) {
+  if (sinceMs == null) return [];
+  const dir = path.dirname(file);
+  const stem = path.basename(file).replace(/\.log$/, "");
+  if (stem === path.basename(file)) return []; // not a .log (events.ndjson, hum-runs.jsonl)
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+  const out = [];
+  for (const n of names) {
+    if (!n.startsWith(`${stem}-`)) continue;
+    const m = n.slice(stem.length).match(ROTATED_SUFFIX);
+    if (!m || m[1] < sinceDay) continue;
+    out.push(path.join(dir, n));
+  }
+  return out.sort();
 }
 
 function collectRecords(opts) {
   const records = [];
   for (const src of opts.sources) {
     const { file, parse } = SOURCES[src];
-    if (!fs.existsSync(file)) continue;
-    const lines = readAllLines(file);
+    const files = [...rotatedSiblings(file, opts.since), file].filter(f => fs.existsSync(f));
+    const lines = files.flatMap(readAllLines);
     for (const raw of lines) {
       if (!raw) continue;
       const parsed = parse(raw);
@@ -191,7 +261,6 @@ function collectRecords(opts) {
 const SOURCE_COLOR = {
   ops:      "\x1b[36m", // cyan
   chat:     "\x1b[35m", // magenta
-  hookdeck: "\x1b[33m", // yellow
   launch:   "\x1b[90m", // grey
   watchdog: "\x1b[33m", // yellow
   events:   "\x1b[34m", // blue

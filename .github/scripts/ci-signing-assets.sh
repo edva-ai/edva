@@ -5,27 +5,26 @@
 #   source "$GITHUB_WORKSPACE/.github/scripts/ci-signing-assets.sh"
 #
 # ┌────────────────────────────────────────────────────────────────────────────┐
-# │ CANONICAL SOURCE: the gandalf repo, .github/scripts/ci-signing-assets.sh    │
-# │ Every signing repo vendors a BYTE-IDENTICAL copy. Do not edit a vendored    │
-# │ copy — edit canonical, bump SA_LIB_VERSION, re-vendor everywhere.           │
-# │ `tools/bin/ci-keychain-lock-audit` compares copies by sha256.               │
+# │ SHARED FILE: every signing repo on a shared runner host should vendor an   │
+# │ IDENTICAL copy. Edit one canonical copy, bump SA_LIB_VERSION, re-vendor    │
+# │ everywhere. `bin/ci-keychain-lock-audit` compares copies by sha256.        │
 # └────────────────────────────────────────────────────────────────────────────┘
 SA_LIB_VERSION="1"
 #
 # WHY THIS EXISTS
 # `~/Library/MobileDevice/Provisioning Profiles/` and `~/private_keys/` are
-# per-USER, not per-job. Every signing workflow on this shared mini was clearing
+# per-USER, not per-job. Every signing workflow on a shared host was clearing
 # them with globs:
 #     rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision
 #     rm -f ~/private_keys/AuthKey_*.p8
 # so the first job to reach setup or teardown deleted every other in-flight
-# job's signing assets. Observed 2026-07-28: a Butterfly build died with
-# "AuthKey_***.p8 ... no such file" and Tracker with "No App Store profile ...
-# found on this runner", both while sibling builds ran.
+# job's signing assets: one build dies with "AuthKey_***.p8 ... no such file",
+# another with "No App Store profile ... found on this runner", whenever
+# sibling builds run at the same time.
 #
 # This is the SAME defect class as the keychain search list (see
 # ci-keychain-lock.sh): shared global per-user state mutated without per-job
-# scoping. The keychain version took Gandalf's Max auth down; this version
+# scoping. The keychain version takes an agent's auth down; this version
 # breaks sibling builds.
 #
 # The hygiene the globs were reaching for — "no stale duplicate profile for MY
@@ -48,7 +47,7 @@ SA_STATE="${SA_STATE:-${RUNNER_TEMP:-/tmp}/.sa-installed-${GITHUB_RUN_ID:-local}
 # read a pipe. `security ... | PlistBuddy /dev/stdin` returns the literal string
 # "Error Reading File: /dev/stdin" — and it prints that to STDOUT, so 2>/dev/null
 # does not hide it. The first version of this function piped, and the bogus value
-# flowed through as a UUID: foodierank installed "Error.mobileprovision" and the
+# flowed through as a UUID: one repo installed "Error.mobileprovision" and the
 # archive failed with "No profile for team". `<<<` materialises a temp file,
 # which is what the hand-rolled code this replaced always did.
 sa__field() {
@@ -103,7 +102,7 @@ sa_install_profile() {
   # The first version accumulated into $SA_INSTALLED and wrote it to GITHUB_ENV
   # each call; with two profiles both calls started from an empty parent value,
   # so GITHUB_ENV's last-wins left only the SECOND path and teardown leaked the
-  # first (observed: "Gandalf Mac Profile" survived a green build). Appending to
+  # first (a macOS profile survived a green build). Appending to
   # a file survives subshells.
   mkdir -p "$(dirname "$SA_STATE")" 2>/dev/null || true
   echo "$SA_PROFILES_DIR/$uuid.$ext" >> "$SA_STATE"

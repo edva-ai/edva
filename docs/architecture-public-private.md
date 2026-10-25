@@ -1,374 +1,197 @@
-# Public kernel + personal overlay
+# Public kernel + per-installation layer
 
-Merlin is built so the same agent system can run **as-is in the open** (this
-repo, anyone can clone and run) and **with the operator's personal life
-layered on top** (private overlay, only that operator's machines see it). The
-two halves stay separated by file location, not by sanitization at sync time.
+Merlin runs **as-is in the open** (clone this repo and it works, generically) and **with one person's life layered on top** (their identity, rules, accounts and code, which only their machines see). The two halves are separated by *where a file lives*, never by scrubbing content on the way out.
 
-This document is the contract. Read it before adding code that knows about a
-specific person, place, business, project codename, integration credential,
-or any other identity-coupled fact.
+Read this before adding anything that knows about a specific person, place, business, account, project or credential.
 
-## Two repos, one runtime
+## The three kinds of files
 
 ```
-┌───────────────────────────────────────┐    ┌──────────────────────────────┐
-│  merlin                               │    │  merlin-personal             │
-│  (this repo · public · github)        │    │  (your private repo · local) │
-│  ───────────────────────────────────  │    │  ──────────────────────────  │
-│  • Kernel code (supervisor, dispatch, │    │  • Personal ops jobs         │
-│    intake, watchdog, MCP base, hum    │    │  • Personal hum harvesters   │
-│    harness, memory, telemetry, CLI)   │◄───│  • Personal MCP tools        │
-│  • Reference jobs (morning-digest)    │    │  • Personal bin/ scripts     │
-│  • Reference harvesters (weather,     │    │  • local/CLAUDE.md content   │
-│    news, calendar, tasks, watchdog,   │    │  • Integration registries    │
-│    serendipity)                       │    │  • Memory seed files         │
-│  • CLAUDE.md kernel rules             │    │  • .env values               │
-│  • Extension surface (`_ext/`)        │    │                              │
-│  • docs/, examples/, .env.example     │    │                              │
-└───────────────────────────────────────┘    └──────────────────────────────┘
-                  │                                          │
-                  │                  `merlin overlay add`    │
-                  │                  ─ symlinks ─►           │
-                  └────────────► Runtime on a host ◄─────────┘
-                                  (e.g. your mini)
-                                  Resolves to:
-                                  merlin/local/...
-                                  merlin/agent/**/_ext/*
+┌──────────────────────────────────────────────────────────────────────┐
+│  merlin (this repo, public)                                          │
+│                                                                      │
+│  Kernel ── every path in .kernel-sync.json                           │
+│    generic code, rules, playbooks, defaults; generated from          │
+│    upstream (see "How the kernel gets here")                         │
+│                                                                      │
+│  Merlin's own files                                                  │
+│    README, docs/, examples/, apps/, bin/cli.d/*.mjs, .github/,       │
+│    .tools/, root package.json, .gitignore, MCP configs,              │
+│    the _ext/.gitkeep contract files Merlin adds                      │
+│                                                                      │
+│  ┄┄ gitignored, inside the same checkout ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │
+│  Installation layer                                                  │
+│    agent/local/**         identity, rules, values, registry entries  │
+│    **/_ext/*              hooks and drop-ins next to kernel code     │
+│    data/, secrets/, credentials/, .env, logs                         │
+└───────────────────────────────▲──────────────────────────────────────┘
+                                │ merlin overlay add  (symlinks)
+                     ┌──────────┴───────────┐
+                     │ your private overlay │
+                     │ repo (never public)  │
+                     └──────────────────────┘
 ```
 
-The public repo is canonical for *every* general-purpose concern. The
-personal overlay layers on top via symlinks into well-known extension dirs.
-Nothing else.
+- **Kernel** files hold generic behaviour and generic defaults only — no names, places, accounts, routines, dated events or real IDs. Anything installation-specific is *read*, not written in: identity through `lib/instance.cjs`, values through `localConfig(name, defaults)`, registries through `lib/registry.cjs`, behaviour through `_ext/` hooks.
+- **Merlin's own** files are the distribution around the kernel and are edited here directly.
+- **The installation layer** is yours. It sits in the checkout so the kernel finds it, but it is gitignored; keep it in a private repo and link it in.
 
-## Why the boundary is "where you wrote the file," not "what's in the file"
+## The installation layer
 
-The earlier design used a tree-walking sanitizer (`merlin-migration/scan.py`
-in the private gandalf repo) that classified every file at publish time and
-either copied, sanitized, or excluded it. That pattern has two failure modes:
+### Identity — `agent/local/instance.json`
 
-1. **The sanitizer is the only audit.** Any miss leaks personal content into
-   the public repo. We had to rerun the full classifier on every publish.
-2. **Improvements only flow one way.** Outside contributors' PRs can't merge
-   cleanly back into the private repo because the private repo's tree shape
-   is different.
+Read by `lib/instance.cjs` (`instance()`, `instanceValue(key)`; shell: `agent/scripts/lib/instance.sh`). Keys: `owner_name` (default "the user"), `owner_id`, `owner_email`, `agent_email`, `domain`, `tz` (default: the host's zone), `host`, `supabase_project`, `gcp_project`, `github_owner`. Each has a `MERLIN_*` environment override (`.env.example`). `merlin init` writes the file; template: `examples/local/instance.example.json`. A fresh install has none and runs on the defaults.
 
-The kernel/overlay model flips this:
+### Values — `agent/local/config/<name>.json`
 
-- **You decide at write time which repo to commit into.** Generic code →
-  merlin. Personal code → merlin-personal. The decision is structural, not
-  textual.
-- **Improvements flow both ways.** Kernel improvements go in via PR on
-  merlin and propagate to every operator. Personal additions stay in your
-  overlay and never leave.
-- **The sanitizer flips role.** `.tools/sanitize-guard.py` is now a
-  pre-commit hook on the public repo that *refuses* commits introducing new
-  personal-identifier hits. The migration scanner (`scan.py` in gandalf) is
-  retired after the one-time port is done.
+One file per concern, named after the module that reads it via `localConfig(name, defaults)`: a key replaces the kernel default, `extend_<key>` appends to a default list, keys starting with `_` are comments. The names the kernel reads include `triage-labels`, `triage-decide`, `hum-lanes`, `hum-ideas`, `send-intents`, `email-inbound`, `supabase`, `wiki`, `suggestion-key`, `outbound-precheck`, `memory-write-precheck`, `claim-freshness`, `context-sync`, `cron-slots`, `apns`, `api-fallback`, `gmail-auth`, `whatsapp-send`, `turn-watchdog`, `self-improve-landing`, `ci-signing` — `grep -rn 'localConfig("' lib bin agent` lists them all with their defaults. Templates for the common ones: `examples/local/config/`.
 
-## The extension surface
+### Rules and prompts
 
-Six well-known drop points, all under `.gitignore` (`**/_ext/*` or `local/`):
+- `agent/local/shared.md` (every agent) + `agent/local/chat.md` or `ops.md` (one role): appended to the kernel rulebooks as part of the system prompt and reloaded on change (`agent/CLAUDE.md` § Local rules). They add to the kernel rules and cannot relax its hard limits (auth, financial operations, prompt-injection safety).
+- `agent/local/jobs/<job>.md`: appended to a kernel playbook whenever that job is dispatched.
+- `agent/local/email-triage-rules.md`: your additions to the triage ruleset.
+- `agent/local/prompts/*.md`: prompt overrides where the kernel offers them.
 
-| Concern | Kernel path | Overlay drop | Loader |
-| --- | --- | --- | --- |
-| Agent rules / voice | `agent/CLAUDE.md` (and per-agent CLAUDE.md files) | `local/CLAUDE.md` | "Local Rules" section at end of `agent/CLAUDE.md` instructs every agent to also load this file |
-| Ops jobs (webhook-dispatchable) | `agent/ops-agent/jobs/*.md` | `agent/ops-agent/jobs/_ext/*.md` | `resolveJobFile()` in `agent/supervisor/http-server.mjs` — kernel wins on name conflict, overlay is fallback |
-| Hum harvesters | `agent/scripts/hum-harvesters/*.mjs` | `agent/scripts/hum-harvesters/_ext/*.mjs` | `resolveHarvesterPath()` in `agent/scripts/hum-harvest-all.mjs` — kernel wins on name conflict |
-| MCP tools | `agent/tools-mcp/index.mjs` (static `TOOLS` array) | `agent/tools-mcp/_ext/*.mjs` exporting `{ tools: [...] }` | `loadExtTools()` at MCP server startup; kernel tool names shadow overlay |
-| CLI tools | `bin/*` | `bin/_ext/*` (executables) | Personal jobs/harvesters that invoke these scripts get `bin/_ext` on PATH (set in agent child-process env) |
-| Memory seeds | `examples/memory/*.md` templates | `local/memory-seed/*.md` | Read by your bootstrap recipe; see `docs/memory.md` |
+### Registries — `agent/local/<name>.json`
 
-Each `_ext/` directory ships with a `.gitkeep` whose body documents the drop
-contract for that point. You can `cat agent/ops-agent/jobs/_ext/.gitkeep` to
-re-read the contract any time.
+`lib/registry.cjs` merges `tasks`, `services`, `job-routing` and `chrome-jobs` with the kernel's files: a new id is added, a known id is overridden field by field, string lists are unioned, an optional `order` sets listing order. `merlin tasks pause|resume` and `merlin doctor --repair` write only to the local file. Template: `examples/local/tasks.example.json`.
 
-## The `merlin overlay` command
+### Hooks — `_ext/` modules next to the kernel code that loads them
+
+Optional; a missing hook means the generic path, and each dir's `.gitkeep` documents its contract.
+
+| Hook | Loaded by | For |
+|---|---|---|
+| `lib/_ext/choice-handlers.mjs` | `lib/choice-reply.mjs` | tap handlers for your own card kinds |
+| `lib/_ext/watches.mjs` | `bin/hum-sense` | a watch engine offered every event |
+| `lib/_ext/context-sources/*.mjs` | `bin/context-sync` | extra indexed sources |
+| `lib/_ext/merlin-context.cjs` | `lib/merlin-context.js` | extra context tables (tastes, profile, projects) |
+| `lib/_ext/presence.mjs` | `lib/claim-facts.mjs`, hum locality | where you are on a date (travel timeline) |
+| `lib/_ext/claim-freshness-timeline.mjs` | `lib/claim-freshness.mjs` | the timeline CLI for stale-claim checks |
+| `lib/_ext/self-improve-landing.mjs` | `lib/self-improve-landing.mjs` | extra refusals for self-improvement changes |
+| `agent/supervisor/_ext/gmail-intake.mjs` | `gmail-source.mjs` | sender-specific mail handling before triage |
+| `agent/supervisor/_ext/routes.mjs` | `http-server.mjs` | extra POST routes on the Gmail push port |
+| `agent/scripts/_ext/watchdog-checks.sh` | `watchdog.sh` | your own watchdog checks |
+| `agent/phone-channel/_ext/reply-hints.mjs` | the phone channel | typed-reply hints for your card kinds |
+| `agent/tools-mcp/_ext/*.mjs` | `tools-mcp` | your own MCP tools |
+| `agent/scripts/hum-resolve-first-sources/_ext/` | `lib/hum-resolve-first.mjs` | extra evidence sources |
+
+### Drop-ins — found by name beside the kernel's (the kernel wins a conflict)
+
+| Drop-in | Resolved by |
+|---|---|
+| `agent/ops-agent/jobs/_ext/<job>.md` | `http-server.mjs` `resolveJobFile` |
+| `agent/scripts/hum-harvesters/_ext/<topic>.mjs` | `hum-harvest-all.mjs` `resolveHarvesterPath` |
+| `agent/scripts/hum-sensors/_ext/<sensor>.mjs` | `bin/hum-sense` |
+| `browsing-skills/skills/_ext/<site>/` | `browsing-skills/tools/run-action.js` |
+| `bin/_ext/<name>` | `optionalBin()` in `lib/ext-hooks.mjs` (env override, then `bin/_ext/`, then `bin/`) |
+
+### State and secrets
+
+`data/`, `agent/logs/`, `logs/`, `agent/supervisor/state/`, `secrets/`, `credentials/`, `.env` — runtime only, never tracked.
+
+## `merlin overlay` — linking your private repo
 
 ```bash
-merlin overlay add <path>      # attach a personal overlay repo (creates symlinks)
-merlin overlay status          # list active overlays + their resolved symlinks
-merlin overlay sync            # re-create symlinks for every registered overlay
-merlin overlay remove <path>   # unlink a previously-added overlay
+merlin overlay add <path> [--dry-run]   # register an overlay and symlink its files in
+merlin overlay status                   # each planned link: linked / missing / blocked
+merlin overlay sync                     # re-link after the overlay changed
+merlin overlay remove <path>            # unlink (the overlay repo is untouched)
 ```
 
-`add` walks the overlay repo's known subdirs and symlinks individual files
-into the matching `_ext/` dir or `local/` location. It refuses to:
-
-- symlink anything outside the declared `OVERLAY_MAP` destinations
-  (definition in `bin/merlin` near `cmdOverlay`),
-- overwrite a real (non-symlink) file at a destination,
-- silently shadow a kernel file (kernel always wins).
-
-State lives in `data/.overlay-registry.json` (gitignored).
-
-### Expected layout of a personal overlay repo
+The overlay mirrors this checkout's paths, limited to the extension surface:
 
 ```
-merlin-personal/
-  CLAUDE.md                 # → linked to local/CLAUDE.md
-  jobs/
-    mkt-ph-launch-monitor.md     # → agent/ops-agent/jobs/_ext/mkt-ph-launch-monitor.md
-    ...
-  harvesters/
-    exercise.mjs                 # → agent/scripts/hum-harvesters/_ext/exercise.mjs
-    ...
-  tools-mcp/
-    home-control.mjs             # → agent/tools-mcp/_ext/home-control.mjs
-    ...
-  bin/
-    aso-rank-pulse-collect       # → bin/_ext/aso-rank-pulse-collect
-    ...
-  memory-seed/
-    pari.md                      # → local/memory-seed/pari.md
-    ...
+my-merlin-overlay/
+  local/                              → agent/local/
+    instance.json
+    shared.md  ops.md  chat.md
+    config/triage-labels.json
+    jobs/morning-digest.md
+    tasks.json
+    sanitize-patterns.json
+  lib/_ext/presence.mjs               → lib/_ext/presence.mjs
+  agent/supervisor/_ext/routes.mjs    → agent/supervisor/_ext/routes.mjs
+  jobs/weekly-report.md               → agent/ops-agent/jobs/_ext/weekly-report.md   (shorthand)
+  harvesters/  sensors/  tools-mcp/  bin/                                           (shorthand)
 ```
 
-Anything in the overlay repo outside these subdirs is silently ignored.
+Files are linked one by one; directories are created for real, so a kernel `.gitkeep` is never shadowed. The command only writes under `agent/local/` and inside `_ext/` dirs whose parent already exists here, never replaces a real file, and ignores everything else in the overlay (READMEs, CI files). State: `data/.overlay-registry.json`.
 
-## Bidirectional flow in practice
-
-### Pull kernel updates onto your mini
+### Onboarding a machine
 
 ```bash
-cd ~/Dev/merlin
-git pull                       # symlinks survive; nothing to re-link
-```
-
-### Write a personal job
-
-```bash
-cd ~/Dev/merlin-personal
-$EDITOR jobs/mkt-ph-launch-monitor.md
-git commit -m "ph: weekend launch monitor" && git push
-# Symlink already exists at merlin/agent/ops-agent/jobs/_ext/...
-# Next dispatch picks it up.
-```
-
-### Promote a personal pattern into the kernel
-
-When you notice a personal job/harvester is really a generic capability with
-your data wired in:
-
-```bash
-cd ~/Dev/merlin
-git checkout -b feature/extract-X
-# 1. Build the generic version in the kernel location, reading data from
-#    .env or data/<config>.json instead of hardcoded values.
-# 2. Add the corresponding template under examples/.
-# 3. Wire the overlay to provide the actual data via the registry it now reads.
-# 4. Update the existing personal job to delegate to the kernel version.
-git commit
-gh pr create
-# Pre-commit guard runs scan.py against your diff — would block if you
-# accidentally left a personal reference behind.
-```
-
-### Onboard a new machine
-
-```bash
-git clone https://github.com/mraccah2/merlin && cd merlin
-./bin/merlin init                                 # public bootstrap
-./bin/merlin overlay add ~/Dev/merlin-personal    # only YOUR machines do this
+git clone <this repository's URL> ~/Dev/merlin && cd ~/Dev/merlin   # URL: GitHub's "Code" button
+./scripts/bootstrap.sh
+./bin/merlin init                                   # or skip: your overlay brings instance.json
+./bin/merlin overlay add ~/Dev/my-merlin-overlay    # only your machines do this
 ./bin/merlin up
 ```
 
-Outside contributors stop after `merlin init` and have a fully functional,
-slightly-empty Merlin. They don't even see the overlay machinery exists
-unless they read this doc.
+Everyone else stops after `merlin init` and has a working, slightly empty Merlin.
+
+### Promoting a personal pattern into the kernel
+
+When something in your overlay is really a generic capability with your data wired in: build the generic version with a generic default, read your values through `localConfig()` or a hook, add a template under `examples/`, and leave only the data in your overlay. Then propose it (kernel files land upstream — see below).
+
+## How the kernel gets here
+
+The maintainer runs this kernel inside a private installation. A sync tool copies the kernel files — the list in that installation's kernel manifest — into a clone of this repo, applying only mechanical rewrites (the kernel's position in the tree, install paths, the product name). It records the list of paths it wrote in `.kernel-sync.json` (nothing about the upstream repo); a path that leaves the manifest is deleted on the next sync, and files the manifest does not produce (everything in "Merlin's own files") are never touched.
+
+There is **no publish-time sanitizer**. The kernel is kept generic at the source, by rules the upstream enforces on every commit:
+
+- a pattern guard over kernel files with the operator's private identity list — a hit blocks the commit, and the sync refuses to run (and scans the transformed files again before and after writing);
+- a classification check: every file in a kernel directory is either kernel or explicitly the installation's own;
+- a closure check: a kernel file may only depend on kernel files, npm packages, the installation-layer paths above, or targets it guards (an `_ext/` hook is optional by contract);
+- kernel tests that run in both layouts against a synthetic identity, never the operator's.
+
+Consequences for contributors: a kernel file edited here is overwritten by the next sync unless the change is made upstream, so kernel PRs are applied upstream and come back with a sync; and nothing personal should ever need to be removed from a kernel file here — if you spot something, report it.
 
 ## Guardrails — defense in depth
 
-No single layer is sufficient. The boundary holds because **multiple
-independent layers** each catch a different class of failure, and the cost
-of each is roughly proportional to how often it catches a real bug.
+No single layer is sufficient; each catches a different class of failure.
 
-### Layer 0 — Convention
-File location at write time is the primary boundary. Generic code → merlin.
-Personal code → merlin-personal. The decision happens before you press Enter.
+1. **Convention.** File location decides: generic → kernel (upstream) or Merlin's own files; personal → the installation layer.
+2. **`.gitignore`.** `agent/local/`, `**/_ext/*` (except `.gitkeep`), `agent/ext/*`, `data/`, `secrets/`, `credentials/`, `.env`, logs.
+3. **Pre-commit hooks** (`.pre-commit-config.yaml`): `gitleaks` for credential formats, and `.tools/sanitize-guard.py` for identity patterns against the accepted baseline. The guard's generic detectors (JWTs such as Supabase keys, prefixed secret keys) are public; **the identity patterns are not** — publishing the list would publish the identity. Each maintainer keeps theirs in `agent/local/sanitize-patterns.json` (or points `MERLIN_SANITIZE_PATTERNS` at a file); template `examples/sanitize-patterns.example.json`. Only the regexes are private: pattern **names** are public (baseline keys, hit reports in CI logs), so name the kind of identifier (`project_homepage`, `companion_app_name`, `address_1`), never the brand, domain, handle or place it matches. Lines carrying `sanitize-guard-ok: <reason>` (or the upstream's reviewed `kernel-guard-ok:`) are exempt.
+4. **CI** (cannot be skipped like a local hook): `secret-scan.yml` runs gitleaks; `sanitize-guard.yml` runs the guard over the whole tree with the identity patterns from the `MERLIN_SANITIZE_PATTERNS_JSON` repo secret (forks without the secret get the generic detectors and a warning).
+5. **Branch protection on `main`**: no force pushes or deletions, required checks. With the `gh` CLI, from a clone:
+   ```bash
+   gh api -X PUT 'repos/{owner}/{repo}/branches/main/protection' --input - <<'EOF'
+   {
+     "required_status_checks": { "strict": true, "contexts": ["sanitize-guard", "gitleaks"] },
+     "enforce_admins": false,
+     "required_pull_request_reviews": null,
+     "restrictions": null,
+     "allow_force_pushes": false,
+     "allow_deletions": false,
+     "required_conversation_resolution": true
+   }
+   EOF
+   ```
+6. **GitHub secret scanning + push protection** for provider token formats.
+7. **PR template + human review** for what no pattern can see.
+8. **`merlin review-pr`** — an LLM review of a diff for *narrative* leaks: content that names nothing yet points at a real person, event or transaction ("the car I bought in 2024 for $X"). Findings are categorized and severity-tagged with a `ship` / `review` / `block` verdict (exit 1 on `block`). `.github/workflows/narrative-review.yml` runs it on every PR and comments, non-blocking by default; it needs the `ANTHROPIC_API_KEY` repo secret. Locally it needs `ANTHROPIC_API_KEY` in the environment or `.env` and `npm ci` at the repo root. Default model `claude-haiku-4-5` (`--model` to change); a typical PR costs about a cent.
+9. **`merlin audit`** (monthly): the guard over every tracked file, the same patterns over the last N commit messages, baseline size, and any file tracked under `agent/local/` or `_ext/`.
+10. **Pattern maintenance.** When a new person, business or account enters your life, add its pattern to your private list *before* the first commit that could mention it.
+11. **Post-incident reality.** Once something is on github.com, assume it is permanent (forks, archives, caches, training sets). History rewrites are expensive and incomplete; prevention is the only real fix.
 
-### Layer 1 — `.gitignore`
-Root has `local/`, `**/_ext/*` (with `!**/_ext/.gitkeep`), and
-`*.local.{md,json}` for ad-hoc scratch. Mechanical; catches files you
-forget to `git add`.
+What none of these catch: content already in past commits (the guard scans the current tree; `merlin audit` scans recent commit messages only), copies outside this repo, and LLM-review false negatives.
 
-### Layer 2 — Pre-commit hooks (local)
-`.pre-commit-config.yaml` runs two hooks on every commit:
-- **`gitleaks`** — known credential formats.
-- **`sanitize-guard`** — `.tools/sanitize-guard.py` against the
-  `.tools/sanitize-guard-baseline.json` accepted-hit set. Blocks new
-  personal-identifier hits. Pattern set visible via
-  `.tools/sanitize-guard.py --list-patterns`.
+## Kernel or installation layer? Heuristics
 
-Local hooks can be bypassed (fresh clone without `pre-commit install`, a
-`git commit --no-verify`, a web-UI edit on github.com). The next layer is
-the actual floor.
-
-### Layer 3 — Server-side CI (cannot be bypassed)
-`.github/workflows/secret-scan.yml` runs `gitleaks` on every PR + push to
-main. `.github/workflows/sanitize-guard.yml` runs `.tools/sanitize-guard.py
---all` on every PR + push. A failed check blocks the merge.
-
-### Layer 4 — Branch protection on `main`
-- No force pushes.
-- No deletions.
-- Required conversation resolution.
-- **Required status checks (TODO — set this once both workflows have run
-  successfully on main at least once):**
-  ```
-  gh api -X PUT /repos/mraccah2/merlin/branches/main/protection \
-    --input - <<EOF
-  {
-    "required_status_checks": {
-      "strict": true,
-      "contexts": ["sanitize-guard", "gitleaks"]
-    },
-    "enforce_admins": false,
-    "required_pull_request_reviews": null,
-    "restrictions": null,
-    "allow_force_pushes": false,
-    "allow_deletions": false,
-    "required_conversation_resolution": true
-  }
-  EOF
-  ```
-
-### Layer 5 — GitHub native protections
-- **Secret scanning** — enabled. GitHub scans for known token formats from
-  major providers (AWS, GitHub, Stripe, Slack, etc.).
-- **Push protection** — enabled. GitHub blocks pushes containing recognized
-  secret formats *before* they land, with author override prompts.
-
-### Layer 6 — PR template + human review
-Every PR opens with `.github/pull_request_template.md` and a checklist
-forcing conscious attention on personal-content review and baseline diff
-intent. Combined with Layer 6a (below), this is what catches
-**paraphrased** or **narrative** personal content (e.g. "the property I
-bought last year for $X" — no pattern fires).
-
-### Layer 7 — Periodic audit
-`merlin audit` (run monthly) walks every tracked file with the guard,
-greps the last N commit messages for the same pattern set (commit
-messages aren't scanned by the pre-commit hook), reports baseline drift
-stats, and confirms no overlay content has been tracked through .gitignore
-bypass. Surfaces drift before it accumulates into a forced-history-rewrite
-incident.
-
-### Layer 8 — Pattern set maintenance
-Life evolves. Every time a new person/business/credential class enters
-your operational scope, add a pattern to `PERSONAL_PATTERNS` in
-`.tools/sanitize-guard.py` *before* the first commit that references it.
-Otherwise the pattern won't catch the leak.
-
-### Layer 9 — Personal repo isolation
-The personal overlay repo has **no public remote.** Either keep it
-local-only or push to a private GitHub/GitLab/etc. The `.env` template
-documents `MERLIN_OWNER` and identity values — those live there, never in
-code.
-
-### Layer 10 — Post-incident reality
-Once content is on github.com, assume it's permanent. Forks, archive
-crawlers (Software Heritage, GHArchive), search caches, and AI training
-datasets all retain copies. Mitigations (`git filter-repo`, force-push,
-GitHub support cache clear) exist but are expensive and incomplete. The
-only real fix is **never let it land in the first place** — i.e. layers
-0–6 doing their job.
-
-### Layer 6a — `merlin review-pr` (Claude-powered narrative review)
-
-The pattern-based guard catches *explicit* identifiers. It cannot catch
-content that, without using any of those tokens, still uniquely
-identifies a real person, event, transaction, or relationship —
-"the property I bought in 2024 for $X", "my partner's medical
-condition", AI-generated docs that paraphrase personal context. That's
-the gap `merlin review-pr` fills.
-
-```bash
-merlin review-pr <PR#>              # diffs PR via `gh pr diff`, prints findings
-merlin review-pr --file <path>      # scan any text file
-merlin review-pr --stdin            # accept a diff from stdin
-merlin review-pr <PR#> --json       # machine-readable, for CI use
-merlin review-pr <PR#> --model M    # override model (default claude-haiku-4-5)
-```
-
-The findings are categorized (`narrative_personal`, `specific_financial`,
-`specific_event`, `geographic_reveal`, `relationship_reveal`,
-`ai_generated_echo`, `other`) and severity-tagged
-(`low` / `medium` / `high`), with a verdict (`ship` / `review` / `block`).
-The exit code is non-zero on `block`, so the command is callable from CI.
-
-**Cost.** Defaults to `claude-haiku-4-5` ($1/$5 per 1M in/out tokens). A
-typical PR review runs ~$0.005-$0.02. Use `--model claude-opus-4-7`
-for higher-confidence review on a high-stakes change.
-
-**Auth.** Requires `ANTHROPIC_API_KEY` in env or `.env`. If you're on
-Claude Max (Mode 2 in `merlin init`), inject the key transiently with
-1Password or similar: `op run --env-file=.env.review-pr -- merlin
-review-pr <N>`.
-
-**Server-side companion.** `.github/workflows/narrative-review.yml` runs
-the same check on every PR, posts findings as a PR comment, and is
-**non-blocking by default**. Remove the `|| true` in the workflow to
-make it blocking. Requires `ANTHROPIC_API_KEY` repo secret.
-
-**Why a separate layer instead of merging into sanitize-guard.** The
-pattern-based guard is deterministic, fast, free, and zero-dependency —
-it must keep that posture so it stays in the pre-commit hook on every
-clone. The LLM review is probabilistic, costs money, and depends on a
-network call. Mixing them would either slow every commit or weaken the
-guarantees the deterministic layer provides. Keep them separate so the
-fast/cheap floor stays fast/cheap.
-
-### What no layer here can catch
-
-- **Past commits already on the public remote.** Layers 2/3 scan HEAD,
-  Layer 6a scans diffs. Use `merlin audit` to scan commit messages back
-  N commits, but full content-history audit (`git filter-repo` + force
-  push + GitHub support cache clear) is a separate one-off operation.
-- **Content in forks, mirrors, AI training datasets, archive crawlers
-  (Software Heritage, GHArchive).** Out of scope of any tooling here.
-  The only mitigation is **prevention** — Layers 0-6a doing their job.
-- **False negatives in Layer 6a itself.** LLM review is probabilistic;
-  a passage Claude judges generic may not be. Treat the verdict as one
-  input to human review, not the final word.
-
-## What goes in the kernel vs the overlay — heuristics
-
-When you're writing a new feature and unsure where it belongs:
-
-| If the feature… | …it goes in the | …because |
+| If the feature… | …it goes in | …because |
 | --- | --- | --- |
-| Names a real person, address, or business | overlay | Identity coupling is private by definition. |
-| Reads from `.env` / config to learn who/what it serves | kernel | Configuration is data, not code. |
-| Depends on a specific external account (your Supabase project, your Vercel team, your Cloudflare zone) | overlay | Account-specific data is private. |
-| Depends on an integration *class* (Supabase generally, Vercel generally) where the user supplies their own credentials | kernel | Integration shape is generic; instance is overlay. |
-| Encodes a routing/voice/safety rule that should apply to anyone running Merlin | kernel (CLAUDE.md) | Universal agent behavior. |
-| Encodes a rule specific to your household, partner, business operations | overlay (`local/CLAUDE.md`) | Personal context. |
-| Reads/writes to a hum harvester for "weather" or "news" or "calendar" | kernel | Generic life domains. |
-| Reads/writes to a hum harvester for "PamperHomes guest reviews" or "Schwab portfolio" | overlay | Specific account data. |
-| Is a CLI tool that takes a generic config | kernel (`bin/`) | Reusable. |
-| Is a CLI tool that's a wrapper around your specific API account | overlay (`bin/_ext/`) | Account-specific. |
+| Names a real person, address, business or account | the installation layer | Identity is private by definition. |
+| Reads who/what it serves from `instance.json` / `localConfig()` | the kernel | Configuration is data, not code. |
+| Depends on a specific account (your Supabase project, your Cloudflare zone) | the installation layer | Account-specific. |
+| Works with an integration *class* where the user supplies credentials | the kernel | The shape is generic; the instance is yours. |
+| Is a routing, voice or safety rule for anyone running Merlin | the kernel (`CLAUDE.md`) | Universal behaviour. |
+| Is a rule about your household, partner or business | `agent/local/shared.md` / `ops.md` / `chat.md` | Personal context. |
+| Harvests weather, news, calendar | the kernel | Generic life domains. |
+| Harvests one specific account of yours (a shop's order history, a club's booking page) | `hum-harvesters/_ext/` | Specific accounts. |
+| Is a CLI over a generic config | the kernel (`bin/`) | Reusable. |
+| Wraps your own API account | `bin/_ext/` | Account-specific. |
 
-When still in doubt: write it in the overlay first. Moving overlay → kernel
-(generalize) is easier than discovering you leaked identity coupling into
-the public tree (retract).
-
-## Migration from the gandalf monolith (one-time)
-
-Phased over multiple PRs — see the project README's "Architecture" section
-or ask the operator for the migration log. The short version:
-
-1. **PR 1** (this PR) — establish the extension surface, loaders, overlay
-   tool, sanitize-guard, and this document. No kernel content moves.
-2. **PR 2** — port the kernel-pure improvements from gandalf into merlin
-   (supervisor durable queue, intake-skip cascade, watchdog phantom-loop
-   fix, etc.), using the new extension points where appropriate.
-3. **PR 3** — bootstrap the merlin-personal repo: walk the gandalf
-   redaction-plan's `exclude` and `generalize` buckets and move that
-   content into the overlay shape above. Run merlin + overlay on the mini.
-   Retire gandalf's process-manager.
-4. **PR 4–6** — port docs (`F`), hum harvesters (`E`), and decide the
-   companion-app scope (`A`).
-
-After PR 3, `gandalf` ceases to exist as a separately-canonical thing —
-merlin + the overlay *is* gandalf. The two-way path is fully open.
+When in doubt, start in the installation layer: generalizing into the kernel later is easy; retracting a leak is not.

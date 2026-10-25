@@ -1,0 +1,6 @@
+{
+  "_comment": "Memory wiki settings. Copy to agent/local/config/wiki.json. `default_pins`: the page ids `wiki pin-defaults` pins (always loaded into sessions); `owner_page`: the page about you (lib/wiki-facts.mjs); `portal_subject`: one line describing what the wiki portal covers (bin/wiki-portal).",
+  "owner_page": "user_owner",
+  "portal_subject": "the user, their household, work, travel and preferences",
+  "default_pins": ["user_owner", "user_routines", "feedback_reply_length"]
+}

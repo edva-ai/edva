@@ -1,0 +1,14 @@
+{
+  "_doc": "Jev relevance judge for chat auto-recall (lib/auto-recall.mjs). One boolean per candidate, keys c0..cN, built from candidate_question with {{n}} = the candidate's number in state.candidates. Mirrors judgePrompt() (the Sonnet judge). Kept = p>=0.5, best first, capped at 4 in code. Confidence = the strength of the best KEPT candidate, or 1 - the best candidate overall when nothing is kept (see interpretRecallAnswers). Only used when Jev is enabled (TYPESAFE_API_KEY set); otherwise the Sonnet judge decides. Kernel definition; an installation's own data/jev-questions/auto-recall.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.65,
+  "notes": "0.65, and confidence means the strength of the set rather than the least-certain of up to 12 booleans: do not prepend a recall block whose BEST note the judge is not actually convinced by, and do not conclude 'nothing is relevant' while a candidate sits within 0.35 of the line. The standing-rule clause exists because topical aboutness alone missed notes that govern the ACTION a message asks for (e.g. a rule for how calendar events are created), which are followed rather than quoted. This decision is additive and fail-soft either way — the agent verifies specifics and still searches memory itself.",
+  "candidate_question": {
+    "type": "boolean",
+    "instructions": "The user sent `message` to their assistant. `candidates` are notes pulled from their memory by similarity search, which returns its top matches whether or not any is actually related, so most are noise. Would you actually cite or follow candidate number {{n}} (the entry with n = {{n}}) when answering `message`? It qualifies if it is about the same specific subject, person, place, or decision as the message. Belonging to the same broad area (both about travel, or food, or the user's life) is NOT enough. A second kind of note also qualifies: when `message` asks the assistant to DO something — put it on the calendar, book it, email it, add a task, pick a place — a standing instruction, preference or past correction of the user's about how that action must be carried out qualifies even though it is not about the message's topic, because the assistant is about to act and would get it wrong without it. Such a note is followed rather than quoted. If you would neither quote it nor follow it, the answer is false. Most messages deserve 0 to 3 notes.",
+    "criteria": {
+      "true": "the note is about the same specific subject, person, place, or decision as the message and would be quoted in the answer — or it is a standing instruction, preference or past correction of the user's governing an action the message asks the assistant to take",
+      "false": "the note is only broadly related, off-topic, or would neither be quoted nor followed"
+    }
+  },
+  "questions": {}
+}

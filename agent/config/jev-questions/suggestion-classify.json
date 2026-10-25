@@ -1,0 +1,49 @@
+{
+  "_doc": "bin/suggestion-classify — is the user's phone message a reaction to a recent hum ping, and which way. state = {lane, suggestion, message, mode, said_since?}. mode=segment: the text was already bound to this suggestion by the hum-reply-attribute pick. Health/exercise-lane pings never reach Jev. Agreement = same is_reaction and, for reactions, same disposition. Kernel definition; an installation's own data/jev-questions/suggestion-classify.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.8,
+  "questions": {
+    "is_reaction": {
+      "type": "boolean",
+      "instructions": "The user's AI assistant recently sent them the suggestion shown in `suggestion` (hum lane `lane`). Is `message` the user reacting to THAT suggestion (liking it, rejecting it, saying they've been there, deferring it, snoozing it) rather than giving the assistant a new, unrelated command or question? Most messages are new commands. When mode is \"segment\", the text has already been tied to this suggestion because it names it; judge whether it expresses a reaction. If the state includes `said_since`, that is what the assistant said AFTER the suggestion and before `message`: decide which of the two `message` answers. When `said_since` asks something or offers to do something and `message` is a bare yes / no / ok, it answers `said_since`, not the suggestion.",
+      "criteria": {
+        "true": "the message responds to the suggestion itself: approval, enthusiasm, booking it, rejection, 'too expensive', 'already been', 'later', a bare yes/no/thumbs-up/heart answering it",
+        "false": "a fresh instruction, question or topic unrelated to the suggestion, or a message that only mentions it in passing"
+      }
+    },
+    "disposition": {
+      "type": "choice",
+      "instructions": "If `message` is a reaction to `suggestion`, what is the user's disposition toward it?",
+      "criteria": {
+        "positive": "likes it or acted on it: love it, sounds great, yes, booking, booked, going, loved it, worth it, good call",
+        "negative": "rejects it: no, pass, not interested, not for me, too expensive, stop recommending, why are you showing this again",
+        "visited": "has already been / already done it / already saw or read it / it's on their list",
+        "snoozed": "asks to be reminded later without rejecting it",
+        "deferred": "timing is wrong but the idea is fine: not now, maybe later, next week, after the trip",
+        "neutral": "acknowledges without a clear lean"
+      }
+    },
+    "reason": {
+      "type": "choice",
+      "instructions": "What is the main reason behind the user's reaction, if one is given?",
+      "criteria": {
+        "price": "too expensive, overpriced, out of budget",
+        "already_seen": "it was already shown or seen, or already done",
+        "cuisine_mismatch": "doesn't like that cuisine, food or style",
+        "timing": "the timing is wrong",
+        "not_interested_topic": "the whole topic doesn't interest them",
+        "explicit_no": "a plain no / pass with no other reason",
+        "duplicate": "it duplicates another suggestion",
+        "none": "no reason given, or the reaction is positive"
+      }
+    },
+    "strength": {
+      "type": "choice",
+      "instructions": "If the reaction is positive, how strong is it?",
+      "criteria": {
+        "love": "strong enthusiasm or acted on it: love it, sounds amazing, booking, booked, let's go, a heart",
+        "up": "casual approval: yes, nice, great, thumbs-up, good call",
+        "none": "not a positive reaction"
+      }
+    }
+  }
+}

@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// wiki-portal — curate the topics on the wiki's home portal (the wiki site).
+//
+// Which topic a page belongs to is a judgment about what it is ABOUT — language,
+// so a model makes it (Rule #0b), never a keyword rule. Sonnet reads every
+// non-episodic page's id, type, title and description and designs 6-12 topics
+// a person would browse by, each with a short blurb, its pages (explicit ids,
+// or id prefixes for uniform families like travel_hotel_*), and a few pages to
+// start from. Code then validates the structure (wiki-portal.js
+// checkPortalConfig: real ids, live prefixes, ≥85% of pages covered) and writes
+// data/wiki-portal.json, which the production host's wiki server reads directly and
+// wiki-cloud-sync pushes to the Worker (wiki_config key 'portal'). Day, week
+// and month pages are not filed: the portal shows them as the timeline.
+//
+// The local rung is skipped, deliberately: the input is the whole corpus's
+// table of contents (~30k tokens), several times gemma3:1b's 8k context, so it
+// could only ever fail validation. The ladder starts at Sonnet.
+//
+// Usage:
+//   wiki-portal build [--if-stale-days N] [--dry-run] [--api-fallback]
+//   wiki-portal show
+//
+// --api-fallback: while Max is unavailable, run the curation on the API under
+// its monthly cap. Only the launchd runner passes it; a hand run stays Max-only.
+//
+// Runs weekly from the nightly launchd agent (run-wiki-assoc-llm.sh, which has
+// the Max login) with --if-stale-days 7; rebuilds early when the number of
+// pages moved by more than 10% since the last curation.
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { createRequire } from "node:module";
+import { runLadder, sonnetRung } from "../lib/model-ladder.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const require = createRequire(import.meta.url);
+const ws = require("../lib/wiki-store.js");
+const { checkPortalConfig, EPISODIC } = require("../lib/wiki-portal.js");
+
+// Who the wiki is about, in the curation prompt. agent/local/config/wiki.json
+// `portal_subject` names the installation's own people; the default stays generic.
+const PORTAL_SUBJECT = require("../lib/instance.cjs").localConfig("wiki", {
+  portal_subject: "the user, their family, their homes, work, travel and preferences",
+}).portal_subject;
+
+const OUT = process.env.WIKI_PORTAL_FILE || installTools("data/wiki-portal.json");
+
+function shelf() {
+  return ws
+    .db()
+    .prepare("SELECT id, type, title, description FROM pages WHERE status = 'active' ORDER BY id")
+    .all()
+    .filter((p) => !EPISODIC.has(p.type));
+}
+
+function prompt(pages, previous) {
+  const toc = pages.map((p) => `${p.id} | ${p.type || "?"} | ${p.title || ""} | ${p.description || ""}`).join("\n");
+  const prev = previous?.topics?.length
+    ? `\nThe current topics are listed below. Keep a topic's slug and name when it still fits, so links stay stable; change what needs changing.\n${previous.topics.map((t) => `- ${t.slug}: ${t.name}`).join("\n")}\n`
+    : "";
+  return `You are organising the home page of a personal memory wiki: everything an AI assistant called Merlin remembers about ${PORTAL_SUBJECT}. The home page shows a handful of TOPICS a person browses by. Design them.
+
+Rules:
+- 6 to 12 topics. Each is something a person would think to look under ("Family & friends", "Homes & rentals", "Travel", "Money", "Health", "Work", "How Merlin works"). Plain names, at most 3 words.
+- "blurb": one short line saying what is in the topic, at most 14 words. Say what KIND of thing is there, never specifics: no names of medical conditions, amounts, account numbers, codes, addresses or passwords.
+- File EVERY page below under at least one topic. Use "prefixes" for families of pages whose ids share a prefix and all belong together (e.g. "travel_hotel_"), and "ids" for the rest. A page may sit in two topics when it truly belongs to both.
+- "featured": 3 to 6 ids from that topic that are the best place to start.
+- "slug": lowercase words joined by hyphens, unique.
+- Day, week and month pages are not listed and need no topic.
+${prev}
+Return ONLY this JSON:
+{"topics": [{"slug": "...", "name": "...", "blurb": "...", "prefixes": ["..."], "ids": ["..."], "featured": ["..."]}]}
+
+PAGES (id | type | title | description):
+${toc}`;
+}
+
+function readCurrent() {
+  try {
+    return JSON.parse(fs.readFileSync(OUT, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function build({ ifStaleDays = null, dryRun = false, apiFallback = false } = {}) {
+  const pages = shelf();
+  const current = readCurrent();
+  if (ifStaleDays != null && current?.generated_at) {
+    const ageDays = (Date.now() - Date.parse(current.generated_at)) / 86400000;
+    const drift = current.page_count ? Math.abs(pages.length - current.page_count) / current.page_count : 1;
+    if (ageDays < ifStaleDays && drift <= 0.1) {
+      return { skipped: true, age_days: Number(ageDays.toFixed(1)), pages: pages.length, previous_pages: current.page_count };
+    }
+  }
+  const ids = pages.map((p) => p.id);
+  let checked = null;
+  const res = await runLadder(prompt(pages, current), {
+    rungs: [sonnetRung({ timeoutMs: 300000, effort: "medium", ...(apiFallback ? { apiCaller: "wiki-portal", apiMaxTokens: 16000 } : {}) })],
+    validate: (parsed) => {
+      checked = checkPortalConfig(parsed, ids);
+      return checked.errors.length ? checked.errors.join("; ") : null;
+    },
+  });
+  if (!res.value) return { written: false, errors: res.errors };
+  const doc = {
+    generated_at: new Date().toISOString(),
+    curated_by: res.via === "api" ? "wiki-portal (Sonnet, API fallback)" : "wiki-portal (Sonnet)",
+    page_count: pages.length,
+    coverage: Number(checked.coverage.toFixed(3)),
+    topics: checked.config.topics,
+  };
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(OUT), { recursive: true });
+    fs.writeFileSync(OUT, JSON.stringify(doc, null, 2) + "\n");
+  }
+  return { written: !dryRun, file: OUT, topics: doc.topics.map((t) => `${t.slug} (${t.ids.length} ids, ${t.prefixes.length} prefixes)`), coverage: doc.coverage };
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (cmd === "build") {
+  const i = rest.indexOf("--if-stale-days");
+  build({ ifStaleDays: i >= 0 ? Number(rest[i + 1]) : null, dryRun: rest.includes("--dry-run"), apiFallback: rest.includes("--api-fallback") })
+    .then((r) => {
+      console.log(JSON.stringify(r, null, 2));
+      if (r.written === false && !r.skipped) process.exit(1);
+    })
+    .catch((e) => { console.error(`wiki-portal: ${e?.stack || e}`); process.exit(1); });
+} else if (cmd === "show") {
+  console.log(JSON.stringify(readCurrent() || { topics: [], note: "not curated yet — run: wiki-portal build" }, null, 2));
+} else {
+  console.error("usage: wiki-portal <build [--if-stale-days N] [--dry-run] [--api-fallback] | show>");
+  process.exit(1);
+}

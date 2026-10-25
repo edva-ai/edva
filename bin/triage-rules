@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+// triage-rules — read email-triage-rules.md by section instead of whole.
+//
+//   triage-rules core              the decision procedure (Steps 0-6 + policies)
+//   triage-rules index             one line per category rule: `slug — title`
+//   triage-rules section <slug>…   full text of one or more category rules
+//   triage-rules sizes             char counts (core vs whole file)
+//
+// The file itself stays authoritative; this only slices it. See lib/triage-rules.mjs.
+
+import { core, index, section, sizes } from "../lib/triage-rules.mjs";
+
+const [cmd, ...rest] = process.argv.slice(2);
+switch (cmd) {
+  case "core": console.log(core()); break;
+  case "index": console.log(index()); break;
+  case "section": {
+    if (!rest.length) { console.error("Usage: triage-rules section <slug> [slug…]  (see: triage-rules index)"); process.exit(1); }
+    let missing = 0;
+    for (const slug of rest) {
+      const t = section(slug);
+      if (t === null) { console.error(`no section "${slug}" — run: triage-rules index`); missing++; continue; }
+      console.log(t + "\n");
+    }
+    process.exit(missing ? 2 : 0);
+  }
+  case "sizes": console.log(JSON.stringify(sizes())); break;
+  default:
+    console.error("Usage: triage-rules core | index | section <slug>… | sizes");
+    process.exit(1);
+}

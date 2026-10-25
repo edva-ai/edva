@@ -16,6 +16,18 @@ import path from "node:path";
 const require = createRequire(import.meta.url);
 const cm = require("../lib/context-memory");
 const wiki = require("../lib/wiki-store");
+const { localConfig, supabaseUrl, supabaseAnonKey } = require("../lib/instance.cjs");
+
+// This installation's sources (agent/local/config/context-sync.json):
+//   key_files         [{path, tags}] under tools/, indexed by `files`
+//   docs_dirs         directories under $HOME scanned by `docs`
+// `watchlist` reads with the installation's Supabase anon key
+// (agent/local/config/supabase.json via instance.cjs supabaseAnonKey(),
+// else SUPABASE_ANON_KEY).
+const CONFIG = localConfig("context-sync", {
+  key_files: [{ path: "data/email-triage-playbook.md", tags: "email,triage,playbook" }],
+  docs_dirs: ["Documents"],
+});
 
 const exec = promisify(execFile);
 const TOOLS = path.resolve(new URL("..", import.meta.url).pathname);
@@ -39,6 +51,7 @@ async function run(command, args = []) {
 async function syncNotes() {
   process.stderr.write("Syncing notes... ");
 
+  // kernel-closure-ok: an optional installation CLI; run() never throws (absent → nothing indexed)
   const raw = await run(path.join(BIN, "notes"), ["list"]);
   if (!raw) {
     console.error("no notes found or error.");
@@ -59,6 +72,7 @@ async function syncNotes() {
     allIds.push(title);
 
     // Read note body
+    // kernel-closure-ok: an optional installation CLI; run() never throws (absent → nothing indexed)
     const body = await run(path.join(BIN, "notes"), ["read", title]);
     const summary = body ? `${title}\n${body.slice(0, 200)}` : title;
 
@@ -81,6 +95,7 @@ async function syncNotes() {
 async function syncImsg() {
   process.stderr.write("Syncing imsg... ");
 
+  // kernel-closure-ok: an optional installation CLI; run() never throws (absent → nothing indexed)
   const raw = await run(path.join(BIN, "imsg"), ["chats", "--limit", "30"]);
   if (!raw) {
     console.error("no chats found or error.");
@@ -108,6 +123,7 @@ async function syncImsg() {
     allIds.push(contact);
 
     // Read recent messages
+    // kernel-closure-ok: an optional installation CLI; run() never throws (absent → nothing indexed)
     const messages = await run(path.join(BIN, "imsg"), ["read", contact, "--limit", "5", "--days", "7"]);
     const preview = messages
       ? messages
@@ -168,14 +184,7 @@ function syncEmail() {
 function syncFiles() {
   process.stderr.write("Syncing files... ");
 
-  // Project-specific reference files the user wants indexed alongside
-  // the auto-discovered sources. Add entries for recurring 1:1 notes,
-  // long-running project docs, playbooks worth keeping in the FTS index.
-  //
-  //   { path: "data/<file>.md", tags: "comma,separated,tags" }
-  const KEY_FILES = [
-    { path: "data/email-triage-playbook.md", tags: "email,triage,playbook" },
-  ];
+  const KEY_FILES = CONFIG.key_files;
 
   const allIds = [];
   let upserted = 0;
@@ -285,15 +294,7 @@ function syncWiki() {
 
 // ── Documents (docx, pdf, xlsx, xls from multiple directories) ──
 
-// Directories the context index walks looking for indexable documents.
-// Tune these to wherever you keep working docs / project repos / reference
-// material. Recursive scan respects MAX_DEPTH below.
-const DOCS_DIRS = [
-  path.join(process.env.HOME, "Documents"),
-  // Add project dirs here, e.g.:
-  //   path.join(process.env.HOME, "Dev", "project-x"),
-  //   "/Volumes/Shared/Reference",
-];
+const DOCS_DIRS = CONFIG.docs_dirs.map((d) => path.join(process.env.HOME, ...d.split("/")));
 const DOC_EXTENSIONS = new Set([".pdf", ".docx", ".xlsx", ".xls"]);
 
 function findDocs(dir, maxDepth = 3, depth = 0) {
@@ -342,13 +343,29 @@ async function extractText(filePath) {
       default:
         return "";
     }
-  } catch {
+  } catch (e) {
+    // Surface WHY, don't just count it. This bare `catch { return "" }` made
+    // every extraction failure indistinguishable from an empty file, so a
+    // two-week outage (a few upserted, over a thousand failed on every 30-min
+    // run, exit 0) went completely unnoticed. Two stacked causes were hiding in here:
+    // a missing `pdftotext` binary, and macOS TCC denying cron read access to
+    // ~/Documents. Both are one-line diagnoses once the message is visible.
+    extractErrors.push({ filePath, reason: (e && e.message) || String(e) });
+    erroredPaths.add(filePath);
     return "";
   }
 }
 
+// Collected per-run so syncDocs() can report a failure histogram rather than a
+// bare count. `erroredPaths` lets the caller tell a genuine extraction error
+// apart from a clean run that yielded no text. Both reset per syncDocs() call.
+let extractErrors = [];
+let erroredPaths = new Set();
+
 async function syncDocs() {
   process.stderr.write("Syncing docs... ");
+  extractErrors = [];
+  erroredPaths = new Set();
 
   // Collect files from all configured directories
   const filesByBase = new Map(); // relPath -> { filePath, baseDir }
@@ -370,6 +387,7 @@ async function syncDocs() {
   const allIds = [];
   let upserted = 0;
   let errors = 0;
+  let empty = 0;   // extractor ran clean but the file has no extractable text
   const entries = [...filesByBase.entries()];
 
   // Process in batches of 10 for concurrency
@@ -386,7 +404,15 @@ async function syncDocs() {
 
         const text = await extractText(filePath);
         if (!text) {
-          errors++;
+          // "No text" has two very different causes and they were being counted
+          // as one. An EXCEPTION (missing binary, unreadable file, timeout) is a
+          // real failure. An extractor that ran cleanly and simply found nothing
+          // — an image-only scanned PDF with no text layer, an empty sheet — is
+          // a normal, permanent property of that file, not something to fix.
+          // Conflating them is what produced an alarming "N failed" count; once
+          // the real cause is fixed the true error count is single digits.
+          if (erroredPaths.has(filePath)) errors++;
+          else empty++;
           return;
         }
 
@@ -406,7 +432,51 @@ async function syncDocs() {
   }
 
   const stale = cm.removeStale("docs", allIds);
-  console.error(`${upserted} upserted, ${errors} failed, ${stale} stale removed.`);
+  console.error(`${upserted} upserted, ${errors} failed, ${empty} no-text, ${stale} stale removed.`);
+
+  // A doc corpus that is mostly unreadable is a broken sync, not a quiet one.
+  // Report the top failure reasons and exit non-zero past a 50% failure rate so
+  // cron surfaces it — the same hardening a backfill job took on 2026-07-17
+  // after failing while exiting 0 for weeks.
+  if (extractErrors.length) {
+    // Bucket by failure CLASS, not by raw message. The raw text embeds the
+    // file path ("Command failed: pdftotext -l 3 -q /Users/.../foo.pdf -"), so
+    // keying on it gives one bucket per file — a histogram where every bar is
+    // 1, which tells you nothing about what's actually wrong. Strip the
+    // arguments down to the failing command (plus the extension, since
+    // "pdftotext on .pdf" and a docx failure are different problems).
+    const classify = (reason, filePath) => {
+      const head = reason.split("\n")[0];
+      const ext = (filePath.match(/\.[A-Za-z0-9]+$/) || [""])[0].toLowerCase();
+      const cmd = head.match(/Command failed: (\S+)/);
+      if (cmd) return `${cmd[1]} failed on ${ext || "(no ext)"}`;
+      if (/EACCES|operation not permitted/i.test(head)) return `permission denied on ${ext}`;
+      if (/ENOENT/.test(head)) return `file missing on ${ext}`;
+      if (/timed? ?out/i.test(head)) return `timeout on ${ext}`;
+      return `${head.slice(0, 60)} (${ext})`;
+    };
+    const byReason = new Map();
+    const example = new Map();
+    for (const { reason, filePath } of extractErrors) {
+      const key = classify(reason, filePath);
+      byReason.set(key, (byReason.get(key) || 0) + 1);
+      if (!example.has(key)) example.set(key, filePath);
+    }
+    const top = [...byReason.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    console.error(`  extraction failures by class (${extractErrors.length} total):`);
+    for (const [reason, n] of top) {
+      console.error(`    ${String(n).padStart(5)}  ${reason}  e.g. ${path.basename(example.get(reason))}`);
+    }
+    const total = upserted + errors;
+    if (total > 0 && errors / total > 0.5) {
+      console.error(
+        `  ${errors}/${total} docs unreadable (>50%) — treating as a failed sync. ` +
+        `Common causes: missing extractor binary (brew install poppler for pdftotext), ` +
+        `or macOS TCC denying cron read access to a protected folder (grant Full Disk Access to /usr/sbin/cron).`,
+      );
+      process.exitCode = 1;
+    }
+  }
 }
 
 // ── Watchlist (Supabase) ──
@@ -422,10 +492,12 @@ async function syncWatchlist() {
     return;
   }
 
-  const supabase = createClient(
-    "https://${MERLIN_SUPABASE_PROJECT}.supabase.co",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zem93cmtqaGZzdHB0bnNzcnprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzMDU2NjAsImV4cCI6MjA5MTg4MTY2MH0.seXkEaAFoc5Zw-MTj1dNKMR5hSnGvf1ijjv3o5WAs20"
-  );
+  const anonKey = supabaseAnonKey() || process.env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl() || !anonKey) {
+    console.error("skipped (no Supabase project or anon key configured).");
+    return;
+  }
+  const supabase = createClient(supabaseUrl(), anonKey);
 
   const { data, error } = await supabase.from("watchlist").select("*");
   if (error) {
@@ -481,11 +553,55 @@ const DRIVE_SKIP_TYPES = new Set([
   "application/vnd.google-apps.shortcut",
   "application/vnd.google-apps.folder",
 ]);
+// ALLOW-LIST for the Drive listing. The context index is a TEXT search index,
+// so it should only pull document-shaped files. Listing everything an account
+// owns can mean millions of rows — photos, octet-streams, TIFF/RAW/HEIF, video,
+// python bytecode, i.e. a Google Photos/Takeout/backup dump — none of it useful
+// to search and all of it re-listed every 30 min (tens of thousands of Drive
+// API calls a day; the sync never finished inside the cron timeout).
+// Owner-scoping is NOT the fix (nearly all of such files are owned); the fix is
+// to list only real documents. Content-extractable Google Workspace types
+// (see DRIVE_EXPORT_TYPES) plus common doc formats — keeps useful SHARED docs
+// too, which an owner filter would have dropped. Everything else never gets
+// listed, so it never gets stored or re-exported.
+const DRIVE_INDEX_TYPES = [
+  "application/vnd.google-apps.document",
+  "application/vnd.google-apps.spreadsheet",
+  "application/vnd.google-apps.presentation",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/rtf",
+  "application/msword",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+];
 
 async function driveRequest(endpoint, token) {
-  const res = await fetch(`${DRIVE_API}${endpoint}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  return driveRequestImpl(endpoint, token, true);
+}
+
+async function driveRequestImpl(endpoint, token, canRetryOn401) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30_000);
+  let res;
+  try {
+    res = await fetch(`${DRIVE_API}${endpoint}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (res.status === 401 && canRetryOn401) {
+    const auth = require("../lib/google-auth.js");
+    auth.clearCache();
+    const fresh = await auth.getAccessToken();
+    return driveRequestImpl(endpoint, fresh, false);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`Drive API ${res.status}: ${text.slice(0, 200)}`);
@@ -497,7 +613,12 @@ async function listAllDriveFiles(token) {
   const files = [];
   let pageToken = null;
   const fields = "nextPageToken,files(id,name,mimeType,modifiedTime,parents,webViewLink,owners,shared)";
-  const q = "trashed=false";
+  // Only list document-shaped files (see DRIVE_INDEX_TYPES) — this is what
+  // collapses a re-list-every-30-min runaway over millions of files to the
+  // real docs. The type filter runs server-side, so photos / binaries are
+  // never paged back at all.
+  const typeClause = DRIVE_INDEX_TYPES.map((t) => `mimeType='${t}'`).join(" or ");
+  const q = `trashed=false and (${typeClause})`;
 
   do {
     const params = new URLSearchParams({ q, fields, pageSize: "1000", orderBy: "modifiedTime desc" });
@@ -583,12 +704,42 @@ async function syncGoogleDrive() {
   const allIds = [];
   let upserted = 0;
   let skipped = 0;
+  let unchanged = 0;
 
-  // Export text in parallel batches, then upsert sequentially (SQLite is single-writer)
   const exportable = files.filter((f) => !DRIVE_SKIP_TYPES.has(f.mimeType));
 
-  for (let i = 0; i < exportable.length; i += 10) {
-    const batch = exportable.slice(i, i + 10);
+  // Change-detection: only export files whose modifiedTime differs from what we
+  // already stored. Re-exporting EVERY Drive file on every 30-min run means
+  // millions of Drive API export calls a month (Drive API is free, but the
+  // volume risks quota and is pure waste). Unchanged files keep their existing
+  // record (pushed to allIds so removeStale doesn't drop them); only
+  // new/modified files are re-exported.
+  const priorMetaStmt = cm.db().prepare(
+    "SELECT metadata_json FROM entries WHERE source = 'gdrive' AND source_id = ?",
+  );
+  const priorModifiedTime = (id) => {
+    const row = priorMetaStmt.get(id);
+    if (!row) return null;
+    try {
+      return JSON.parse(row.metadata_json || "{}").modifiedTime || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const changed = [];
+  for (const f of exportable) {
+    if (f.modifiedTime && priorModifiedTime(f.id) === f.modifiedTime) {
+      allIds.push(f.id); // unchanged — keep the record, skip the export call
+      unchanged++;
+    } else {
+      changed.push(f);
+    }
+  }
+
+  // Export text in parallel batches, then upsert sequentially (SQLite is single-writer)
+  for (let i = 0; i < changed.length; i += 10) {
+    const batch = changed.slice(i, i + 10);
     // Parallel: fetch text from Drive API
     const results = await Promise.all(
       batch.map(async (file) => {
@@ -635,10 +786,51 @@ async function syncGoogleDrive() {
   }
 
   const stale = cm.removeStale("gdrive", allIds);
-  console.error(`${upserted} upserted, ${skipped} export failures, ${stale} stale removed.`);
+  console.error(`${upserted} upserted, ${unchanged} unchanged (export skipped), ${skipped} export failures, ${stale} stale removed.`);
 }
 
 // ── Main ──
+
+// ── Installation sources (_ext) ──
+//
+// An installation adds its own source (a personal database, a project tracker)
+// by dropping an ES module into lib/_ext/context-sources/:
+//
+//   export default {
+//     name: "my-source",
+//     describe: "Index my source",
+//     async sync({ cm, wiki, run, BIN, DATA }) { ... cm.upsert(...); cm.removeStale(...) },
+//   };
+//
+// `context-sync <name>` runs one; `all` runs them after the kernel sources.
+// Kernel names win on a conflict; a module that fails to load or to sync is
+// reported and skipped, never fatal to the other sources.
+const KERNEL_SOURCES = new Set(["notes", "imsg", "email", "files", "wiki", "docs", "watchlist", "gdrive", "all"]);
+async function extSources() {
+  const dir = path.join(TOOLS, "lib", "_ext", "context-sources");
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".mjs")).sort()) {
+    try {
+      const mod = (await import(path.join(dir, file))).default;
+      if (!mod || typeof mod.sync !== "function" || !mod.name) continue;
+      if (KERNEL_SOURCES.has(mod.name) || out.some((s) => s.name === mod.name)) {
+        console.error(`context-sync: installation source ${file} shadows "${mod.name}"; kernel wins, skipped.`);
+        continue;
+      }
+      out.push({ name: mod.name, describe: mod.describe || "(installation source)", sync: () => mod.sync({ cm, wiki, run, BIN, DATA }) });
+    } catch (e) {
+      console.error(`context-sync: installation source ${file} failed to load: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+async function syncExt(sources) {
+  for (const s of sources) {
+    try { await s.sync(); } catch (e) { console.error(`context-sync: ${s.name} failed: ${e.message}`); }
+  }
+}
 
 async function syncAll() {
   await syncNotes();
@@ -649,13 +841,14 @@ async function syncAll() {
   await syncDocs();
   await syncWatchlist();
   await syncGoogleDrive();
+  await syncExt(await extSources());
 
   const rows = cm.stats();
   const total = rows.reduce((sum, r) => sum + r.count, 0);
   console.error(`Done. Total: ${total} entries.`);
 }
 
-function usage() {
+function usage(ext = []) {
   console.log(`context-sync — index data sources into context memory
 
 Commands:
@@ -668,7 +861,7 @@ Commands:
   watchlist  Index watchlist from Supabase
   gdrive     Index Google Drive (Docs, Sheets, Slides, files)
   all        Run all sources
-`);
+${ext.map((s) => `  ${s.name.padEnd(10)} ${s.describe}`).join("\n")}`.trimEnd() + "\n");
 }
 
 switch (cmd) {
@@ -699,6 +892,10 @@ switch (cmd) {
   case "all":
     await syncAll();
     break;
-  default:
-    usage();
+  default: {
+    const ext = await extSources();
+    const s = ext.find((x) => x.name === cmd);
+    if (s) await syncExt([s]);
+    else usage(ext);
+  }
 }

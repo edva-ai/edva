@@ -1,0 +1,84 @@
+#!/usr/bin/env node
+// job-run — launch a long-running command as its own protected background
+// job (see lib/job-runner.mjs for the full design).
+//
+// Usage:
+//   job-run --name <label> [--tier ops|ops-light|ops-haiku]
+//           [--notify-task "<template>"] [--requested-by <agent>]
+//           [--cwd <dir>] -- <command> [args...]
+//
+// Returns immediately with the job id — does NOT wait for the command to
+// finish. Use `job-list` / `job-status <id>` for visibility, `job-cancel <id>`
+// to stop it early.
+//
+// <template> may reference {{status}}, {{exit_code}}, {{id}}, {{name}} —
+// substituted by the process-manager watcher when the job reaches a terminal
+// state, then dispatched as a task to the named tier's supervisor webhook.
+// Omit --notify-task if you only want visibility, no follow-up dispatch.
+//
+// Example:
+//   job-run --name report-build-<area> --tier ops \
+//     --notify-task "Background job {{name}} ({{id}}) finished with status {{status}}. Read its log and report what landed." \
+//     -- ~/Dev/merlin/bin/<some-builder> --area <area>
+
+import { startJob } from "../lib/job-runner.mjs";
+
+function usage() {
+  process.stderr.write(
+    "Usage: job-run --name <label> [--tier ops|ops-light|ops-haiku] " +
+      "[--notify-task \"<template>\"] [--requested-by <agent>] [--cwd <dir>] " +
+      "-- <command> [args...]\n"
+  );
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const sepIdx = argv.indexOf("--");
+  if (sepIdx === -1) usage();
+  const flagsPart = argv.slice(0, sepIdx);
+  const command = argv[sepIdx + 1];
+  const args = argv.slice(sepIdx + 2);
+  if (!command) usage();
+
+  const opts = { tier: null, notifyTask: null, requestedBy: null, cwd: null, name: null };
+  for (let i = 0; i < flagsPart.length; i++) {
+    const flag = flagsPart[i];
+    if (flag === "--name") opts.name = flagsPart[++i];
+    else if (flag === "--tier") opts.tier = flagsPart[++i];
+    else if (flag === "--notify-task") opts.notifyTask = flagsPart[++i];
+    else if (flag === "--requested-by") opts.requestedBy = flagsPart[++i];
+    else if (flag === "--cwd") opts.cwd = flagsPart[++i];
+    else usage();
+  }
+  if (!opts.name) usage();
+  if (opts.notifyTask && !opts.tier) {
+    process.stderr.write("job-run: --notify-task requires --tier\n");
+    process.exit(2);
+  }
+  if (opts.tier && !["ops", "ops-light", "ops-haiku"].includes(opts.tier)) {
+    process.stderr.write(`job-run: --tier must be one of ops|ops-light|ops-haiku, got '${opts.tier}'\n`);
+    process.exit(2);
+  }
+  return { ...opts, command, args };
+}
+
+const { name, tier, notifyTask, requestedBy, cwd, command, args } = parseArgs(process.argv.slice(2));
+
+const onComplete = notifyTask ? { tier, task: notifyTask } : null;
+
+const { id, log_file } = startJob({
+  name,
+  command,
+  args,
+  cwd: cwd || undefined,
+  requestedBy,
+  onComplete,
+});
+
+console.log(`started job ${id}`);
+console.log(`log: ${log_file}`);
+if (onComplete) {
+  console.log(`will notify ${tier} on completion`);
+} else {
+  console.log("no completion notification configured (visibility only — job-status " + id + ")");
+}

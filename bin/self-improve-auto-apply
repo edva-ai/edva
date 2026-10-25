@@ -1,0 +1,272 @@
+#!/usr/bin/env node
+// self-improve-auto-apply — land a verified, low-blast-radius self-improvement
+// directly: write it, commit it, show it in the Improvements channel with a
+// green check. No Face-ID card.
+//
+// The counterpart to self-improve-request, and the enforcement point for rubric
+// schema v4 (cards are reserved for complex, high-blast-radius items;
+// everything else is applied automatically). The caller proposes; this decides. It refuses — with exit code 3
+// and the reasons — anything lib/self-improve-landing.mjs says belongs on
+// a card, so a misjudged risk label cannot land a change to money, outbound
+// messages, the calendar, triage, the supervisor or the pipeline itself.
+//
+// Usage:
+//   self-improve-auto-apply --summary "<one line, plain language>" \
+//     --problem "..." --impact "..." --fix "..." --side-effects "..." \
+//     --files-json <path> --risk low|moderate --category <rubric category> \
+//     --critic SAFE --base-rev <commit> [--details "<verification + revert>"] [--source <review item id>] [--redo] [--dry-run]
+//
+// --files-json holds {"files": {"<repo-relative path>": "<complete new content>"}}
+// (a bare {path: content} map is accepted, as with self-improve-request), and may
+// also carry "base_sha256": {"<path>": "<sha256 of the version you read>" | null}.
+//
+// EVERY file must be pinned to the version the fix was written against: by
+// --base-rev (the commit you read the tree at — `git rev-parse HEAD` taken right
+// before reading the files for THIS change) or by base_sha256 (wins per file).
+// A file that moved on since then is refused with exit 7 (step 2b).
+//
+// Exit codes:
+//   0  applied (or, with --dry-run, would apply)
+//   3  belongs on a Face-ID card — file it with self-improve-request instead
+//   4  a target file has someone else's uncommitted edits — do not clobber; try next run
+//   5  the finding looks stale or already resolved — nothing applied, nothing to file
+//   6  the new content failed a syntax check — nothing applied
+//   7  a target file changed after the fix was written — nothing applied. Re-read
+//      it, regenerate the fix ONCE against the current content, and resubmit with
+//      a fresh --base-rev and --redo. A 7 on a --redo submission means stop.
+//   8  the change itself must be redrafted — nothing applied, and it may not go
+//      on a card either. The reasons say what to fix: e.g. personal data added
+//      to a kernel file (move it to system/changelog.md / the commit
+//      message, agent/local/, or an _ext/ hook) or a new file left out of
+//      system/kernel-manifest.json. Fix that and resubmit once.
+//   64 bad usage
+//   1  commit failed after writing — files restored, nothing landed
+
+import path from "node:path";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { installRoot } from "../lib/root.cjs";
+const exec = promisify(execFile);
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+
+const { decideLanding, composeCard } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
+
+function arg(name) { const i = process.argv.indexOf("--" + name); return i > 0 ? process.argv[i + 1] : null; }
+const flag = (name) => process.argv.includes("--" + name);
+function usage(msg) {
+  if (msg) console.error(`self-improve-auto-apply: ${msg}`);
+  console.error('usage: self-improve-auto-apply --summary "..." --problem "..." --impact "..." --fix "..." --side-effects "..." --files-json <path> --risk low|moderate --category <c> --critic SAFE --base-rev <commit> [--details "..."] [--source <id>] [--redo] [--dry-run]');
+  process.exit(64);
+}
+
+const summary = arg("summary");
+const risk = (arg("risk") || "").toLowerCase();
+const category = arg("category") || "";
+const critic = arg("critic") || "";
+const source = arg("source") || null;
+const dryRun = flag("dry-run");
+const redo = flag("redo");
+const baseRev = arg("base-rev");
+const filesJson = arg("files-json");
+if (!summary || !filesJson || !risk || !category || !critic) usage("missing a required flag");
+
+let card;
+try {
+  card = composeCard({
+    problem: arg("problem"),
+    impact: arg("impact"),
+    fix: arg("fix"),
+    sideEffects: arg("side-effects"),
+    details: arg("details") || "",
+  });
+} catch (e) {
+  usage(`${e.message} — every change is explained in plain language, applied automatically or not`);
+}
+
+let item;
+try { item = JSON.parse(fs.readFileSync(filesJson, "utf8")); } catch (e) { usage(`bad --files-json: ${e.message}`); }
+if (item && typeof item === "object" && !Array.isArray(item) && !("files" in item)) {
+  const keys = Object.keys(item);
+  if (keys.length && keys.every((k) => k.includes("/") && typeof item[k] === "string")) item = { files: item };
+}
+const files = item?.files;
+const baseSha256 = item?.base_sha256 && typeof item.base_sha256 === "object" && !Array.isArray(item.base_sha256) ? item.base_sha256 : null;
+if (!files || typeof files !== "object" || Array.isArray(files) || !Object.keys(files).length) {
+  usage('--files-json needs a non-empty "files": {"path": "content"} object');
+}
+for (const rel of Object.keys(files)) {
+  const fp = path.resolve(ROOT, rel);
+  if (!fp.startsWith(ROOT + path.sep) || path.isAbsolute(rel)) usage(`path outside the repo: ${rel}`);
+  if (typeof files[rel] !== "string") usage(`content for ${rel} is not a string`);
+}
+
+const out = (o) => console.log(JSON.stringify(o));
+const before = Object.fromEntries(
+  Object.keys(files).map((rel) => {
+    try { return [rel, fs.readFileSync(path.resolve(ROOT, rel), "utf8")]; } catch { return [rel, null]; }
+  })
+);
+
+// 1. The boundary — decided from the real file set and diff, not the caller's say-so.
+const landing = decideLanding({ files, before, risk, category, critic });
+if (landing.mode !== "auto") {
+  const route = landing.mode === "card" ? "self-improve-request" : landing.redraft ? "redraft" : "none";
+  out({ applied: false, route, reasons: landing.reasons, lines: landing.lines, files: landing.fileCount });
+  process.exit(landing.mode === "card" ? 3 : landing.redraft ? 8 : 64);
+}
+
+// 2. Never clobber a concurrent session's uncommitted work on the same file.
+const { stdout: porcelain } = await exec("git", ["status", "--porcelain", "--", ...Object.keys(files)], { cwd: ROOT });
+const dirty = porcelain.split("\n").filter(Boolean).map((l) => l.slice(3));
+if (dirty.length) {
+  out({ applied: false, route: "retry-next-run", reasons: dirty.map((p) => `uncommitted edits already on ${p}`) });
+  process.exit(4);
+}
+
+// 2b. Was the fix written against the file as it is now? ("Refuse and redo".)
+// Until then this wrote whole files with no check, and in one
+// week that overwrote newer work twice — four entries wiped from
+// architecture.md, and a five-day-old copy of the day-builder that would have
+// dropped a newer fix from the rebuilt day. No merge here, by the user's
+// choice: a moved file is refused and the author regenerates once against the
+// current content (lib/self-improve-rebase.mjs findMovedFiles).
+{
+  const { findMovedFiles } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
+  const { moved, unpinned } = await findMovedFiles(ROOT, files, { baseSha256, baseRev });
+  if (unpinned.length) {
+    usage(`no base recorded for ${unpinned.join(", ")} — pass --base-rev <the commit you read the files at> (git rev-parse HEAD, taken right before reading them) or base_sha256 in --files-json, so a file that moved on is refused instead of overwritten`);
+  }
+  if (moved.length) {
+    let head = null;
+    try { head = (await exec("git", ["rev-parse", "HEAD"], { cwd: ROOT })).stdout.trim(); } catch {}
+    try {
+      fs.appendFileSync(
+        path.join(ROOT, "data/self-improvement-classifier-feedback.jsonl"),
+        JSON.stringify({ ts: new Date().toISOString(), id: source, event: "base_moved", redo, files: moved.map((m) => m.rel), summary }) + "\n"
+      );
+    } catch {}
+    out({
+      applied: false,
+      route: redo ? "stop" : "redo",
+      reasons: moved.map((m) => m.reason),
+      head,
+      next: redo
+        ? "This was already the regenerated attempt. Do not try again this run; record it as retry-next-run."
+        : "Re-read these files as they are now, rewrite the fix against that content once, and resubmit with --base-rev <head> --redo.",
+    });
+    process.exit(7);
+  }
+}
+
+// 3. Rule #2 — is the finding still true right now? Same gate a card passes
+// before it is shown (self-improve-unified.mjs `recheckFreshness`), and it
+// carries the same `evidence_as_of: "live"` declaration for the same reason:
+// a submission's files arrive INLINE, written and verified in the turn that is
+// submitting them. Undated meant stale, which sent a code change through a
+// pass specified for stateful claims someone else controls — see the long note
+// at that function for the measurement that forced this.
+try {
+  const { checkFreshness } = await import(path.join(ROOT, "lib/claim-freshness.mjs"));
+  const fresh = await checkFreshness({ text: `${summary}\n\n${card}`, subject: "code-fix", solicited: false, evidence_as_of: "live" });
+  if (fresh?.verdict === "drop") {
+    out({ applied: false, route: "none", reasons: [`stale: ${fresh.reasons?.[0] || "the finding looks resolved"}`] });
+    process.exit(5);
+  }
+} catch {
+  // Fail-open, as every other claim-freshness call site does.
+}
+
+// 4. Syntax check the new JavaScript before it touches the tree.
+const tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || "/tmp", "si-auto-"));
+try {
+  for (const [rel, content] of Object.entries(files)) {
+    const isJs = /\.(m?js|cjs)$/.test(rel) || /^#!.*\bnode\b/.test(content);
+    if (!isJs) continue;
+    // Keep the module system the file will actually run under: its own
+    // extension, or — for an extensionless script — ESM if it imports/exports.
+    const esm = /^\s*(import|export)\s/m.test(content);
+    const ext = rel.endsWith(".mjs") ? ".mjs" : rel.endsWith(".cjs") ? ".cjs" : esm ? ".mjs" : ".cjs";
+    const probe = path.join(tmp, `probe${ext}`);
+    fs.writeFileSync(probe, content.replace(/^#!.*\n/, "\n"));
+    try {
+      await exec(process.execPath, ["--check", probe]);
+    } catch (e) {
+      out({ applied: false, route: "none", reasons: [`syntax error in ${rel}: ${(e.stderr || e.message).toString().split("\n").slice(0, 3).join(" ")}`] });
+      process.exit(6);
+    }
+  }
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+if (dryRun) {
+  out({ applied: false, dryRun: true, route: "auto", lines: landing.lines, files: Object.keys(files) });
+  process.exit(0);
+}
+
+// 4b. The freshness check above is a model call and can take a while; check the
+// base once more right before writing, so a commit that landed meanwhile is
+// still refused rather than overwritten.
+{
+  const { findMovedFiles } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
+  const { moved } = await findMovedFiles(ROOT, files, { baseSha256, baseRev });
+  if (moved.length) {
+    out({ applied: false, route: redo ? "stop" : "redo", reasons: moved.map((m) => m.reason) });
+    process.exit(7);
+  }
+}
+
+// 5. Write, commit (file-scoped, through the hook-satisfying wrapper), push.
+const restore = () => {
+  for (const [rel, old] of Object.entries(before)) {
+    const fp = path.resolve(ROOT, rel);
+    if (old === null) fs.rmSync(fp, { force: true });
+    else fs.writeFileSync(fp, old);
+  }
+};
+for (const [rel, content] of Object.entries(files)) {
+  const fp = path.resolve(ROOT, rel);
+  fs.mkdirSync(path.dirname(fp), { recursive: true });
+  fs.writeFileSync(fp, content);
+  if (content.startsWith("#!")) fs.chmodSync(fp, 0o755);
+}
+const message = `[auto-impl] ${summary}\n\n${card}${source ? `\n\nReview item: ${source}` : ""}\n\nApplied automatically under rubric schema v4 (${risk} risk, ${category}, ${landing.lines} changed lines). Revert with git revert.`;
+let sha;
+try {
+  await exec(path.join(ROOT, "bin/merlin-commit"), ["-m", message, "--", ...Object.keys(files)], { cwd: ROOT });
+  sha = (await exec("git", ["rev-parse", "--short", "HEAD"], { cwd: ROOT })).stdout.trim();
+} catch (e) {
+  restore();
+  out({ applied: false, route: "retry-next-run", reasons: [`commit failed, files restored: ${(e.stderr || e.message).toString().trim().slice(0, 300)}`] });
+  process.exit(1);
+}
+try {
+  await exec(path.join(ROOT, "bin/merlin-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
+} catch {
+  // The sync cron reports its own failures; the change is committed either way.
+}
+
+// 6. Show it in the Improvements channel with a green check — visible, not asked-for.
+try {
+  await exec(path.join(ROOT, "bin/self-improve-feed-log"), [
+    "--type", "code-fix", "--risk", risk, "--summary", summary, "--rationale", card, "--commit", sha, "--status", "applied",
+  ], { cwd: ROOT, timeout: 30_000 });
+} catch (e) {
+  process.stderr.write(`self-improve-auto-apply: applied ${sha}, but the Improvements log row failed: ${(e.stderr || e.message).toString().trim().slice(0, 200)}\n`);
+}
+
+// 7. Audit trail the rubric's §4 reads.
+try {
+  fs.appendFileSync(
+    path.join(ROOT, "data/self-improvement-classifier-feedback.jsonl"),
+    JSON.stringify({ ts: new Date().toISOString(), id: source, event: "auto_applied", risk, category, files: Object.keys(files), lines: landing.lines, commit: sha, summary, digest: crypto.createHash("sha256").update(message).digest("hex").slice(0, 12) }) + "\n"
+  );
+} catch {}
+
+out({ applied: true, commit: sha, files: Object.keys(files), lines: landing.lines });

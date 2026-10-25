@@ -258,4 +258,91 @@ describe("PriorityDispatcher", () => {
     assert.equal(events[1].type, "dispatching");
     assert.equal(events[2].type, "turn_complete");
   });
+
+  // ── Coalescing (Claude-Code "type several lines, one turn") ─────────
+
+  it("merges the contiguous same-source same-priority run into one turn", () => {
+    dispatcher.dispatch("running", "merlin", { priority: "high" }); // in-flight
+    dispatcher.dispatch("msg1", "merlin", { priority: "high" });
+    dispatcher.dispatch("msg2", "merlin", { priority: "high" });
+    dispatcher.dispatch("msg3", "merlin", { priority: "high" });
+
+    session.completeCurrentTurn(); // running done → drain merges msg1..3
+    assert.equal(session.sent.length, 2, "one merged turn, not three");
+    assert.equal(session.sent[1], "msg1\n\nmsg2\n\nmsg3");
+    assert.equal(dispatcher.inFlight.mergedCount, 2);
+    assert.equal(dispatcher.inFlight.mergedFrom.length, 2);
+  });
+
+  it("does NOT merge across different sources", () => {
+    dispatcher.dispatch("running", "merlin", { priority: "high" });
+    dispatcher.dispatch("a", "merlin", { priority: "high" });
+    dispatcher.dispatch("b", "triage", { priority: "high" }); // different source
+
+    session.completeCurrentTurn();
+    assert.equal(session.sent[1], "a", "only the merlin item dispatches");
+    assert.equal(dispatcher.queue.length, 1);
+    assert.equal(dispatcher.queue[0].content, "b", "triage stays its own turn");
+  });
+
+  it("does NOT merge across different priorities", () => {
+    dispatcher.dispatch("running", "merlin", { priority: "normal" });
+    dispatcher.dispatch("h", "merlin", { priority: "high" });
+    dispatcher.dispatch("n", "merlin", { priority: "normal" });
+
+    session.completeCurrentTurn(); // head=h(high); next is normal → no merge
+    assert.equal(session.sent[1], "h");
+    assert.equal(dispatcher.queue[0].content, "n");
+  });
+
+  it("respects maxCoalesce cap", () => {
+    session = new MockSession({ autoComplete: false });
+    dispatcher = new PriorityDispatcher(session, { maxCoalesce: 2 });
+    dispatcher.dispatch("running", "g", { priority: "high" });
+    dispatcher.dispatch("m1", "g", { priority: "high" });
+    dispatcher.dispatch("m2", "g", { priority: "high" });
+    dispatcher.dispatch("m3", "g", { priority: "high" });
+
+    session.completeCurrentTurn(); // cap 2 → head m1 + one merge (m2); m3 waits
+    assert.equal(session.sent[1], "m1\n\nm2");
+    assert.equal(dispatcher.queue.length, 1);
+    assert.equal(dispatcher.queue[0].content, "m3");
+  });
+
+  it("coalesce:false disables merging entirely", () => {
+    session = new MockSession({ autoComplete: false });
+    dispatcher = new PriorityDispatcher(session, { coalesce: false });
+    dispatcher.dispatch("running", "g", { priority: "high" });
+    dispatcher.dispatch("m1", "g", { priority: "high" });
+    dispatcher.dispatch("m2", "g", { priority: "high" });
+
+    session.completeCurrentTurn();
+    assert.equal(session.sent[1], "m1", "each item its own turn");
+    assert.equal(dispatcher.queue.length, 1);
+  });
+
+  it("frees every merged msgId from the dedup set on completion", () => {
+    dispatcher.dispatch("running", "g", { priority: "high" });
+    dispatcher.dispatch("m1", "g", { priority: "high", msgId: "id1" });
+    dispatcher.dispatch("m2", "g", { priority: "high", msgId: "id2" });
+
+    session.completeCurrentTurn(); // merged m1+m2 now in-flight
+    // Both ids still held while the merged turn runs → a dupe is rejected.
+    assert.equal(dispatcher.dispatch("dupe", "g", { priority: "high", msgId: "id2" }), null);
+
+    session.completeCurrentTurn(); // merged turn done → id1 + id2 freed
+    assert.ok(dispatcher.dispatch("reuse", "g", { priority: "high", msgId: "id2" }) !== null);
+  });
+
+  it("emits a coalesced event with the merge count", () => {
+    const events = [];
+    dispatcher.on("coalesced", (e) => events.push(e));
+    dispatcher.dispatch("running", "merlin", { priority: "high" });
+    dispatcher.dispatch("m1", "merlin", { priority: "high" });
+    dispatcher.dispatch("m2", "merlin", { priority: "high" });
+    session.completeCurrentTurn();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].mergedCount, 1);
+    assert.equal(events[0].source, "merlin");
+  });
 });

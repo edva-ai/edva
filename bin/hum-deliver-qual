@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+// hum-deliver-qual — deliver a QUEUED qualitative (lane-diagnosis) hum question
+// at a gated tick moment, atomically with the pending-question slot lock.
+//
+// WHY (2026-07-20 bug): hum-metrics-collect runs early in the local morning — inside hum's
+// sleep window — and detects lane-decay events. It cannot deliver a question
+// then (DND), and it runs only once/day, so it QUEUES the question (see
+// dispatch_qualitative_question). Previously it instead wrote the question
+// straight into hum-pending-question.json with a 48h TTL and NEVER sent it:
+// the slot sat occupied for two days, silently downgrading every real tick
+// question to silent (pending_question_active) and blocking ideation refills,
+// while the user never saw the question. One lane diagnosis could zombie the
+// whole question channel for a day and block a time-sensitive tip from
+// another lane.
+//
+// This helper — run on a gated tick, AFTER the sleep/activity/calendar/pause
+// gates that protect every hum ping (since 2026-10-15 trigger-hum.sh kicks the
+// launchd agent ai.claude.hum-deliver-qual, whose run-hum-deliver-qual.sh runs
+// this with the Max login the send's resolve-first gate needs) — delivers
+// the queued question at the next good moment and only THEN writes the pending
+// slot. Delivery and slot-lock are ATOMIC: the slot is never written without a
+// real send, so the zombie class of bug is structurally impossible. If nothing
+// lands (precheck suppression, transport error), the queue is left in place and
+// retried next tick until deliver_by, after which the stale decay signal is
+// dropped.
+//
+// 2026-09 addition: hum-pending-question.json is a SHARED
+// slot — any other hum question can overwrite it before THIS question's own
+// 24h TTL elapses, which made lib/hum-lane-quiesce.mjs's expiry check
+// permanently blind (it only ever looked at whatever currently sat in the
+// slot). So the moment a lane_diagnosis question lands here, we also stamp a
+// durable per-lane (id, expires_at) record straight into
+// hum-lane-quiesce-state.json via recordLaneDiagnosisDelivered() — a copy
+// that survives the shared slot being overwritten. See that file's header for
+// the full story.
+//
+// Fail-safe: any error → exit 0, leave the queue, never block the tick.
+//
+// Test seams (env): HOME (fixture root), HUM_SEND_BIN (fake sender),
+// HUM_QUAL_NOW_ISO (deterministic clock).
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { recordLaneDiagnosisDelivered } from "../lib/hum-lane-quiesce.mjs";
+import { readSidecar } from "../lib/hum-resolve-first.mjs";
+import { createRequire } from "node:module";
+import { installTools } from "../lib/root.cjs";
+// The installation's home time zone (agent/local/instance.json tz; the host zone when unset).
+const instanceTz = () => createRequire(import.meta.url)("../lib/instance.cjs").instance().tz;
+
+const HOME = os.homedir();
+const DATA = installTools("data");
+const QUEUE = path.join(DATA, "hum-qual-delivery-queue.json");
+const PENDING = path.join(DATA, "hum-pending-question.json");
+const STATE = path.join(DATA, "hum-state.json");
+const RUNS = path.join(DATA, "hum-runs.jsonl");
+const SEND = process.env.HUM_SEND_BIN || installTools("bin/merlin-send-curl");
+
+const REPLY_WINDOW_H = 24;   // how long the delivered question stays answerable
+const DELIVER_HOUR_LO = 9;   // courtesy window (local); trigger-hum already >= 9
+const DELIVER_HOUR_HI = 21;  // don't land a reflective diagnostic late at night
+
+function readJSON(p) {
+  try {
+    const r = fs.readFileSync(p, "utf8").trim();
+    if (!r || r === "null") return null;
+    return JSON.parse(r);
+  } catch { return null; }
+}
+function log(m) { process.stdout.write(`${new Date().toISOString()} [hum-deliver-qual] ${m}\n`); }
+function now() { return process.env.HUM_QUAL_NOW_ISO ? new Date(process.env.HUM_QUAL_NOW_ISO) : new Date(); }
+function userTz() {
+  const j = readJSON(path.join(DATA, "user-timezone.json"));
+  return (j && j.timezone) || instanceTz();
+}
+function localHour(d) {
+  return Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hour12: false, timeZone: userTz() }).format(d));
+}
+function localDate(d) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: userTz() }).format(d); // YYYY-MM-DD
+}
+
+function main() {
+  const q = readJSON(QUEUE);
+  if (!q || !q.question) return 0;                       // nothing queued
+
+  // Don't stack: if a question is already outstanding (unexpired), wait.
+  const pend = readJSON(PENDING);
+  if (pend && pend.expires_at && new Date(pend.expires_at).getTime() > now().getTime()) return 0;
+
+  // Stale decay signal — drop rather than deliver a day-old diagnosis.
+  if (q.deliver_by && new Date(q.deliver_by).getTime() < now().getTime()) {
+    try { fs.unlinkSync(QUEUE); } catch {}
+    log(`dropped stale queued question ${q.id} (past deliver_by ${q.deliver_by})`);
+    return 0;
+  }
+
+  // Courtesy hours (local). trigger-hum guarantees >= 9; this adds the evening cap.
+  const hr = localHour(now());
+  if (hr < DELIVER_HOUR_LO || hr >= DELIVER_HOUR_HI) return 0;
+
+  // Send via merlin-send-curl. --capture-id writes the inserted
+  // merlin_messages.id to a file ONLY on HTTP 201. When a gate holds the
+  // message it writes a {"suppressed":true} JSON sentinel there instead (the
+  // precheck, or the resolve-first gate with by: hum-resolve-first). So
+  // (status 0 AND a non-JSON id) == actually landed. Before 2026-10-15 the
+  // sentinel read as an id, and a suppressed question took the slot.
+  const idFile = path.join(os.tmpdir(), `hum-qual-${process.pid}.id`);
+  const ctxFile = path.join(os.tmpdir(), `hum-qual-${process.pid}.context.json`);
+  try { fs.unlinkSync(idFile); } catch {}
+  try { fs.unlinkSync(`${idFile}.resolve.json`); } catch {}   // a stale sidecar from a reused pid
+  const intent = `hum:${q.lane || "global"}:lane-diagnosis`;
+  const sendArgs = ["--capture-id", idFile, "--intent", intent];
+  try {
+    fs.writeFileSync(ctxFile, JSON.stringify({ kind: "question", lane: q.lane || "global", dedup_key: q.id || null, subject: q.subject || null }));
+    sendArgs.push("--hum-context", ctxFile);
+  } catch {}
+  sendArgs.push(q.question);
+  const res = spawnSync(SEND, sendArgs, { encoding: "utf8" });
+  try { fs.unlinkSync(ctxFile); } catch {}
+  const side = readSidecar(idFile);
+  let msgId = "";
+  try { msgId = fs.readFileSync(idFile, "utf8").trim(); } catch {}
+  try { fs.unlinkSync(idFile); } catch {}
+  if (res.status === 0 && msgId.startsWith("{")) {
+    let sentinel = {};
+    try { sentinel = JSON.parse(msgId); } catch {}
+    if (sentinel.by === "hum-resolve-first") {
+      // Merlin's own records already answer it: nothing to ask, nothing to retry.
+      try { fs.unlinkSync(QUEUE); } catch {}
+      log(`queued question ${q.id} resolved before asking — dropped from the queue, slot left free`);
+      return 0;
+    }
+    log(`send held by the precheck (${String(sentinel.reason || "").slice(0, 120)}) — leaving queue for retry`);
+    return 0;
+  }
+  if (res.status !== 0 || !msgId) {
+    log(`send did not land (status=${res.status}, id='${msgId}') — leaving queue for retry`);
+    return 0;                                            // fail-safe: retry next tick
+  }
+  if (side && side.action === "rewrite" && !side.still_question) {
+    // The answer went out as an FYI instead: delivered, but nothing to wait for.
+    try { fs.unlinkSync(QUEUE); } catch {}
+    log(`queued question ${q.id} answered from the records — an FYI went out instead, slot left free (msg=${msgId})`);
+    return 0;
+  }
+  // Narrowed by the gate to the part still open: the slot holds what the user saw.
+  if (side && side.action === "rewrite" && side.text) q.question = side.text;
+
+  const n = now();
+  // Write the pending slot as a DELIVERED, reply-awaiting question.
+  const pending = {
+    id: q.id,
+    category: q.category || "lane_diagnosis",
+    lane: q.lane || "global",
+    metric_snapshot: q.metric_snapshot,
+    subject: q.subject,
+    memory_hook: q.memory_hook || "hum_improvement_loop",
+    question: q.question,
+    asked_at: n.toISOString(),
+    expires_at: new Date(n.getTime() + REPLY_WINDOW_H * 3600e3).toISOString(),
+    delivered: true,
+    delivered_msg_id: msgId,
+    source: "qual-delivery",
+    trigger_event: q.trigger_event,
+  };
+  fs.writeFileSync(PENDING, JSON.stringify(pending, null, 2));
+
+  // Durable per-lane record — survives the shared slot above being
+  // overwritten by an unrelated question before this one's own TTL elapses.
+  // No-op for category !== "lane_diagnosis" or lane === "global" (see
+  // recordLaneDiagnosisDelivered); never throws, never blocks delivery.
+  if (pending.category === "lane_diagnosis" && pending.lane && pending.lane !== "global") {
+    try {
+      recordLaneDiagnosisDelivered({ lane: pending.lane, id: pending.id, expiresAt: pending.expires_at, now: n.getTime() });
+    } catch (e) {
+      log(`recordLaneDiagnosisDelivered failed (non-fatal): ${e && e.message}`);
+    }
+  }
+
+  // Stamp state: question accounting + the DAYS-SINCE-LAST-QUESTION backstop clock.
+  const st = readJSON(STATE) || {};
+  const today = localDate(n);
+  if (!st.today || st.today.date !== today) {
+    st.today = { date: today, runs: (st.today && st.today.runs) || 0, pings: 0, questions: 0 };
+  }
+  st.today.questions = (st.today.questions || 0) + 1;
+  st.last_question_at = n.toISOString();
+  fs.writeFileSync(STATE, JSON.stringify(st, null, 2) + "\n");
+
+  // Minimal tick trace so hum-daily / hum-review account for the send.
+  try {
+    const trace = {
+      ts: n.toISOString(),
+      source: "qual-delivery",
+      sonnet: { decision: "question", subject: q.subject, rationale: `delivered queued lane-diagnosis question for '${q.lane}' decay` },
+      outcome: { sent: true, decision: "question", subject: q.subject, question_id: q.id, ping_id: msgId },
+    };
+    fs.appendFileSync(RUNS, JSON.stringify(trace) + "\n");
+  } catch {}
+
+  try { fs.unlinkSync(QUEUE); } catch {}                 // delivery done
+  log(`delivered qual question ${q.id} (lane=${q.lane}) msg=${msgId}`);
+  return 0;
+}
+
+try { process.exit(main()); }
+catch (e) { log(`error: ${e && e.message}`); process.exit(0); }  // never block the tick

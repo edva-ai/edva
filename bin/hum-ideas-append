@@ -1,0 +1,291 @@
+#!/usr/bin/env node
+// hum-ideas-append — the ONLY writer of new ideas into hum-ideas.jsonl
+// (jobs/hum-ideation.md Steps 6, 6.5 and 7).
+//
+// The ideation agent used to apply the structural dedup rules, run claim-check
+// per idea and `>>` hand-assembled JSON into the reservoir itself. The
+// generation is the model's job; everything below is not, so it lives here:
+//
+//   schema      required fields, enums, ranges; task_id when draws_on has
+//               "tasks"; verify_question when confidence is "low". Malformed
+//               ideas are refused, never half-written.
+//   id          an id already in the reservoir is refused.
+//   Rule 9      supporting_data.task_id in the digest's task_ids_blocked or an
+//               unexpired hum-resolved-topics row → refused.
+//   Rule 12     thread_id (or gmail_thread_id) already unconsumed, consumed in
+//               48h, or in an unexpired resolved-topics row → refused. No
+//               override: same thread = same email.
+//   Rule 1      near-duplicate of a live unconsumed idea, judged by EMBEDDING
+//               similarity (lib/hum-novelty.mjs, local nomic-embed-text)
+//               instead of "≥3 shared keywords" — word overlap is arithmetic on
+//               language (Rule #0b) and both over- and under-fires on paraphrase.
+//               Overridable only by `supporting_data.supersedes_reason` (what
+//               materially changed), which the model must write.
+//               Fail-open: embedder down → the rule is skipped and reported.
+//   Rule 10     same topic as an unexpired hum-resolved-topics row (the user
+//               acknowledged it in the last 48h), by embedding similarity to the
+//               row's topic (lib/hum-topic-match.mjs, ≥0.80) — replaced
+//               "≥2 shared content words".
+//   Rule 11     same topic as an idea consumed in the last 48h (digest
+//               consumed_recent), by embedding similarity (≥0.86) — replaced
+//               "≥4 shared content words".
+//               Rules 1/10/11 share one override: supporting_data.supersedes_reason,
+//               the model's statement of what materially changed (replaces the
+//               old "why_now documents it" judgment, which code cannot check).
+//               Fail-open like Rule 1: embedder down → skipped and reported.
+//   Step 6.5    claim-check per surviving idea: pass → write, rewrite/drop →
+//               refused with the correction, so the agent fixes and resubmits.
+//               Run this CLI from INSIDE the agent turn — claim-check's memory
+//               stage forks `claude -p` and needs the turn's keychain access.
+//               One drop is re-labelled `schema` (fix and resubmit) rather
+//               than final: a place the travel timeline cannot resolve — a
+//               country, a day-trip town — read as contradicting the base
+//               metro. See unresolvablePlace() below.
+//
+// Usage:
+//   <ideas as JSONL or a JSON array on stdin> | hum-ideas-append [--dry-run] [--no-claim-check]
+// Stdout: {written:[id], rejected:[{id, rule, detail}], novelty_checked:bool}
+// Exit 0 always on a processed batch (rejections are data); 2 on unreadable input.
+// Env (tests): MERLIN_DATA_DIR, HUM_IDEAS_DUP_THRESHOLD, HUM_IDEAS_NO_EMBED=1.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { embed } from "../lib/hum-novelty.mjs";
+import { embedAll, nearest, resolvedText, RESOLVED_THRESHOLD, CONSUMED_THRESHOLD } from "../lib/hum-topic-match.mjs";
+import { createRequire } from "node:module";
+import { loadTimeline, presenceProvider } from "../lib/claim-facts.mjs";
+import { lensOf } from "../lib/hum-ideas-scorecard.mjs";
+
+import { installTools } from "../lib/root.cjs";
+// The installation's presence provider (claim-facts.mjs; lib/_ext/presence.mjs).
+const P = presenceProvider();
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const RESERVOIR = path.join(DIR, "hum-ideas.jsonl");
+const DIGEST = path.join(DIR, "hum-ideas-digest.json");
+const RESOLVED = path.join(DIR, "hum-resolved-topics.jsonl");
+// Ideas paraphrase each other far more than pings restate each other, so this
+// sits below hum-ping's near-verbatim 0.93. Logged on every refusal so it can
+// be tuned from data.
+const DUP_THRESHOLD = Number(process.env.HUM_IDEAS_DUP_THRESHOLD || 0.86);
+
+// An installation adds its own categories (say, a side project or a hobby)
+// as extend_categories in agent/local/config/hum-ideas.json.
+const { instance, localConfig } = createRequire(import.meta.url)("../lib/instance.cjs");
+const OWNER = instance().owner_name;
+const CATEGORIES = new Set(localConfig("hum-ideas", { categories: ["event-prep", "stale-p1", "weekend-planning", "travel-prep", "family",
+  "taste-match", "cross-topic", "stuck-task", "seasonal-closing", "health-care", "merlin-systems", "dining"] }).categories);
+const LENSES = new Set(["substitute", "combine", "adapt", "modify", "put-to-other-use", "eliminate", "reverse"]);
+const CONFIDENCE = new Set(["high", "medium", "low"]);
+
+function jsonl(p) {
+  try { return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { return []; }
+}
+function readJson(p) { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } }
+const isIso = (v) => typeof v === "string" && Number.isFinite(Date.parse(v));
+
+// WHY THE FIELDS ARE JOINED AS SENTENCES (from a Jev disagreement review).
+//
+// claim-check reads one text, and the three fields used to be glued with a bare
+// space. A subject has no closing full stop, so when it ended on a time and the
+// rationale opened on a date, the join wrote a claim nobody made: "...starts
+// at 9am" + "<date> is the event day" read as "starts at 9am <date>".
+// claim-check's Sonnet adjudicator called a true idea garbled and rewrote it, the
+// ideation agent resubmitted the correction (which again opened on the date), and
+// three rewrites later it gave up on the idea. Replayed with the same memory, 2
+// samples each: joined, 5 of 6 rewrites; with the subject closed by a full stop,
+// 6 of 6 passes, and Jev's verdict unchanged either way. The same join is how
+// Stage 1 captured "<Country> The" as a place; a full stop ends that
+// capture too. Each field keeps its own punctuation; only a missing one is added.
+export function claimCheckText(idea) {
+  return [idea.subject, idea.rationale, idea.why_now]
+    .map((s) => String(s || "").trim())
+    .filter(Boolean)
+    .map((s) => (".!?".includes(s.slice(-1)) ? s : `${s}.`))
+    .join(" ");
+}
+
+// WHY A LOCATION DROP CAN BE A SCHEMA ERROR (from a Jev disagreement review).
+//
+// claim-check Stage 1 compares the place an idea asserts (location_claim.city,
+// or a "you're in X" phrase) to the travel timeline by metro key, and a miss on
+// every probed date is a hard drop with no adjudication. That is right for a
+// real metro the user will not be in — "<city A> on <date>" while the timeline
+// says <city B>. But a place the timeline has no metro for can never match, so
+// it reads as a contradiction even when it is true: a country name or a nearby
+// town checked against the base metro of a stay. Each such drop was final ("do
+// not resubmit"), so the idea was lost and counted as claim_check_dropped — the
+// metric hum-review reads as the gate doing work. A known metro on a date the
+// user is elsewhere is a real contradiction and still drops.
+//
+// The Stage-1 rule is left alone; only the label of the refusal changes. When
+// the stated place does not normalize to a metro the timeline knows, the idea
+// comes back as `schema` with the base metro named, and the agent restates it
+// (or abandons it, if it only works somewhere the user will not be) — the same fix-
+// and-resubmit-once path as any other schema error. A known metro keeps the
+// final drop. Resolution is presence.normalizeMetro against METRO_DEFS plus the
+// timeline's own segments and flights — the comparison claim-facts already
+// makes, so the two cannot disagree. Fail-safe: no timeline → METRO_DEFS only.
+let knownMetrosP = null;
+function knownMetros() {
+  if (!knownMetrosP) knownMetrosP = (async () => {
+    const known = new Set(P.METRO_DEFS.map(([k]) => k));
+    const add = (v) => { const m = v ? P.normalizeMetro(v) : null; if (m) for (const k of m.split(P.AMBIGUOUS_SEP)) known.add(k); };
+    try {
+      const t = await loadTimeline();
+      for (const seg of t.segments || []) add(seg.metro);
+      for (const f of t.flights || []) for (const c of [f.to_city, f.from_city, f.to, f.from, f.destination, f.origin]) add(c);
+    } catch { /* METRO_DEFS alone */ }
+    return known;
+  })();
+  return knownMetrosP;
+}
+
+// Returns {stated, on, base} when the drop is an unresolvable place, else null.
+// `base` names the metro the user is in on that date as a city, not the
+// segment's label, which can be a street address.
+export async function unresolvablePlace(verdict) {
+  const loc = verdict?.correction;
+  if (!loc || loc.field !== "location" || !loc.stated) return null;
+  const m = P.normalizeMetro(loc.stated);
+  if (m && (await knownMetros()).has(m)) return null;
+  const hard = (verdict.contradictions || []).find((c) => c.severity === "hard" && c.on === loc.on) || {};
+  const def = P.METRO_DEFS.find(([k]) => k === hard.actual_metro);
+  const base = def ? def[1][0].split(" ").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") : loc.actual;
+  return { stated: loc.stated, on: loc.on, base };
+}
+
+export function validate(idea) {
+  const errs = [];
+  const str = (k, max) => { if (typeof idea[k] !== "string" || !idea[k].trim()) errs.push(`${k} missing`); else if (max && idea[k].length > max) errs.push(`${k} longer than ${max}`); };
+  str("id"); str("subject", 100); str("rationale"); str("why_now");
+  if (idea.id && !String(idea.id).startsWith("idea-")) errs.push("id must start with idea-");
+  if (!CATEGORIES.has(idea.category)) errs.push(`category "${idea.category}" not a known lens`);
+  const lens = lensOf(idea);
+  if (!LENSES.has(lens)) errs.push(`idea_lens "${lens}" invalid`);
+  if (typeof idea.urgency !== "number" || idea.urgency < 0 || idea.urgency > 1) errs.push("urgency must be a number in 0..1");
+  if (idea.time_sensitive_until != null && !isIso(idea.time_sensitive_until)) errs.push("time_sensitive_until must be ISO or null");
+  if (!Array.isArray(idea.draws_on)) errs.push("draws_on must be an array");
+  if (idea.supporting_data != null && typeof idea.supporting_data !== "object") errs.push("supporting_data must be an object");
+  if (!CONFIDENCE.has(idea.confidence)) errs.push("confidence must be high|medium|low");
+  if (idea.confidence === "low" && !(typeof idea.verify_question === "string" && idea.verify_question.trim())) errs.push("verify_question required when confidence is low");
+  if (Array.isArray(idea.draws_on) && idea.draws_on.includes("tasks") && !idea.supporting_data?.task_id) errs.push("supporting_data.task_id required when draws_on includes tasks");
+  return errs;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const dry = args.includes("--dry-run");
+  const noClaim = args.includes("--no-claim-check");
+  let raw = "";
+  try { raw = fs.readFileSync(0, "utf8").trim(); } catch { /* empty */ }
+  let ideas;
+  try { ideas = raw.startsWith("[") ? JSON.parse(raw) : raw.split("\n").filter(Boolean).map((l) => JSON.parse(l)); }
+  catch (e) { process.stderr.write(`hum-ideas-append: unreadable input: ${e.message}\n`); process.exit(2); }
+
+  const existing = new Set(jsonl(RESERVOIR).map((r) => r.id).filter(Boolean));
+  const digest = readJson(DIGEST) || {};
+  const now = Date.now();
+  const resolved = jsonl(RESOLVED).filter((r) => Date.parse(r.suppress_until || "") > now);
+  const blockedTasks = new Set([...(digest.task_ids_blocked || []), ...resolved.map((r) => r.task_id).filter(Boolean)]);
+  const blockedThreads = new Set([...(digest.unconsumed_thread_ids || []), ...(digest.thread_ids_blocked || []), ...resolved.map((r) => r.thread_id).filter(Boolean)]);
+
+  // Rule 1 corpus: live unconsumed subjects, embedded once per batch.
+  const useEmbed = process.env.HUM_IDEAS_NO_EMBED !== "1";
+  const corpus = [];
+  let noveltyChecked = false;
+  if (useEmbed) {
+    for (const u of digest.unconsumed || []) {
+      const v = await embed(`${u.subject}`);
+      if (v) { corpus.push({ id: u.id, subject: u.subject, vec: v }); noveltyChecked = true; }
+      else if (!corpus.length) break; // embedder down — fail open, don't hammer it
+    }
+  }
+
+  // Rules 10 + 11 corpora: active resolved topics, and ideas consumed in 48h.
+  let resolvedRows = [], consumedRows = [];
+  if (useEmbed && (noveltyChecked || !(digest.unconsumed || []).length)) {
+    const r10 = await embedAll(resolved.map((r, i) => ({ id: r.source_ping_id || `resolved-${i}`, subject: resolvedText(r), text: resolvedText(r) })));
+    const r11 = r10.available ? await embedAll((digest.consumed_recent || []).map((c) => ({ id: c.id, subject: c.subject, text: c.subject }))) : { rows: [], available: false };
+    resolvedRows = r10.rows; consumedRows = r11.rows;
+    if (r10.available && r11.available) noveltyChecked = true;
+  }
+
+  const written = [], rejected = [];
+  const accepted = [];
+  for (const idea of ideas) {
+    const id = idea?.id || null;
+    const errs = validate(idea || {});
+    if (errs.length) { rejected.push({ id, rule: "schema", detail: errs.join("; ") }); continue; }
+    if (existing.has(id) || accepted.some((a) => a.id === id)) { rejected.push({ id, rule: "duplicate-id", detail: "id already in the reservoir" }); continue; }
+    const sd = idea.supporting_data || {};
+    if (sd.task_id && blockedTasks.has(sd.task_id)) { rejected.push({ id, rule: "rule-9-task-id", detail: `task ${sd.task_id} consumed in 48h or resolved` }); continue; }
+    const thread = sd.thread_id || sd.gmail_thread_id;
+    if (thread && (blockedThreads.has(thread) || accepted.some((a) => (a.supporting_data?.thread_id || a.supporting_data?.gmail_thread_id) === thread))) {
+      rejected.push({ id, rule: "rule-12-thread-id", detail: `thread ${thread} already has a live, recent or resolved idea` }); continue;
+    }
+    if (noveltyChecked && !sd.supersedes_reason) {
+      const v = await embed(idea.subject);
+      if (v) {
+        const hint = "set supporting_data.supersedes_reason if it materially changed";
+        const r1 = nearest(v, corpus);
+        if (r1.best && r1.sim >= DUP_THRESHOLD) {
+          rejected.push({ id, rule: "rule-1-near-duplicate", detail: `cosine ${r1.sim.toFixed(3)} vs live ${r1.best.id} ("${r1.best.subject}") — ${hint}` });
+          continue;
+        }
+        const r10 = nearest(v, resolvedRows);
+        if (r10.best && r10.sim >= RESOLVED_THRESHOLD) {
+          rejected.push({ id, rule: "rule-10-resolved-topic", detail: `cosine ${r10.sim.toFixed(3)} vs resolved topic "${r10.best.subject}" (${OWNER} settled it in the last 48h) — ${hint}` });
+          continue;
+        }
+        const r11 = nearest(v, consumedRows);
+        if (r11.best && r11.sim >= CONSUMED_THRESHOLD) {
+          rejected.push({ id, rule: "rule-11-recently-consumed", detail: `cosine ${r11.sim.toFixed(3)} vs ${r11.best.id} ("${r11.best.subject}"), surfaced in the last 48h — ${hint}` });
+          continue;
+        }
+        corpus.push({ id, subject: idea.subject, vec: v }); // in-batch dedup
+      }
+    }
+    if (!noClaim) {
+      const cc = spawnSync(path.join(HERE, "claim-check"), ["--json"], {
+        input: JSON.stringify({ text: claimCheckText(idea), subject: idea.subject, supporting_data: sd, lane: "ideas" }),
+        encoding: "utf8", timeout: 120000,
+      });
+      let verdict = null;
+      try { verdict = JSON.parse(String(cc.stdout || "").trim().split("\n").pop()); } catch { verdict = null; }
+      if (verdict && verdict.verdict === "drop") {
+        const loc = await unresolvablePlace(verdict);
+        if (loc) {
+          rejected.push({ id, rule: "schema", detail: `"${loc.stated}" is not a place the travel timeline can resolve, so claim-check read it as contradicting ${loc.base} on ${loc.on}. Set supporting_data.location_claim.city (and any "you're in …" wording) to the metro the timeline names for that date — "${loc.base}" — since a country, a region or a day-trip town is anchored at the base, then resubmit. If the idea only works somewhere the user will not be, leave it out instead.` });
+          continue;
+        }
+        rejected.push({ id, rule: "claim-check-drop", detail: (verdict.reasons || []).join("; ") }); continue;
+      }
+      if (verdict && verdict.verdict === "rewrite") {
+        rejected.push({ id, rule: "claim-check-rewrite", detail: verdict.correction || (verdict.reasons || []).join("; "), corrected_text: verdict.corrected_text || null });
+        continue;
+      }
+      // pass, or claim-check unreachable (it is fail-open by contract) → write
+    }
+    accepted.push({
+      ...idea,
+      created_at: isIso(idea.created_at) ? idea.created_at : new Date().toISOString(),
+      source: idea.source || "hum-ideation-agent",
+      supporting_data: sd,
+      consumed: false, consumed_at: null, ping_id: null,
+    });
+    written.push(id);
+  }
+
+  if (!dry && accepted.length) fs.appendFileSync(RESERVOIR, accepted.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  process.stdout.write(JSON.stringify({ written, rejected, novelty_checked: noveltyChecked, dry_run: dry }) + "\n");
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((e) => { process.stderr.write(`hum-ideas-append: ${e.stack || e.message}\n`); process.exit(1); });
+}

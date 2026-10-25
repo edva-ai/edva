@@ -1,9 +1,12 @@
-# Personal ops-agent job overlay drop.
+# Installation job playbooks.
 #
-# Files placed here (e.g. `mkt-ph-launch-monitor.md`, `flights-scan.md`)
-# are dispatchable through the webhook channel exactly like the bundled
-# jobs in the parent dir. The job-file resolver checks the kernel jobs
-# dir first, then falls back to `_ext/`.
+# A playbook placed here (`<job>.md`) is dispatchable through the supervisor
+# webhooks exactly like the bundled jobs in the parent dir:
+# agent/supervisor/http-server.mjs resolves {"job": "<name>"} to
+# jobs/<name>.md first, then to jobs/_ext/<name>.md (a kernel job wins on a
+# name), and appends agent/local/jobs/<name>.md when that exists. Give a new
+# job a tier in agent/local/job-routing.json and a schedule in
+# agent/local/tasks.json (both merged with the kernel's by lib/registry.cjs).
 #
-# Anything you place under `_ext/` is gitignored — see .gitignore at repo
-# root and docs/architecture-public-private.md.
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

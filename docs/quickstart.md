@@ -1,39 +1,41 @@
 # Quickstart
 
-Five commands. About 15 minutes of clicking through prompts. Result: agents running on your host, talking to a webhook channel, logging to your terminal.
+Five commands and a few prompts. Result: Merlin's supervisors running on your host, a webhook you can dispatch jobs to, and an event stream in your terminal.
 
 ## Before you start
 
 Install once:
 
-- **Node.js 22.5+** (built-in `node:sqlite` requires 22.5+). Verify with `node --version`.
-- **[Ollama](https://ollama.com)** — the phone-channel ack layer + memory embeddings run against a local model. After installing:
+- **Node.js 22.5+** (built-in `node:sqlite`). Verify with `node --version`.
+- **The Claude Code CLI**, logged in with a **Claude Max** subscription: `npm install -g @anthropic-ai/claude-code`, then run `claude` once and sign in. Every agent runs through `claude -p` on that login; the supervisors deliberately hide `ANTHROPIC_API_KEY` from those sessions (see [`agent-auth-model.md`](agent-auth-model.md)).
+- **[Ollama](https://ollama.com)** for local classification and memory embeddings:
   ```bash
-  ollama pull gemma3:4b              # ~2.5 GB — the ack model
-  ollama pull nomic-embed-text       # ~280 MB — embeddings for memory
+  ollama pull gemma3:1b              # small local classifier
+  ollama pull nomic-embed-text       # embeddings for memory
   ollama serve                       # leave running
   ```
-- **A Claude API key** at https://console.anthropic.com — OR an active Claude Max subscription (in which case you'll also install the Claude Code CLI: `npm install -g @anthropic-ai/claude-code` and log in once with `claude`).
 
-That's the floor. The bootstrap script will probe for everything else and tell you what else (if anything) you're missing.
+The bootstrap script probes for everything else and tells you what is missing. Merlin is developed on macOS; parts of it (launchd, Keychain, `ioreg`) are macOS-only — see [`dependencies.md`](dependencies.md).
 
 ## Step 1 — Clone + bootstrap
 
 ```bash
-git clone https://github.com/mraccah2/merlin.git ~/Dev/merlin
+# Clone this repository — copy its URL from the green "Code" button on GitHub
+git clone <this repository's URL> ~/Dev/merlin
 cd ~/Dev/merlin
 ./scripts/bootstrap.sh
 ```
 
 What the bootstrap does:
 
-- Verifies Node 22.5+ / npm / Ollama / optional tools (`claude`, `gh`, `op`, `gog`, `jq`).
-- Runs `npm install` in every subpackage (root, agent, supervisor, tools-mcp, the 4 channels, bin).
-- Creates the runtime directories: `data/`, `logs/`, `agent/logs/`, `agent/supervisor/state/{ops,chat}/`, `secrets/`, `credentials/`.
-- Marks every CLI in `bin/`, `agent/bin/`, `agent/scripts/`, and `scripts/` executable.
-- Copies `.env.example` → `.env` if `.env` is absent.
+- Verifies Node 22.5+, npm, Ollama and optional tools (`claude`, `gh`, `op`, `gog`, `jq`).
+- Runs `npm install` in every package (root, `agent/`, the supervisor, `tools-mcp`, the channels, `browsing-skills/`, `bin/`).
+- Creates the runtime directories: `data/`, `logs/`, `agent/logs/`, `agent/supervisor/state/{ops,chat}/`, `agent/local/`, `secrets/`, `credentials/`.
+- Marks the CLIs and scripts executable and copies `.env.example` → `.env` if `.env` is absent.
 
-Idempotent — re-run any time after `git pull`.
+Idempotent — re-run it after every `git pull`.
+
+**Cloned somewhere else?** The CLI and scripts find the installation through `MERLIN_HOME` (default `~/Dev/merlin`). Export it in your shell and keep it in `.env`.
 
 ## Step 2 — Configure
 
@@ -41,20 +43,24 @@ Idempotent — re-run any time after `git pull`.
 ./bin/merlin init
 ```
 
-This walks you through about 8 questions:
+A short wizard:
 
-1. **`MERLIN_HOME`** — usually `~/Dev/merlin`. Press Enter to accept.
-2. **`ANTHROPIC_API_KEY`** — paste it, or leave blank if you'll use Max subscription.
-3. **`MERLIN_OWNER_EMAIL`** — the address agent-originated email goes to.
-4. **`MERLIN_OWNER`** — your GitHub login.
-5. **`SUPABASE_URL`** — optional. If blank, the phone-channel + companion app are disabled.
-6. *(if Supabase)* **`SUPABASE_SERVICE_ROLE_KEY`** + **`MERLIN_SUPABASE_PROJECT`** — your project's URL slug.
-7. **`OLLAMA_URL`** — default `http://127.0.0.1:11434` is right if Ollama is local.
-8. Model overrides — defaults `gemma3:4b` + `nomic-embed-text` match what you pulled in step 0.
+1. **`MERLIN_HOME`** — the checkout path. Enter accepts it.
+2. **`ANTHROPIC_API_KEY`** — optional; only developer tools such as `merlin review-pr` use it.
+3. **Identity** — your name, email, the From: address for mail the agent sends, your time zone, your GitHub user. Written to `agent/local/instance.json`, which the kernel reads through `lib/instance.cjs`.
+4. **Supabase** (optional) — project ref, service-role key, Management API token, anon key. Without it the phone channel and companion apps stay off.
+5. **Ollama** — URL and model names (defaults match the models above).
+6. **Telemetry** — whether to send one anonymous install ping (no PII, no raw IP; `MERLIN_NO_TELEMETRY=1` skips the question and the ping).
 
-It also generates a random 32-byte `WEBHOOK_TOKEN`, writes it to both `.env` and `secrets/webhook-token` (the latter is what cron-driven scripts read), and creates the runtime dirs.
+It also generates a random webhook token in `secrets/webhook-token`, creates the runtime dirs, and seeds `data/hum-interests.json`, `data/hum-intent.md` and `data/user-timezone.json` from `examples/` (never overwriting). Re-run with `--force` to overwrite. Every variable is documented in [`.env.example`](../.env.example).
 
-You can re-run `merlin init --force` to overwrite an existing `.env`. To skip the wizard, copy `.env.example` to `.env` by hand and fill in the values.
+Then check the install:
+
+```bash
+./bin/merlin doctor
+```
+
+Before `up`, the supervisor and channel checks fail (nothing is running yet); everything else should pass or tell you what to fix.
 
 ## Step 3 — Run
 
@@ -62,15 +68,7 @@ You can re-run `merlin init --force` to overwrite an existing `.env`. To skip th
 ./bin/merlin up
 ```
 
-That spawns `agent/bin/process-manager.mjs` in the foreground. You'll see lines like:
-
-```
-[process-manager] starting children…
-[chat-supervisor] listening on :9094
-[ops-supervisor]  listening on :9090 (gmail) :9092 (webhook) :9093 (health)
-```
-
-Ctrl-C cleanly stops the tree.
+That runs `agent/bin/process-manager.mjs` in the foreground: the chat supervisor, the three ops tiers (`ops`, `ops-light`, `ops-haiku`) and the channel processes. Ctrl-C stops the tree. Logs go to `agent/logs/`.
 
 ## Step 4 — Fire a job (in another terminal)
 
@@ -78,9 +76,7 @@ Ctrl-C cleanly stops the tree.
 ./bin/merlin dispatch morning-digest
 ```
 
-This POSTs to the ops-supervisor webhook. With no args, `merlin dispatch` lists dispatch-able jobs. The job's playbook lives at `agent/ops-agent/jobs/morning-digest.md` — the supervisor reads it at dispatch time, hands the contents to `claude -p`, and lets the agent execute.
-
-If you set up Supabase + the companion app, the agent's output gets pushed to your phone. If not, it lands as an HTML email via `email-send` (if SMTP2Go is wired) or just shows up in the supervisor event stream.
+`dispatch` posts `{"job": "morning-digest"}` to the webhook of the job's tier (its `model` in `agent/config/job-routing.json`: haiku → `ops-haiku` :9072, other non-opus → `ops-light` :9082, opus → `ops` :9092), falling back to a higher tier when that one isn't healthy. The supervisor loads `agent/ops-agent/jobs/morning-digest.md`, appends your own additions from `agent/local/jobs/morning-digest.md` if you wrote any, and hands it to the agent. With no arguments, `merlin dispatch` lists the playbooks and their tiers.
 
 ## Step 5 — Watch it work
 
@@ -88,36 +84,33 @@ If you set up Supabase + the companion app, the agent's output gets pushed to yo
 ./bin/merlin tail ops
 ```
 
-That tails `agent/logs/supervisor-ops/events.ndjson` — one JSON line per turn the agent takes. Other tails:
+That follows `agent/logs/supervisor-ops/events.ndjson`, one JSON line per event. Others:
 
 ```bash
-./bin/merlin tail chat        # chat-supervisor events
-./bin/merlin tail --all       # both, multiplexed
-./bin/merlin tail morning-digest   # logs/morning-digest.log when a job emits one
+./bin/merlin tail ops-light      # or ops-haiku, chat
+./bin/merlin tail --all          # every supervisor
+./bin/merlin tail usage-push     # agent/logs/<name>.log (else logs/<name>.log)
 ```
 
 ---
 
 ## What now
 
-You have a working Merlin. To make it actually useful, the next things to do (in roughly this order):
+1. **Tell Merlin about you.** Put your standing rules in `agent/local/shared.md` (every agent) and `agent/local/chat.md` / `ops.md` (one role) — template: [`examples/local/shared.example.md`](../examples/local/shared.example.md). The supervisors append them to the kernel rules and reload them on change.
+2. **Tune a job without forking it.** Add `agent/local/jobs/<job>.md` to extend a kernel playbook, or drop a whole new playbook in `agent/ops-agent/jobs/_ext/`. See [`writing-a-job.md`](writing-a-job.md).
+3. **Keep your own layer in a private repo.** `agent/local/` and the `_ext/` dirs are gitignored; `./bin/merlin overlay add <path>` links a private repo into them. See [`architecture-public-private.md`](architecture-public-private.md).
+4. **Wire Gmail** — [`integrations/gmail.md`](integrations/gmail.md).
+5. **Read the architecture map** — [`system/architecture.md`](../system/architecture.md).
 
-1. **Customize the morning-digest job** — `agent/ops-agent/jobs/morning-digest.md` is generic. Edit it to compile the summary you actually want.
-2. **Wire Gmail** — see [`docs/integrations/gmail.md`](integrations/gmail.md) for the Pub/Sub + OAuth flow.
-3. **Write your first job** — see [`docs/writing-a-job.md`](writing-a-job.md).
-4. **Read the architecture map** — [`system/architecture.md`](../system/architecture.md). Skim once now, refer back when something doesn't behave.
-5. **Decide on auth model** — API key (default) is fine to start. If you'd rather flat-rate via Claude Max, see [`docs/hardening.md`](hardening.md).
-
-For 24/7 deployment (not just terminal-session-runtime), install the launchd/systemd service — see [`docs/installer.md`](installer.md).
+For 24/7 operation see [`installer.md`](installer.md).
 
 ---
 
 ## When something doesn't work
 
-- `./bin/merlin status` — supervisor health, child PIDs, last activity, restart counts.
-- `./bin/merlin doctor` — drift checks: tasks.json vs cron, playbook references, supervisor config consistency.
-- `./bin/merlin logs <stream>` — same as `merlin tail` but prints a slice rather than following.
-- `node --check agent/bin/process-manager.mjs` — syntax-check the kernel boot.
-- `./scripts/bootstrap.sh --quiet` — re-run setup. Idempotent. Reports missing prerequisites.
+- `./bin/merlin status` — supervisor health, last activity, restart counts.
+- `./bin/merlin doctor` — drift and health checks (schedules vs tasks, MCP configs, Claude Code on PATH, ...).
+- `./bin/merlin logs <component>` — a slice of a log instead of following it.
+- `./scripts/bootstrap.sh --quiet` — re-run setup; reports missing prerequisites.
 
-Most "it doesn't work" reports trace back to: Ollama not running, the wrong `ANTHROPIC_API_KEY`, or the supervisor binding to a port already in use (default ports are 9090–9094 + 9096). Check those three first.
+Most first-run problems are one of: `claude` not logged in (or not on a Max plan), `MERLIN_HOME` not set for a checkout outside `~/Dev/merlin`, Ollama not running, or a port already in use (the supervisors use 9071–9073, 9081–9083, 9090–9095).

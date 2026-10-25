@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+// whatsapp-send: send a WhatsApp message via the local whatsapp-channel runner.
+//
+// The runner (agent/whatsapp-channel/index.mjs) holds a paired Open-WA
+// session for the user's personal WhatsApp account and exposes POST /send on
+// localhost. This CLI is a thin wrapper.
+//
+// Usage:
+//   whatsapp-send --to <+E164|chat-id> --text "message"
+//   whatsapp-send --to <+E164> --text-file /path/to/body.txt
+//
+// Recipients:
+//   +15551234567        an individual (E.164 with leading +)
+//   15551234567@c.us    same, in WhatsApp's native form
+//   <id>@g.us           a group chat id (get via whatsapp-send --list-groups)
+//
+// The runner must be live on http://localhost:9100. If it is not, see
+// docs/whatsapp-gateway-setup.md for how to start and pair it.
+
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+const require = createRequire(import.meta.url);
+const { loadEnv } = require("../lib/load-env.js");
+const { localConfig } = require("../lib/instance.cjs");
+
+loadEnv();
+
+const RUNNER = process.env.WHATSAPP_RUNNER_URL || "http://localhost:9100";
+// The user's own WhatsApp number, from the first of these env vars that is set:
+// WHATSAPP_OWNER_NUMBER, then any an installation lists in
+// agent/local/config/whatsapp-send.json `extend_owner_number_env` (an
+// older name its .env still uses).
+function ownerNumber(env = process.env) {
+  const names = localConfig("whatsapp-send", { owner_number_env: ["WHATSAPP_OWNER_NUMBER"] }).owner_number_env;
+  for (const n of names) if ((env[n] || "").trim()) return env[n].trim();
+  return "";
+}
+const OWNER_WA = ownerNumber();
+const SENT_LOG = installTools("data/whatsapp-sent.jsonl");
+
+function printUsage() {
+  console.log(`whatsapp-send: send a WhatsApp message via the local runner
+
+Usage:
+  whatsapp-send --to <+E164|chat-id> --text "message"
+  whatsapp-send --to <+E164> --text-file <path>
+  whatsapp-send --health
+
+The runner runs at WHATSAPP_RUNNER_URL (default http://localhost:9100).
+If WHATSAPP_OWNER_NUMBER (the user's own number) is set in .env, the em-dash gate
+fires on messages to that number.`);
+}
+
+function parseArgs(argv) {
+  const a = { to: null, text: null, health: false };
+  for (let i = 2; i < argv.length; i++) {
+    const k = argv[i];
+    if (k === "--to") a.to = argv[++i];
+    else if (k === "--text") a.text = argv[++i];
+    else if (k === "--text-file") a.text = fs.readFileSync(argv[++i], "utf8");
+    else if (k === "--health") a.health = true;
+    else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
+    else { console.error(`whatsapp-send: unknown flag: ${k}`); process.exit(2); }
+  }
+  return a;
+}
+
+function emDashGate({ to, text }) {
+  if (!OWNER_WA || process.env.WHATSAPP_ALLOW_DASHES) return;
+  // Normalize both sides to digits-only for comparison so +15551234567,
+  // 15551234567, and 15551234567@c.us all collapse to the same key.
+  const norm = (s) => String(s).replace(/[^\d]/g, "");
+  if (norm(to) !== norm(OWNER_WA)) return;
+  if (!text) return;
+  if (/[—–]/.test(text)) {
+    const m = text.match(/.{0,40}[—–].{0,40}/);
+    console.error(`whatsapp-send: em/en dash found in --text (violates the configured no-dash rule for messages to the user). Example: ${JSON.stringify(m?.[0] || "")}. Replace with comma/semicolon/period/parens/hyphen, or set WHATSAPP_ALLOW_DASHES=1 to override.`);
+    process.exit(1);
+  }
+}
+
+async function cmdHealth() {
+  try {
+    const res = await fetch(`${RUNNER}/health`);
+    const json = await res.json();
+    console.log(JSON.stringify(json, null, 2));
+    process.exit(res.ok ? 0 : 1);
+  } catch (err) {
+    console.error(`whatsapp-send: runner unreachable at ${RUNNER} (${err.message}). See docs/whatsapp-gateway-setup.md.`);
+    process.exit(1);
+  }
+}
+
+async function cmdSend(a) {
+  if (!a.to || !a.text) { printUsage(); process.exit(2); }
+  emDashGate({ to: a.to, text: a.text });
+
+  let res;
+  try {
+    res = await fetch(`${RUNNER}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        to: a.to,
+        text: a.text,
+        originating_task: process.env.MERLIN_TASK_ID || null,
+      }),
+    });
+  } catch (err) {
+    console.error(`whatsapp-send: runner unreachable at ${RUNNER} (${err.message}). Is whatsapp-channel running? See docs/whatsapp-gateway-setup.md.`);
+    process.exit(1);
+  }
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { _raw: text }; }
+  if (!res.ok || !json.ok) {
+    console.error(`whatsapp-send: ${res.status} ${json.error || text}`);
+    process.exit(1);
+  }
+  console.log(`Sent: message_id=${json.message_id}`);
+
+  // Mirror the runner's append so callers that only look at this file
+  // (e.g. ad-hoc shell scripts) see the send recorded without double-running
+  // the runner's logic. The runner also writes to the same file; duplicate
+  // lines for the same message_id are expected and tolerated.
+  try {
+    fs.appendFileSync(SENT_LOG, JSON.stringify({
+      ts: new Date().toISOString(),
+      kind: "sent",
+      message_id: json.message_id,
+      to: a.to,
+      text: a.text,
+      originating_task: process.env.MERLIN_TASK_ID || null,
+      via: "cli",
+    }) + "\n");
+  } catch (err) {
+    console.error(`whatsapp-send: sent-log append failed: ${err.message}`);
+  }
+}
+
+const args = parseArgs(process.argv);
+if (args.health) cmdHealth();
+else cmdSend(args).catch((e) => { console.error(`whatsapp-send fatal: ${e.message}`); process.exit(1); });

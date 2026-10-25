@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+// triage-decide — "the model decides, code acts" email triage. See lib/triage-decide.mjs.
+//
+//   triage-decide shadow <messageId> --from F --subject S [--date D] [--to T] [--stamps a,b] [--jev-json J]
+//       Decide + plan, execute NOTHING, append to data/triage-decide-shadow.jsonl.
+//       Spawned detached by gmail-source for every agent-dispatched email while
+//       data/triage-decide-config.json says mode=shadow.
+//   triage-decide live <messageId> (same flags)
+//       Decide + plan; when the decision is valid and needs no agent, EXECUTE the
+//       Step-5 plan and print {"handled":true}. Otherwise print {"handled":false}
+//       and the caller (gmail-source) dispatches to the agent as before.
+//   triage-decide report [--days N] [--json]
+//       Shadow vs actual (triage_decisions rows), plus the cutover verdict.
+//   triage-decide plan --decision-json J <messageId> --from F --subject S [--date D]
+//       Print the Step-5 plan for a given decision (debugging; executes nothing).
+
+import path from "node:path";
+import os from "node:os";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  decide, planActions, appendShadow, readShadow, compare, cutoverReady, validateDecision,
+} from "../lib/triage-decide.mjs";
+import { installRoot } from "../lib/root.cjs";
+
+const require = createRequire(import.meta.url);
+const ROOT = installRoot();
+const BIN = path.join(ROOT, "bin");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+function flag(name) {
+  const i = argv.indexOf(`--${name}`);
+  return i !== -1 && i + 1 < argv.length ? argv[i + 1] : undefined;
+}
+const has = (name) => argv.includes(`--${name}`);
+
+function packetFromArgs() {
+  const messageId = argv[1];
+  let jev = null;
+  try { jev = flag("jev-json") ? JSON.parse(flag("jev-json")) : null; } catch {}
+  return {
+    messageId,
+    from: flag("from") || "",
+    to: flag("to") || "",
+    subject: flag("subject") || "",
+    date: flag("date") || "",
+    stamps: (flag("stamps") || "").split(",").map((s) => s.trim()).filter(Boolean),
+    jev,
+  };
+}
+
+function historyLine(from) {
+  try {
+    const td = require("../lib/triage-decisions.js");
+    const c = td.senderConsensus(from);
+    if (!c.enough) return `fewer than 3 recorded decisions for this sender (n=${c.n})`;
+    return c.consensus ? `${c.n} recorded decisions, consistently ${c.consensus.label}/P3` : `${c.n} recorded decisions, mixed or some P1/P2`;
+  } catch { return "unavailable"; }
+}
+
+async function buildPacket() {
+  const p = packetFromArgs();
+  if (!p.messageId) throw new Error("messageId required");
+  const { fetchBody } = await import("../lib/jev-email-triage.mjs");
+  p.body = await fetchBody(p.messageId, { timeoutMs: 8000 }).catch(() => "");
+  p.history = historyLine(p.from);
+  return p;
+}
+
+function execute(plan) {
+  const env = { ...process.env, MERLIN_TRIAGE_ACTOR: "triage-decide" };
+  const results = [];
+  for (const a of plan.actions) {
+    let r;
+    if (a.kind === "gmail-action") r = spawnSync(path.join(BIN, "gmail-action"), a.argv, { env, timeout: 15000 });
+    else if (a.kind === "notify") r = spawnSync(path.join(BIN, "merlin-send-curl"), a.argv, { env, timeout: 120000 });
+    else if (a.kind === "p1-task") r = spawnSync(path.join(BIN, "p1-task"), a.argv, { env, timeout: 30000 });
+    else if (a.kind === "webhook") {
+      let token = "";
+      try { token = require("node:fs").readFileSync(path.join(ROOT, "secrets/webhook-token"), "utf8").trim(); } catch {}
+      r = spawnSync("curl", ["-s", "-m", "10", "-X", "POST", "http://localhost:9092", "-H", `Authorization: Bearer ${token}`, "-H", "Content-Type: application/json", "-d", JSON.stringify(a.payload)], { timeout: 15000 });
+    }
+    results.push({ kind: a.kind, argv: a.argv?.slice(0, 3), status: r ? r.status : null });
+    // A failed label/star is the one failure that leaves the email visibly wrong —
+    // stop and let the caller hand it to the agent rather than half-apply.
+    if (a.kind === "gmail-action" && (!r || r.status !== 0)) return { ok: false, results };
+  }
+  return { ok: true, results };
+}
+
+async function runDecision(live) {
+  const packet = await buildPacket();
+  const r = await decide(packet);
+  const row = {
+    ts: new Date().toISOString(), mode: live ? "live" : "shadow",
+    messageId: packet.messageId, from: packet.from, subject: packet.subject, date: packet.date,
+    stamps: packet.stamps, ok: r.ok, latency_ms: r.latency_ms,
+  };
+  if (!r.ok) {
+    row.error = r.error; row.raw = r.raw;
+    appendShadow(row);
+    return { handled: false, reason: r.error };
+  }
+  const plan = planActions(r.decision, packet);
+  Object.assign(row, { decision: r.decision, plan: plan.actions, needs_agent: plan.needsAgent, agent_tags: plan.agentTags });
+  if (!live || plan.needsAgent) {
+    appendShadow(row);
+    return { handled: false, reason: plan.needsAgent ? `agent: ${plan.agentTags.join(",")}` : "shadow" };
+  }
+  const ex = execute(plan);
+  row.executed = ex.results; row.executed_ok = ex.ok;
+  appendShadow(row);
+  return { handled: ex.ok, reason: ex.ok ? "executed" : "execute-failed" };
+}
+
+function report() {
+  const days = Number(flag("days") || 7);
+  const since = Date.now() - days * 86400e3;
+  const rows = readShadow().filter((r) => Date.parse(r.ts) >= since);
+  const td = require("../lib/triage-decisions.js");
+  const stats = compare(rows, (id) => td.get(id));
+  const first = rows.length ? Math.min(...rows.map((r) => Date.parse(r.ts))) : Date.now();
+  const spanDays = (Date.now() - first) / 86400e3;
+  const verdict = cutoverReady(stats, spanDays);
+  if (has("json")) { console.log(JSON.stringify({ days, rows: rows.length, span_days: spanDays, stats, verdict }, null, 2)); return; }
+  console.log(`triage-decide shadow report — last ${days}d, ${rows.length} rows, span ${spanDays.toFixed(1)}d`);
+  console.log(`  compared ${stats.compared} | label ${(verdict.label_rate * 100).toFixed(1)}% | priority ${(verdict.priority_rate * 100).toFixed(1)}%`);
+  console.log(`  missed P1 ${stats.missed_p1} | over-P1 ${stats.over_p1} | would still dispatch ${stats.would_dispatch} | model failures ${stats.failed} | waiting ${stats.waiting} | no actual ${stats.no_actual}`);
+  console.log(`  cutover: ${verdict.ready ? "READY — set mode=live in data/triage-decide-config.json" : "not ready — " + verdict.reasons.join("; ")}`);
+  for (const d of stats.disagreements.slice(0, 25)) console.log(`  ≠ ${d.messageId} ${d.shadow} vs ${d.actual} (${d.by || "?"}) — ${String(d.subject).slice(0, 70)}`);
+}
+
+async function main() {
+  switch (cmd) {
+    case "shadow": console.log(JSON.stringify(await runDecision(false))); break;
+    case "live": console.log(JSON.stringify(await runDecision(true))); break;
+    case "report": report(); break;
+    case "plan": {
+      const p = packetFromArgs();
+      const v = validateDecision(JSON.parse(flag("decision-json") || "{}"), p);
+      if (!v.ok) { console.error(v.error); process.exit(1); }
+      console.log(JSON.stringify(planActions(v.decision, p), null, 2));
+      break;
+    }
+    default:
+      console.error("Usage: triage-decide shadow|live <messageId> --from F --subject S [--date D] [--stamps a,b] [--jev-json J] | report [--days N] [--json] | plan --decision-json J <messageId> --from F --subject S");
+      process.exit(1);
+  }
+}
+
+main().catch((e) => { console.log(JSON.stringify({ handled: false, reason: `error: ${e.message}` })); process.exit(0); });

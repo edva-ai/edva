@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// recall — one recall across short-term chat + long-term wiki + the user's own
+// dated replies (+ activity log).
+//
+// The single entry point for "what do we know about X?", spanning what the user
+// just typed (recent chat, merlin_messages pgvector), what the user ANSWERED when
+// hum asked ("<date> · <user> said: …", utterance-store), curated memory
+// (wiki hybrid), and — with --events — Merlin's own activity log. Fuses them
+// via RRF.
+//
+// Usage:
+//   recall "plumber"                      # chat + wiki + replies (default)
+//   recall "conference trip" --events     # also fuse the activity log
+//   recall "board games" -k 8 --json
+//   recall "..." --no-wiki                # drop the wiki  /  --no-chat, --no-replies
+//   recall "..." --chat-days 7            # bound chat recall to last 7 days
+//   recall "portfolio value" --quantity brokerage_holdings
+//                                         # money question: prefer sources tagged with
+//                                         # that quantity, drop ones tagged otherwise
+//                                         # (types: lib/money-quantity.mjs)
+
+import { recall } from "../lib/unified-recall.mjs";
+
+const raw = process.argv.slice(2);
+const pos = [];
+const opts = { k: 10, chat: true, wiki: true, replies: true, events: false, chatSinceDays: 21, json: false };
+for (let i = 0; i < raw.length; i++) {
+  const a = raw[i];
+  if (a === "-k" || a === "--k") opts.k = Number(raw[++i]);
+  else if (a === "--events") opts.events = true;
+  else if (a === "--no-chat") opts.chat = false;
+  else if (a === "--no-wiki") opts.wiki = false;
+  else if (a === "--no-replies") opts.replies = false;
+  else if (a === "--chat-days") opts.chatSinceDays = Number(raw[++i]);
+  else if (a === "--json") opts.json = true;
+  else if (a === "--quantity") opts.quantity = String(raw[++i] || "").split(",").filter(Boolean);
+  else pos.push(a);
+}
+const query = pos.join(" ").trim();
+if (!query) {
+  console.error('usage: recall "<query>" [-k N] [--events] [--no-chat|--no-wiki|--no-replies] [--chat-days D] [--quantity TYPE[,TYPE]] [--json]');
+  process.exit(2);
+}
+
+const out = await recall(query, opts);
+if (opts.json) {
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
+if (!out.results.length) {
+  console.log(`(no recall for "${query}" across ${out.sources.join(" + ")})`);
+  process.exit(0);
+}
+for (const r of out.results) {
+  const tag = `[${r.source}]`.padEnd(9);
+  const label = r.source === "wiki"
+    ? r.id
+    : (r.created_at || r.ts || "").slice(0, 16);
+  const q = r.quantity && r.quantity.length ? `  {quantity: ${r.quantity.join("+")}}` : "";
+  console.log(`${tag} ${label}${r.title ? " — " + r.title : ""}${q}`);
+  if (r.snippet) console.log(`   ${r.snippet}`);
+}
+console.log(`\n${out.results.length} result${out.results.length === 1 ? "" : "s"} across ${out.sources.join(" + ")}`);

@@ -3,12 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execSync } from "node:child_process";
-import { readStdinJson, emit, emitNull, stampRun } from "./_common.mjs";
+import { readStdinJson, emit, emitNull, stampRun, GOG_ACCOUNT, localConfig } from "./_common.mjs";
 
-const HUM_STATE_FILE = path.join(
-  os.homedir(),
-  "dev/merlin/data/hum-state.json",
-);
+import { installTools } from "../../../lib/root.cjs";
+const HUM_STATE_FILE = installTools("data/hum-state.json");
 
 /**
  * Return true if the two [start,end) intervals overlap by more than 1s.
@@ -22,17 +20,22 @@ export function overlaps(s1, e1, s2, e2) {
   return end - start > 1000;
 }
 
+// Summary prefixes that mark someone else's events on the user's calendar
+// (agent/local/config/hum-calendar.json `ignore_summary_prefixes`).
+const CALENDAR_CFG = localConfig("hum-calendar", { ignore_summary_prefixes: [] });
+
 /**
  * Filter out events that shouldn't participate in conflict detection:
  *   - transparency === "transparent" (shown as "free" on the calendar — e.g.,
- *     maintenance blocks, shared-calendar events marked free, workout placeholders)
- *   - summary prefixed with any string in `config.calendar.exclude_prefixes`
- *     (default: empty — set to e.g. ["[Shared]"] to filter out shared-calendar
- *     entries that don't block the owner's time)
+ *     maintenance blocks, other people's events marked free, workout placeholders)
+ *   - summary starting with one of the configured ignore prefixes (e.g. a
+ *     someone-else's-event tag per the local calendar-scheduling convention — they
+ *     don't block the user's time even if they accidentally default to opaque
+ *     transparency)
  * Also filters events without valid start/end so downstream code can rely
  * on numeric timestamps.
  */
-export function filterScannableEvents(events, excludePrefixes = []) {
+export function filterScannableEvents(events) {
   return (events || [])
     .map((e) => {
       const start = new Date(e?.start?.dateTime || e?.start?.date || 0).getTime();
@@ -43,9 +46,7 @@ export function filterScannableEvents(events, excludePrefixes = []) {
       if (!e._start || !e._end) return false;
       if (e.transparency === "transparent") return false;
       const summary = String(e.summary || "").trim();
-      for (const prefix of excludePrefixes) {
-        if (summary.startsWith(prefix)) return false;
-      }
+      if (CALENDAR_CFG.ignore_summary_prefixes.some((p) => summary.startsWith(p))) return false;
       return true;
     });
 }
@@ -102,7 +103,7 @@ if (isMain) {
 
   try {
     const json = execSync(
-      "gog calendar list --account ${MERLIN_OWNER_EMAIL} --days 2 --max 30 --json 2>/dev/null",
+      `/opt/homebrew/bin/gog calendar list${GOG_ACCOUNT ? ` --account ${GOG_ACCOUNT}` : ""} --days 2 --max 30 --json 2>/dev/null`,
       { encoding: "utf8", timeout: 10000 },
     );
     const data = JSON.parse(json);

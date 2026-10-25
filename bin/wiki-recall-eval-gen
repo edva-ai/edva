@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+// wiki-recall-eval-gen — build the ASSOCIATIVE eval set from the live wiki.
+//
+// The single-answer set (data/wiki-recall-eval.json) cannot see
+// association: every case has one gold page, so bringing up the pages
+// associated with it scores the same as not bringing them up. This builds
+// multi-hop questions whose answer needs SEVERAL pages, from the corpus's own
+// graph, in the MuSiQue style (compose connected single hops, then filter out
+// questions that can be answered without the chain):
+//
+//   1. Sample a 2-3 page PATH over the association graph. Each step is weighted
+//      by the next node's specificity ln(N/fan)/ln(N), so paths do not route
+//      through hubs (`travel`, `user_alex`) — a question bridged by a hub is a
+//      question about nothing.
+//   2. A model (the Rule #0b ladder: local, then Sonnet on validation failure)
+//      reads the pages and writes ONE question whose answer is on the LAST page,
+//      that names only the first page's subject, plus an evidence quote from
+//      EVERY page on the path showing each one is needed.
+//   3. Code keeps a question only if
+//        - every page's quote is verbatim on that page (no invented hops);
+//        - the question does not name the final page's title (no shortcut);
+//        - plain BM25 on the question does NOT put the final page in its top 3
+//          (no lexical leak — the hop has to be made, not matched).
+//   4. Each case records its SPLIT — which kind of edge the path used:
+//        links     wikilinks only (the edges the retriever walks, so this split
+//                  is the friendliest to association — report it separately)
+//        temporal  at least one day-to-day contiguity hop (not a wikilink)
+//        facts     at least one typed fact edge
+//        hebbian   at least one co-retrieval edge
+//      and `reviewed: false` until a person has looked at it. `wiki-recall-eval
+//      --set assoc` reads the result.
+//
+// The third split the research recommends — real questions the user asked, with
+// hand-labelled gold sets — is added with `add`:
+//   wiki-recall-eval-gen add "which dinner did <friend> host" --gold day_<date>,user_<friend> --final day_<date>
+//
+// Usage:
+//   wiki-recall-eval-gen [--n 60] [--split links|temporal|facts|hebbian|any] [--no-sonnet] [--seed N] [--dry-run]
+//   wiki-recall-eval-gen add "<question>" --gold a,b[,c] --final c [--class asked]
+//   wiki-recall-eval-gen stats
+//
+// Needs the Max login for the Sonnet rung (run it from an interactive Claude
+// session or the launchd agent, not cron). Page text goes only to Merlin's own
+// models, so health and finance pages are in scope.
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { createRequire } from "node:module";
+import { openMemoryDb } from "../lib/memory-db.mjs";
+import { buildAssocGraph, loadAssocGraphRows } from "../lib/wiki-assoc.mjs";
+import { runLadder, localRung, sonnetRung } from "../lib/model-ladder.mjs";
+import { quoteIn } from "../lib/quote-check.mjs";
+
+import { installTools } from "../lib/root.cjs";
+const require = createRequire(import.meta.url);
+const ws = require("../lib/wiki-store.js");
+
+const OUT =
+  process.env.WIKI_RECALL_EVAL_ASSOC ||
+  installTools("data/wiki-recall-eval-assoc.json");
+const PAGE_CHARS = 1800;
+// A node this unspecific is a hub; never a step on a sampled path.
+const MIN_SPEC = 0.25;
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--n") out.n = Number(argv[++i]);
+    else if (a === "--split") out.split = argv[++i];
+    else if (a === "--seed") out.seed = Number(argv[++i]);
+    else if (a === "--gold") out.gold = argv[++i];
+    else if (a === "--final") out.final = argv[++i];
+    else if (a === "--class") out.cls = argv[++i];
+    else if (a === "--no-sonnet") out.noSonnet = true;
+    else if (a === "--dry-run") out.dryRun = true;
+    else out._.push(a);
+  }
+  return out;
+}
+
+function loadSet() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(OUT, "utf8"));
+    return Array.isArray(raw) ? { cases: raw } : raw;
+  } catch {
+    return { cases: [] };
+  }
+}
+function saveSet(set) {
+  set.updated_at = new Date().toISOString();
+  fs.mkdirSync(path.dirname(OUT), { recursive: true });
+  fs.writeFileSync(OUT, JSON.stringify(set, null, 2) + "\n");
+}
+
+// Small seeded PRNG so a run is reproducible with --seed.
+function rng(seed) {
+  let x = (seed >>> 0) || 0x9e3779b9;
+  return () => {
+    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    return x / 0x100000000;
+  };
+}
+
+function splitOf(kinds) {
+  if (kinds.some((k) => k === "next_day" || k === "prev_day")) return "temporal";
+  if (kinds.some((k) => String(k).startsWith("fact"))) return "facts";
+  if (kinds.includes("hebbian")) return "hebbian";
+  return "links";
+}
+
+// One random walk of `len` nodes, or null.
+function samplePath(graph, rand, { len = 3 } = {}) {
+  const { n, adj, spec, ids, type } = graph;
+  const starts = [];
+  for (let i = 0; i < n; i++) if (spec[i] >= MIN_SPEC && adj[i].length && type[i] !== "month") starts.push(i);
+  if (!starts.length) return null;
+  const path = [starts[Math.floor(rand() * starts.length)]];
+  const kinds = [];
+  while (path.length < len) {
+    const cur = path[path.length - 1];
+    const opts = adj[cur].filter((e) => !path.includes(e.j) && spec[e.j] >= MIN_SPEC);
+    if (!opts.length) return null;
+    const total = opts.reduce((a, e) => a + e.w * spec[e.j], 0);
+    let r = rand() * total;
+    let pick = opts[opts.length - 1];
+    for (const e of opts) { r -= e.w * spec[e.j]; if (r <= 0) { pick = e; break; } }
+    path.push(pick.j);
+    kinds.push(pick.kind);
+  }
+  // A path of three day pages is a question about a calendar, not a memory.
+  if (path.every((i) => type[i] === "day")) return null;
+  return { ids: path.map((i) => ids[i]), kinds, split: splitOf(kinds) };
+}
+
+function prompt(pages) {
+  const blocks = pages
+    .map((p, i) => `PAGE ${i + 1} — id ${p.id}\nTITLE: ${p.title}\nDESCRIPTION: ${p.description || "(none)"}\n${String(p.body_md || "").slice(0, PAGE_CHARS)}`)
+    .join("\n\n---\n\n");
+  return `You are writing a test question for a personal assistant's memory. The pages below are connected in a chain (page 1 → page 2${pages.length > 2 ? " → page 3" : ""}).
+
+Write ONE question the person might really ask, such that:
+- the answer is found on the LAST page;
+- the question mentions only what page 1 is about — it must NOT name the last page's title or subject directly;
+- answering it requires going through every page in the chain, in order;
+- it sounds natural, in the person's own voice (e.g. "who did we have lunch with the day we went to the lighthouse").
+
+For EVERY page, give the exact words from that page (at least 3 words, copied, not paraphrased) that make it a necessary step.
+
+If these pages do not support a natural question like that, return {"skip": true}.
+
+Return ONLY this JSON:
+{"question": "...", "answer": "...", "evidence": [{"page": "<id>", "quote": "..."}]}
+
+${blocks}`;
+}
+
+function validate(parsed, pages) {
+  if (parsed.skip === true) return null;
+  if (typeof parsed.question !== "string" || parsed.question.trim().length < 12) return "no question";
+  if (typeof parsed.answer !== "string" || !parsed.answer.trim()) return "no answer";
+  if (!Array.isArray(parsed.evidence)) return "no evidence";
+  for (const p of pages) {
+    const ev = parsed.evidence.find((e) => e && e.page === p.id);
+    const src = [p.title, p.description, p.body_md].filter(Boolean).join("\n");
+    if (!ev || !quoteIn(ev.quote, src)) return `no verbatim evidence from ${p.id}`;
+  }
+  const last = pages[pages.length - 1];
+  const q = parsed.question.toLowerCase();
+  if (last.title && last.title.length >= 4 && q.includes(last.title.toLowerCase())) return "question names the final page";
+  return null;
+}
+
+async function generate(flags) {
+  const d = openMemoryDb();
+  if (!d) throw new Error("no memory db");
+  const graph = buildAssocGraph(loadAssocGraphRows(d));
+  const rand = rng(flags.seed ?? Date.now());
+  const want = flags.n || 60;
+  const wantSplit = flags.split && flags.split !== "any" ? flags.split : null;
+  const rungs = [localRung({ maxTokens: 600, timeoutMs: 60000 })];
+  if (!flags.noSonnet) rungs.push(sonnetRung({ timeoutMs: 150000 }));
+  const budget = { sonnet: Number(process.env.WIKI_EVAL_GEN_SONNET_BUDGET || want * 2) };
+
+  const set = loadSet();
+  const seen = new Set(set.cases.map((c) => (c.gold || []).join(">")));
+  const stats = { sampled: 0, skipped_by_model: 0, rejected: 0, leaked: 0, kept: 0, by_split: {} };
+  let attempts = 0;
+  while (stats.kept < want && attempts < want * 25) {
+    attempts++;
+    const p = samplePath(graph, rand, { len: rand() < 0.5 ? 2 : 3 });
+    if (!p || (wantSplit && p.split !== wantSplit) || seen.has(p.ids.join(">"))) continue;
+    seen.add(p.ids.join(">"));
+    stats.sampled++;
+    const pages = p.ids.map((id) => ws.getPage(id)).filter(Boolean);
+    if (pages.length !== p.ids.length) continue;
+    if (flags.dryRun) { console.log(`${p.split.padEnd(9)} ${p.ids.join(" → ")}  (${p.kinds.join(", ")})`); stats.kept++; continue; }
+    const res = await runLadder(prompt(pages), { rungs, budget, validate: (x) => validate(x, pages) });
+    if (!res.value) { stats.rejected++; continue; }
+    if (res.value.skip) { stats.skipped_by_model++; continue; }
+    const final = p.ids[p.ids.length - 1];
+    const lexTop = ws.searchPages(res.value.question, { mode: "fts", limit: 3, match: "or" }).map((r) => r.id);
+    if (lexTop.includes(final)) { stats.leaked++; continue; }
+    set.cases.push({
+      class: `assoc-${p.split}`,
+      split: p.split,
+      query: res.value.question.trim(),
+      gold: p.ids,
+      final,
+      expect: [final],
+      why: `${p.ids.join(" → ")} via ${p.kinds.join(", ")}; answer: ${res.value.answer.trim().slice(0, 160)}`,
+      generated: { rung: res.rung, at: new Date().toISOString() },
+      reviewed: false,
+    });
+    stats.kept++;
+    stats.by_split[p.split] = (stats.by_split[p.split] || 0) + 1;
+    if (stats.kept % 10 === 0) saveSet(set); // a long run keeps what it made
+  }
+  if (!flags.dryRun) saveSet(set);
+  return { ...stats, total_cases: set.cases.length, file: OUT };
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+const flags = parseFlags(cmd === "add" || cmd === "stats" ? rest : [cmd, ...rest].filter(Boolean));
+if (cmd === "add") {
+  const query = flags._.join(" ").trim();
+  const gold = String(flags.gold || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!query || !gold.length) {
+    console.error('usage: wiki-recall-eval-gen add "<question>" --gold a,b[,c] --final c [--class asked]');
+    process.exit(1);
+  }
+  const missing = gold.filter((id) => !ws.getPage(id));
+  if (missing.length) {
+    console.error(`no such page(s): ${missing.join(", ")}`);
+    process.exit(1);
+  }
+  const final = flags.final || gold[gold.length - 1];
+  const set = loadSet();
+  set.cases.push({ class: flags.cls || "asked", split: "asked", query, gold, final, expect: [final],
+    why: "hand-labelled", reviewed: true });
+  saveSet(set);
+  console.log(JSON.stringify({ added: query, total_cases: set.cases.length }, null, 2));
+} else if (cmd === "stats") {
+  const set = loadSet();
+  const by = {};
+  for (const c of set.cases) by[c.split || c.class] = (by[c.split || c.class] || 0) + 1;
+  console.log(JSON.stringify({ file: OUT, cases: set.cases.length, reviewed: set.cases.filter((c) => c.reviewed).length, by_split: by }, null, 2));
+} else {
+  generate(flags)
+    .then((r) => console.log(JSON.stringify(r, null, 2)))
+    .catch((e) => { console.error(`wiki-recall-eval-gen: ${e?.stack || e}`); process.exit(1); });
+}

@@ -1,0 +1,76 @@
+#!/bin/sh
+':' //; for n in /opt/homebrew/bin/node /usr/local/bin/node "$(command -v node 2>/dev/null)"; do [ -x "$n" ] && exec "$n" "$0" "$@"; done; echo "$0: no node interpreter found" >&2; exit 127
+// cron-unpause — switch a `#MARKER#`-paused family of cron jobs back on.
+// (Lines 1-2: a sh launcher that is also valid JS — node reads line 2 as a
+// string and a comment. cron runs this with a bare PATH that has no node, so
+// `#!/usr/bin/env node` would exit 127; the launcher tries the stable Homebrew
+// and /usr/local paths first, then PATH. Same as lib/root.cjs nodeBin.)
+//
+// Usage:
+//   cron-unpause HUMPAUSE [--dry-run]
+//
+// Exit codes: 0 restored (or nothing to do), 1 refused, 2 usage.
+//
+// Refuses rather than guesses: if the rewrite would change the number of lines,
+// or `crontab -l` cannot be read, it writes nothing. The previous crontab is
+// copied to data/backups/ before any install.
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+const { unpause, labelOf } = require(path.join(__dirname, "../lib/cron-pause-marker.js"));
+const { installTools } = require("../lib/root.cjs");
+
+const TOOLS = installTools();
+const LOG = path.join(TOOLS, "data/logs/cron-unpause.log");
+const BACKUPS = path.join(TOOLS, "data/backups");
+
+const args = process.argv.slice(2);
+const dryRun = args.includes("--dry-run");
+const marker = args.find((a) => !a.startsWith("--"));
+if (!marker) { console.error("usage: cron-unpause <MARKER> [--dry-run]"); process.exit(2); }
+
+function log(msg) {
+  const line = `${new Date().toISOString()} [${marker}] ${msg}\n`;
+  try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.appendFileSync(LOG, line); } catch {}
+}
+
+let current;
+try {
+  current = execFileSync("crontab", ["-l"], { encoding: "utf8" });
+} catch (e) {
+  log(`refused: crontab -l failed (${e.message})`);
+  console.error("cron-unpause: could not read the crontab");
+  process.exit(1);
+}
+
+const lines = current.split("\n");
+const { lines: next, restored } = unpause(lines, marker);
+if (!restored.length) process.exit(0);   // nothing paused under this marker
+
+if (next.length !== lines.length) {      // cannot happen; assert it anyway
+  log(`refused: line count ${lines.length} -> ${next.length}`);
+  console.error("cron-unpause: refusing, the rewrite changed the line count");
+  process.exit(1);
+}
+
+const labels = restored.map((l) => labelOf(l) || l.slice(0, 40));
+if (dryRun) {
+  console.log(`would restore ${restored.length}: ${labels.join(", ")}`);
+  process.exit(0);
+}
+
+try {
+  fs.mkdirSync(BACKUPS, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-"); // lang-regex-ok: sanitises a timestamp for a filename
+  fs.writeFileSync(path.join(BACKUPS, `crontab-${stamp}.txt`), current);
+  execFileSync("crontab", ["-"], { input: next.join("\n") });
+} catch (e) {
+  log(`FAILED to install: ${e.message}`);
+  console.error(`cron-unpause: install failed — ${e.message}`);
+  process.exit(1);
+}
+
+log(`restored ${restored.length}: ${labels.join(", ")}`);
+console.log(`cron-unpause: restored ${restored.length} job(s): ${labels.join(", ")}`);

@@ -1,0 +1,26 @@
+# Per-instance resolve-first evidence sources (overlay drop).
+#
+# lib/hum-resolve-first.mjs reads a bundle of Merlin's own records before
+# any hum question or comment is sent, so it never asks something the records
+# already answer. The kernel bundle is generic (calendar, tasks, recent chat,
+# memory recall, email memory, this gate's earlier conclusions). Modules placed
+# here add this installation's own sources — a travel timeline, bookings,
+# appointments, location history — without the kernel knowing they exist.
+#
+# Contract: one `<id>.mjs` per source, default-exporting
+#   { id: "<id>", live: true|false,
+#     async read({ run, nowMs, message, fetchFn, storeFile }) {
+#       return { title: "<what this is + its source>", text: "<bounded text>", as_of?: "<when read>" }
+#           || { error: "<why empty>" };
+#     } }
+# `run(bin, args, opts)` resolves {ok, out, error} and never rejects.
+# `live: true` marks a source of record for changeable status (bookings,
+# reservations). A kernel source id wins over an overlay one. A module that fails to
+# load is skipped.
+#
+# Order and wording: agent/local/config/hum-resolve-first.json may set
+#   source_order  — the section order of the whole bundle (kernel + overlay ids);
+#   live_sources  — every live source, in the order the prompt names them;
+#   prompt        — this installation's examples for the prompt (see PROMPT_DEFAULTS).
+#
+# Modules here belong to this installation, not to the kernel.

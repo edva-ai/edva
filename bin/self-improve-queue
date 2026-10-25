@@ -1,0 +1,96 @@
+#!/usr/bin/env node
+// self-improve-queue — how many Face-ID cards are ACTUALLY waiting on the user,
+// and the break-glass sweep that closes out cards nobody signed in time.
+//
+// Why it exists (2026-10-06 Self Improvement Review, item 2). improvement-plan
+// caps itself at 5 unsigned cards. It used to count them by reading
+// `status = pending` straight off the table — but an unsigned card that passed
+// its 24h TTL was never marked anything else, so it read `pending` forever.
+// Seven such rows (2 to 55 days old, none signable) filled the cap, and the
+// job filed no cards at all: the whole improvement pipeline stopped, silently.
+//
+// The count here uses the SAME predicate as the app's badge and the APNs badge
+// — isApprovalRowPending() in lib/apns-push.mjs, over unskipped pending
+// rows — so the cap, the phone and the push can never disagree about what is
+// waiting. Do not re-implement that test anywhere else; import it.
+//
+// Usage:
+//   self-improve-queue count [--json]      — live unsigned cards (the cap's number)
+//   self-improve-queue sweep [--apply]     — expire unsigned, unskipped cards past
+//                                            their TTL. DRY RUN unless --apply.
+//
+// `sweep --apply` is the same operation self-improve-approval-poll now runs on
+// every tick (sweepExpired in core/self-improve-unified.mjs); this is the manual
+// handle for clearing a backlog by hand. Idempotent: an expired row is never
+// listed again. Skipped rows are left alone on purpose — they are already a
+// decision, and they must stay `pending` so unskip can re-arm them.
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = process.env.MERLIN_ROOT || installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!K) { console.error("self-improve-queue: no SUPABASE_SERVICE_ROLE_KEY"); process.exit(1); }
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+const { isApprovalRowPending } = await import(path.join(ROOT, "lib/apns-push.mjs"));
+const { createUnifiedApproval, approvalExpiresAtMs } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
+
+const CARD_CAP = 5;   // improvement-plan.md Critical Rule 4
+
+async function unsignedPending() {
+  const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=id,summary,status,signature,skipped,risk,created_at,expires_at,expires_at_ms&status=eq.pending&skipped=is.false&order=created_at.desc`, { headers: H });
+  if (!r.ok) throw new Error(`query ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+
+if (cmd === "count") {
+  const rows = await unsignedPending();
+  const nowMs = Date.now();
+  const live = rows.filter((row) => !row.signature && isApprovalRowPending(row, nowMs));
+  const expired = rows.filter((row) => !row.signature && !isApprovalRowPending(row, nowMs)
+    && approvalExpiresAtMs(row) != null && approvalExpiresAtMs(row) <= nowMs);
+  const out = {
+    unsigned_live: live.length,
+    cap: CARD_CAP,
+    room: Math.max(0, CARD_CAP - live.length),
+    live: live.map((r) => ({ id: r.id, summary: r.summary, created_at: r.created_at })),
+    expired_still_pending: expired.map((r) => r.id),
+  };
+  if (rest.includes("--json")) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
+  console.log(`${out.unsigned_live} card(s) waiting on Face ID (cap ${CARD_CAP}, room for ${out.room} more).`);
+  for (const r of out.live) console.log(`  ${r.id}  ${r.summary}`);
+  if (expired.length) console.log(`\n${expired.length} expired card(s) still read "pending" and are NOT counted — the poller's next tick (or \`self-improve-queue sweep --apply\`) closes them out.`);
+  process.exit(0);
+}
+
+if (cmd === "sweep") {
+  const apply = rest.includes("--apply");
+  const patched = [];
+  const store = {
+    async listUnsignedPending() { return (await unsignedPending()).filter((r) => !r.signature); },
+    async updateApproval(id, patch) {
+      patched.push(id);
+      if (!apply) return;
+      const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${encodeURIComponent(id)}&status=eq.pending&signature=is.null`, { method: "PATCH", headers: H, body: JSON.stringify(patch) });
+      if (!r.ok) throw new Error(`update ${id} ${r.status}: ${await r.text()}`);
+    },
+  };
+  const u = createUnifiedApproval({ store, deviceKeys: { getKey: async () => null }, postSuggestion: null, applyItem: async () => ({ ok: false }) });
+  const swept = await u.sweepExpired();
+  if (!swept.length) { console.log("Nothing to sweep — no unsigned, unskipped card is past its window."); process.exit(0); }
+  console.log(`${apply ? "Expired" : "Would expire (dry run — pass --apply to write)"} ${swept.length} card(s):`);
+  for (const id of swept) console.log(`  ${id}`);
+  process.exit(0);
+}
+
+console.error("usage: self-improve-queue count [--json] | sweep [--apply]");
+process.exit(64);

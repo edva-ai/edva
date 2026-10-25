@@ -1,0 +1,164 @@
+#!/usr/bin/env node
+// inbox-mem — keep the inbox flowing into memory, and query what it knows.
+//
+// The inbox was never a memory channel. `context-sync email` indexes email
+// *classification rules*; nothing indexed the messages themselves, so `recall`
+// could not answer "what has the mailbox told us about X?" and the release gate
+// went around memory to query Gmail directly — where a keyword miss cost it the
+// motivating stale-status ping (see lib/inbox-mem.mjs's header).
+//
+// Usage:
+//   inbox-mem sync [--days N] [--max N] [--query <gmail query>]  pull recent mail into memory
+//   inbox-mem embed [--limit N]                          backfill embeddings (semantic half)
+//   inbox-mem search <query> [--since ISO] [--limit N]   what does the mailbox know?
+//   inbox-mem stats
+//   inbox-mem prune [--days N]
+//
+// AUTH: `gog` reads its token from the login keyring, which is only reachable
+// inside the GUI session — the same constraint that binds `claude -p`. Run this
+// from cron-via-webhook or an agent turn, never a bare SSH shell, or every sync
+// silently indexes nothing. (`gog` prints "no TTY available for keyring file
+// backend password prompt" and exits non-zero; the sync reports 0 fetched.)
+
+import { execFile } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { indexMessage, searchInbox, searchInboxHybrid, embedPending, stats, pruneOlderThan } from "../lib/inbox-mem.mjs";
+import { localLlmEmbed } from "../lib/local-llm.mjs";
+
+const HOME = os.homedir();
+const GOG = "/opt/homebrew/bin/gog";
+// The operator's mailbox (lib/instance.cjs owner_email).
+const ACCOUNT = createRequire(import.meta.url)("../lib/instance.cjs").instanceValue("owner_email");
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+function flag(name, dflt = undefined) {
+  const i = argv.indexOf(`--${name}`);
+  return i === -1 || i + 1 >= argv.length ? dflt : argv[i + 1];
+}
+
+function run(bin, args, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    try {
+      const child = execFile(bin, args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+        (err, stdout) => resolve(err && !stdout ? "" : String(stdout || "")));
+      child.on("error", () => resolve(""));
+    } catch { resolve(""); }
+  });
+}
+
+// gog renders dates as "YYYY-MM-DD HH:MM" with NO offset marker, in whatever
+// timezone it was asked for. That is a trap: the same string means different
+// instants depending on a flag elsewhere in the command, and getting it wrong
+// silently shifts every message by the host offset — corrupting the `since`
+// comparison the whole gate rests on (the same bug already fixed once in
+// claim-freshness). So the sync pins `--timezone UTC` at the call site and this
+// parses as UTC. The two must stay in lockstep; neither is safe alone.
+function utcStampToIso(stamp) {
+  const s = String(stamp || "").trim();
+  // lang-regex-ok: parsing a machine-formatted timestamp, not interpreting language
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) {
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0));
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+async function cmdSync() {
+  const days = Number(flag("days", "14"));
+  const query = flag("query", `newer_than:${days}d`);
+  // --max defaults to TEN. The first run of this sync quietly indexed 10
+  // messages for a 14-day window and looked like a success. --timezone UTC
+  // pins the ambiguous "YYYY-MM-DD HH:MM" output to a known zone (see
+  // utcStampToIso); the two settings must change together.
+  const max = flag("max", "500");
+  const out = await run(GOG, [
+    "gmail", "search", query,
+    "--account", ACCOUNT, "--json", "--results-only",
+    "--max", String(max), "--timezone", "UTC",
+  ], 180000);
+  if (!out.trim()) {
+    console.error("inbox-mem sync: gog returned nothing (keyring unreachable outside the GUI session?)");
+    console.log(JSON.stringify({ fetched: 0, inserted: 0, skipped: 0 }));
+    process.exit(0);
+  }
+  let rows;
+  try { rows = JSON.parse(out); } catch { rows = null; }
+  if (!Array.isArray(rows)) {
+    console.error("inbox-mem sync: unexpected gog output shape");
+    console.log(JSON.stringify({ fetched: 0, inserted: 0, skipped: 0 }));
+    process.exit(0);
+  }
+
+  let inserted = 0, skipped = 0;
+  for (const r of rows) {
+    const ts = utcStampToIso(r.date);
+    // Subject + sender is the load-bearing content for transactional mail --
+    // "Autopay set up: <payee> - <account>" is the whole fact. gog's
+    // thread listing carries no body, so that is what gets indexed; the
+    // semantic layer is what makes it answerable in other words.
+    const res = indexMessage({
+      id: r.id,
+      thread_id: r.threadId || r.id,
+      ts,
+      sender: r.from,
+      subject: r.subject,
+      text: [r.subject, r.snippet, Array.isArray(r.labels) ? r.labels.join(" ") : ""].filter(Boolean).join("\n"),
+    });
+    if (res === "inserted") inserted++; else skipped++;
+  }
+  console.log(JSON.stringify({ fetched: rows.length, inserted, skipped, query }));
+}
+
+async function cmdEmbed() {
+  const limit = Number(flag("limit", "300"));
+  const res = await embedPending({ embedFn: (t) => localLlmEmbed(t), limit });
+  console.log(JSON.stringify(res));
+}
+
+async function cmdSearch() {
+  const since = flag("since", null);
+  const limit = Number(flag("limit", "10"));
+  // Collect positionals by walking the argv, so a flag's VALUE is never mistaken
+  // for a query word (indexOf-based filtering breaks on repeated tokens).
+  const words = [];
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--since" || a === "--limit") { i++; continue; }
+    if (a.startsWith("--")) continue;
+    words.push(a);
+  }
+  const q = words.join(" ");
+  const hits = await searchInboxHybrid(q, { since, limit, embedQuery: (t) => localLlmEmbed(t) });
+  if (argv.includes("--json")) { console.log(JSON.stringify(hits, null, 1)); return; }
+  if (!hits.length) { console.log("(no matches)"); return; }
+  for (const h of hits) {
+    console.log(`[${String(h.ts).slice(0, 16)}] ${String(h.sender || "").slice(0, 40)}`);
+    console.log(`   ${h.subject}`);
+    if (h.snippet) console.log(`   ${String(h.snippet).replace(/\s+/g, " ").slice(0, 160)}`); // lang-regex-ok: whitespace collapse for display
+  }
+  console.log(`\n${hits.length} result(s)`);
+}
+
+switch (cmd) {
+  case "sync": await cmdSync(); break;
+  case "embed": await cmdEmbed(); break;
+  case "search": await cmdSearch(); break;
+  case "stats": console.log(JSON.stringify(stats(), null, 1)); break;
+  case "prune": console.log(JSON.stringify({ pruned: pruneOlderThan(Number(flag("days", "120"))) })); break;
+  default:
+    console.log(`inbox-mem — the inbox as a memory channel
+
+  sync   [--days N] [--query <gmail query>]   pull recent mail into memory
+  embed  [--limit N]                          backfill embeddings
+  search <query> [--since ISO] [--limit N] [--json]
+  stats
+  prune  [--days N]
+
+Run sync/embed from inside the GUI session (agent turn or webhook-dispatched
+cron) -- gog's keyring is unreachable over plain SSH.`);
+}

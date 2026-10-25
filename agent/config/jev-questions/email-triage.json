@@ -1,0 +1,32 @@
+{
+  "_doc": "Jev questions for inbound email triage (bin/jev-email-classify, lib/jev-email-triage.mjs). Only used when Jev is enabled (TYPESAFE_API_KEY set); otherwise the legacy local-classify path decides. State = {from, subject, body, sender_history}; `sender_history` is the email-mem excerpt with the agent's own extracted (label, priority) consensus prepended. value = {label, priority}; confidence = min(label, priority). Jev auto-handles ONLY a confident P3 with needs_{{owner_id}}=false (label + mark-read, no dispatch); anything else goes to the ops-agent dispatch. Keep the label criteria in sync with the installation's triage-labels config (lib/triage-labels.cjs): add a criterion for every label you add there (a label Jev cannot choose is never auto-filed). Kernel definition; an installation's own data/jev-questions/email-triage.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.9,
+  "questions": {
+    "label": {
+      "type": "choice",
+      "instructions": "Which ONE Gmail label does this email belong under for the user? Judge ONLY the newest message — the text above the first attribution line (\"On <date>, <name> wrote:\") or above the first line beginning with \">\". Everything below is quoted thread history. Use sender_history as strong evidence when it states a consistent past label for THIS sender; when it says the past decisions are about other senders or are not visible, judge this message on its own content.",
+      "criteria": {
+        "personal": "the user's personal life: friends and family, tickets, reservations, finance, legal, newsletters they subscribe to, and build/release mail for software they publish themselves",
+        "vendor": "SaaS, billing, status pages, and marketing from real companies or platforms the user does business with; app-store, CI and build mail for somebody else's product. Consumer marketing (promos, deals, loyalty offers) is vendor.",
+        "spam": "unsolicited junk from unknown or random senders, scams, rotating-domain offer blasts. A message actually written by a real person to the user is never spam, even when it quotes or warns about a spam message."
+      }
+    },
+    "priority": {
+      "type": "choice",
+      "instructions": "How urgently does the user personally need to see this email? Judge ONLY the newest message (above the quoted history).",
+      "criteria": {
+        "P1": "urgent, needs the user now: legal or financial issues from a real person, a request for their signature, a payment failure, a named person answering a support case the user opened, a calendar invitation asking them to attend a meeting (new or updated), any reply to something the user sent",
+        "P2": "needs their reply or attention within about 24 hours but is not an emergency (a person writing on a live thread, a reservation confirmation, a build that finished processing)",
+        "P3": "FYI or automated: newsletters, receipts, confirmations, shipping notices, payouts, status notices, marketing, one-time codes and sign-in links, a support case's own automated acknowledgment or status update. MOST mail is P3."
+      }
+    },
+    "needs_{{owner_id}}": {
+      "type": "boolean",
+      "instructions": "Does this email ask the user to DO something (reply, sign, pay, decide, call, fix a problem)? Judge ONLY the newest message.",
+      "criteria": {
+        "true": "a person or system is asking them to act, or reports a problem that needs them",
+        "false": "informational only; nothing for them to do. A marketing call-to-action (shop now, claim your offer, take a survey) is NOT an ask, and neither is a scam's manufactured urgency."
+      }
+    }
+  }
+}

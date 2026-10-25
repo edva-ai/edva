@@ -7,28 +7,73 @@
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { isPhantomResult } from "./phantom-result.mjs";
 
 const PRIORITY = { high: 0, normal: 1, low: 2 };
 const INTERRUPT_THRESHOLD_MS = 30_000;
 
 export class PriorityDispatcher extends EventEmitter {
-  constructor(session) {
+  // `session` is always the turn-complete source of truth — its "result" event
+  // is what drains the queue, regardless of send path. `sendFn` optionally
+  // overrides HOW a turn is dispatched (e.g. routing through a substrate Agent
+  // instead of calling session.send() directly) without touching that wiring.
+  // Defaults to session.send(), so every existing caller is unaffected.
+  //
+  // `coalesce` (default on): when draining, merge the contiguous run of queued
+  // items that share the head's (source, priority) into ONE turn — the
+  // Claude-Code "type several lines while it's working, they all land in the
+  // next turn" behavior. Before this, N rapid Merlin messages ran as N separate
+  // turns (full startup latency each, and the agent never saw them together);
+  // now they're one turn the agent answers holistically. Merging is deliberately
+  // conservative — SAME source AND SAME priority only — so a Merlin message is
+  // never fused with a background triage/cron task (different source, usually
+  // different priority), which must stay a distinct turn. `maxCoalesce` caps a
+  // single merged turn so a flood can't build one enormous prompt.
+  constructor(session, { sendFn, coalesce = true, maxCoalesce = 10, separator = "\n\n" } = {}) {
     super();
     this.session = session;
+    this._sendFn = sendFn || ((content) => session.send(content));
+    this._coalesce = coalesce;
+    this._maxCoalesce = Math.max(1, maxCoalesce);
+    this._separator = separator;
     this.queue = [];
     this.inFlight = null;
     this.completed = 0;
     this._seenMsgIds = new Set();
     this._maxSeenIds = 500;
+    // Quota hold: nothing is sent before this epoch-ms
+    // deadline. The chat supervisor owns it: it sets it when the Max usage
+    // limit refuses a turn, carries it onto a replacement dispatcher after a
+    // restart, and calls releaseHold() from its own timer. Queued work waits.
+    this.holdUntil = 0;
 
     session.on("result", (ev) => {
       const done = this.inFlight;
+      // Resume-handshake guard — see lib/phantom-result.mjs. After a
+      // turn-watchdog SIGKILL, the respawned `--resume` child emits a zero-work
+      // result closing out the killed turn, ~2s after the retry was already
+      // dispatched into it. Swallowing the retry here is worse on chat than on
+      // ops: the dropped item is a message from the user that never gets answered.
+      if (done && isPhantomResult(ev)) {
+        this.emit("phantom_result", { item: done, result: ev });
+        return;
+      }
       this.inFlight = null;
       this.completed++;
-      if (done?.msgId) this._seenMsgIds.delete(done.msgId);
+      // Free the msgId of the head item AND every item merged into this turn.
+      this._forgetIds(done);
       this.emit("turn_complete", { message: done, result: ev });
       this._drain();
     });
+  }
+
+  // Drop an item's msgId (and any merged-in ids) from the dedup set on completion.
+  _forgetIds(item) {
+    if (!item) return;
+    if (item.msgId) this._seenMsgIds.delete(item.msgId);
+    for (const m of item.mergedFrom || []) {
+      if (m.msgId) this._seenMsgIds.delete(m.msgId);
+    }
   }
 
   dispatch(content, source = "unknown", { priority = "normal", msgId } = {}) {
@@ -75,28 +120,60 @@ export class PriorityDispatcher extends EventEmitter {
     return elapsed > INTERRUPT_THRESHOLD_MS;
   }
 
+  hold(until) { if (until > this.holdUntil) this.holdUntil = until; }
+  isHeld(now = Date.now()) { return this.holdUntil > now; }
+  releaseHold() { this.holdUntil = 0; this._drain(); }
+
   _drain() {
-    if (this.inFlight) return;
-    const next = this.queue.shift();
-    if (!next) return;
-    this.inFlight = { ...next, dispatchedAt: Date.now() };
+    if (this.inFlight || this.isHeld()) return;
+    const head = this.queue.shift();
+    if (!head) return;
+
+    // Coalesce the contiguous run of queued items sharing head's (source,
+    // priority) into a single turn. The queue is priority-ordered, so this run
+    // sits right behind head; anything of a different source/priority stays
+    // queued and dispatches as its own turn next.
+    const merged = [];
+    if (this._coalesce) {
+      while (
+        merged.length + 1 < this._maxCoalesce &&
+        this.queue.length &&
+        this.queue[0].source === head.source &&
+        this.queue[0].priority === head.priority
+      ) {
+        merged.push(this.queue.shift());
+      }
+    }
+
+    let content = head.content;
+    let mergedFrom;
+    if (merged.length) {
+      content = [head, ...merged].map((it) => it.content).join(this._separator);
+      // Provenance for dedup cleanup on completion + observability.
+      mergedFrom = merged.map((it) => ({ id: it.id, msgId: it.msgId, source: it.source }));
+      this.emit("coalesced", { head, mergedCount: merged.length, source: head.source, priorityName: head.priorityName });
+    }
+
+    this.inFlight = { ...head, content, mergedFrom, mergedCount: merged.length, dispatchedAt: Date.now() };
     this.emit("dispatching", this.inFlight);
     try {
-      this.session.send(this.inFlight.content);
+      this._sendFn(this.inFlight.content);
     } catch (err) {
       this.emit("dispatch_error", { item: this.inFlight, error: err.message });
       this.inFlight = null;
     }
   }
 
-  requeueInFlight() {
+  // `front`: ahead of the items already queued at its priority instead of
+  // behind them (a refused turn keeps its place in line).
+  requeueInFlight({ front = false } = {}) {
     if (!this.inFlight) return null;
     const item = this.inFlight;
     this.inFlight = null;
     // Re-insert at correct priority position.
     let insertIdx = this.queue.length;
     for (let i = 0; i < this.queue.length; i++) {
-      if (this.queue[i].priority > item.priority) {
+      if (this.queue[i].priority > item.priority || (front && this.queue[i].priority === item.priority)) {
         insertIdx = i;
         break;
       }
@@ -118,6 +195,7 @@ export class PriorityDispatcher extends EventEmitter {
         ? { id: this.inFlight.id, source: this.inFlight.source, priority: this.inFlight.priorityName, dispatchedAt: this.inFlight.dispatchedAt, enqueuedAt: this.inFlight.enqueuedAt }
         : null,
       completed: this.completed,
+      rateLimitHoldUntil: this.isHeld() ? new Date(this.holdUntil).toISOString() : null,
     };
   }
 }

@@ -1,0 +1,808 @@
+#!/usr/bin/env node
+// gmail-action — CLI for Gmail label / archive / draft / send / query operations.
+// Uses OAuth token from ~/Dev/merlin/credentials/gmail-push-token.json.
+// Run `gmail-action` with no args to see the full command list.
+
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+const require = createRequire(import.meta.url);
+const { triageLog } = require("../lib/triage-log.js");
+const { MIME_TYPES, guessMimeType } = require("../lib/mime-types.js");
+// The installation's writing rules for mail written on the user's behalf
+// (lib/draft-gate.js), when it has them: checkDraft for a draft to a third
+// party, checkSend for a send with --from. Each returns {ok, message?}; the
+// message is printed after "gmail-action <command>: ". An installation without
+// that module (or without one of the two) has no such rules, so everything passes.
+const DRAFT_GATE = (() => {
+  try { return require("../lib/draft-gate.js"); } // kernel-closure-ok: optional installation module, absence handled below
+  catch (e) { if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("draft-gate")) throw e; return {}; }
+})();
+const checkDraft = DRAFT_GATE.checkDraft || (() => ({ ok: true, external: [] }));
+const checkSend = DRAFT_GATE.checkSend || (() => ({ ok: true }));
+// Structured triage outcome per message (lib/triage-decisions.js). Every
+// label/star/mark-read lands here so sender consensus is a GROUP BY, not a regex
+// over the agent's free-text email-mem notes. Fail-soft by construction.
+const triageDecisions = require("../lib/triage-decisions.js");
+
+const { getAccessToken, fetchWithRetry, describeError } = require("../lib/google-auth.js");
+// This installation's own addresses (agent/local/instance.json): the
+// user's mailbox and the agent's sending address.
+const { instance } = require("../lib/instance.cjs");
+const OWNER_ADDR = String(instance().owner_email || "").toLowerCase();
+const AGENT_ADDR = String(instance().agent_email || "").toLowerCase();
+const OWNER_NAME = instance().owner_name;
+const reEsc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// The agent's own address and the user's (with any +tag): mail from either is
+// never a "correspondent" for reply-to-me.
+function selfAddressRe() {
+  const alts = [];
+  if (AGENT_ADDR) alts.push(reEsc(AGENT_ADDR));
+  const at = OWNER_ADDR.lastIndexOf("@");
+  if (at > 0) alts.push(`${reEsc(OWNER_ADDR.slice(0, at))}(\\+[^@]*)?@${reEsc(OWNER_ADDR.slice(at + 1))}`);
+  return alts.length ? new RegExp(`^(${alts.join("|")})$`) : /(?!)/;
+}
+const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+
+// Self-action marker — updated on every mutating Gmail request (anything other
+// than GET). The Pub/Sub push handler (supervisor/gmail-source.mjs) reads this
+// to recognize phantom history-delta pushes that were triggered by our own
+// label/star/mark-read calls, so it can suppress the corresponding empty
+// dispatch instead of waking the agent to triage nothing.
+const SELF_ACTION_MARKER = installTools("data/.gmail-action-last-at");
+
+function recordSelfAction() {
+  try {
+    fs.writeFileSync(SELF_ACTION_MARKER, String(Date.now()));
+  } catch {}
+}
+
+let _authenticatedEmail = null;
+async function getAuthenticatedEmail() {
+  if (_authenticatedEmail) return _authenticatedEmail;
+  const profile = await gmailRequest("/profile");
+  _authenticatedEmail = profile.emailAddress;
+  return _authenticatedEmail;
+}
+
+async function gmailRequest(endpoint, method = "GET", body = null) {
+  const token = await getAccessToken();
+  const opts = {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+
+  const res = await fetchWithRetry(`${GMAIL_API}${endpoint}`, opts);
+  const data = await res.json();
+
+  if (data.error) {
+    console.error(`Gmail API error: ${data.error.message} (http ${res.status}, code ${data.error.code ?? "?"})`);
+    process.exit(1);
+  }
+  if (method !== "GET") recordSelfAction();
+  return data;
+}
+
+async function ensureLabel(labelName) {
+  const { labels } = await gmailRequest("/labels");
+  const existing = labels.find(
+    (l) => l.name.toLowerCase() === labelName.toLowerCase()
+  );
+  if (existing) return existing.id;
+
+  const created = await gmailRequest("/labels", "POST", {
+    name: labelName,
+    labelListVisibility: "labelShow",
+    messageListVisibility: "show",
+  });
+  console.error(`Created label: ${labelName} (${created.id})`);
+  return created.id;
+}
+
+async function addLabel(messageId, labelName) {
+  if (String(labelName).toLowerCase() === "spam") return markSpam(messageId);
+  const labelId = await ensureLabel(labelName);
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: [labelId],
+  });
+  triageLog("LABEL", { messageId, label: labelName });
+  triageDecisions.recordAction(messageId, "label", labelName);
+  console.log(`Labeled ${messageId} as "${labelName}"`);
+}
+
+async function removeLabel(messageId, labelName) {
+  if (String(labelName).toLowerCase() === "spam") return notSpam(messageId);
+  const { labels } = await gmailRequest("/labels");
+  const existing = labels.find(
+    (l) => l.name.toLowerCase() === labelName.toLowerCase()
+  );
+  if (!existing) {
+    console.log(`Label "${labelName}" not present on ${messageId} (no such label)`);
+    return;
+  }
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    removeLabelIds: [existing.id],
+  });
+  triageLog("UNLABEL", { messageId, label: labelName });
+  triageDecisions.recordAction(messageId, "unlabel", labelName);
+  console.log(`Unlabeled ${messageId} from "${labelName}"`);
+}
+
+async function archive(messageId, { silent = false } = {}) {
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    removeLabelIds: ["INBOX"],
+  });
+  if (!silent) triageLog("ARCHIVE", { messageId });
+  console.log(`Archived ${messageId}`);
+}
+
+async function labelAndArchive(messageId, labelName) {
+  if (String(labelName).toLowerCase() === "spam") return markSpam(messageId);
+  const labelId = await ensureLabel(labelName);
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: [labelId],
+    removeLabelIds: ["INBOX"],
+  });
+  triageLog("LABEL+ARCHIVE", { messageId, label: labelName });
+  triageDecisions.recordAction(messageId, "label", labelName);
+  console.log(`Labeled "${labelName}" + archived ${messageId}`);
+}
+
+async function unarchive(messageId) {
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: ["INBOX"],
+  });
+  console.log(`Unarchived ${messageId} (moved back to inbox)`);
+}
+
+// All Merlin email to the user is P1 and stays UNREAD unless the user adds an
+// exception. Many job playbooks and digest-deliver still say "star + mark read"
+// from an older policy, so the rule is enforced HERE, at the one call they all
+// share, rather than trusted to their prose. The policy source is p1-senders.json via
+// `p1-sender check` — an exception the user adds (`p1-sender add <agent address>
+// --unless-subject <re>`) is honoured automatically. Fail-open on any lookup
+// error (the mark-read proceeds). `--force` bypasses it.
+async function isMerlinP1(messageId) {
+  try {
+    const m = await gmailRequest(`/messages/${messageId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`);
+    const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
+    const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
+    if (!AGENT_ADDR || addr !== AGENT_ADDR || (m.labelIds || []).includes("SENT")) return false;
+    const { spawnSync } = await import("node:child_process");
+    const r = spawnSync(process.execPath, [path.join(path.dirname(new URL(import.meta.url).pathname), "p1-sender"), "check", "--sender", addr, "--subject", h("subject")], { timeout: 5000 });
+    return r.status === 0;
+  } catch { return false; }
+}
+
+// Gmail's Spam folder. There is no user label called "spam": the
+// triage taxonomy's `spam` resolves, through ensureLabel's case-insensitive name
+// match, to Gmail's own SPAM system label, so `label <id> spam` has always moved
+// the message into the Spam folder, silently. It is explicit now, and guarded,
+// because Gmail deletes Spam after 30 days: a message that must never be buried
+// is refused with exit 3 and left exactly where it was. `label`, `label-archive`
+// and `unlabel <id> spam` route here, so every existing caller gets the same guard.
+async function spamRefusal(messageId) {
+  const m = await gmailRequest(`/messages/${messageId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`);
+  const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
+  const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
+  const labelIds = m.labelIds || [];
+  if (AGENT_ADDR && addr === AGENT_ADDR) return "Merlin's own email";
+  if ((OWNER_ADDR && addr === OWNER_ADDR) || labelIds.includes("SENT")) return `${OWNER_NAME} sent it`;
+  if (labelIds.includes("STARRED")) return "it is starred (P1/P2)";
+  const { spawnSync } = await import("node:child_process");
+  const r = spawnSync(process.execPath, [path.join(path.dirname(new URL(import.meta.url).pathname), "p1-sender"), "check", "--sender", addr, "--subject", h("subject")], { timeout: 5000 });
+  if (r.status === 0) return "a listed P1 sender (p1-senders.json)";
+  if (r.status !== 3) return "the P1 sender check could not run";
+  return null;
+}
+
+async function markSpam(messageId) {
+  const why = await spamRefusal(messageId);
+  if (why) {
+    triageLog("SPAM-REFUSED", { messageId, reason: why });
+    console.log(`Left ${messageId} where it is, not moved to Spam: ${why}`);
+    process.exitCode = 3;
+    return;
+  }
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: ["SPAM"],
+    removeLabelIds: ["INBOX", "UNREAD"],
+  });
+  triageLog("SPAM", { messageId });
+  triageDecisions.recordAction(messageId, "label", "spam");
+  triageDecisions.recordAction(messageId, "mark-read");
+  console.log(`Moved ${messageId} to Spam`);
+}
+
+async function notSpam(messageId) {
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: ["INBOX"],
+    removeLabelIds: ["SPAM"],
+  });
+  triageLog("NOT-SPAM", { messageId });
+  console.log(`Moved ${messageId} out of Spam, back to the inbox`);
+}
+
+async function markUnread(messageId) {
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: ["UNREAD"],
+  });
+  triageLog("MARK-UNREAD", { messageId });
+  console.log(`Marked ${messageId} as unread`);
+}
+
+async function markRead(messageId, { force = false } = {}) {
+  if (!force && (await isMerlinP1(messageId))) {
+    triageLog("MARK-READ-REFUSED", { messageId, reason: "merlin-p1" });
+    console.log(`Left ${messageId} unread — Merlin email is P1 (p1-senders.json); use --force to override`);
+    return;
+  }
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    removeLabelIds: ["UNREAD"],
+  });
+  triageLog("MARK-READ", { messageId });
+  triageDecisions.recordAction(messageId, "mark-read");
+  console.log(`Marked ${messageId} as read`);
+}
+
+async function star(messageId) {
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    addLabelIds: ["STARRED"],
+  });
+  triageLog("STAR", { messageId });
+  triageDecisions.recordAction(messageId, "star");
+  console.log(`Starred ${messageId}`);
+}
+
+// Self-unstar ledger: every unstar Merlin makes is recorded so the P1 unstar
+// sweep (bin/p1-unstar-sweep) can tell its own removals apart from
+// the user's when it reads Gmail history. Written BEFORE the API call, so the
+// ledger row always exists by the time the history event does.
+const SELF_UNSTARS = process.env.GMAIL_SELF_UNSTARS || installTools("data/gmail-self-unstars.jsonl");
+
+async function unstar(messageId) {
+  try {
+    fs.appendFileSync(SELF_UNSTARS, JSON.stringify({ messageId, at: new Date().toISOString() }) + "\n");
+  } catch {}
+  await gmailRequest(`/messages/${messageId}/modify`, "POST", {
+    removeLabelIds: ["STARRED"],
+  });
+  triageLog("UNSTAR", { messageId });
+  triageDecisions.recordAction(messageId, "unstar");
+  console.log(`Unstarred ${messageId}`);
+}
+
+async function batchArchive(messageIds) {
+  for (const id of messageIds) {
+    await archive(id, { silent: true });
+  }
+  triageLog("BATCH-ARCHIVE", { count: messageIds.length, messageIds: messageIds.join(",") });
+  console.log(`Archived ${messageIds.length} messages`);
+}
+
+// Sanitize header value — strip CR/LF to prevent header injection
+function sanitizeHeader(value) {
+  return value.replace(/[\r\n]/g, " ");
+}
+
+// RFC 2047 B-encoding for header values containing non-ASCII characters.
+function encodeHeaderValue(value) {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(value)) return value;
+  const b64 = Buffer.from(value, "utf-8").toString("base64");
+  return `=?UTF-8?B?${b64}?=`;
+}
+
+
+// Refuse a draft to a third party that breaks one of the installation's draft
+// rules. The rules, their scope and the note-to-self exemption all live in
+// lib/draft-gate.js (none without it).
+async function assertDraftAllowed(to, subject, body, command, { inheritedSubject = false } = {}) {
+  const verdict = checkDraft({
+    to,
+    subject,
+    body,
+    inheritedSubject,
+    selfAddress: await getAuthenticatedEmail(),
+    allowDashes: !!process.env.GMAIL_ACTION_ALLOW_DASHES,
+    allowUnsigned: !!process.env.GMAIL_ACTION_ALLOW_UNSIGNED,
+  });
+  if (verdict.ok) return;
+
+  const who = (verdict.external || []).join(", ");
+  console.error(
+    `gmail-action ${command}: ${verdict.message || `draft to ${who} breaks the installation's draft rule "${verdict.rule || "unnamed"}".`}`
+  );
+  process.exit(1);
+}
+
+async function createDraft(to, subject, body) {
+  await assertDraftAllowed(to, subject, body, "draft");
+
+  const raw = Buffer.from(
+    `To: ${sanitizeHeader(to)}\r\nSubject: ${sanitizeHeader(subject)}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+  ).toString("base64url");
+
+  const draft = await gmailRequest("/drafts", "POST", {
+    message: { raw },
+  });
+  triageLog("DRAFT", { draftId: draft.id, to, subject });
+  console.log(`Draft created: ${draft.id}`);
+  return draft;
+}
+
+// Markup detection (format, not language): the body opens with a tag or
+// contains a block-level element. Plain prose with a stray "<3" stays plain.
+function looksLikeHtml(body) {
+  const t = String(body || "").trimStart();
+  return /^<(!doctype|html|body|div|p|table|h[1-6]|ul|ol|span|br)\b/i.test(t)
+    || /<\/(div|p|table|ul|ol|li|h[1-6])>/i.test(t);
+}
+
+async function sendMessage(to, subject, body, { html = false, attachments = [], fromName = null, fromAddress = null } = {}) {
+  // The installation's writing rules for mail sent on the user's behalf
+  // (checkSend in lib/draft-gate.js; none by default). They belong on
+  // THIS path, the "on-behalf-of-the-user to a third party" exception (Outbound
+  // Email Policy), not on email-send's self-addressed digests/alerts. Fires
+  // whenever the send represents the user (--from set), since that's the only
+  // sanctioned use of this function. GMAIL_ACTION_ALLOW_DASHES=1 is handed to
+  // the rules as their one-off override.
+  if (fromAddress) {
+    const verdict = checkSend({ subject, body, allowDashes: !!process.env.GMAIL_ACTION_ALLOW_DASHES });
+    if (!verdict.ok) {
+      console.error(`gmail-action send: ${verdict.message || `blocked by the installation's send rule "${verdict.rule || "unnamed"}".`}`);
+      process.exit(1);
+    }
+  }
+
+  // A body that is clearly markup goes out as HTML even when the caller forgot
+  // --html (an email once built as a styled <div> was sent without the flag,
+  // so Gmail showed raw tags).
+  if (!html && looksLikeHtml(body)) html = true;
+  const bodyContentType = html ? "text/html" : "text/plain";
+  const headers = [];
+  if (fromName || fromAddress) {
+    // Build From header. If only fromName, use authenticated account's email (Gmail will
+    // reject a From that isn't the authenticated user or a verified sendAs alias).
+    const addr = fromAddress || (await getAuthenticatedEmail());
+    const name = fromName ? encodeHeaderValue(fromName) : null;
+    headers.push(`From: ${name ? `${name} <${addr}>` : addr}`);
+  }
+  headers.push(
+    `To: ${sanitizeHeader(to)}`,
+    `Subject: ${encodeHeaderValue(sanitizeHeader(subject))}`,
+    `MIME-Version: 1.0`,
+  );
+
+  let mimeMessage;
+  if (attachments.length === 0) {
+    headers.push(`Content-Type: ${bodyContentType}; charset=utf-8`);
+    mimeMessage = headers.join("\r\n") + "\r\n\r\n" + body;
+  } else {
+    const boundary = `----=_Part_${Date.now()}_${Math.floor(Math.random() * 1e9)}`;
+    headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+
+    const bodyPart =
+      `--${boundary}\r\n` +
+      `Content-Type: ${bodyContentType}; charset=utf-8\r\n` +
+      `Content-Transfer-Encoding: 8bit\r\n\r\n` +
+      body + "\r\n";
+
+    const attachmentParts = attachments.map((att) => {
+      const content = fs.readFileSync(att.path);
+      const b64 = content.toString("base64").replace(/(.{76})/g, "$1\r\n");
+      const mimeType = att.mimeType || guessMimeType(att.path);
+      const filename = att.filename || path.basename(att.path);
+      return (
+        `--${boundary}\r\n` +
+        `Content-Type: ${mimeType}; name="${filename}"\r\n` +
+        `Content-Disposition: attachment; filename="${filename}"\r\n` +
+        `Content-Transfer-Encoding: base64\r\n\r\n` +
+        b64 + "\r\n"
+      );
+    });
+
+    mimeMessage =
+      headers.join("\r\n") + "\r\n\r\n" +
+      bodyPart +
+      attachmentParts.join("") +
+      `--${boundary}--\r\n`;
+  }
+
+  const raw = Buffer.from(mimeMessage, "utf-8").toString("base64url");
+  const sent = await gmailRequest("/messages/send", "POST", { raw });
+  triageLog("SEND", { messageId: sent.id, to, subject, html, attachments: attachments.length });
+  console.log(`Sent: ${sent.id}`);
+  return sent;
+}
+
+async function sendDraft(draftId) {
+  const sent = await gmailRequest("/drafts/send", "POST", { id: draftId });
+  triageLog("SEND-DRAFT", { draftId, messageId: sent.id });
+  console.log(`Sent draft ${draftId}: ${sent.id}`);
+  return sent;
+}
+
+async function createDraftReply(messageId, body) {
+  const msg = await gmailRequest(`/messages/${messageId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Message-ID`);
+  const headers = msg.payload.headers;
+  const from = headers.find((h) => h.name === "From")?.value || "";
+  const subject = headers.find((h) => h.name === "Subject")?.value || "";
+  const msgIdHeader = headers.find((h) => h.name === "Message-ID")?.value || "";
+  const threadId = msg.threadId;
+
+  const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  // The reply goes back to whoever sent the original, so that From header is
+  // the recipient the gate has to judge. The subject is THEIRS, carried forward
+  // verbatim, so rules about what Merlin writes do not judge it (inheritedSubject).
+  await assertDraftAllowed(from, replySubject, body, "draft-reply", { inheritedSubject: true });
+
+  const raw = Buffer.from(
+    `To: ${sanitizeHeader(from)}\r\nSubject: ${sanitizeHeader(replySubject)}\r\nIn-Reply-To: ${sanitizeHeader(msgIdHeader)}\r\nReferences: ${sanitizeHeader(msgIdHeader)}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+  ).toString("base64url");
+
+  const draft = await gmailRequest("/drafts", "POST", {
+    message: { raw, threadId },
+  });
+  triageLog("DRAFT-REPLY", { draftId: draft.id, messageId, threadId, to: from, subject: replySubject });
+  console.log(`Draft reply created: ${draft.id} (thread: ${threadId})`);
+  return draft;
+}
+
+// List unread inbox messages older than N minutes. Returns JSON array of
+// { id, ageMs, from, subject } for each stuck message. Used by the watchdog
+// to detect emails that slipped through push or silent triage failures.
+//
+// Gmail's `older_than:` operator only accepts d/m/y units (m = months, not
+// minutes), so we use `before:<epoch-seconds>` for minute-granular cutoffs.
+// On the normal path (0 stuck messages) this is a single API call.
+//
+// We EXCLUDE `label:p1` because P1 triage intentionally leaves emails unread
+// (per ops-agent/CLAUDE.md Step 5: "Do NOT mark-read — P1 emails stay unread
+// so the user sees them"). Without this exclusion the watchdog's gmail-unread
+// sweep treats every legit-unread P1 as "stuck" and dispatches RECLASSIFY
+// every 2-min tick until the user reads the email — a phantom loop.
+async function listUnreadOlder(minutes) {
+  const n = parseInt(minutes, 10);
+  const cutoff = Math.floor((Date.now() - n * 60 * 1000) / 1000);
+  const q = encodeURIComponent(`is:unread label:INBOX -label:p1 before:${cutoff}`);
+  const list = await gmailRequest(`/messages?q=${q}&maxResults=50`);
+  if (!list.messages || list.messages.length === 0) {
+    console.log(JSON.stringify([]));
+    return;
+  }
+  // Fetch metadata only for the (typically 0-5) messages that are actually stuck.
+  const now = Date.now();
+  const results = await Promise.all(
+    list.messages.map(async (m) => {
+      const msg = await gmailRequest(`/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`);
+      const headers = msg.payload?.headers || [];
+      return {
+        id: m.id,
+        ageMs: now - parseInt(msg.internalDate, 10),
+        from: headers.find((h) => h.name === "From")?.value || "",
+        subject: headers.find((h) => h.name === "Subject")?.value || "",
+      };
+    })
+  );
+  console.log(JSON.stringify(results));
+}
+
+// Existence check for an arbitrary Gmail query — a cheap GET used by cron
+// triggers to gate an Opus dispatch on whether there is actually any work to do
+// (e.g. p1-resolution-scan only needs the agent when an unstarred P1 exists;
+// without this it dispatched the agent every 30 min to scan an empty set). The
+// exit code mirrors `gog gmail search --fail-empty` so the caller can branch on
+// it directly:
+//   exit 0 → at least one match  (prints {"hasMatch":true,...})  → dispatch
+//   exit 3 → zero matches        (prints {"hasMatch":false,...}) → skip
+//   exit 1 → API/auth/network error (main's catch) → caller should FAIL-OPEN.
+// GET-only, so it never trips the self-action marker. We use maxResults=1 and
+// test the messages array — resultSizeEstimate is an unreliable estimate for
+// small counts, but presence/absence of a first message is exact, which is all
+// a yes/no dispatch gate needs.
+async function countQuery(query) {
+  const q = encodeURIComponent(query);
+  const list = await gmailRequest(`/messages?q=${q}&maxResults=1`);
+  const hasMatch = !!(list.messages && list.messages.length);
+  console.log(JSON.stringify({ query, hasMatch, estimate: list.resultSizeEstimate ?? null }));
+  process.exit(hasMatch ? 0 : 3);
+}
+
+// `ids <query>` — authoritative, paginated list of message IDs matching a Gmail
+// query, one per line. Unlike `count` (existence only) and unlike the
+// claude.ai connector / resultSizeEstimate (both unreliable for `label:p1`),
+// this returns the exact message-level ID set, which change-detecting dispatch
+// gates need (e.g. p1-scan: dispatch only when a NEW unstarred-P1 appears, not
+// every tick a stale one lingers). GET-only. Exit 0 if ≥1, 3 if none, 1 on error.
+async function listIds(query, max = 500) {
+  const q = encodeURIComponent(query);
+  const ids = [];
+  let pageToken = null;
+  do {
+    const list = await gmailRequest(
+      `/messages?q=${q}&maxResults=100${pageToken ? `&pageToken=${pageToken}` : ""}`
+    );
+    if (list.messages) ids.push(...list.messages.map((m) => m.id));
+    pageToken = list.nextPageToken;
+  } while (pageToken && ids.length < max);
+  ids.slice(0, max).forEach((id) => console.log(id));
+  process.exit(ids.length ? 0 : 3);
+}
+
+// `reply-to-me <messageId>` — is this message a response to an email the user
+// sent? Answered from Gmail's own thread structure, not from language:
+// a message is a reply to the user when its thread already contains an older
+// message carrying the `SENT` label (i.e. one the user sent from their Gmail, or
+// that `gmail-action send --from <user address>` sent on their behalf).
+// `email-send` traffic from the agent's own address goes via SMTP, never SENT, so an
+// agent-originated digest is correctly NOT counted as "an email the user sent".
+//
+// Deliberately deterministic (Rule #0b — code owns structure, a model owns
+// language): thread membership, label sets and timestamps are machine facts.
+// Ordering matters — only messages at or before the triaged message count, so a
+// reply the user writes LATER in the thread never retro-flags the inbound one.
+// The triaged message being SENT itself (the user's own outbound) is never a reply to
+// the user. GET-only. Exit 0 = yes, 3 = no, 1 = error (callers FAIL OPEN: fall
+// through to normal prioritization rather than guessing).
+async function replyToMe(messageId) {
+  const meta = "format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date";
+  const msg = await gmailRequest(`/messages/${messageId}?${meta}`);
+  const hdr = (m, name) =>
+    (m.payload?.headers || []).find((h) => h.name.toLowerCase() === name)?.value || "";
+
+  const selfSent = (msg.labelIds || []).includes("SENT");
+  const at = parseInt(msg.internalDate, 10);
+  const thread = await gmailRequest(`/threads/${msg.threadId}?${meta}`);
+  const priorSent = (thread.messages || [])
+    .filter(
+      (m) =>
+        m.id !== messageId &&
+        parseInt(m.internalDate, 10) <= at &&
+        (m.labelIds || []).includes("SENT")
+    )
+    .sort((a, b) => parseInt(b.internalDate, 10) - parseInt(a.internalDate, 10))[0];
+
+  // Correspondent fallback. Support-case systems answer in a NEW
+  // thread: each advisor contact on a vendor support case arrived as a fresh
+  // "[<case>] ... Support" thread, so the thread check above saw no prior SENT
+  // and the advisor's question was filed P3 and missed. The case number IS the
+  // thread on those systems; the machine fact that survives the split is that
+  // the user has WRITTEN TO THIS EXACT ADDRESS recently. Same footing as the
+  // thread check (labels, addresses, timestamps — no language): SENT mail to the
+  // sender's address in the 30 days before this message. Merlin's and the user's
+  // own addresses are excluded — the user writes to the agent's address
+  // constantly, and Merlin-initiated mail must stay class 2.
+  const fromAddr = (hdr(msg, "from").match(/<([^>]+)>/)?.[1] || hdr(msg, "from")).trim().toLowerCase();
+  const NOT_CORRESPONDENT = selfAddressRe();
+  let correspondent = null;
+  if (!selfSent && !priorSent && fromAddr.includes("@") && !NOT_CORRESPONDENT.test(fromAddr)) {
+    const atSec = Math.floor(at / 1000);
+    const q = encodeURIComponent(`in:sent to:${fromAddr} after:${atSec - 30 * 86400} before:${atSec}`);
+    const list = await gmailRequest(`/messages?q=${q}&maxResults=1`);
+    const hit = list.messages?.[0];
+    if (hit) correspondent = { id: hit.id, to: fromAddr };
+  }
+
+  const isReplyToUser = !selfSent && (!!priorSent || !!correspondent);
+  console.log(
+    JSON.stringify({
+      messageId,
+      threadId: msg.threadId,
+      isReplyToUser,
+      selfSent,
+      from: hdr(msg, "from"),
+      subject: hdr(msg, "subject"),
+      threadSize: (thread.messages || []).length,
+      userSent: priorSent
+        ? {
+            id: priorSent.id,
+            subject: hdr(priorSent, "subject"),
+            date: hdr(priorSent, "date"),
+          }
+        : null,
+      via: priorSent ? "thread" : correspondent ? "correspondent" : null,
+      correspondent,
+    })
+  );
+  process.exit(isReplyToUser ? 0 : 3);
+}
+
+// `meeting-request <messageId>` — is this a calendar invitation asking the user to
+// attend (all meeting requests should always be P1)? Answered from the
+// iCalendar part the sender's calendar attaches, never from the subject line
+// (Rule #0b): a `text/calendar` / `application/ics` part whose METHOD is
+// REQUEST — new or updated invitations. CANCEL (cancellations) and REPLY
+// (someone accepted the user's invite) are not requests to attend. The user's own outbound
+// (SENT) never counts. Exit 0 = yes, 3 = no, 1 = error (callers fail open).
+async function meetingRequest(messageId) {
+  const msg = await gmailRequest(`/messages/${messageId}?format=full`);
+  const selfSent = (msg.labelIds || []).includes("SENT");
+  const parts = [];
+  const walk = (p) => { if (!p) return; parts.push(p); (p.parts || []).forEach(walk); };
+  walk(msg.payload);
+  const isCal = (p) => {
+    const mt = String(p.mimeType || "").toLowerCase();
+    return mt === "text/calendar" || mt === "application/ics" || String(p.filename || "").toLowerCase().endsWith(".ics");
+  };
+  let method = null;
+  for (const p of parts.filter(isCal)) {
+    // The MIME type parameter carries the method on most senders' parts.
+    const ct = (p.headers || []).find((h) => h.name.toLowerCase() === "content-type")?.value || "";
+    const param = ct.split(";").map((x) => x.trim().split("=")).find(([k]) => k && k.toLowerCase() === "method");
+    if (param && param[1]) { method = param[1].replace(/"/g, "").toUpperCase(); break; }
+    // Otherwise read the iCalendar body's own METHOD property.
+    let data = p.body?.data;
+    if (!data && p.body?.attachmentId) {
+      const att = await gmailRequest(`/messages/${messageId}/attachments/${p.body.attachmentId}`);
+      data = att.data;
+    }
+    if (!data) continue;
+    const ics = Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const line = ics.split(/\r?\n/).find((l) => l.toUpperCase().startsWith("METHOD:"));
+    if (line) { method = line.slice(7).trim().toUpperCase(); break; }
+  }
+  const isRequest = !selfSent && method === "REQUEST";
+  console.log(JSON.stringify({ messageId, isMeetingRequest: isRequest, method, selfSent }));
+  process.exit(isRequest ? 0 : 3);
+}
+
+async function listLabels() {
+  const { labels } = await gmailRequest("/labels");
+  labels
+    .filter((l) => l.type === "user")
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .forEach((l) => console.log(`${l.id}\t${l.name}`));
+}
+
+// CLI — wrap in async main to properly await all operations
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+
+  switch (cmd) {
+    case "label":
+      if (args.length < 3) { console.error("Usage: gmail-action label <messageId> <labelName>"); process.exit(1); }
+      await addLabel(args[1], args[2]);
+      break;
+    case "unlabel":
+      if (args.length < 3) { console.error("Usage: gmail-action unlabel <messageId> <labelName>"); process.exit(1); }
+      await removeLabel(args[1], args[2]);
+      break;
+    case "archive":
+      if (args.length < 2) { console.error("Usage: gmail-action archive <messageId>"); process.exit(1); }
+      await archive(args[1]);
+      break;
+    case "unarchive":
+      if (args.length < 2) { console.error("Usage: gmail-action unarchive <messageId>"); process.exit(1); }
+      await unarchive(args[1]);
+      break;
+    case "label-archive":
+      if (args.length < 3) { console.error("Usage: gmail-action label-archive <messageId> <labelName>"); process.exit(1); }
+      await labelAndArchive(args[1], args[2]);
+      break;
+    case "mark-read":
+      if (args.length < 2) { console.error("Usage: gmail-action mark-read <messageId>"); process.exit(1); }
+      await markRead(args[1], { force: args.includes("--force") });
+      break;
+    case "spam":
+      if (args.length < 2) { console.error("Usage: gmail-action spam <messageId>"); process.exit(1); }
+      await markSpam(args[1]);
+      break;
+    case "not-spam":
+      if (args.length < 2) { console.error("Usage: gmail-action not-spam <messageId>"); process.exit(1); }
+      await notSpam(args[1]);
+      break;
+    case "mark-unread":
+      if (args.length < 2) { console.error("Usage: gmail-action mark-unread <messageId>"); process.exit(1); }
+      await markUnread(args[1]);
+      break;
+    case "star":
+      if (args.length < 2) { console.error("Usage: gmail-action star <messageId>"); process.exit(1); }
+      await star(args[1]);
+      break;
+    case "unstar":
+      if (args.length < 2) { console.error("Usage: gmail-action unstar <messageId>"); process.exit(1); }
+      await unstar(args[1]);
+      break;
+    case "batch-archive":
+      if (args.length < 2) { console.error("Usage: gmail-action batch-archive <id1> <id2> ..."); process.exit(1); }
+      await batchArchive(args.slice(1));
+      break;
+    case "draft":
+      if (args.length < 4) { console.error("Usage: gmail-action draft <to> <subject> <body>"); process.exit(1); }
+      await createDraft(args[1], args[2], args[3]);
+      break;
+    case "draft-reply":
+      if (args.length < 3) { console.error("Usage: gmail-action draft-reply <messageId> <body>"); process.exit(1); }
+      await createDraftReply(args[1], args[2]);
+      break;
+    case "send": {
+      // Positional args (first 3 non-flag args after 'send') = to, subject, body
+      const positional = [];
+      const attachments = [];
+      let html = false;
+      let fromName = null;
+      let fromAddress = null;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--html") html = true;
+        else if (args[i] === "--attach") attachments.push({ path: args[++i] });
+        else if (args[i] === "--from-name") fromName = args[++i];
+        else if (args[i] === "--from") fromAddress = args[++i];
+        else positional.push(args[i]);
+      }
+      if (positional.length < 3) { console.error("Usage: gmail-action send <to> <subject> <body> [--html] [--attach <file>]... [--from-name <name>] [--from <address>]"); process.exit(1); }
+      for (const a of attachments) {
+        if (!fs.existsSync(a.path)) { console.error(`Attachment not found: ${a.path}`); process.exit(1); }
+      }
+      await sendMessage(positional[0], positional[1], positional[2], { html, attachments, fromName, fromAddress });
+      break;
+    }
+    case "send-draft":
+      if (args.length < 2) { console.error("Usage: gmail-action send-draft <draftId>"); process.exit(1); }
+      await sendDraft(args[1]);
+      break;
+    case "list-unread-older":
+      if (args.length < 2) { console.error("Usage: gmail-action list-unread-older <minutes>"); process.exit(1); }
+      await listUnreadOlder(args[1]);
+      break;
+    case "labels":
+      await listLabels();
+      break;
+    case "count":
+      if (args.length < 2) { console.error("Usage: gmail-action count <gmail-query>"); process.exit(1); }
+      await countQuery(args.slice(1).join(" "));
+      break;
+    case "ids":
+      if (args.length < 2) { console.error("Usage: gmail-action ids <gmail-query>"); process.exit(1); }
+      await listIds(args.slice(1).join(" "));
+      break;
+    case "reply-to-me":
+      if (args.length < 2) { console.error("Usage: gmail-action reply-to-me <messageId>"); process.exit(1); }
+      await replyToMe(args[1]);
+      break;
+    case "meeting-request":
+      if (args.length < 2) { console.error("Usage: gmail-action meeting-request <messageId>"); process.exit(1); }
+      await meetingRequest(args[1]);
+      break;
+    default:
+      console.log(`gmail-action — Gmail label/archive/draft operations
+
+Commands:
+  label <messageId> <labelName>         Add a label ("spam" = the spam command below)
+  unlabel <messageId> <labelName>       Remove a label ("spam" = not-spam)
+  spam <messageId>                      Move to Gmail's Spam folder + mark read. Refused (exit 3, untouched)
+                                        for Merlin's own mail, mail ${OWNER_NAME} sent, starred mail, a P1 sender
+  not-spam <messageId>                  Move out of Spam, back to the inbox
+  archive <messageId>                   Remove from INBOX
+  label-archive <messageId> <label>     Label + archive
+  mark-read <messageId> [--force]       Mark as read (refused for a P1 Merlin email unless --force)
+  mark-unread <messageId>               Mark as unread
+  star <messageId>                      Add yellow star
+  unstar <messageId>                    Remove star
+  batch-archive <id1> <id2> ...         Archive multiple
+  draft <to> <subject> <body>           Create a draft
+  draft-reply <messageId> <body>        Draft reply to a message
+  send <to> <subject> <body> [--html] [--attach <file>]... [--from-name <name>] [--from <address>]
+                                        Send an email (supports HTML, attachments, custom display name / alias)
+  send-draft <draftId>                  Send an existing draft
+  list-unread-older <minutes>           JSON array of unread inbox msgs older than N min (id, ageMs, from, subject)
+  labels                                List user labels
+  count <gmail-query>                   Existence check for a Gmail query: exit 0 if ≥1 match, 3 if none (cron dispatch gates)
+  ids <gmail-query>                     Authoritative paginated message-ID list (one/line) for change-detecting gates: exit 0 if ≥1, 3 if none
+  reply-to-me <messageId>               Is this a response to an email ${OWNER_NAME} sent? (older SENT message in the same thread, or SENT to this exact sender in the last 30d) JSON out; exit 0 = yes, 3 = no, 1 = error
+  meeting-request <messageId>           Is this a calendar invitation to attend (iCalendar METHOD:REQUEST, not the user's own)? JSON out; exit 0 = yes, 3 = no, 1 = error`);
+  }
+}
+
+main().catch((err) => {
+  // describeError walks err.cause — see google-auth.js for why this replaced
+  // a bare err.message (root cause of a chronic unstar-scan failure).
+  console.error(`gmail-action error: ${describeError(err)}`);
+  process.exit(1);
+});

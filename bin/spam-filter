@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+// CLI tool for managing the email spam filter (blocklist + allowlist)
+// Usage: spam-filter <command> [options]
+//   block   --sender <pattern> | --topic <pattern>  [--reason <text>] [--scam] [--message <id>]
+//   check   --sender <email> | --topic <text>  [--json]
+//   allow   --sender <pattern> | --topic <pattern>  [--reason <text>]
+//   unblock --sender <pattern> | --topic <pattern>
+//   unallow --sender <pattern> | --topic <pattern>
+//   list
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { triageLog } = require("../lib/triage-log.js");
+const { installTools } = require("../lib/root.cjs");
+
+const HOME = process.env.HOME || "";
+const FILE = installTools("data/spam-blocklist.json");
+const GMAIL_ACTION = process.env.SPAM_FILTER_GMAIL_ACTION || path.join(path.dirname(new URL(import.meta.url).pathname), "gmail-action");
+
+// `scam: true` on an entry (the user's rule: confirmed scam mail goes to Gmail's
+// Spam folder, not just blocked + marked read). The blocklist also holds real
+// senders the user only wanted silenced (payout notices, webhooks, receipts), and
+// Gmail deletes Spam after 30 days, so the move is opt-in per entry: intake
+// (`intakeSpamCheck` in gmail-source.mjs) moves a scam match to Spam and only
+// marks a plain match read, leaving it in the inbox as before.
+const tag = (e) => (e.scam ? " [scam: to Spam]" : "");
+
+// `--message <id>`: handle the email that prompted the block, in the same call.
+// A scam block moves it to Spam; a plain block marks it read.
+function actOnMessage(messageId, scam) {
+  const r = spawnSync(GMAIL_ACTION, [scam ? "spam" : "mark-read", messageId], { encoding: "utf8", timeout: 20000 });
+  process.stdout.write(r.stdout || "");
+  process.stderr.write(r.stderr || "");
+  if (r.status !== 0) process.exitCode = r.status ?? 1;
+}
+
+function load() {
+  try {
+    const data = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    if (!data.blocklist) data.blocklist = { senders: [], topics: [] };
+    if (!data.allowlist) data.allowlist = { senders: [], topics: [] };
+    // Migrate old format: top-level "senders" array → blocklist.senders
+    if (data.senders && !data.blocklist.senders.length) {
+      data.blocklist.senders = data.senders;
+      delete data.senders;
+    }
+    return data;
+  } catch {
+    return { blocklist: { senders: [], topics: [] }, allowlist: { senders: [], topics: [] } };
+  }
+}
+
+function save(data) {
+  const tmp = FILE + ".tmp." + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, FILE);
+}
+
+function parseArgs(args) {
+  const result = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--sender" && args[i + 1]) result.sender = args[++i];
+    else if (args[i] === "--topic" && args[i + 1]) result.topic = args[++i];
+    else if (args[i] === "--reason" && args[i + 1]) result.reason = args[++i];
+    else if (args[i] === "--message" && args[i + 1]) result.message = args[++i];
+    else if (args[i] === "--scam") result.scam = true;
+    else if (args[i] === "--json") result.json = true;
+  }
+  return result;
+}
+
+const command = process.argv[2];
+const opts = parseArgs(process.argv.slice(3));
+const today = new Date().toISOString().split("T")[0];
+
+if (command === "block") {
+  if (!opts.sender && !opts.topic) { console.error("Usage: spam-filter block --sender <pattern> | --topic <pattern>"); process.exit(1); }
+  const data = load();
+  const list = opts.sender ? data.blocklist.senders : data.blocklist.topics;
+  const pattern = (opts.sender || opts.topic).toLowerCase();
+  const existing = list.find(e => e.pattern === pattern);
+  if (existing && (existing.scam || !opts.scam)) {
+    console.log(`Already blocked: ${pattern}${tag(existing)}`);
+  } else if (existing) {
+    existing.scam = true;
+    save(data);
+    triageLog("SPAM-BLOCK", { type: opts.sender ? "sender" : "topic", pattern, reason: existing.reason || "", scam: true });
+    console.log(`Marked as scam: ${pattern}${tag(existing)}`);
+  } else {
+    const entry = { pattern, reason: opts.reason || "", added: today };
+    if (opts.scam) entry.scam = true;
+    list.push(entry);
+    save(data);
+    triageLog("SPAM-BLOCK", { type: opts.sender ? "sender" : "topic", pattern, reason: opts.reason || "", scam: !!opts.scam });
+    console.log(`Blocked ${opts.sender ? "sender" : "topic"}: ${pattern}${opts.reason ? ` (${opts.reason})` : ""}${tag(entry)}`);
+  }
+  if (opts.message) actOnMessage(opts.message, !!(existing?.scam || opts.scam));
+
+} else if (command === "allow") {
+  if (!opts.sender && !opts.topic) { console.error("Usage: spam-filter allow --sender <pattern> | --topic <pattern>"); process.exit(1); }
+  const data = load();
+  const list = opts.sender ? data.allowlist.senders : data.allowlist.topics;
+  const pattern = (opts.sender || opts.topic).toLowerCase();
+  if (list.some(e => e.pattern === pattern)) {
+    console.log(`Already allowed: ${pattern}`);
+  } else {
+    list.push({ pattern, reason: opts.reason || "", added: today });
+    // Also remove from blocklist if present
+    const blockList = opts.sender ? data.blocklist.senders : data.blocklist.topics;
+    const idx = blockList.findIndex(e => e.pattern === pattern);
+    if (idx !== -1) blockList.splice(idx, 1);
+    save(data);
+    triageLog("SPAM-ALLOW", { type: opts.sender ? "sender" : "topic", pattern, reason: opts.reason || "" });
+    console.log(`Allowed ${opts.sender ? "sender" : "topic"}: ${pattern}${opts.reason ? ` (${opts.reason})` : ""}`);
+  }
+
+} else if (command === "unblock") {
+  if (!opts.sender && !opts.topic) { console.error("Usage: spam-filter unblock --sender <pattern> | --topic <pattern>"); process.exit(1); }
+  const data = load();
+  const list = opts.sender ? data.blocklist.senders : data.blocklist.topics;
+  const pattern = (opts.sender || opts.topic).toLowerCase();
+  const idx = list.findIndex(e => e.pattern === pattern);
+  if (idx === -1) {
+    console.log(`Not found in blocklist: ${pattern}`);
+  } else {
+    list.splice(idx, 1);
+    save(data);
+    console.log(`Unblocked ${opts.sender ? "sender" : "topic"}: ${pattern}`);
+  }
+
+} else if (command === "unallow") {
+  if (!opts.sender && !opts.topic) { console.error("Usage: spam-filter unallow --sender <pattern> | --topic <pattern>"); process.exit(1); }
+  const data = load();
+  const list = opts.sender ? data.allowlist.senders : data.allowlist.topics;
+  const pattern = (opts.sender || opts.topic).toLowerCase();
+  const idx = list.findIndex(e => e.pattern === pattern);
+  if (idx === -1) {
+    console.log(`Not found in allowlist: ${pattern}`);
+  } else {
+    list.splice(idx, 1);
+    save(data);
+    console.log(`Removed from allowlist ${opts.sender ? "sender" : "topic"}: ${pattern}`);
+  }
+
+} else if (command === "check") {
+  // Deterministic spam check: returns match/no-match for a sender or topic
+  if (!opts.sender && !opts.topic) { console.error("Usage: spam-filter check --sender <email> | --topic <text>"); process.exit(1); }
+  const data = load();
+  const input = (opts.sender || opts.topic).toLowerCase();
+  const listToCheck = opts.sender ? data.blocklist.senders : data.blocklist.topics;
+  const allowList = opts.sender ? data.allowlist.senders : data.allowlist.topics;
+
+  // Check allowlist first — allowed senders/topics are never spam
+  const list = opts.sender ? "sender" : "topic";
+  const allowed = allowList.find(e => input.includes(e.pattern));
+  if (allowed) {
+    if (opts.json) console.log(JSON.stringify({ result: "allowed", list, pattern: allowed.pattern }));
+    else console.log(`ALLOWED: ${input} matches allowlist pattern "${allowed.pattern}"`);
+    process.exit(0);
+  }
+
+  // Check blocklist — substring match (pattern can match anywhere in sender/topic)
+  const blocked = listToCheck.find(e => input.includes(e.pattern));
+  if (blocked) {
+    if (opts.json) console.log(JSON.stringify({ result: "blocked", list, pattern: blocked.pattern, reason: blocked.reason || "", scam: !!blocked.scam }));
+    else console.log(`BLOCKED: ${input} matches "${blocked.pattern}"${blocked.reason ? ` (${blocked.reason})` : ""}${tag(blocked)}`);
+    process.exit(2);  // exit code 2 = blocked (scam or not)
+  }
+
+  if (opts.json) console.log(JSON.stringify({ result: "pass", list }));
+  else console.log(`PASS: ${input} does not match any blocklist pattern`);
+  process.exit(0);
+
+} else if (command === "list") {
+  const data = load();
+  const bs = data.blocklist.senders, bt = data.blocklist.topics;
+  const as = data.allowlist.senders, at = data.allowlist.topics;
+  if (!bs.length && !bt.length && !as.length && !at.length) {
+    console.log("No spam filter rules configured.");
+  } else {
+    if (bs.length) { console.log("BLOCKED SENDERS:"); bs.forEach(e => console.log(`  ${e.pattern}${tag(e)}${e.reason ? ` — ${e.reason}` : ""}`)); }
+    if (bt.length) { console.log("BLOCKED TOPICS:"); bt.forEach(e => console.log(`  ${e.pattern}${tag(e)}${e.reason ? ` — ${e.reason}` : ""}`)); }
+    if (as.length) { console.log("ALLOWED SENDERS:"); as.forEach(e => console.log(`  ${e.pattern}${e.reason ? ` — ${e.reason}` : ""}`)); }
+    if (at.length) { console.log("ALLOWED TOPICS:"); at.forEach(e => console.log(`  ${e.pattern}${e.reason ? ` — ${e.reason}` : ""}`)); }
+  }
+
+} else {
+  console.log("Usage: spam-filter <command> [--sender <pattern>] [--topic <pattern>] [--reason <text>] [--scam] [--message <id>] [--json]");
+  console.log("\nCommands:");
+  console.log("  check     Check if a sender/topic matches the blocklist (exit 2=blocked, 0=pass; --json for machine output)");
+  console.log("  block     Add a sender or topic pattern to the blocklist");
+  console.log("            --scam: confirmed scam/phishing/junk; intake moves its mail to Gmail's Spam folder");
+  console.log("                    (without it the sender is only silenced: marked read, stays in the inbox)");
+  console.log("            --message <id>: also handle that email now (scam: move to Spam; plain: mark read)");
+  console.log("  allow     Add to allowlist (overrides blocklist)");
+  console.log("  unblock   Remove from blocklist");
+  console.log("  unallow   Remove from allowlist");
+  console.log("  list      Show all rules");
+  console.log("\nExamples:");
+  console.log('  spam-filter check --sender "marketing@spammer.com"');
+  console.log('  spam-filter block --sender "marketing@spammer.com" --reason "cold outreach"');
+  console.log('  spam-filter block --sender "@scamdomain.com" --reason "fake insurance offer" --scam --message 19abc...');
+  console.log('  spam-filter allow --sender "important@company.com"');
+  console.log("  spam-filter list");
+}

@@ -1,112 +1,97 @@
 #!/usr/bin/env node
-// Scan hum-ideas.jsonl for unconsumed ideas matching keyword(s) and mark them consumed.
-// Called when the user signals "already done/handled" or gives a skip/down reaction to a hum ping.
+// hum-reservoir-review — the user said a topic is handled (or skipped a ping
+// about it): retire the unconsumed reservoir ideas that are ABOUT that topic.
 //
-// Usage: hum-reservoir-review <keyword> [keyword2 ...] [--reason "text"] [--dry-run]
+// "About that topic" is decided by EMBEDDING similarity between the topic
+// phrase and each idea's subject (lib/hum-topic-match.mjs, local
+// nomic-embed-text) — not by keyword equality. The keyword version did
+// arithmetic on language (Rule #0b): it missed paraphrases, and on 2026-08-04
+// its substring predecessor consumed 49 unrelated ideas off "claim" inside
+// "acclaimed". Two guards replace it:
+//   - a similarity floor (HUM_TOPIC_SWEEP_THRESHOLD, default 0.80);
+//   - a breadth cap: a topic that would sweep more than HUM_TOPIC_SWEEP_MAX
+//     (default 6) ideas is refused as too broad — consume nothing, say so.
+// Embedder down → consume nothing (the safe direction for a destructive op).
 //
-// Exit codes:
-//   0 — success (0 or more consumed)
-//   2 — no keywords provided
+// The caller (a model) writes the topic phrase — it is the one reading what
+// the user meant. Positional words are still accepted for old call sites and
+// are simply joined into the phrase; nothing matches on them as words.
+//
+// Usage:
+//   hum-reservoir-review --topic "<short phrase naming the topic>" [--reason "text"] [--dry-run] [--json]
+//   hum-reservoir-review <word> [word ...] [--reason "text"] [--dry-run]     (legacy form)
+// Exit: 0 ok (0+ consumed) · 2 no topic · 3 refused (too broad / embedder down)
+// Env (tests): MERLIN_DATA_DIR, HUM_TOPIC_SWEEP_THRESHOLD, HUM_TOPIC_SWEEP_MAX.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { embed } from "../lib/hum-novelty.mjs";
+import { embedAll, ideaText, sweepMatches, SWEEP_THRESHOLD, SWEEP_MAX } from "../lib/hum-topic-match.mjs";
 
+import { installTools } from "../lib/root.cjs";
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
-const reasonIdx = args.indexOf("--reason");
-let customReason = null;
-if (reasonIdx !== -1) {
-  customReason = args[reasonIdx + 1];
+const asJson = args.includes("--json");
+const valueOf = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] ?? null : null; };
+const customReason = valueOf("--reason");
+const flagged = new Set(["--reason", "--topic"]);
+const positional = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && flagged.has(args[i - 1])));
+const topic = String(valueOf("--topic") || positional.join(" ")).trim();
+
+function out(obj, text) {
+  console.log(asJson ? JSON.stringify(obj) : text);
 }
 
-const keywords = args.filter((a, i) => {
-  if (a.startsWith("--")) return false;
-  if (i > 0 && args[i - 1] === "--reason") return false;
-  return true;
-});
-
-if (keywords.length === 0) {
-  console.error("usage: hum-reservoir-review <keyword> [keyword2 ...] [--reason text] [--dry-run]");
+if (!topic) {
+  console.error('usage: hum-reservoir-review --topic "<phrase>" [--reason text] [--dry-run] [--json]');
   process.exit(2);
 }
 
-const file = path.join(os.homedir(), "dev/merlin/data/hum-ideas.jsonl");
-
+const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const file = path.join(DIR, "hum-ideas.jsonl");
 if (!fs.existsSync(file)) {
-  console.log("0 matches (reservoir file not found)");
+  out({ topic, consumed: [], reason: "no reservoir" }, "0 matches (reservoir file not found)");
   process.exit(0);
 }
 
-const lines = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
-
-// Collapse by id — later records override earlier ones
 const byId = new Map();
-for (const line of lines) {
+for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+  if (!line.trim()) continue;
   try {
     const obj = JSON.parse(line);
-    if (!obj.id) continue;
-    const existing = byId.get(obj.id) || {};
-    byId.set(obj.id, { ...existing, ...obj });
-  } catch {
-    // skip malformed lines
-  }
+    if (obj.id) byId.set(obj.id, { ...(byId.get(obj.id) || {}), ...obj });
+  } catch { /* skip malformed lines */ }
+}
+const unconsumed = [...byId.values()].filter((i) => !i.consumed && !i.expired);
+
+const topicVec = await embed(topic);
+const { rows, available } = topicVec ? await embedAll(unconsumed.map((i) => ({ id: i.id, subject: i.subject, text: ideaText(i) }))) : { rows: [], available: false };
+if (!topicVec || !available) {
+  out({ topic, consumed: [], refused: "embedder unavailable" }, `refused: embedder unavailable — consumed nothing for "${topic}"`);
+  process.exit(3);
 }
 
-// Build search string for each idea — subject + rationale + category + why_now
-function searchText(idea) {
-  return [
-    idea.subject || "",
-    idea.rationale || "",
-    idea.category || "",
-    idea.why_now || "",
-    JSON.stringify(idea.supporting_data || {}),
-  ]
-    .join(" ")
-    .toLowerCase();
+const { matched, refused } = sweepMatches(topicVec, rows);
+if (refused) {
+  out({ topic, consumed: [], refused, candidates: matched.slice(0, 10) }, `refused: ${refused} — consumed nothing for "${topic}"`);
+  process.exit(3);
 }
-
-const lowerKeywords = keywords.map((k) => k.toLowerCase());
-
-function matches(idea) {
-  const text = searchText(idea);
-  return lowerKeywords.some((kw) => text.includes(kw));
-}
-
-const unconsumed = [...byId.values()].filter((idea) => !idea.consumed);
-const matched = unconsumed.filter(matches);
-
-if (matched.length === 0) {
-  console.log(`0 matches for keywords: ${keywords.join(", ")}`);
+if (!matched.length) {
+  out({ topic, consumed: [], threshold: SWEEP_THRESHOLD }, `0 matches for topic: ${topic}`);
   process.exit(0);
 }
 
+const list = matched.map((m) => `  ${m.id} — ${m.subject} (${m.sim.toFixed(3)})`).join("\n");
 if (dryRun) {
-  console.log(`[dry-run] would consume ${matched.length} idea(s):`);
-  for (const idea of matched) {
-    console.log(`  ${idea.id} — ${idea.subject}`);
-  }
+  out({ topic, would_consume: matched, dry_run: true }, `[dry-run] would consume ${matched.length} idea(s):\n${list}`);
   process.exit(0);
 }
 
 const now = new Date().toISOString();
-const reason = customReason || `feedback signal: ${keywords.join(", ")}`;
-
-const toAppend = matched
-  .map((idea) =>
-    JSON.stringify({
-      id: idea.id,
-      consumed: true,
-      consumed_at: now,
-      consumed_reason: reason,
-      ping_id: null,
-    })
-  )
-  .join("\n");
-
-fs.appendFileSync(file, "\n" + toAppend + "\n");
-
-console.log(`consumed ${matched.length} idea(s) matching [${keywords.join(", ")}]:`);
-for (const idea of matched) {
-  console.log(`  ${idea.id} — ${idea.subject}`);
-}
+const reason = customReason || `feedback signal: ${topic}`;
+const lead = fs.readFileSync(file, "utf8").endsWith("\n") ? "" : "\n"; // never glue onto an unterminated last line
+fs.appendFileSync(file, lead + matched.map((m) => JSON.stringify({
+  id: m.id, consumed: true, consumed_at: now, consumed_reason: reason, ping_id: null, review_sim: Number(m.sim.toFixed(3)),
+})).join("\n") + "\n");
+out({ topic, consumed: matched, max: SWEEP_MAX }, `consumed ${matched.length} idea(s) about "${topic}":\n${list}`);

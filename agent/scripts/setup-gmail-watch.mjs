@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-const path = require("node:path");
-const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/merlin");
-
 /**
  * Gmail Watch Setup — registers push notifications via Google Pub/Sub.
  * Run once to activate, then re-run every 7 days (Gmail watch expires).
@@ -10,7 +7,7 @@ const MERLIN_HOME = process.env.MERLIN_HOME || path.join(process.env.HOME, "Dev/
  *   1. gcloud CLI authenticated: gcloud auth application-default login
  *   2. Pub/Sub topic created: gcloud pubsub topics create gmail-new-messages
  *   3. Gmail API enabled in Google Cloud Console
- *   4. OAuth credentials saved to ${MERLIN_HOME}/credentials/gmail-oauth.json
+ *   4. OAuth credentials saved to ~/Dev/merlin/credentials/gmail-oauth.json
  *
  * Usage: node scripts/setup-gmail-watch.mjs
  */
@@ -19,14 +16,20 @@ import { google } from "googleapis";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const CREDS_PATH = join(ROOT, "..", "credentials", "gmail-oauth.json");
 const TOKEN_PATH = join(ROOT, "..", "data", "gmail-push-token.json");
 
-// UPDATE THIS to your Google Cloud project ID
-const PROJECT_ID = "${MERLIN_GCP_PROJECT}";
+// This installation's Google Cloud project (lib/instance.cjs gcp_project;
+// MERLIN_GCP_PROJECT overrides).
+const PROJECT_ID = createRequire(import.meta.url)("../../lib/instance.cjs").instanceValue("gcp_project");
+if (!PROJECT_ID) {
+  console.error("No GCP project configured: set gcp_project in agent/local/instance.json or MERLIN_GCP_PROJECT.");
+  process.exit(1);
+}
 const TOPIC_NAME = `projects/${PROJECT_ID}/topics/gmail-new-messages`;
 
 async function getAuthClient() {

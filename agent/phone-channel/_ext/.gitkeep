@@ -1,0 +1,7 @@
+# Installation hooks for the phone channel. Optional; fail-open.
+#
+# reply-hints.mjs   agent/phone-channel/index.mjs — typed-reply hints for your
+#   own card kinds: export const cardHints = { <kind>: (choices) => text }
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

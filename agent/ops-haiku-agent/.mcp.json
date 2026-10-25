@@ -1,0 +1,24 @@
+{
+  "_comment": "Project-scope MCP servers for the ops-haiku supervisor tier (cwd agent/ops-haiku-agent; CLAUDE.md is a symlink to ../ops-agent/CLAUDE.md, so every ops tier follows one rulebook). Chrome-less on purpose: only the ops tier loads chrome-devtools, and the router pins Chrome jobs (agent/config/chrome-jobs.json) to ops. No secrets here: ${VAR} placeholders are expanded from the environment, which process-manager.mjs loads from .env.",
+  "mcpServers": {
+    "tools": {
+      "command": "node",
+      "args": ["${MERLIN_HOME}/agent/tools-mcp/index.mjs"],
+      "env": {
+        "MERLIN_AGENT_ID": "ops-haiku"
+      },
+      "alwaysLoad": true
+    },
+    "supabase-merlin": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@supabase/mcp-server-supabase@latest",
+        "--project-ref=${MERLIN_SUPABASE_PROJECT}"
+      ],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"
+      }
+    }
+  }
+}

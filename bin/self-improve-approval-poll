@@ -1,0 +1,465 @@
+#!/usr/bin/env node
+// self-improve-approval-poll — DETERMINISTIC verifier for the unified self-improve
+// approval flow. Reads self_improve_approvals rows the app has SIGNED, verifies
+// the Face-ID/Enclave signature (core/app-approval) against the device's
+// registered public key, and applies the item exactly once. No LLM. Runs on a
+// short cron; exits cheaply when nothing is signed-and-pending.
+//
+// Also picks up `retry_requested` rows (a failed improvement must be
+// retryable) — set via the app's Retry button or
+// `bin/self-improve-retry <id>` on a row whose apply mechanically failed
+// (status `apply_failed`). A retry re-runs applyItem with NO new signature
+// check, because the item was already Face-ID'd once; see
+// core/self-improve-unified.mjs's decideRow for why that's safe.
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
+import { installRoot } from "../lib/root.cjs";
+const exec = promisify(execFile);
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+const EXT = path.join(ROOT, "agent/ext");
+
+const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
+const { writebackApprovalOutcome } = await import(path.join(ROOT, "lib/system-issue-writeback.mjs"));
+const { rebaseDrifted, isLegacyArchCard } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
+// The installation's rebuild queue for a card whose apply hit a conflict
+// (optional: without it the "ask me in chat to rebuild it" notice stands).
+const REBUILD_LIB = path.join(ROOT, "lib/self-improve-rebuild.mjs");
+const { queueCardRebuild } = fs.existsSync(REBUILD_LIB)
+  ? await import(REBUILD_LIB)
+  : { queueCardRebuild: () => ({ queued: false, reason: "no rebuild queue in this installation" }) };
+const SIC_STATE = path.join(ROOT, "data/system-issue-review-state.json");
+
+// ---- Supabase-backed stores (REST) ----------------------------------------
+const store = {
+  async listSignedPending() {
+    // `retry_requested` included so a user-initiated retry (app menu or
+    // `self-improve-retry <id>`) gets picked up on the next tick, same as a
+    // freshly-signed approval. `apply_failed`/`failed` are deliberately
+    // excluded — those sit until a retry is explicitly requested, never
+    // auto-retried. `skipped=is.false` keeps a card the user has decided against
+    // out of the batch entirely (decideRow guards it a second time for the
+    // sign-here-skip-there race).
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=*&signature=not.is.null&skipped=is.false&status=in.(pending,signed,approved,retry_requested)`, { headers: H });
+    return r.ok ? r.json() : [];
+  },
+  async listUnsignedPending() {
+    // For sweepExpired(): unsigned, unskipped cards still reading `pending`.
+    // The core decides which are past their TTL; this only narrows the fetch.
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=id,status,signature,skipped,expires_at,expires_at_ms&status=eq.pending&signature=is.null&skipped=is.false`, { headers: H });
+    return r.ok ? r.json() : [];
+  },
+  async updateApproval(id, patch) {
+    await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${id}`, { method: "PATCH", headers: H, body: JSON.stringify(patch) });
+  },
+  async getApproval(id) {
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?id=eq.${id}&select=*&limit=1`, { headers: H });
+    const d = r.ok ? await r.json() : []; return d[0] || null;
+  },
+};
+const deviceKeys = {
+  async getKey(deviceId) {
+    if (!deviceId) return null;
+    const r = await fetch(`${BASE}/rest/v1/approval_device_keys?device_id=eq.${encodeURIComponent(deviceId)}&select=public_key_raw&limit=1`, { headers: H });
+    const d = r.ok ? await r.json() : []; return d[0] || null;
+  },
+};
+
+// ---- apply an approved item (deterministic) --------------------------------
+function safeExt(name) {
+  if (!/^[a-z0-9][a-z0-9-]{1,48}$/.test(String(name || ""))) return null;
+  const p = path.resolve(EXT, name);
+  return p.startsWith(EXT + path.sep) ? p : null;
+}
+// Commits go through merlin-commit, the wrapper every agent/job in this repo
+// must use: it declares the manifest itself, so it satisfies
+// githooks/pre-commit by construction. A raw `git add` + `git commit`
+// in the shared clone is exactly what the hook refuses, and when this used to
+// do that the refusal was swallowed — the user got "Approved + applied" pings
+// for fixes that were never committed (and, for supervisor code, never took
+// effect).
+async function gitCommit(paths, msg) {
+  try {
+    await exec(path.join(ROOT, "bin/merlin-commit"), ["-m", msg, "--", ...paths], { cwd: ROOT });
+  } catch (e) {
+    return { error: (e.stderr || e.message || "").toString().trim() };
+  }
+  // A commit that only exists on this host is one `git checkout` from gone
+  // and invisible to every other clone. The 15-minute sync cron used to be
+  // the only thing that pushed, and it refused whenever another clone had
+  // pushed first, so approved fixes sat unpushed. merlin-sync now rebases
+  // and pushes on its own; run
+  // it here too so an approved fix reaches origin in seconds, not at the next
+  // tick. Best-effort: a sync failure is the cron's problem to report, not a
+  // reason to call the apply failed.
+  try {
+    await exec(path.join(ROOT, "bin/merlin-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
+  } catch (e) {
+    process.stderr.write(`[self-improve-approval-poll] committed but merlin-sync did not push: ${(e.stderr || e.message || "").toString().trim().slice(0, 300)}\n`);
+  }
+  return true;
+}
+
+// ---- pending-commit recovery ------------------------------------------------
+// The merlin-commit fix above made a failed commit VISIBLE. It never made it
+// RECOVERABLE. Detection fires one ping into the Improvements channel, the row
+// keeps `status:"applied"` and `result.ok:true`, and nothing retries or
+// re-raises it. Every downstream reader — cost-efficiency-review's state,
+// nightly-review's roundup, system-issue-review's writeback — then reads the
+// change as landed.
+//
+// That gap bit when two owner-signed cards were refused by merlin-commit
+// because a CONCURRENT session had left unrelated files staged in the shared
+// clone's index. The hook was right to refuse and those files were not ours to
+// sweep — but the condition is transient by construction, and any later retry
+// would have landed both. Days later they were still live-on-disk and absent
+// from HEAD, one `git checkout --` from silently reverting while every record
+// said APPLIED. It also cascades: the first card left its own file staged, and
+// that file then appeared inside the second card's refusal. One unrecovered
+// failure poisons the next card in the same batch.
+//
+// Recovery reconciles against the approvals table rather than a seed list, so it
+// picks up any such row in the window — including ones that failed before this
+// code existed.
+const UNCOMMITTED = path.join(ROOT, "data/self-improve-uncommitted.json");
+const RETRY_GIVE_UP_DAYS = 7;
+const RECONCILE_WINDOW_DAYS = 14;
+
+function readUncommitted() {
+  try { const j = JSON.parse(fs.readFileSync(UNCOMMITTED, "utf8")); return Array.isArray(j) ? j : []; }
+  catch { return []; }
+}
+function writeUncommitted(list) {
+  try {
+    fs.mkdirSync(path.dirname(UNCOMMITTED), { recursive: true });
+    fs.writeFileSync(UNCOMMITTED, JSON.stringify(list, null, 2) + "\n");
+  } catch (e) { console.error(`[si-approval] could not persist pending-commit queue: ${e?.message || e}`); }
+}
+
+// Every named file already matches HEAD → nothing left to commit (it may have
+// been landed by hand). Also true when a path no longer exists.
+async function alreadyClean(files) {
+  if (!Array.isArray(files) || !files.length) return true;
+  try { await exec("git", ["diff", "--quiet", "HEAD", "--", ...files], { cwd: ROOT }); return true; }
+  catch { return false; }
+}
+
+// Pull applied-but-uncommitted rows from the last RECONCILE_WINDOW_DAYS and add
+// any whose files are still dirty. Never throws — a Supabase hiccup must not
+// take the applier down, and the queue file alone still drives retries.
+async function reconcileUncommitted(list) {
+  try {
+    const since = new Date(Date.now() - RECONCILE_WINDOW_DAYS * 864e5).toISOString();
+    const r = await fetch(`${BASE}/rest/v1/self_improve_approvals?select=id,summary,result,applied_at&applied_at=gte.${since}`, { headers: H });
+    if (!r.ok) return list;
+    for (const row of await r.json()) {
+      const err = row?.result?.git?.error;
+      const files = row?.result?.files;
+      if (!err || !Array.isArray(files) || !files.length) continue;
+      if (list.some((e) => e.id === row.id)) continue;
+      if (await alreadyClean(files)) continue;
+      console.error(`[si-approval] reconciled uncommitted approval ${row.id} into the retry queue`);
+      list.push({
+        id: row.id, files,
+        msg: `self-improve: apply owner-approved fix (Face-ID) — ${row.summary || row.id}`,
+        first_failed_at: row.applied_at || new Date().toISOString(),
+        last_attempt_at: null, attempts: 0, last_error: String(err).slice(0, 400), last_escalated_at: null,
+      });
+    }
+  } catch (e) { console.error(`[si-approval] reconcile skipped: ${e?.message || e}`); }
+  return list;
+}
+
+// Runs on EVERY tick, ahead of the no-rows cheap exit: the blocking condition
+// clears at a moment that has nothing to do with a new approval arriving, and on
+// a quiet week there may be no new rows for days.
+async function drainUncommitted() {
+  let list = await reconcileUncommitted(readUncommitted());
+  if (!list.length) return;
+  const now = Date.now();
+  const keep = [];
+  for (const e of list) {
+    if (await alreadyClean(e.files)) { console.error(`[si-approval] pending commit ${e.id} already in HEAD — clearing`); continue; }
+    const g = await gitCommit(e.files, e.msg);
+    if (g === true) {
+      console.error(`[si-approval] committed on retry ${e.id} (attempt ${(e.attempts || 0) + 1})`);
+      await confirm(`✅ Committed on retry: ${e.files.join(", ")}. The commit that failed when this was approved has gone through — it is in git now, not just on disk.`);
+      continue;
+    }
+    e.attempts = (e.attempts || 0) + 1;
+    e.last_attempt_at = new Date().toISOString();
+    e.last_error = String(g?.error || "unknown").slice(0, 400);
+    // Escalate at most once per 24h, never inside the first 24h — this class of
+    // failure usually clears itself, and a same-day ping already went out.
+    const ageDays = (now - Date.parse(e.first_failed_at)) / 864e5;
+    const sinceEscH = e.last_escalated_at ? (now - Date.parse(e.last_escalated_at)) / 3.6e6 : Infinity;
+    const givingUp = ageDays >= RETRY_GIVE_UP_DAYS;
+    if (ageDays >= 1 && sinceEscH >= 24) {
+      e.last_escalated_at = new Date().toISOString();
+      await confirm(givingUp
+        ? `⚠️ ${e.files.join(", ")} has been live on disk but missing from git for ${ageDays.toFixed(1)} days. I have stopped retrying — it needs a commit by hand. Last error: ${e.last_error}`
+        : `⚠️ ${e.files.join(", ")} is still applied but not committed after ${ageDays.toFixed(1)} days. Still retrying each tick. Last error: ${e.last_error}`);
+    }
+    if (!givingUp) keep.push(e);
+    else console.error(`[si-approval] giving up on pending commit ${e.id} after ${RETRY_GIVE_UP_DAYS}d`);
+  }
+  writeUncommitted(keep);
+}
+// A staged file arrives as { path: content } — a shape with nowhere to carry a
+// mode bit — so fs.writeFileSync creates it 0644. That is right for a doc, a
+// JSON blob or an imported module, and silently wrong for an executable: a new
+// bin script shipped through a Face-ID card is born non-executable, and
+// any caller that runs it directly dies with EACCES (exit 126).
+//
+// This bit us twice on one file: a script created and then rewritten 100644
+// exited 126 instantly on every launch. The caller reported that as a lock
+// timeout, so the follow-up fix went chasing a phantom concurrent holder in a
+// script that could never execute, and a day's output was lost outright.
+//
+// fs.writeFileSync only applies a mode when it CREATES the file — an existing
+// file keeps the mode it already has — so this runs after every write, not just
+// the first, or a file born 0644 stays 0644 through every later approval.
+function ensureExecIfScript(fp, content) {
+  if (!/^#!/.test(String(content))) return;
+  try {
+    fs.chmodSync(fp, 0o755);
+  } catch {
+    // Best-effort: a mode we cannot set must never fail an approved apply.
+  }
+}
+
+async function applyItem(row) {
+  const item = row.item_json || {};
+  if (row.item_type === "new-capability") {
+    const dest = safeExt(item.name);
+    if (!dest || !item.files || typeof item.files !== "object") return { ok: false, error: "invalid capability payload" };
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.mkdirSync(dest, { recursive: true });
+    for (const [f, content] of Object.entries(item.files)) {
+      const fp = path.resolve(dest, f);
+      if (!fp.startsWith(dest + path.sep)) return { ok: false, error: `bad file path ${f}` };
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, String(content));
+      ensureExecIfScript(fp, content);
+    }
+    const g = await gitCommit([path.relative(ROOT, dest)], `self-improve: load owner-approved capability '${item.name}' (Face-ID)`);
+    return { ok: true, loaded: item.name, git: g === true ? "committed" : g, note: "callable as mcp__tools__* on next session refresh" };
+  }
+  if (row.item_type === "code-fix") {
+    // item.files = { repo-relative-path: content }. Confined to the repo.
+    // Guard: a code-fix request whose --files-json omitted
+    // `files` used to fall through to an empty rels=[] and a doomed gitCommit
+    // call, but still returned ok:true with files:[] — the user got an
+    // "Approved + applied" confirmation for a fix that wrote nothing at all.
+    const files = item.files || {};
+    if (!files || typeof files !== "object" || Object.keys(files).length === 0) {
+      return { ok: false, error: "code-fix item_json has no files — nothing to write" };
+    }
+    // STALE-BASE CHECK — see the long note in self-improve-request.
+    // item.base_sha256[rel] is the hash the file had when this card was AUTHORED.
+    // If the file has since changed to something that is neither that snapshot nor
+    // what this card writes, then applying the card would revert somebody else's
+    // landed change — which is how one approval once reverted the three criteria
+    // another approval had just applied to a Jev question file.
+    //
+    // Refuse instead. The user signed this, so silence is not an option: returning
+    // ok:false routes to the `o.result?.error` branch in main(), which logs and
+    // posts "⚠️ Approved but apply FAILED" to the Improvements channel, and the
+    // authoring job re-files against current content. Reverting the user's own approved
+    // work while reporting success is strictly worse than an apply the user is told about.
+    //
+    // Two deliberate exemptions:
+    //   - no base_sha256 at all (a card filed before this guard, or one that only
+    //     creates new files) → no check, exactly as before;
+    //   - on-disk content already EQUALS what this card writes → already applied.
+    //     The retry path (a write that succeeded, a commit that failed, then
+    //     reconcileUncommitted re-running applyItem) lands here every time, and
+    //     it must stay idempotent.
+    //
+    // Checked for EVERY file before ANY is written — a multi-file card that
+    // half-applied would be a worse outcome than the drift it is guarding against.
+    const base = item.base_sha256 || null;
+    const drifted = [];
+    if (base && typeof base === "object") {
+      const sha = (buf) => createHash("sha256").update(buf).digest("hex");
+      for (const [rel, want] of Object.entries(base)) {
+        if (!(rel in files)) continue;
+        const fp = path.resolve(ROOT, rel);
+        if (!fp.startsWith(ROOT + path.sep)) continue;       // rejected by the loop below
+        let onDisk;
+        try { onDisk = fs.readFileSync(fp); } catch { onDisk = null; }
+        if (onDisk === null) {
+          return { ok: false, conflict: true, error: `${rel} no longer exists — it did when this card was authored, so its new content cannot be trusted. Nothing was written.` };
+        }
+        const now = sha(onDisk);
+        if (now === want) continue;                                      // unchanged since authoring
+        if (now === sha(Buffer.from(String(files[rel])))) continue;       // already applied (retry)
+        drifted.push({ rel, want, current: onDisk, card: files[rel] });
+      }
+    }
+    // A card with no recorded base that still carries the pre-2026-10-24
+    // "## Recent changes" section of architecture.md (now system/changelog.md)
+    // would paste the whole old changelog back into the map. Only a card with a
+    // base can be split safely (rebaseDrifted); this one is refused as a conflict
+    // so it is rebuilt once on the current tree.
+    for (const [rel, content] of Object.entries(files)) {
+      if (base && typeof base === "object" && rel in base) continue;
+      let onDisk = null;
+      try { onDisk = fs.readFileSync(path.resolve(ROOT, rel)); } catch {}
+      if (onDisk && isLegacyArchCard(rel, onDisk, content)) {
+        return { ok: false, conflict: true, error: `${rel} in this card still holds the old changelog section, which now lives in system/changelog.md, and the card has no recorded base to split it against. Nothing was written.` };
+      }
+    }
+    // Drifted files are carried over by a 3-way merge (current, authored base,
+    // card) instead of refused outright — see lib/self-improve-rebase.mjs
+    // for the card that motivated it. A conflict, or a base no longer in
+    // git history, still refuses before anything is written.
+    let writes = files, rebased = [];
+    if (drifted.length) {
+      const rb = await rebaseDrifted(ROOT, drifted);
+      // `conflict: true` is what main() reads to rebuild the card once on the
+      // current tree (lib/self-improve-rebuild.mjs) instead of leaving it dead.
+      if (!rb.ok) return { ok: false, conflict: true, error: rb.error };
+      writes = { ...files, ...rb.merged };
+      rebased = Object.keys(rb.merged);
+    }
+    const rels = [];
+    for (const [rel, content] of Object.entries(writes)) {
+      const fp = path.resolve(ROOT, rel);
+      if (!fp.startsWith(ROOT + path.sep)) return { ok: false, error: `bad path ${rel}` };
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, Buffer.isBuffer(content) ? content : String(content));
+      ensureExecIfScript(fp, String(content));
+      rels.push(rel);
+    }
+    const g = await gitCommit(rels, `self-improve: apply owner-approved fix (Face-ID) — ${row.summary || row.id}`);
+    return { ok: true, files: rels, ...(rebased.length ? { rebased } : {}), git: g === true ? "committed" : g };
+  }
+  return { ok: false, error: `unknown item_type ${row.item_type}` };
+}
+
+// confirm to the user in the Improvements channel
+async function confirm(text) {
+  try { await exec(path.join(ROOT, "bin/merlin-send-curl"), ["--channel", "improvements", "--skip-precheck", text], { timeout: 15000 }); } catch {}
+}
+
+const u = createUnifiedApproval({ store, deviceKeys, postSuggestion: null, applyItem });
+
+async function main() {
+  if (!K) { console.error("[si-approval] no service key"); return; }
+  // Ahead of the cheap exit: a stuck commit is independent of whether anything
+  // new is signed and pending.
+  await drainUncommitted();
+  // Also ahead of the cheap exit: an unsigned card expires on the clock, not
+  // on any new signature. Without this an unsigned card read `pending` forever
+  // and jammed improvement-plan's card cap.
+  // Silent — an expired card is the user's silence playing out, not a failure.
+  try {
+    const swept = await u.sweepExpired();
+    if (swept.length) console.error(`[si-approval] expired ${swept.length} unsigned card(s) past their 24h window: ${swept.join(", ")}`);
+  } catch (e) { console.error(`[si-approval] expiry sweep skipped: ${e?.message || e}`); }
+  const rows = await store.listSignedPending();
+  if (!Array.isArray(rows) || !rows.length) return;   // cheap exit
+  const out = await u.processSigned();
+  const titleOf = Object.fromEntries(rows.map((r) => [r.id, r.summary || r.id]));
+  const rowById = Object.fromEntries(rows.map((r) => [r.id, r]));
+  for (const o of out) {
+    const retried = !!o.retried;
+    if (o.ok) {
+      const label = o.result?.loaded || o.result?.files?.join(", ") || o.id;
+      const gitErr = o.result?.git && o.result.git !== "committed" ? o.result.git.error : null;
+      if (gitErr) {
+        // Files were written to disk but the commit failed — do NOT report a
+        // plain success. This branch exists because that exact silent gap
+        // (files landed, commit threw, still confirmed as "applied") is what
+        // once let several owner-approved fixes sit uncommitted/unrestarted
+        // for up to a day before anyone noticed.
+        console.error(`[si-approval] applied-but-uncommitted ${o.id}: ${gitErr}`);
+        // Nothing to enqueue here by hand — reconcileUncommitted() picks this
+        // row up from the approvals table on the next tick and retries it.
+        await confirm(`⚠️ Applied but NOT committed: ${label}. The files are on disk but the commit failed (${gitErr}). I will keep retrying, and say something again if it is still stuck tomorrow.`);
+      } else {
+        console.error(`[si-approval] applied ${o.id}${retried ? " (retry)" : ""}`);
+        await confirm(`✅ ${retried ? "Retried and applied" : "Approved + applied"}: ${label}. ${o.result?.note || ""}`);
+      }
+    }
+    // `expired` and `skipped` are the user's own decisions playing out, not
+    // failures — they get a log line, never a channel ping.
+    else if (o.reason && o.reason !== "expired" && o.reason !== "skipped") { console.error(`[si-approval] ${o.id} rejected: ${o.reason}`); await confirm(`⚠️ Approval rejected (${o.reason}) for ${o.id}.`); }
+    else if (o.result?.error) {
+      // Signature verified fine but applyItem itself failed (bad payload,
+      // invalid path, etc.) — decideRow has no `reason` for this case, only
+      // result.error, so without this branch it fell through both checks
+      // above and was never reported at all (exactly what happened to the
+      // early approvals whose item_json had no `files`).
+      console.error(`[si-approval] ${o.id} apply failed: ${o.result.error}`);
+      // Named by its title and says what to do: this notice used to read
+      // "apply FAILED for <uuid>…: <file> changed on disk (base <sha>…)".
+      // Nothing in it said which feature it was or that the feature had not
+      // shipped, and the user only found out from the next morning's brief.
+      const title = titleOf[o.id] || o.id;
+      if (o.result.stale) {
+        // The signing-time truth check (core/self-improve-unified.mjs decideRow)
+        // found the card's finding no longer true. Nothing was written. Retry is
+        // the user's override: it re-runs the apply without asking the check again.
+        await confirm(`⚠️ You approved "${title}", but before applying it I checked again and it no longer looks true: ${o.result.error} Nothing was changed. If you still want it, tap Retry on the card.`);
+      } else if (o.result.conflict) {
+        // "Refuse and redo": a card that failed because its
+        // files moved on is rebuilt once on the current code, as a fresh card,
+        // instead of waiting for the user to ask (a card that died here once
+        // let the same problem reach the user again eleven days later).
+        const rb = queueCardRebuild({ root: ROOT, row: rowById[o.id] || { id: o.id }, error: o.result.error });
+        if (rb.queued) console.error(`[si-approval] ${o.id} queued for rebuild as build request ${rb.requestId}`);
+        else console.error(`[si-approval] ${o.id} not rebuilt: ${rb.reason}`);
+        await confirm(rb.queued
+          ? `⚠️ You approved "${title}", but the code it changes moved on before it could go in, so nothing was written. I'm rebuilding it on the current code now; it will come back as a fresh card for your Face ID.`
+          : `⚠️ ${retried ? `I retried "${title}" and it still didn't go in` : `You approved "${title}", but it didn't go in`}: ${o.result.error} ${rb.already ? "It has already been rebuilt once, so ask me in chat if you want another try." : "Ask me in chat to rebuild it on the current code."}`);
+      } else {
+        await confirm(retried
+          ? `⚠️ I retried "${title}" and it still didn't go in: ${o.result.error} Ask me in chat to rebuild it on the current code.`
+          : `⚠️ You approved "${title}", but it didn't go in: ${o.result.error} Ask me in chat to rebuild it on the current code.`);
+      }
+    }
+
+    // ── Bookkeeping ──────────────────────────────────────────────────────────
+    // Deliberately LAST in the iteration: the fix and the confirmation have
+    // already happened by this point, so nothing here can prevent either. This
+    // records an outcome that already occurred — it closes the loop back to
+    // system-issue-review's cluster, which otherwise stays `awaiting_approval`
+    // forever (Step 2d only closes `verifying`, Step 3 skips
+    // `awaiting_approval` by CRITICAL RULE 8), so no verification window ever
+    // opens and the issue goes invisible to both lanes. Three approvals stalled
+    // that way in Aug 2026 and had to be reconciled by hand.
+    //
+    // writebackApprovalOutcome never throws; the try/catch is belt-and-braces
+    // so a future edit to it still cannot take the applier down.
+    try {
+      const wbOutcome = o.ok ? "applied" : (o.reason === "skipped" ? "skipped" : null);
+      if (wbOutcome) {
+        // No commit sha is available here — gitCommit() reports "committed",
+        // not a rev — so only what actually exists is recorded.
+        const wb = writebackApprovalOutcome(SIC_STATE, o.id, wbOutcome, new Date().toISOString(), {
+          files: Array.isArray(o.result?.files) ? o.result.files : undefined,
+        });
+        if (wb.changed) console.error(`[si-approval] writeback ${o.id}: ${wb.cluster_id} ${wb.from} → ${wb.to}`);
+        else if (wb.reason && wb.reason !== "no-matching-cluster") {
+          console.error(`[si-approval] writeback ${o.id} no-op: ${wb.reason}${wb.error ? ` (${wb.error})` : ""}`);
+        }
+      }
+    } catch (e) {
+      console.error(`[si-approval] writeback ${o.id} threw: ${e?.message || e}`);
+    }
+  }
+}
+await main();

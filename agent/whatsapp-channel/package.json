@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp-channel",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs",
+    "pair": "node index.mjs --pair"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "github:poison/Baileys#fix/pairing-code-regression-upstream",
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

@@ -1,0 +1,328 @@
+#!/usr/bin/env node
+// wiki-recall-eval — A/B recall measurement for the wiki retrieval stack.
+//
+// The unit tests prove the plumbing works. They cannot prove recall got BETTER,
+// because a fixture corpus has none of the properties that make recall hard —
+// no hubs, no many-topic pages, no vocabulary the agent has never seen. This
+// harness runs a fixed query set against the REAL corpus and reports hit@k and
+// MRR for each retrieval configuration, so a change to the stack has to earn
+// its default rather than merely be argued for.
+//
+// It is the measurement the 2026-08-09 cue-anchor + link-expansion work was
+// gated on: if `+links` does not beat `+cues`, expansion ships default-off.
+//
+// Configurations (each is a fresh module import with different env, because the
+// tuning constants are read at load time):
+//   fts          pure BM25 — the floor
+//   hybrid       BM25 + whole-page KNN, fused by RRF (the pre-2026-08-09 stack)
+//   +cues        ... plus structural cue anchors (the current default)
+//   +triggers    ... plus trigger cues (WIKI_USE_TRIGGERS=1)
+//   +facts       ... plus typed fact sentences as entry points (WIKI_USE_FACTS=1)
+//   +all         ... triggers + facts + spreading activation together
+//   +assoc       ... plus spreading-activation association (WIKI_ASSOC=sa)
+//   +assoc-ppr   ... plus personalized-PageRank association (WIKI_ASSOC=ppr)
+//   +assoc+prior ... spreading activation plus the base-level activation prior
+//   episode      episode_search as it is: FTS scoped to day pages
+//   episode+assoc  episode_search associate:true (day FTS + context reinstatement)
+// The retired 2026-08-09 one-hop expansion (`+links`) is gone; WIKI_EXPAND_LINKS
+// now maps to +assoc.
+//
+// Usage:
+//   wiki-recall-eval [--set <file>|assoc] [-k N] [--json] [--config <name>[,<name>]]
+//   wiki-recall-eval --queries            # list the eval set
+//
+// Two eval sets:
+//   data/wiki-recall-eval.json        the single-answer set (27 cases, v2)
+//   data/wiki-recall-eval-assoc.json  the ASSOCIATIVE set (--set assoc),
+//                                           written by bin/wiki-recall-eval-gen
+//
+// A case:
+//   { "query": "...", "expect": ["page_id", ...], "why": "what it probes",
+//     "gold": ["a", "b", "c"], "final": "c", "class": "...", "type": "day",
+//     "after": "YYYY-MM-DD", "before": "YYYY-MM-DD" }
+// `expect` is a HAND-CHECKED answer key — a query counts as a hit when ANY
+// expected page appears in the top k. Keep it small and unambiguous; a fuzzy
+// key measures nothing.
+//
+// `gold` (optional) is the SET of pages an associative answer needs, and the
+// metrics that can see association use it (LongMemEval's definitions):
+//   recall_all@k   1 only if EVERY gold page is in the top k
+//   coverage@k     the fraction of gold pages in the top k
+//   nDCG@k         binary relevance over the gold set
+//   final@k        is `final` — the hop the query's words do not reach — in the
+//                  top k. This is where association's benefit shows up, if it
+//                  shows up at all.
+// A single-answer eval cannot register "brings up all associated memories":
+// returning the associated pages scores the same as not returning them. That
+// is the fourth reason the 2026-08-09 expansion measured zero.
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { localLlmEmbedCached } from "../lib/local-llm.mjs";
+import { performance } from "node:perf_hooks";
+import { installRoot } from "../lib/root.cjs";
+
+const HOME = os.homedir();
+const ROOT = installRoot();
+const DEFAULT_SET = path.join(ROOT, "data/wiki-recall-eval.json");
+const ASSOC_SET = path.join(ROOT, "data/wiki-recall-eval-assoc.json");
+
+function parseFlags(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--json") out.json = true;
+    else if (a === "--queries") out.queries = true;
+    else if (a === "-k" || a === "--top") out.k = Number(argv[++i]);
+    else if (a === "--set") out.set = argv[++i];
+    else if (a === "--config") out.config = argv[++i];
+    else if (a === "--match") out.match = argv[++i];
+    else out._.push(a);
+  }
+  return out;
+}
+
+const flags = parseFlags(process.argv.slice(2));
+const K = flags.k || 5;
+const setPath = flags.set === "assoc" ? ASSOC_SET : flags.set || DEFAULT_SET;
+// Production defaults to "and" (wiki-store.searchPages, and unified-recall's
+// wikiMatch). "or" is the honest setting for sentence-shaped queries, but the
+// gap between them IS a finding, so it is a flag rather than a constant.
+const MATCH = flags.match || "or";
+
+if (!fs.existsSync(setPath)) {
+  console.error(`wiki-recall-eval: no eval set at ${setPath}`);
+  if (setPath === ASSOC_SET) console.error("  generate it first: bin/wiki-recall-eval-gen --n 60 (see its header)");
+  process.exit(1);
+}
+const RAW = JSON.parse(fs.readFileSync(setPath, "utf8"));
+// The associative set is { cases: [...] } (it carries generation metadata);
+// the original set is a bare array.
+const CASES = (Array.isArray(RAW) ? RAW : RAW.cases || []).map((c) => ({
+  ...c,
+  expect: Array.isArray(c.expect) && c.expect.length ? c.expect : c.final ? [c.final] : c.gold || [],
+}));
+
+if (flags.queries) {
+  for (const c of CASES) console.log(`${c.query}\n   → ${c.expect.join(", ")}${c.why ? `   (${c.why})` : ""}`);
+  process.exit(0);
+}
+
+// Each config is (env overrides, mode). Applied before a fresh import so the
+// module-level constants pick them up.
+const OFF = { WIKI_EXPAND_LINKS: "0", WIKI_ASSOC: "off", WIKI_PRIOR: "0", WIKI_USE_TRIGGERS: "0", WIKI_USE_FACTS: "0" };
+const CONFIGS = [
+  { name: "fts", env: {}, mode: "fts" },
+  { name: "hybrid", env: { ...OFF, WIKI_USE_CUES: "0" }, mode: "hybrid" },
+  { name: "+cues", env: { ...OFF, WIKI_USE_CUES: "1" }, mode: "hybrid" },
+  { name: "+triggers", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_USE_TRIGGERS: "1" }, mode: "hybrid" },
+  { name: "+facts", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_USE_FACTS: "1" }, mode: "hybrid" },
+  { name: "+all", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_USE_TRIGGERS: "1", WIKI_USE_FACTS: "1", WIKI_ASSOC: "sa" }, mode: "hybrid" },
+  { name: "+assoc", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_ASSOC: "sa" }, mode: "hybrid" },
+  { name: "+assoc-ppr", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_ASSOC: "ppr" }, mode: "hybrid" },
+  { name: "+assoc+prior", env: { ...OFF, WIKI_USE_CUES: "1", WIKI_ASSOC: "sa", WIKI_PRIOR: "1" }, mode: "hybrid" },
+  { name: "episode", env: {}, mode: "episode" },
+  { name: "episode+assoc", env: {}, mode: "episode-assoc" },
+];
+// The episode configs only make sense on day-page questions, so they run by
+// default only when asked for, or on the associative set (which has them).
+const DEFAULT_CONFIGS = ["fts", "hybrid", "+cues", "+triggers", "+facts", "+assoc", "+assoc-ppr", "+all"];
+const wanted = new Set(flags.config ? flags.config.split(",") : DEFAULT_CONFIGS);
+const configs = CONFIGS.filter((c) => wanted.has(c.name));
+
+async function runConfig(cfg) {
+  for (const [k, v] of Object.entries(cfg.env)) process.env[k] = v;
+  // Cache-busted import: the constants are read at module scope.
+  const mod = await import(
+    path.resolve(ROOT, "lib/wiki-embed.mjs") + `?cfg=${cfg.name}&t=${Date.now()}`
+  );
+  const ws = (await import("node:module")).createRequire(import.meta.url)(
+    path.resolve(ROOT, "lib/wiki-store.js"),
+  );
+
+  const rows = [];
+  const latencies = [];
+  for (const c of CASES) {
+    let hits = [];
+    const t0 = performance.now();
+    try {
+      if (cfg.mode === "fts") {
+        // Sentence-shaped queries need OR, or the AND-matched FTS half returns
+        // nothing at all and the "floor" would be an artificially easy zero.
+        hits = ws.searchPages(c.query, { mode: "fts", limit: K, match: MATCH, type: c.type || null });
+      } else if (cfg.mode === "episode") {
+        hits = ws.searchPages(c.query, { mode: "fts", limit: K, type: "day" });
+      } else if (cfg.mode === "episode-assoc") {
+        hits = mod.searchDaysAssociative(c.query, { limit: K, after: c.after || null, before: c.before || null });
+      } else {
+        hits = await mod.searchPagesHybrid(c.query, {
+          limit: K,
+          embedQuery: (t) => localLlmEmbedCached(t),
+          match: MATCH,
+          type: c.type || null,
+          after: c.after || null,
+          before: c.before || null,
+        });
+      }
+    } catch (e) {
+      rows.push({ query: c.query, rank: null, error: e.message, top: [] });
+      continue;
+    }
+    latencies.push(performance.now() - t0);
+    const ids = hits.map((h) => h.id);
+    const idx = ids.findIndex((id) => c.expect.includes(id));
+    const gold = Array.isArray(c.gold) && c.gold.length ? c.gold : null;
+    rows.push({
+      query: c.query,
+      expect: c.expect,
+      rank: idx === -1 ? null : idx + 1,
+      top: ids,
+      // Provenance of the winning row — how the hit was actually reached.
+      how: idx === -1 ? null : hits[idx].matched || cfg.mode,
+      cue: idx === -1 ? null : hits[idx].cue || null,
+      linked_from: idx === -1 ? null : hits[idx].expanded_from || null,
+      ...(gold ? setMetrics(ids, gold, c.final) : {}),
+    });
+  }
+  try { mod._closeForTest?.(); } catch {}
+  for (const k of Object.keys(cfg.env)) delete process.env[k];
+
+  const hit = rows.filter((r) => r.rank != null).length;
+  const mrr = rows.reduce((a, r) => a + (r.rank ? 1 / r.rank : 0), 0) / rows.length;
+  const goldRows = rows.filter((r) => r.recall_all != null);
+  const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+  const pct = (p) => {
+    const xs = [...latencies].sort((a, b) => a - b);
+    return xs.length ? xs[Math.min(xs.length - 1, Math.floor(p * xs.length))] : null;
+  };
+  const assocMetrics = goldRows.length
+    ? {
+        n_gold: goldRows.length,
+        recall_all: mean(goldRows.map((r) => r.recall_all)),
+        coverage: mean(goldRows.map((r) => r.coverage)),
+        ndcg: mean(goldRows.map((r) => r.ndcg)),
+        final: mean(goldRows.filter((r) => r.final != null).map((r) => r.final)),
+      }
+    : null;
+
+  // Per-class, because the classes measure different things and a single
+  // average hides exactly the effect this harness exists to find: the curated
+  // pages were already well-served, so a change that only helps the long
+  // episodic pages shows up as a shrug in the aggregate.
+  const byClass = {};
+  for (const [i, c] of CASES.entries()) {
+    const k = c.class || "unclassified";
+    (byClass[k] = byClass[k] || []).push(rows[i]);
+  }
+  const classes = Object.fromEntries(
+    Object.entries(byClass).map(([k, rs]) => [
+      k,
+      {
+        n: rs.length,
+        hitRate: rs.filter((r) => r.rank != null).length / rs.length,
+        mrr: rs.reduce((a, r) => a + (r.rank ? 1 / r.rank : 0), 0) / rs.length,
+        recall_all: mean(rs.filter((r) => r.recall_all != null).map((r) => r.recall_all)),
+        final: mean(rs.filter((r) => r.final != null).map((r) => r.final)),
+      },
+    ]),
+  );
+  return {
+    name: cfg.name, rows, hitRate: hit / rows.length, mrr, classes, assoc: assocMetrics,
+    latency_ms: { p50: pct(0.5), p95: pct(0.95) },
+  };
+}
+
+// Set-recall metrics for one query against its gold set (LongMemEval's
+// recall_all / ndcg_any definitions, plus final-hop recall).
+function setMetrics(ids, gold, final) {
+  const g = new Set(gold);
+  const found = ids.filter((id) => g.has(id));
+  let dcg = 0;
+  ids.forEach((id, i) => { if (g.has(id)) dcg += 1 / Math.log2(i + 2); });
+  let idcg = 0;
+  for (let i = 0; i < Math.min(g.size, ids.length || K); i++) idcg += 1 / Math.log2(i + 2);
+  return {
+    recall_all: gold.every((id) => ids.includes(id)) ? 1 : 0,
+    coverage: new Set(found).size / g.size,
+    ndcg: idcg ? dcg / idcg : 0,
+    final: final ? (ids.includes(final) ? 1 : 0) : null,
+  };
+}
+
+const results = [];
+for (const cfg of configs) results.push(await runConfig(cfg));
+
+if (flags.json) {
+  console.log(JSON.stringify({ k: K, cases: CASES.length, results }, null, 2));
+  process.exit(0);
+}
+
+// Per-query rank across configs — the column that shows WHERE a config helps.
+const w = Math.max(...CASES.map((c) => c.query.length), 20);
+const CW = Math.max(8, ...results.map((r) => r.name.length + 2));
+console.log(`\n${"query".padEnd(w)}  ${results.map((r) => r.name.padStart(CW)).join("")}`);
+console.log("-".repeat(w + results.length * CW + 2));
+CASES.forEach((c, i) => {
+  const cells = results
+    .map((r) => {
+      const rank = r.rows[i].rank;
+      return (rank == null ? "—" : `#${rank}`).padStart(CW);
+    })
+    .join("");
+  console.log(`${c.query.padEnd(w)}  ${cells}`);
+});
+
+console.log("-".repeat(w + results.length * CW + 2));
+console.log(
+  `${`hit@${K}`.padEnd(w)}  ${results.map((r) => `${(r.hitRate * 100).toFixed(0)}%`.padStart(CW)).join("")}`,
+);
+console.log(
+  `${"MRR".padEnd(w)}  ${results.map((r) => r.mrr.toFixed(3).padStart(CW)).join("")}`,
+);
+const fmt = (x) => (x == null ? "—" : `${(x * 100).toFixed(0)}%`).padStart(CW);
+if (results.some((r) => r.assoc)) {
+  const n = results.find((r) => r.assoc).assoc.n_gold;
+  console.log(`${`recall_all@${K} (${n} with gold)`.padEnd(w)}  ${results.map((r) => fmt(r.assoc?.recall_all)).join("")}`);
+  console.log(`${`coverage@${K}`.padEnd(w)}  ${results.map((r) => fmt(r.assoc?.coverage)).join("")}`);
+  console.log(`${`nDCG@${K}`.padEnd(w)}  ${results.map((r) => (r.assoc?.ndcg == null ? "—" : r.assoc.ndcg.toFixed(3)).padStart(CW)).join("")}`);
+  console.log(`${`final-hop@${K}`.padEnd(w)}  ${results.map((r) => fmt(r.assoc?.final)).join("")}`);
+}
+console.log(
+  `${"latency p50 / p95 ms".padEnd(w)}  ${results.map((r) => `${Math.round(r.latency_ms.p50 ?? 0)}/${Math.round(r.latency_ms.p95 ?? 0)}`.padStart(CW)).join("")}`,
+);
+
+const classNames = [...new Set(CASES.map((c) => c.class || "unclassified"))];
+if (classNames.length > 1) {
+  console.log();
+  for (const cn of classNames) {
+    const n = results[0].classes[cn].n;
+    console.log(
+      `${`hit@${K} · ${cn} (${n})`.padEnd(w)}  ` +
+        results.map((r) => `${(r.classes[cn].hitRate * 100).toFixed(0)}%`.padStart(CW)).join(""),
+    );
+  }
+}
+
+// What each association config gained over its baseline, and how — the actual
+// decision input. On a gold set the comparison is recall_all (did it bring up
+// EVERYTHING), otherwise any-hit.
+const byName = new Map(results.map((r) => [r.name, r]));
+const PAIRS = [
+  ["+cues", "+triggers"], ["+cues", "+facts"], ["+cues", "+assoc"], ["+cues", "+assoc-ppr"],
+  ["+cues", "+assoc+prior"], ["+cues", "+all"], ["episode", "episode+assoc"],
+];
+const won = (r) => (r.recall_all != null ? r.recall_all === 1 : r.rank != null);
+for (const [baseName, name] of PAIRS) {
+  const prev = byName.get(baseName);
+  const last = byName.get(name);
+  if (!prev || !last) continue;
+  const gained = last.rows.filter((r, i) => won(r) && !won(prev.rows[i]));
+  const lost = last.rows.filter((r, i) => !won(r) && won(prev.rows[i]));
+  console.log(`\n${last.name} vs ${prev.name}: +${gained.length} recovered, -${lost.length} lost`);
+  for (const g of gained) {
+    const how = g.linked_from ? `linked from ${g.linked_from}` : g.cue ? `cue "${g.cue}"` : g.how;
+    console.log(`  + "${g.query}" → #${g.rank} (${how})`);
+  }
+  for (const l of lost) console.log(`  - "${l.query}" (was found, now missing)`);
+}

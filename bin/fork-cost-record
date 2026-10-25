@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+// fork-cost-record — turn one `claude -p --output-format json` run into (a) a
+// cost-ledger row and (b) the run's plain text on stdout.
+//
+// Usage: fork-cost-record <job-name> <json-output-file> [--model <id>]
+//
+// Called by agent/scripts/lib/run-ephemeral-opus.sh and any trigger
+// with its own `claude -p` line, after that run exits. Those
+// scripts used to capture the run's TEXT, which carries no usage; they now
+// capture the JSON envelope, and this prints its `result` text so their
+// auth/empty guards and logs see exactly what they saw before.
+//
+// Never fails the job: unparseable output (a crash, an auth error printed as
+// plain text, an empty file) is passed through to stdout unchanged and no row
+// is written. Always exits 0. Ledger: lib/fork-cost-ledger.cjs.
+
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { recordForkCost } = require(path.join(__dirname, "../lib/fork-cost-ledger.cjs"));
+
+const args = process.argv.slice(2);
+const mi = args.indexOf("--model");
+const model = mi >= 0 ? args[mi + 1] : null;
+const [job, file] = args.filter((_, i) => mi < 0 || (i !== mi && i !== mi + 1));
+
+if (!job || !file) {
+  process.stderr.write("usage: fork-cost-record <job-name> <json-output-file> [--model <id>]\n");
+  process.exit(0);
+}
+
+let raw = "";
+try { raw = fs.readFileSync(file, "utf8"); } catch { process.exit(0); }
+
+let obj = null;
+try { obj = JSON.parse(raw.trim()); } catch { obj = null; }
+if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+  process.stdout.write(raw);
+  process.exit(0);
+}
+
+recordForkCost({ job, result: obj, model });
+const text = typeof obj.result === "string" ? obj.result : "";
+process.stdout.write(text && !text.endsWith("\n") ? `${text}\n` : text);

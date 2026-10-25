@@ -1,0 +1,655 @@
+#!/usr/bin/env node
+// hum-sense — the always-on situational trigger engine behind hum.
+//
+//   sensors → events → gate → dispatch
+//
+// Runs the sensor registry (data/hum-sensors.json) on their own
+// intervals, drains events pushed in by other processes, and asks the gate
+// (lib/hum-events.mjs) whether this moment justifies waking the hum
+// agent. Most ticks do nothing at all and cost nothing — no subprocess, no
+// agent turn, no tokens.
+//
+// Usage:
+//   hum-sense daemon                     run the engine (launchd: ai.claude.hum-sense)
+//   hum-sense once [--dispatch]          one full pass; prints the verdict as JSON
+//   hum-sense once --sensor <name>       run one sensor and print what it detects
+//   hum-sense emit '<json>'              inject an event (push sources, testing)
+//   hum-sense emit --type X --summary Y [--salience N] [--lanes a,b]
+//   hum-sense status [--json]            heartbeat, gate state, recent verdicts
+//   hum-sense sensors                    registry + last run / last error per sensor
+//   hum-sense log [--since H]            joined timeline: events → dispatch → what hum DID
+//   hum-sense tail [-n N]                raw event-ledger rows
+//
+// Design notes worth knowing before changing anything here:
+//   * The gate is pure and lives in the lib; this file is the impure shell
+//     around it (clock, files, subprocesses, network). Keep it that way — the
+//     gate is the part with tests.
+//   * A sensor that throws, hangs, or returns garbage is isolated: it is
+//     recorded as an error and every other sensor still runs. A blind sensor
+//     must never take the engine down, because the engine going down means
+//     hum goes silent.
+//   * The registry is re-read every tick, so enabling/disabling/retuning a
+//     sensor takes effect without a restart.
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { pathToFileURL, fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import {
+  PATHS, DEFAULT_CONFIG, loadRegistry, loadState, saveState, pruneState,
+  normalizeEvent, evaluate, applyDecision, appendLedger, ledgerRow,
+  dispatchLedgerRow, reconcileOutcomes, tailLines,
+  spoolEvent, drainSpool, buildPayload, dispatch, stampHeartbeat,
+  readJson, localParts, userTz, clamp01, sensorErrorLog,
+} from "../lib/hum-events.mjs";
+import { checkExpiredLaneDiagnosis, checkPositiveReactionReenable } from "../lib/hum-lane-quiesce.mjs";
+import { humJevGate, applyJevSkip, reconcileHumOutcomes } from "../lib/jev-hum-gate.mjs";
+// The installation's watch engine, when it has one (lib/_ext/watches.mjs,
+// exporting spoolEvents(events)): every event is offered to it (step 2b).
+let spoolWatchEvents = () => {};
+{
+  const watchesLib = path.join(path.dirname(fileURLToPath(import.meta.url)), "../lib/_ext/watches.mjs");
+  if (fs.existsSync(watchesLib)) ({ spoolEvents: spoolWatchEvents } = await import(pathToFileURL(watchesLib).href));
+}
+import { installRoot } from "../lib/root.cjs";
+
+const HOME = os.homedir();
+const MERLIN = installRoot();
+const LOGFILE = path.join(MERLIN, "agent/logs/hum-sense.log");
+// Names this daemon in any paid call its sensors make (the excursion sensor
+// runs `places`); launchd starts it outside cron-run, which sets this for jobs.
+if (!process.env.MERLIN_JOB) process.env.MERLIN_JOB = "hum-sense";
+
+// Load .env before anything runs. `gog` (calendar + tasks sensors) reads
+// its OAuth token from a file-backed keyring that needs GOG_KEYRING_PASSWORD in
+// the environment; without it, and with no TTY under launchd, it fails with
+// "no TTY available for keyring file backend password prompt" and both sensors
+// go permanently blind. Cron-launched triggers get this from `cron-run`; a
+// launchd daemon has to do it itself. Caught on first live verification
+// 2026-08-02 — the daemon reported zero errors while two of ten sensors had
+// never once reached their data source.
+createRequire(fileURLToPath(import.meta.url))("../lib/load-env.js").loadEnv();
+
+function log(msg) {
+  const line = `${new Date().toISOString()} [hum-sense] ${msg}\n`;
+  try { fs.mkdirSync(path.dirname(LOGFILE), { recursive: true }); fs.appendFileSync(LOGFILE, line); } catch {}
+  if (process.env.HUM_SENSE_VERBOSE) process.stderr.write(line);
+}
+
+// ─── situational gates ─────────────────────────────────────────────────────
+//
+// Everything the gate needs to know about the user's availability, assembled
+// from files the rest of Merlin already maintains. Only `activity` costs a
+// subprocess, and it is cached — the rest is free.
+
+let activityCache = { ts: 0, value: null };
+
+async function readActivityState() {
+  if (Date.now() - activityCache.ts < 5 * 60_000) return activityCache.value;
+  const { execFile } = await import("node:child_process");
+  const value = await new Promise((resolve) => {
+    const child = execFile(path.join(MERLIN, "bin/merlin"), ["activity", "--state-only"],
+      { timeout: 10000, env: { ...process.env, PATH: `/opt/homebrew/bin:${process.env.PATH || ""}` } },
+      (err, stdout) => resolve(err && !stdout ? null : String(stdout || "").trim() || null));
+    child.on("error", () => resolve(null));
+  });
+  activityCache = { ts: Date.now(), value };
+  return value;
+}
+
+async function gatherGates(state, config, nowMs) {
+  const tz = userTz();
+  const local = localParts(tz, new Date(nowMs));
+
+  const humState = readJson(PATHS.humState, {});
+  const paused = Boolean(humState?.pause?.until && new Date(humState.pause.until).getTime() > nowMs);
+
+  const pending = readJson(PATHS.pendingQuestion, null);
+  // A question gates hum only while it is genuinely outstanding: it must name a
+  // question AND carry a TTL that has not passed. Anything else is malformed —
+  // most importantly `{}`, which a half-written clear leaves behind. The old
+  // check was truthy on `{}` and treated a missing `expires_at` as "never
+  // expires", so a malformed slot became a question that could never clear and
+  // silently held every non-urgent ping. That is exactly what happened on
+  // 2026-08-19: hum went dark for 42h and only urgent-salience events escaped.
+  // Fail OPEN on a malformed slot; the worst case is one extra ping.
+  const pendingExpiresAt =
+    pending && typeof pending === "object" ? Date.parse(pending.expires_at) : NaN;
+  const pendingQuestion = Boolean(
+    pending && typeof pending === "object" &&
+    (pending.id || pending.question) &&
+    Number.isFinite(pendingExpiresAt) && pendingExpiresAt > nowMs
+  );
+
+  // "In a meeting" comes free from the calendar sensor's own memo — it already
+  // resolved the current event this interval, so there is no reason to spend a
+  // second gog call on the same question.
+  // That is the sensor's `hold_id` (an event that should hold
+  // hum), not whatever is on the calendar: a 10-hour "<city>" day block once held
+  // most of a day's events. A memo from before the change has no
+  // `hold_id` key and keeps the old reading until the sensor next runs.
+  const cal = state.sensors?.calendar?.memo || {};
+  const inMeeting = Boolean(Object.hasOwn(cal, "hold_id") ? cal.hold_id : cal.current_id);
+
+  // Mid-conversation: if the user just messaged Merlin, the chat agent is
+  // answering the user. An ambient ping on top of that is interruption, not
+  // ambience — hold until the exchange settles.
+  const cursor = readJson(path.join(MERLIN, "data/phone-channel-cursor.json"), null);
+  const inConversation = Boolean(
+    cursor?.lastSeenAt &&
+    (nowMs - new Date(cursor.lastSeenAt).getTime()) / 60000 < (config.conversation_grace_min ?? 4)
+  );
+
+  return {
+    local_hour: local.hour,
+    paused,
+    activity_state: await readActivityState(),
+    in_meeting: inMeeting,
+    // The gate treats a live conversation exactly like an outstanding
+    // question: hold, don't drop.
+    pending_question: pendingQuestion || inConversation,
+    in_conversation: inConversation,
+    hum_disabled: process.env.HUM_SENSE_DISABLED === "1",
+  };
+}
+
+// ─── sensor execution ──────────────────────────────────────────────────────
+
+const moduleCache = new Map();
+
+async function loadSensor(entry) {
+  // The kernel dir's script, else the installation's _ext/ one.
+  const base = entry.script || `${entry.name}.mjs`;
+  let file = path.join(PATHS.sensorDir, base);
+  if (!fs.existsSync(file) && fs.existsSync(path.join(PATHS.sensorExtDir, base))) file = path.join(PATHS.sensorExtDir, base);
+  if (moduleCache.has(file)) return moduleCache.get(file);
+  const mod = await import(pathToFileURL(file).href);
+  const fn = mod.default;
+  if (typeof fn !== "function") throw new Error(`${entry.name}: no default export`);
+  moduleCache.set(file, fn);
+  return fn;
+}
+
+/**
+ * Run one sensor with a hard timeout and total isolation. Returns
+ * {name, events, error, memo} — never throws.
+ */
+async function runSensor(entry, { state, config, nowMs }) {
+  const name = entry.name;
+  let nextMemo = state.sensors?.[name]?.memo ?? {};
+  const ctx = {
+    now: new Date(nowMs),
+    nowMs,
+    tz: userTz(),
+    local: localParts(userTz(), new Date(nowMs)),
+    config,
+    state,
+    memo: state.sensors?.[name]?.memo ?? {},
+    setMemo: (m) => { nextMemo = m; },
+  };
+  try {
+    const fn = await loadSensor(entry);
+    const timeoutMs = (entry.timeout_sec ?? 20) * 1000;
+    const raw = await Promise.race([
+      Promise.resolve(fn(ctx)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs)),
+    ]);
+    const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    const events = list
+      .map((e) => normalizeEvent(e, name))
+      .filter(Boolean)
+      .map((e) => applyRegistryOverrides(e, entry));
+    return { name, events, error: null, error_key: null, memo: nextMemo };
+  } catch (err) {
+    // `repeat_key` lets a sensor whose message embeds a changing number ("fix
+    // is 44m old") say "this is the same error as last minute's", so the log
+    // records it once instead of once per poll (sensorErrorLog in the lib).
+    const key = typeof err?.repeat_key === "string" && err.repeat_key ? err.repeat_key : null;
+    return { name, events: [], error: String(err?.message || err).slice(0, 240), error_key: key, memo: nextMemo };
+  }
+}
+
+/**
+ * Registry entries can retune a sensor without touching its code — that is the
+ * point of having a registry. `salience_scale` dials a whole sensor up or down,
+ * `cooldown_min` / `ttl_min` set defaults, `lanes` supplies lanes for events
+ * that didn't declare any, and `min_salience` drops an event outright.
+ */
+function applyRegistryOverrides(e, entry) {
+  if (entry.salience_scale != null) e.salience = clamp01(e.salience * Number(entry.salience_scale));
+  if (e.cooldown_min == null && entry.cooldown_min != null) e.cooldown_min = Number(entry.cooldown_min);
+  if (e.ttl_min == null && entry.ttl_min != null) e.ttl_min = Number(entry.ttl_min);
+  if ((!e.lanes || !e.lanes.length) && Array.isArray(entry.lanes)) e.lanes = entry.lanes;
+  return e;
+}
+
+function sensorIsDue(entry, state, nowMs) {
+  if (entry.enabled === false) return false;
+  const last = state.sensors?.[entry.name]?.last_run_at;
+  if (!last) return true;
+  return (nowMs - new Date(last).getTime()) / 1000 >= (entry.interval_sec ?? 300);
+}
+
+// ─── outcome reconciliation ────────────────────────────────────────────────
+
+const RUNS_FILE = path.join(MERLIN, "data/hum-runs.jsonl");
+
+/**
+ * Join each dispatch to the hum run it produced and append the outcome to the
+ * ledger, so the log answers "what came of that event" and not merely "it was
+ * dispatched". Bounded: tail-reads the run trace, never the whole file.
+ */
+function reconcile(state, config, nowMs) {
+  const pending = state.pending_outcomes || [];
+  if (!pending.length) return;
+  const runs = tailLines(RUNS_FILE, 60)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((r) => r && r.ts);
+  const { rows, stillPending } = reconcileOutcomes(pending, runs, { nowMs });
+  // Jev shadow week: compare each dispatch Jev confidently let through against
+  // what the turn actually did (lib/jev-hum-gate.mjs). Isolated — a
+  // throw here must never break the loop.
+  if (rows.length) { try { reconcileHumOutcomes(rows, nowMs); } catch (err) { log(`jev reconcile error: ${err?.message || err}`); } }
+  if (rows.length) {
+    appendLedger(rows, config);
+    for (const r of rows) {
+      log(r.match === "no-run"
+        ? `outcome ${r.dispatch_id}: NO RUN within window — the agent turn may not have happened`
+        : `outcome ${r.dispatch_id}: ${r.decision}${r.sent ? " (sent)" : ""} after ${r.lag_sec}s${r.based_on_topic ? ` [${r.based_on_topic}]` : ""}`);
+    }
+  }
+  state.pending_outcomes = stillPending;
+}
+
+/**
+ * Auto-quiesce a lane after 2 consecutive expired-unanswered lane_diagnosis
+ * questions (and auto-re-enable on a positive reaction). See
+ * lib/hum-lane-quiesce.mjs and data/hum-improvement-loop.md
+ * § Qualitative diagnosis. Same isolation posture as every other housekeeping
+ * step here — a throw must never take the tick down.
+ */
+function laneQuiesceHousekeeping(nowMs) {
+  try {
+    for (const a of checkExpiredLaneDiagnosis({ now: nowMs })) {
+      if (a.type === "expired_unanswered") {
+        log(`lane-quiesce: ${a.lane} lane_diagnosis question ${a.id} expired unanswered (streak=${a.consecutive})`);
+      } else if (a.type === "quiesced") {
+        log(`lane-quiesce: ${a.lane} auto-quiesced (intervention ${a.intervention_id})`);
+      }
+    }
+    for (const a of checkPositiveReactionReenable({ now: nowMs })) {
+      log(`lane-quiesce: ${a.lane} auto re-enabled — ${a.reason} (intervention ${a.intervention_id})`);
+    }
+  } catch (err) {
+    log(`lane-quiesce housekeeping error: ${err?.message || err}`);
+  }
+}
+
+// ─── one pass ──────────────────────────────────────────────────────────────
+
+/**
+ * Drain the spool, run every due sensor, evaluate, and (optionally) dispatch.
+ * This is the whole engine; `daemon` is just this on a timer.
+ */
+async function pass({ dispatchAllowed = true, onlySensor = null, force = false } = {}) {
+  const nowMs = Date.now();
+  const { config, sensors } = loadRegistry();
+  const state = loadState();
+
+  // 1. Push sources first — an arrival that landed 3 seconds ago should be in
+  //    the same bundle as whatever the sensors are about to detect.
+  const pushed = drainSpool();
+
+  // 2. Poll sensors that are due.
+  const due = sensors.filter((s) => (onlySensor ? s.name === onlySensor : force || sensorIsDue(s, state, nowMs)));
+  const results = await Promise.all(due.map((entry) => runSensor(entry, { state, config, nowMs })));
+
+  const nowIso = new Date(nowMs).toISOString();
+  for (const r of results) {
+    const prev = state.sensors[r.name] || {};
+    // `last_error` is still set on every failing run (status stays honest);
+    // only the LOG is de-duplicated: first occurrence, an hourly reminder,
+    // and a recovery line.
+    const { line, fields } = sensorErrorLog(prev, r, nowMs);
+    state.sensors[r.name] = {
+      ...prev,
+      last_run_at: nowIso,
+      memo: r.memo,
+      last_error: r.error,
+      ...fields,
+      ...(r.events.length ? { last_event_at: nowIso } : {}),
+    };
+    if (line) log(line);
+  }
+
+  const fresh = [...pushed, ...results.flatMap((r) => r.events)];
+
+  // 2b. Watches (lib/_ext/watches.mjs, optional): every event, whatever hum's gate makes
+  //     of it, is also a candidate trigger for the user's standing instructions.
+  //     Tap + detached kick only — the watch engine's model calls and actions
+  //     never run inside this tick, so a slow or broken watch cannot stall hum.
+  if (fresh.length) spoolWatchEvents(fresh);
+  if (watchKicks) kickWatch(fresh.length > 0);
+
+  // 3. Gate.
+  const gates = await gatherGates(state, config, nowMs);
+  const verdict = evaluate({ events: fresh, state, config, nowMs, gates });
+
+  // 4. Ledger — every event that was considered, with the verdict it met.
+  //    Only newly-seen events are logged; a held event isn't re-logged on
+  //    every subsequent tick, or a quiet afternoon would write thousands of
+  //    identical rows.
+  const rows = fresh.map((e) => ledgerRow(e, verdict, nowIso));
+  appendLedger(rows, config);
+
+  // 4b. Close the loop on earlier dispatches — what did hum actually do?
+  //     Runs every pass, costs one bounded tail-read of the run trace.
+  reconcile(state, config, nowMs);
+
+  // 4c. Auto-quiesce a lane after 2 consecutive expired-unanswered
+  //     lane_diagnosis questions (and auto-re-enable on a positive
+  //     reaction). Cheap, isolated, runs every pass.
+  laneQuiesceHousekeeping(nowMs);
+
+  // 5. Dispatch.
+  let dispatched = null;
+  // 5a. Jev gate (2026-09-23, lib/jev-hum-gate.mjs; docs/jev.md):
+  //     the deterministic gate says the moment is ELIGIBLE; Jev may skip the
+  //     Sonnet turn when it is confident nothing here is worth reaching out
+  //     about. Fail-open: any error, exclusion or doubt dispatches as before.
+  //     Idle-only bundles skip Jev and instead get the PREVIEW gate (2026-10-04):
+  //     a side-effect-free `hum-harvest-all --preview`; nothing eligible and no
+  //     model lane due → skipped in code, ledger kind "preview-skip".
+  let jevSkip = null;
+  let payload = null;
+  if (verdict.decision === "dispatch" && dispatchAllowed) {
+    payload = buildPayload(verdict, { gates: { in_meeting: gates.in_meeting, activity: gates.activity_state } });
+    const jg = await humJevGate({ verdict, gates, state, nowMs, dispatchId: payload.dispatch_id, tz: userTz() });
+    if (!jg.dispatch) jevSkip = jg;
+  }
+  if (jevSkip) {
+    appendLedger([{ ts: nowIso, kind: jevSkip.via === "preview" ? "preview-skip" : "jev-skip", dispatch_id: payload.dispatch_id, event_ids: verdict.accepted.map((e) => e.id),
+      types: verdict.accepted.map((e) => e.type), lanes: verdict.lanes, score: verdict.score, reason: jevSkip.reason }], config);
+    log(`${jevSkip.via === "preview" ? "preview-skip" : "jev-skip"} ${payload.dispatch_id} [${verdict.accepted.map((e) => e.type).join(",")}] — ${jevSkip.reason}`);
+    applyJevSkip(state, verdict, { pruneState, config, nowMs });
+  } else if (verdict.decision === "dispatch" && dispatchAllowed) {
+    dispatched = await dispatch(payload);
+    appendLedger([dispatchLedgerRow(payload, verdict, dispatched, nowIso)], config);
+    if (dispatched.ok) {
+      const folded = dispatched.delivery && dispatched.delivery.startsWith("folded");
+      log(`dispatch ${payload.dispatch_id} → :${dispatched.port} [${verdict.accepted.map((e) => e.type).join(",")}] lanes=${verdict.lanes.join(",") || "*"} score=${verdict.score.toFixed(2)}${folded ? ` (${dispatched.delivery})` : ""}`);
+      // Queue it for outcome reconciliation on a later pass. A FOLDED dispatch
+      // is deliberately not queued: it has no turn of its own by design (its
+      // context is consumed by the hum turn already waiting), so asking the
+      // reconciler to find one would manufacture a `no-run` every time the
+      // fold worked correctly — the opposite of what that signal is for.
+      if (!folded) {
+        state.pending_outcomes = [...(state.pending_outcomes || []), { dispatch_id: payload.dispatch_id, ts: nowIso }].slice(-40);
+      }
+      applyDecision(state, verdict, config, nowMs);
+    } else {
+      // A dead supervisor is not a reason to burn the events: hold them and
+      // try again next tick, exactly like any other soft gate.
+      log(`dispatch FAILED (${dispatched.error}) — holding ${verdict.accepted.length} event(s)`);
+      state.pending = verdict.accepted;
+      pruneState(state, config, nowMs);
+    }
+  } else {
+    applyDecision(state, verdict, config, nowMs);
+    if (verdict.decision === "dispatch" && !dispatchAllowed) log(`would dispatch (dry run): ${verdict.reason}`);
+  }
+
+  saveState(state);
+  return { verdict, gates, fresh, results, dispatched, config };
+}
+
+// ─── watch engine kick ─────────────────────────────────────────────────────
+//
+// `watch tick` (bin/watch) runs as a detached child: at most once a
+// minute, or within ~10 s when this pass produced events. It holds its own
+// single-flight lock, so an overlapping kick is a cheap no-op. Only the daemon
+// kicks (watchKicks), never `hum-sense once`.
+
+let watchKicks = false;
+let lastWatchKick = 0;
+function kickWatch(hasEvents) {
+  const now = Date.now();
+  const gap = now - lastWatchKick;
+  if (!(gap >= 60_000 || (hasEvents && gap >= 10_000))) return;
+  lastWatchKick = now;
+  const watchBin = path.join(MERLIN, "bin/watch");
+  if (!fs.existsSync(watchBin)) return; // no watch engine in this installation
+  import("node:child_process").then(({ spawn }) => {
+    const child = spawn(process.execPath, [watchBin, "tick"], { detached: true, stdio: "ignore", env: process.env });
+    child.on("error", (e) => log(`watch kick failed: ${e.message}`));
+    child.unref();
+  }).catch(() => {});
+}
+
+// ─── daemon ────────────────────────────────────────────────────────────────
+
+async function daemon() {
+  watchKicks = true;
+  const { config } = loadRegistry();
+  log(`daemon start pid=${process.pid} tick=${config.tick_sec}s`);
+  stampHeartbeat({ status: "starting" });
+  let stopping = false;
+  for (const sig of ["SIGTERM", "SIGINT"]) {
+    process.on(sig, () => { stopping = true; log(`${sig} — stopping`); stampHeartbeat({ status: "stopped" }); process.exit(0); });
+  }
+  // Never let one bad pass kill the loop; the engine's whole value is that it
+  // is always there.
+  for (;;) {
+    if (stopping) return;
+    const started = Date.now();
+    let decision = "error";
+    try {
+      const { verdict } = await pass({ dispatchAllowed: true });
+      decision = verdict.decision;
+    } catch (err) {
+      log(`pass failed: ${err?.stack || err}`);
+    }
+    stampHeartbeat({ status: "running", last_pass_ms: Date.now() - started, last_decision: decision });
+    const { config: fresh } = loadRegistry();
+    await new Promise((r) => setTimeout(r, Math.max(2, fresh.tick_sec ?? DEFAULT_CONFIG.tick_sec) * 1000));
+  }
+}
+
+// ─── cli ───────────────────────────────────────────────────────────────────
+
+function arg(name, fallback = undefined) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[i + 1] : fallback;
+}
+function has(name) { return process.argv.includes(`--${name}`); }
+
+async function cmdOnce() {
+  const out = await pass({
+    dispatchAllowed: has("dispatch"),
+    onlySensor: arg("sensor", null),
+    force: Boolean(arg("sensor", null)) || has("force"),
+  });
+  console.log(JSON.stringify({
+    decision: out.verdict.decision,
+    reason: out.verdict.reason,
+    score: out.verdict.score,
+    threshold: out.verdict.threshold,
+    lanes: out.verdict.lanes,
+    gates: out.gates,
+    // `detected` is what the sensors produced this pass; `accepted` is what the
+    // gate actually put in the dispatch — they differ whenever an event held
+    // from an earlier pass joins the bundle, which is the normal case after a
+    // meeting or a quiet-hours window ends.
+    detected: out.fresh.map((e) => ({ type: e.type, summary: e.summary, salience: e.salience, lanes: e.lanes })),
+    accepted: out.verdict.accepted.map((e) => ({ type: e.type, summary: e.summary, salience: e.salience })),
+    held: out.verdict.held.map((e) => ({ type: e.type, summary: e.summary })),
+    dropped: out.verdict.dropped.map((d) => ({ type: d.event.type, reason: d.reason })),
+    sensor_errors: out.results.filter((r) => r.error).map((r) => ({ sensor: r.name, error: r.error })),
+    dispatched: out.dispatched,
+  }, null, 2));
+}
+
+function cmdEmit() {
+  const inline = process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : null;
+  let raw;
+  if (inline) {
+    try { raw = JSON.parse(inline); } catch { console.error("emit: argument must be valid JSON"); process.exit(2); }
+  } else {
+    const type = arg("type");
+    if (!type) { console.error("emit: need inline JSON or --type"); process.exit(2); }
+    raw = {
+      type,
+      sensor: arg("sensor", "external"),
+      subject: arg("subject", null),
+      summary: arg("summary", type),
+      salience: Number(arg("salience", "0.5")),
+      lanes: (arg("lanes", "") || "").split(",").filter(Boolean),
+      dedup_key: arg("dedup-key", undefined),
+      cooldown_min: arg("cooldown-min") ? Number(arg("cooldown-min")) : undefined,
+      ttl_min: arg("ttl-min") ? Number(arg("ttl-min")) : undefined,
+    };
+  }
+  const e = spoolEvent(raw, raw.sensor || "external");
+  if (!e) { console.error("emit: failed to spool"); process.exit(1); }
+  console.log(JSON.stringify(e));
+}
+
+function cmdStatus() {
+  const { config, sensors } = loadRegistry();
+  const state = loadState();
+  const hb = readJson(PATHS.heartbeat, null);
+  const hbAge = hb?.ts ? (Date.now() - new Date(hb.ts).getTime()) / 1000 : null;
+  const recent = (state.dispatches || []).filter((iso) => (Date.now() - new Date(iso).getTime()) / 60000 <= config.recent_window_min);
+  const threshold = Math.min(config.salience_threshold_max,
+    config.base_salience_threshold + config.salience_ramp_per_recent_dispatch * recent.length);
+  const info = {
+    daemon: { alive: hbAge != null && hbAge < 120, heartbeat_age_sec: hbAge == null ? null : Math.round(hbAge), pid: hb?.pid ?? null, status: hb?.status ?? null },
+    last_dispatch_at: state.last_dispatch_at,
+    dispatches_in_window: recent.length,
+    current_threshold: +threshold.toFixed(2),
+    pending_events: (state.pending || []).map((e) => ({ type: e.type, summary: e.summary, salience: e.salience })),
+    sensors: sensors.map((s) => ({
+      name: s.name,
+      enabled: s.enabled !== false,
+      interval_sec: s.interval_sec,
+      last_run_at: state.sensors?.[s.name]?.last_run_at ?? null,
+      last_event_at: state.sensors?.[s.name]?.last_event_at ?? null,
+      last_error: state.sensors?.[s.name]?.last_error ?? null,
+    })),
+  };
+  if (has("json")) { console.log(JSON.stringify(info, null, 2)); return; }
+  const d = info.daemon;
+  console.log(`daemon        ${d.alive ? "alive" : "DOWN"}${d.pid ? ` (pid ${d.pid})` : ""}${d.heartbeat_age_sec != null ? ` — heartbeat ${d.heartbeat_age_sec}s ago` : ""}`);
+  console.log(`last dispatch ${info.last_dispatch_at || "never"}  (${info.dispatches_in_window} in the last ${config.recent_window_min}m)`);
+  console.log(`threshold     ${info.current_threshold}  (base ${config.base_salience_threshold}, +${config.salience_ramp_per_recent_dispatch}/dispatch)`);
+  if (info.pending_events.length) {
+    console.log(`pending       ${info.pending_events.length} held event(s):`);
+    for (const e of info.pending_events) console.log(`              ${e.salience.toFixed(2)}  ${e.type}  ${e.summary}`);
+  }
+  console.log("\nsensors:");
+  for (const s of info.sensors) {
+    const age = s.last_run_at ? `${Math.round((Date.now() - new Date(s.last_run_at).getTime()) / 1000)}s ago` : "never";
+    console.log(`  ${s.enabled ? " " : "×"} ${s.name.padEnd(10)} every ${String(s.interval_sec).padStart(4)}s  ran ${age.padEnd(12)}${s.last_error ? `  ERROR: ${s.last_error}` : ""}`);
+  }
+}
+
+function cmdSensors() {
+  const { sensors } = loadRegistry();
+  for (const s of sensors) {
+    console.log(`${s.enabled === false ? "×" : "•"} ${s.name}  (${s.script}, every ${s.interval_sec}s, ${s.cost || "?"})`);
+    if (s.detects) console.log(`    ${s.detects}`);
+  }
+}
+
+function cmdTail() {
+  const n = Number(arg("n", process.argv.includes("-n") ? process.argv[process.argv.indexOf("-n") + 1] : "20")) || 20;
+  let lines = [];
+  try { lines = fs.readFileSync(PATHS.ledger, "utf8").split("\n").filter(Boolean).slice(-n); } catch {}
+  if (!lines.length) { console.log("(no events yet)"); return; }
+  for (const l of lines) {
+    try {
+      const r = JSON.parse(l);
+      console.log(`${r.ts.slice(0, 19)}  ${String(r.salience).padEnd(5)} ${r.type.padEnd(26)} ${String(r.outcome).padEnd(12)} ${r.summary}`);
+    } catch { console.log(l); }
+  }
+}
+
+/**
+ * The joined timeline: every event, the verdict it met, and — for the ones
+ * that dispatched — what hum actually did about it. `tail` shows raw rows;
+ * this shows the story.
+ */
+function cmdLog() {
+  const sinceH = Number(arg("since", "12")) || 12;
+  const cutoff = Date.now() - sinceH * 3600 * 1000;
+  const rows = tailLines(PATHS.ledger, 4000)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((r) => r && new Date(r.ts).getTime() >= cutoff);
+  if (!rows.length) { console.log(`(no hum events in the last ${sinceH}h)`); return; }
+
+  if (has("json")) { console.log(JSON.stringify(rows, null, 2)); return; }
+
+  // Index outcomes by dispatch so each dispatch line can carry its result.
+  const outcomes = new Map();
+  for (const r of rows) if (r.kind === "outcome") outcomes.set(r.dispatch_id, r);
+
+  const t = (iso) => new Date(iso).toLocaleTimeString("en-US", { timeZone: userTz(), hour12: false });
+  let dispatches = 0, fired = 0, sent = 0;
+
+  for (const r of rows) {
+    if (r.kind === "outcome") continue; // rendered under its dispatch
+    if (r.kind === "jev-skip") {
+      console.log(`${t(r.ts)}  ⊘ JEV SKIP  ${(r.types || []).join(", ")}   score ${r.score?.toFixed?.(2) ?? "?"} — ${r.reason}`);
+      continue;
+    }
+    if (r.kind === "dispatch") {
+      dispatches++;
+      const o = outcomes.get(r.dispatch_id);
+      console.log(`${t(r.ts)}  ▶ DISPATCH  ${r.types.join(", ")}`);
+      console.log(`              lanes: ${r.lanes.join(", ") || "(all, cadence-gated)"}   score ${r.score?.toFixed?.(2) ?? "?"}${r.delivered ? ` → :${r.port}` : `  DELIVERY FAILED: ${r.error}`}`);
+      if (!o) { console.log(`              ⋯ awaiting outcome`); continue; }
+      if (o.match === "no-run") { console.log(`              ⚠ ${o.note}`); continue; }
+      const what = o.sent ? `SENT${o.ping_id ? ` (${o.ping_id})` : ""}` : "stayed silent";
+      console.log(`              → ${what} after ${o.lag_sec}s — ${o.decision}${o.based_on_topic ? ` via ${o.based_on_topic}` : ""}${o.focus_source ? `, focus=${o.focus_source}` : ""}`);
+      if (o.rationale) console.log(`                "${o.rationale.slice(0, 150)}${o.rationale.length > 150 ? "…" : ""}"`);
+      if (o.sent) sent++;
+      continue;
+    }
+    fired++;
+    const mark = r.outcome === "dispatched" ? "•" : r.outcome === "held" ? "·" : "×";
+    console.log(`${t(r.ts)}  ${mark} ${String(r.salience).padEnd(4)} ${r.type.padEnd(26)} ${String(r.outcome).padEnd(18)} ${r.summary}`);
+  }
+  // Times are rendered in the user's CURRENT local zone, not the home zone — deliberately,
+  // because that is the clock the gate itself reasons in (quiet hours, dayparts).
+  // A log that disagreed with the decisions it is explaining would be worse than
+  // one in an unexpected zone, so the zone is labelled rather than converted.
+  console.log(`\n${fired} events · ${dispatches} dispatches · ${sent} ping${sent === 1 ? "" : "s"} sent, in the last ${sinceH}h  (times in ${userTz()})`);
+}
+
+function usage() {
+  console.log(`hum-sense — situational trigger engine for hum
+
+  daemon                        run the engine
+  once [--dispatch] [--force]   one pass; --dispatch actually pings, otherwise dry run
+  once --sensor <name>          run a single sensor and show what it detects
+  emit '<json>' | --type X ...  inject an event (push sources, testing)
+  status [--json]               daemon health, gate state, per-sensor liveness
+  sensors                       the registry
+  log [--since H] [--json]      joined timeline: events, dispatches, and what hum DID (default 12h)
+  tail [-n N]                   raw event ledger rows
+
+Registry: data/hum-sensors.json     Docs: system/hum-events.md`);
+}
+
+const cmd = process.argv[2];
+switch (cmd) {
+  case "daemon": await daemon(); break;
+  case "once": await cmdOnce(); break;
+  case "emit": cmdEmit(); break;
+  case "status": cmdStatus(); break;
+  case "sensors": cmdSensors(); break;
+  case "tail": cmdTail(); break;
+  case "log": cmdLog(); break;
+  default: usage(); process.exit(cmd ? 2 : 0);
+}

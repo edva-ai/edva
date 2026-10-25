@@ -1,0 +1,83 @@
+{
+  "_comment": "Sensor registry for hum's event-driven trigger framework. Copy to data/hum-sensors.json. Each sensor is a cheap edge detector in agent/scripts/hum-sensors/ (or a personal one in agent/scripts/hum-sensors/_ext/) that answers 'did X just change?' and emits events; the gate in lib/hum-events.mjs decides whether the moment is worth an agent turn. Adding a trigger = one .mjs file + one entry here. Tuning = edit this file; the hum-sense daemon re-reads it every tick. See system/hum-events.md.",
+  "schema_version": 1,
+  "config": {
+    "tick_sec": 10,
+    "coalesce_sec": 25,
+    "global_refractory_min": 10,
+    "base_salience_threshold": 0.35,
+    "salience_ramp_per_recent_dispatch": 0.08,
+    "recent_window_min": 120,
+    "salience_threshold_max": 0.9,
+    "urgent_salience": 0.9,
+    "quiet_hours": {
+      "start": 0,
+      "end": 9,
+      "wake_floor": 7
+    },
+    "default_ttl_min": 30,
+    "default_cooldown_min": 45,
+    "idle_fallback_min": 75,
+    "conversation_grace_min": 4,
+    "max_pending": 40,
+    "ledger_max_rows": 4000
+  },
+  "sensors": [
+    {
+      "name": "daypart",
+      "enabled": true,
+      "script": "daypart.mjs",
+      "interval_sec": 30,
+      "detects": "crossing a boundary that changes what a useful suggestion looks like — day start, meal windows, work day ending, Friday afternoon",
+      "cost": "none (pure clock)"
+    },
+    {
+      "name": "calendar",
+      "enabled": true,
+      "script": "calendar.mjs",
+      "interval_sec": 300,
+      "detects": "a meeting just ended, an event with a place starts within 40 min, a long free window opened; also decides which current event holds hum (memo hold_id)",
+      "cost": "1 gog calendar call; a background model read for busy events over 3h"
+    },
+    {
+      "name": "desk",
+      "enabled": true,
+      "script": "desk.mjs",
+      "interval_sec": 120,
+      "detects": "back at the Mac after a long absence (macOS only)",
+      "cost": "1 ioreg call"
+    },
+    {
+      "name": "comms",
+      "enabled": true,
+      "script": "comms.mjs",
+      "interval_sec": 120,
+      "detects": "a wave of inbound mail since the last check",
+      "cost": "1 local log read"
+    },
+    {
+      "name": "weather",
+      "enabled": false,
+      "script": "weather.mjs",
+      "interval_sec": 900,
+      "detects": "rain becoming likely / clearing, a temperature swing >=12F (needs MERLIN_WEATHER_BIN)",
+      "cost": "1 weather CLI call"
+    },
+    {
+      "name": "tasks",
+      "enabled": true,
+      "script": "tasks.mjs",
+      "interval_sec": 600,
+      "detects": "a task crossing into overdue",
+      "cost": "1 gog tasks call"
+    },
+    {
+      "name": "idle",
+      "enabled": true,
+      "script": "idle.mjs",
+      "interval_sec": 60,
+      "detects": "nothing has dispatched for idle_fallback_min — the slow lanes' way in",
+      "cost": "none"
+    }
+  ]
+}

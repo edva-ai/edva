@@ -6,7 +6,7 @@
     "script": "Override script path. Default is hum-harvesters/<name>.mjs.",
     "cadence_min": "Minimum minutes between runs (0 = run every tick)",
     "cache_ttl_min": "Per-topic harvester output cache TTL (the harvester reads its cache before doing network work)",
-    "active_window": "When this topic should run. Examples: 'daily', 'mon-fri 09:30-16:00 ET', 'sat-sun', or null. If null/'daily', always runs.",
+    "active_window": "When this topic should run. Examples: 'daily', 'mon-fri 09:30-16:00 ET' (US market hours), 'sat-sun', or null. If null/'daily', always runs.",
     "urgency_rule": "Optional inline override of the ranker's urgency weight. Defaults are fine to start."
   },
   "topics": [

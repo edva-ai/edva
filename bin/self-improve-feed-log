@@ -1,0 +1,69 @@
+#!/usr/bin/env node
+// self-improve-feed-log — record an already-decided LOW/MODERATE self-improvement
+// into self_improve_approvals so it shows in the app's "Improvements" channel with
+// a green check (or a spinning "applying" glyph if you log it in-progress first).
+//
+// This is DISPLAY-ONLY: low/moderate items auto-apply on the production host and never need
+// the user's signature. High-risk items must go through `self-improve-request`
+// (which requires the user's Face-ID approval before anything is applied) — do NOT use
+// this for high-risk work.
+//
+// Usage:
+//   self-improve-feed-log --type code-fix --risk low \
+//     --summary "<what changed, one line>" [--rationale "<why>"] \
+//     [--commit <sha>] [--status applied|approved]
+//   --status approved  → shows the in-progress (applying) glyph
+//   --status applied   → shows the green check (default)
+
+import path from "node:path";
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { installRoot } from "../lib/root.cjs";
+
+const ROOT = installRoot();
+for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
+  const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+}
+const BASE = process.env.SUPABASE_URL || createRequire(import.meta.url)("../lib/instance.cjs").supabaseUrl();
+const K = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!K) { console.error("self-improve-feed-log: no SUPABASE_SERVICE_ROLE_KEY"); process.exit(1); }
+const H = { apikey: K, Authorization: "Bearer " + K, "Content-Type": "application/json" };
+
+function arg(name) { const i = process.argv.indexOf("--" + name); return i > 0 ? process.argv[i + 1] : null; }
+
+const type = arg("type") || "code-fix";
+const risk = (arg("risk") || "low").toLowerCase();
+const summary = arg("summary");
+const rationale = arg("rationale") || "";
+const commit = arg("commit") || null;
+const status = arg("status") || "applied";
+
+if (!summary) { console.error('usage: self-improve-feed-log --type code-fix --risk low --summary "..." [--rationale "..."] [--commit <sha>] [--status applied]'); process.exit(64); }
+if (risk === "high") { console.error("self-improve-feed-log: high-risk items must use self-improve-request (Face-ID approval), not this display logger."); process.exit(64); }
+if (!["applied", "approved"].includes(status)) { console.error("--status must be applied or approved"); process.exit(64); }
+
+const now = Date.now();
+const row = {
+  id: crypto.randomUUID(),
+  item_type: type,
+  summary,
+  rationale,
+  risk,
+  status,
+  // Auto-applied items are never signature-verified, but item_hash/nonce are
+  // NOT NULL columns — set harmless placeholders (a hash of the summary + a
+  // random nonce). expiry is irrelevant but kept non-null for a uniform decode.
+  item_hash: crypto.createHash("sha256").update(String(summary)).digest("hex"),
+  nonce: crypto.randomBytes(16).toString("hex"),
+  created_at: new Date(now).toISOString(),
+  expires_at: new Date(now).toISOString(),
+  expires_at_ms: now,
+  decided_at: new Date(now).toISOString(),
+  applied_at: status === "applied" ? new Date(now).toISOString() : null,
+  result: commit ? { commit } : null,
+};
+
+const res = await fetch(`${BASE}/rest/v1/self_improve_approvals`, { method: "POST", headers: H, body: JSON.stringify(row) });
+if (!res.ok) { console.error(`self-improve-feed-log: insert ${res.status}: ${await res.text()}`); process.exit(1); }
+console.log(`logged ${status} improvement ${row.id} to the Improvements channel`);

@@ -1,0 +1,95 @@
+#!/usr/bin/env node
+// hum-idea-decide — record the user's yes/no on a hum improvement hum asked them about.
+//
+// The chat agent calls this after `hum-answer`, once it has READ the user's answer and
+// decided what they meant (Rule #0b: this tool never interprets language — the
+// caller passes the verdict). Hum asks in the chat (the `hum_asks` lane);
+// a yes moves the idea to `approved`, which the daily
+// hum-action-executor picks up, designs, and lands (automatically, or as one
+// Improvements card if the change is high-blast-radius). A no closes it.
+//
+// The answer does not have to be yes/no. When the user says HOW they want it ("only on weekdays",
+// "do the first one but skip the threshold change"), that is an approve, and
+// `--note` carries the user's words: hum-action-executor treats `decision_note` as the
+// spec, and it wins over the idea's own proposed_change where they differ.
+//
+// Usage:
+//   hum-idea-decide --question <q-id> approve|decline [--note "<the user's words>"]
+//   hum-idea-decide <idea-id>         approve|decline [--note "<the user's words>"]
+//
+// --question resolves the idea from hum-runs.jsonl (the tick that sent that
+// question carried dedup_key `hum_asks:<idea-id>`), so the chat agent needs
+// only the question id the [Hum state] block already shows it.
+//
+// Exit: 0 recorded · 3 no such askable idea · 64 usage.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { appendRow, latestById, readRows, routeFor } from "../lib/hum-ideas.mjs";
+import { createRequire } from "node:module";
+import { installTools } from "../lib/root.cjs";
+// Who the assistant serves, as an identifier (agent/local/instance.json owner_id).
+const OWNER_ID = createRequire(import.meta.url)("../lib/instance.cjs").instance().owner_id;
+
+const RUNS = process.env.HUM_RUNS_FILE || installTools("data/hum-runs.jsonl");
+
+function usage(msg) {
+  if (msg) console.error(`hum-idea-decide: ${msg}`);
+  console.error('usage: hum-idea-decide (--question <q-id> | <idea-id>) approve|decline [--note "<their words>"]');
+  process.exit(64);
+}
+
+/** The idea id a sent hum_asks question was about, from the tick trace that sent it. */
+export function ideaForQuestion(questionId, file = RUNS) {
+  let raw;
+  try { raw = fs.readFileSync(file, "utf8"); } catch { return null; }
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i] || !lines[i].includes(questionId)) continue;
+    let row;
+    try { row = JSON.parse(lines[i]); } catch { continue; }
+    if (row?.outcome?.question_id !== questionId) continue;
+    const key = String(row?.sonnet?.dedup_key || row?.outcome?.dedup_key || "");
+    if (key.startsWith("hum_asks:")) return key.slice("hum_asks:".length);
+  }
+  return null;
+}
+
+export function decide({ id, verdict, note = null, now = new Date() }) {
+  const idea = latestById(readRows()).get(id);
+  if (!idea) return { ok: false, reason: `no idea ${id}` };
+  const route = routeFor(idea);
+  if (route !== "ask_in_chat") return { ok: false, reason: `${id} is not waiting on a decision (route: ${route}, status: ${idea.status})` };
+  const row = {
+    id,
+    status: verdict === "approve" ? "approved" : "declined",
+    decided_at: now.toISOString(),
+    decided_by: `${OWNER_ID}-chat`, // persisted: derived from the owner name, so existing rows keep their value
+    ...(note ? { decision_note: String(note).slice(0, 800) } : {}),
+  };
+  appendRow(row);
+  return { ok: true, ...row };
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const take = (flag) => { const i = args.indexOf(flag); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v ?? null; };
+  const question = take("--question");
+  const note = take("--note");
+  const verdict = args.find((a) => a === "approve" || a === "decline");
+  const positional = args.filter((a) => a !== verdict && !a.startsWith("--"));
+  if (!verdict) usage("need approve or decline");
+  let id = positional[0] || null;
+  if (question) {
+    id = ideaForQuestion(question);
+    if (!id) { console.error(`hum-idea-decide: question ${question} was not a hum improvement ask`); process.exit(3); }
+  }
+  if (!id) usage("need --question <q-id> or an idea id");
+  const res = decide({ id, verdict, note });
+  console.log(JSON.stringify(res));
+  process.exit(res.ok ? 0 : 3);
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main();

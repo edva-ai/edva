@@ -1,0 +1,10 @@
+# Installation hum sensors.
+#
+# A sensor placed here (same shape as the bundled ones in the parent dir:
+# `export const meta = { name, lanes }` and a default `detect(ctx)` returning
+# events) is loaded by bin/hum-sense when no kernel sensor has that file name
+# (lib/hum-events.mjs PATHS.sensorExtDir). Enable it the way the bundled
+# sensors are enabled (examples/hum-sensors.example.json).
+#
+# Everything here except this file is gitignored — see .gitignore and
+# docs/architecture-public-private.md.

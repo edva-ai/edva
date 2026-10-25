@@ -1,0 +1,12 @@
+{
+  "_doc": "lib/hum-vetoes.mjs findSamePlacePitch — does a dining/place candidate re-recommend a place already recommended in the last few weeks under a different key? Questions are built per call from same_place_template (one choice over the earlier recommendations + none). Kernel definition; an installation's own data/jev-questions/hum-place-repeat.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.85,
+  "questions": {},
+  "same_place_template": {
+    "type": "choice",
+    "instructions": "`candidate` is a suggestion the user's assistant is about to send them. `earlier_recommendations` are restaurant and place recommendations the assistant already sent in the last few weeks. Is the new suggestion re-recommending a place already recommended? Pick an earlier id ONLY when the candidate pitches the same restaurant, shop, venue or site again as a fresh suggestion of somewhere to go, as if the user had not heard of it (any spelling, nickname or wording). Reminders, follow-ups about an already-planned visit, warnings, day-of or last-chance nudges, a different event at a place mentioned before, and suggestions that merely mention a place answer none. A different place, or not sure, is none.",
+    "fixed_criteria": {
+      "none": "not a re-recommendation: a different place; a reminder or closing nudge; a follow-up about a planned visit; a warning or logistics note; a different event at a known place; a passing mention; or not sure"
+    }
+  }
+}

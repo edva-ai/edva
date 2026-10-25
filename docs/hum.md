@@ -1,170 +1,116 @@
 # Hum — going from empty to useful
 
-Hum is the always-on ambient-awareness loop: every 20 min, fan out to a set of **harvesters**, rank candidate findings with a sub-LLM, optionally surface one as a phone-channel ping. It's how the agent goes from "passive responder" to "noticing things."
+Hum is the always-on ambient-awareness loop. Cheap **sensors** watch for situational edges (a meeting just ended, rain is coming, you're back at your desk, a task went overdue); a deterministic gate decides whether the moment is worth an agent turn; when it is, the `hum` job fans out to **harvesters**, ranks what they found, and may surface one thing as a phone ping. It's how the agent goes from "passive responder" to "noticing things." Design: [`system/hum-events.md`](../system/hum-events.md) and `system/architecture.md` § Hum.
 
-The kernel ships with the harness and 7 generic harvesters but **no registry config** — meaning out of the box, hum ticks every 20 min and finds nothing because no topics are enabled. This doc gets you from that empty state to a working loop.
+Out of the box hum has the engine, the sensors, the generic harvesters and its playbooks — but no registry config, so it detects little and harvests nothing. This doc gets you from that empty state to a working loop.
 
 ## Ground state
 
 Right after `merlin init` / `merlin up`:
 
-| File | State | What |
+| Path | State | What |
 |---|---|---|
-| `agent/scripts/hum-harvest-all.mjs` | shipped | The fan-out + ranker harness |
-| `agent/scripts/hum-harvesters/*.mjs` | shipped (7 files) | Generic harvesters: `_common`, `weather`, `news`, `calendar`, `tasks`, `watchdog`, `serendipity` |
-| `agent/ops-agent/jobs/hum*.md` | shipped (6 playbooks) | hum, hum-canary, hum-daily, hum-ideation, hum-operations, hum-review |
-| `bin/hum-*` | shipped (4 CLIs) | hum-answer, hum-ping, hum-mark-idea-consumed, hum-reservoir-review |
-| `data/hum-interests.json` | **missing — you create it** | Which harvesters to run, on what cadence |
-| `data/hum-intent.md` | **missing — you create it** | Hum's "north star" — what hum-review grades against |
-| `data/user-timezone.json` | **missing — you create it** | Read by the trigger script's sleep-window gate |
-| `data/hum-state.json` | auto-created on first tick | Daily counters, min-ping-interval, pause flag |
-| `data/hum-runs.jsonl` | auto-appended on each tick | Tick trace |
-| `data/hum-feedback.jsonl` | auto-appended on each ping | Per-ping records + reactions |
-| `data/hum-learnings.jsonl` | auto-appended on each Q+A | Answers to hum's questions |
+| `bin/hum-sense` | shipped | The event engine: sensors → events → gate → dispatch (`hum-sense daemon`) |
+| `agent/scripts/hum-sensors/*.mjs` | shipped | `daypart`, `calendar`, `desk` (macOS), `comms`, `weather`, `tasks`, `idle` |
+| `agent/scripts/hum-harvest-all.mjs` | shipped | The harvester fan-out + ranker |
+| `agent/scripts/hum-harvesters/*.mjs` | shipped | `weather`, `news`, `calendar`, `tasks`, `watchdog`, `serendipity`, `ideas`, `open_questions`, `hum_asks`, `dream_asks` (`_common.mjs` is shared code) |
+| `agent/ops-agent/jobs/hum*.md` | shipped | `hum`, `hum-review`, `hum-ideation`, `hum-consolidate`, `hum-daily`, `hum-explore` |
+| `data/hum-sensors.json` | **you create it** | Which sensors run, how often, gate tuning |
+| `data/hum-interests.json` | seeded by `merlin init` | Which harvesters run, on what cadence |
+| `data/hum-intent.md` | seeded by `merlin init` | Hum's north star — what `hum-review` grades against |
+| `data/user-timezone.json` | seeded by `merlin init` | Local-hour gates (the companion app keeps it current) |
+| `data/hum-state.json`, `hum-runs.jsonl`, `hum-feedback.jsonl`, `hum-learnings.jsonl` | written at run time | Counters, tick trace, pings + reactions, answers |
 
-Everything in `data/` is gitignored. The three files marked "you create it" come from `examples/`.
+Everything in `data/` is gitignored; the templates live in `examples/`.
 
-## Step 1 — seed the registry
-
-The harvest runner reads `data/hum-interests.json` to decide which harvesters to run. Without it, hum fires the empty-list code path and exits silent.
+## Step 1 — the sensors
 
 ```bash
-cp examples/hum-interests.example.json data/hum-interests.json
+cp examples/hum-sensors.example.json data/hum-sensors.json
 ```
 
-The shipped example enables 5 of the 7 generic harvesters (`weather`, `news`, `calendar`, `tasks`, `watchdog`) with sensible cadences. `serendipity` is disabled by default (it needs richer place-scoring than we ship). `_common` isn't a topic — it's the shared utilities module the other harvesters import.
+Each sensor entry names a script in `agent/scripts/hum-sensors/` (or your own in `hum-sensors/_ext/`), its interval and whether it is enabled; `config` tunes the gate (salience threshold, refractory period, quiet hours — `start`–`wake_floor` is a hard drop, `wake_floor`–`end` a soft shoulder). The daemon re-reads the file every tick. Defaults for every `config` key are in `lib/hum-events.mjs`.
 
-Edit to taste. Each topic entry takes:
+Run the engine:
+
+```bash
+./bin/hum-sense once                 # one pass, prints the verdict
+./bin/hum-sense once --sensor daypart
+agent/launch-agents/install.sh ai.claude.hum-sense   # always-on, macOS
+./bin/hum-sense status               # heartbeat, gate state, recent verdicts
+```
+
+`agent/scripts/trigger-hum.sh` stays in cron every 20 minutes as a **watchdog only**: it exits at once while the engine's heartbeat is fresh and dispatches a tick only when the event path is down.
+
+## Step 2 — the harvesters
+
+`data/hum-interests.json` (seeded from `examples/hum-interests.example.json`) enables `weather`, `news`, `calendar`, `tasks` and `watchdog`; `serendipity` is off by default. Each topic:
 
 ```jsonc
 {
-  "name": "weather",         // matches agent/scripts/hum-harvesters/<name>.mjs
-  "enabled": true,           // false = skipped entirely
+  "name": "weather",         // agent/scripts/hum-harvesters/<name>.mjs (or _ext/<name>.mjs)
+  "enabled": true,
   "cadence_min": 20,         // minimum minutes between runs
-  "cache_ttl_min": 60,       // per-topic cache TTL (harvester reads cache before network)
-  "active_window": "daily",  // when this topic should run; see below
-  "urgency_rule": null       // optional override of ranker weight
+  "cache_ttl_min": 60,       // the harvester's own cache TTL
+  "active_window": "daily",  // "daily" | "mon-fri 09:00-17:00" | "sat-sun" | "21:00-23:00"
+  "urgency_rule": null       // optional ranker-weight override
 }
 ```
 
-`active_window` formats the runner understands:
+Lanes that are location-bound or operational are listed in `agent/local/config/hum-lanes.json` (`extend_place_bound`, `extend_operational`; template in `examples/local/config/`), so a harvester of your own is classified like the kernel's.
 
-- `"daily"` or omitted/null → always runs
-- `"mon-fri 09:30-16:00 ET"` → weekday market hours
-- `"sat-sun"` → weekends only
-- `"21:00-23:00"` → evenings local time
-- Combined: `"mon-fri 17:00-19:00 ET"`
+## Step 3 — the intent doc
 
-## Step 2 — seed the intent doc
+`hum-review` (weekly) grades the prior week's pings and silences against `data/hum-intent.md`. Fill in the template's success criteria, anti-patterns, operating assumptions (work hours, sleep window) and durable "no" categories. It is read by the review and by you — not on every tick.
 
-Hum-review (weekly, Sundays 09:30 by default) grades the prior week's ticks against `data/hum-intent.md`. Without intent, the review has nothing to grade against and proposes nothing.
+## Step 4 — test it
 
 ```bash
-cp examples/hum-intent.example.md data/hum-intent.md
+./bin/merlin hum test                # one tick now, bypassing the gates
+./bin/merlin hum status              # next run, pings today, cool-down, pause state
+./bin/hum-sense log --since 6        # events → dispatch → what hum did
 ```
 
-The example is a template — fill in the sections marked as initially-empty. Important parts:
-
-- **Success criteria** — what makes a ping "good" vs "bad" for you specifically
-- **Anti-patterns** — what hum should never do (don't pester on rejection, no re-surfacing, etc.)
-- **Operating assumptions** — your work hours, sleep window, pre-meeting buffer, etc. These become the agent's defaults.
-- **What the user has explicitly said no to** — durable category-level rejections (start empty; hum-review will propose additions over time)
-
-The doc isn't read by hum itself on every tick (that would be expensive). It's read by hum-review weekly + by you when you tune.
-
-## Step 3 — seed the timezone file
-
-Trigger-hum.sh gates on the local hour (skips during sleep window). It reads timezone from `data/user-timezone.json` first, falls back to `America/New_York`.
-
-```bash
-cp examples/user-timezone.example.json data/user-timezone.json
-# edit if you're not in ET
-```
-
-If you've wired the companion iOS app + phone-context publishing, this file gets overwritten automatically from device data — you only need to seed it for hosts without the app.
-
-## Step 4 — wire the trigger
-
-Hum needs to actually fire. Add to your crontab (`crontab -e`):
-
-```cron
-*/20 * * * * /Users/<you>/Dev/merlin/agent/scripts/trigger-hum.sh
-```
-
-Replace the path with your `${MERLIN_HOME}`. The script self-gates on sleep window + supervisor liveness, so it's safe to fire every 20 min.
-
-Test it ad-hoc without waiting for cron:
-
-```bash
-./bin/merlin dispatch hum
-```
-
-Should produce a tick in `data/hum-runs.jsonl` within seconds.
+`./bin/merlin hum pause 2h | today | until-morning | weekend` and `hum resume` silence it; `hum feedback last 👍` records a reaction by hand.
 
 ## Writing your own harvester
 
-A harvester is a small Node script in `agent/scripts/hum-harvesters/<name>.mjs` that:
-
-1. Reads `{situation, context}` JSON on stdin
-2. Does its work (fetch RSS, query a DB, hit an API, scan a file…)
-3. Emits exactly one candidate JSON object on stdout, OR `null` to skip this tick
-
-The candidate shape:
+A harvester is a small Node script that reads `{situation, context}` JSON on stdin, does its work and prints exactly one candidate object (or `null`) on stdout:
 
 ```jsonc
 {
-  "topic": "your-topic-name",
+  "topic": "your-topic",
   "signal": "≤ 280-char one-line summary of the finding",
   "urgency": "low" | "med" | "high",
-  "freshness_min": 5,                // how fresh is the underlying signal in minutes
+  "freshness_min": 5,
   "dedup_key": "stable-id-for-this-finding",
-  "supporting_data": { /* anything the ranker should see */ }
+  "supporting_data": { }
 }
 ```
 
-Reference: read `agent/scripts/hum-harvesters/news.mjs` — it's the simplest non-trivial harvester (RSS scan + freshness filter). Use it as a template.
-
-Then add an entry to `data/hum-interests.json`:
-
-```jsonc
-{ "name": "your-topic-name", "enabled": true, "cadence_min": 30, "cache_ttl_min": 5, "active_window": "daily" }
-```
-
-Restart isn't required — the harness re-reads the registry on every tick. Fire ad-hoc to test:
-
-```bash
-./bin/merlin dispatch hum
-tail -n1 data/hum-runs.jsonl | jq .
-```
-
-You'll see your topic in `harvest.candidates` if it emitted, or in `harvest.errors` if it crashed.
+Start from `agent/scripts/hum-harvesters/news.mjs`. Put yours in `agent/scripts/hum-harvesters/_ext/your-topic.mjs` (gitignored; link it from your overlay repo) and add `{ "name": "your-topic", "enabled": true, "cadence_min": 30 }` to `data/hum-interests.json`. The harness re-reads the registry on every tick; after `merlin hum test`, `tail -n1 data/hum-runs.jsonl | jq .harvest` shows your topic under candidates or errors. A sensor of your own works the same way in `agent/scripts/hum-sensors/_ext/`.
 
 ## Hum CLIs
 
 | CLI | What |
 |---|---|
-| `bin/hum-ping` | Send + log a ping atomically. Inserts into Supabase, appends to hum-feedback.jsonl, writes a surfaced event to suggestion-history. Used by the hum playbook, rarely called directly. |
-| `bin/hum-answer <id> "<answer>"` | Record an answer to a pending hum question. Writes to hum-learnings.jsonl; the chat-agent calls this when it detects a reply that matches a pending-question file. |
-| `bin/hum-mark-idea-consumed <id>` | Mark an idea from the reservoir as "we surfaced this". Bookkeeping. |
-| `bin/hum-reservoir-review <keyword>... --reason "..."` | Drop matching ideas from the reservoir. Called by chat-agent when the user signals "already handled X". |
-
-You won't typically invoke these by hand — they're called by the hum playbook + chat-agent reply-handlers. They're documented here so you know what each does when you read the logs.
+| `bin/hum-sense` | The event engine (daemon, one-shot pass, status, log, emit). |
+| `bin/hum-ping` | Send and log a ping atomically (Supabase message, hum-feedback row, suggestion history). Called by the hum playbook. |
+| `bin/hum-ask` / `bin/hum-answer` | Ask the user a question / record the answer into `hum-learnings.jsonl`. |
+| `bin/hum-ideas-append`, `hum-idea-decide`, `hum-ideas-resolve`, `hum-mark-idea-consumed` | The ideas reservoir: add, decide, resolve, mark surfaced (`system/hum-ideas-reservoir.md`). |
+| `bin/hum-reservoir-review`, `hum-reservoir-prune` | Drop handled ideas; nightly pruning and scorecard rebuild. |
+| `bin/hum-resolve-first` | Check a candidate against evidence sources before it is surfaced ([`hum-resolve-first.md`](hum-resolve-first.md)). |
 
 ## What hum doesn't do out of the box
 
-Until you populate it, hum doesn't have any of the things that made it feel valuable in the upstream system:
-
-- **No tastes / preferences.** The `context.tastes` object hum's ranker reads is sourced from your wiki pages (`user_food_taste.md`, `user_art_taste.md`, etc.). Empty by default; add `type: user` pages to your wiki.
-- **No active projects.** Same — `context.projects` reads `type: project` pages. Empty until you author them.
-- **No harvesters for stocks, music, art, dining, fitness, etc.** These were personal in the upstream source; the public tree ships only the generic 7. Write your own.
-- **No ideation loop running.** `hum-ideation` (the playbook that generates new ideas) needs project/taste context to produce useful ideas. Stays mostly silent until your wiki has substance.
-
-The ramp from "5 generic harvesters running" to "hum surfaces something I'd have missed daily" is the part where the system stops being a kernel and starts being yours.
+- **No tastes or projects.** The ranker's `context.tastes` and `context.projects` come from your wiki pages (`type: user`, `type: project`) and from `lib/_ext/merlin-context.cjs` if you add one. Empty until you write them ([`memory.md`](memory.md)).
+- **No personal harvesters.** Stocks, music, dining, fitness and the like are yours to write in `_ext/`.
+- **No presence timeline.** Location- and travel-aware checks fail open until you provide `lib/_ext/presence.mjs` (contract in `lib/_ext/.gitkeep`).
+- **A quiet ideation loop.** `hum-ideation` needs project and taste context before it produces anything worth surfacing.
 
 ## Disabling hum
 
-If you don't want the ambient loop at all:
+1. Stop the engine (`agent/launch-agents/install.sh --uninstall ai.claude.hum-sense`) and remove the `trigger-hum.sh` cron line.
+2. Set every topic in `data/hum-interests.json` to `enabled: false` (or delete the file).
 
-1. Remove the `trigger-hum.sh` cron entry.
-2. `rm data/hum-interests.json` (or set every topic's `enabled: false`).
-3. Stays out of the way; everything else (email triage, scheduled jobs, chat) works fine without hum.
+Email triage, scheduled jobs and chat work fine without hum.
