@@ -2,8 +2,8 @@
 // wiki-cloud-sync — mirror the wiki (pages, links, revisions) to Supabase.
 //
 // The production host's memory-index.db stays the working store: every wiki read and
-// write Merlin does is local and synchronous. This tool keeps an off-box
-// copy in the merlin Supabase project (wiki_pages / wiki_page_links /
+// write Edva does is local and synchronous. This tool keeps an off-box
+// copy in the edva Supabase project (wiki_pages / wiki_page_links /
 // wiki_page_revisions — migration 20261004_wiki_cloud.sql), which is
 //   * the disaster-recovery source (`restore` rebuilds the wiki tables), and
 //   * what the wiki site reads.

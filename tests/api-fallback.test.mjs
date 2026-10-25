@@ -11,7 +11,7 @@ import path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "api-fallback-"));
 process.env.HOME = tmp; // no real .env is read
 process.env.WIKI_API_NO_ALERT = "1";
-delete process.env.MERLIN_WIKI_API_KEY;
+delete process.env.EDVA_WIKI_API_KEY;
 
 const af = await import("../lib/api-fallback.mjs");
 const ladder = await import("../lib/model-ladder.mjs");
@@ -48,10 +48,10 @@ test("without the key it is off, and says so", async () => {
   const r = await af.apiComplete("x", { caller: "wiki-answer" });
   assert.equal(r.error.kind, "no_key");
   process.env.WIKI_API_FALLBACK = "0";
-  process.env.MERLIN_WIKI_API_KEY = "k";
+  process.env.EDVA_WIKI_API_KEY = "k";
   assert.equal((await af.apiComplete("x", { caller: "wiki-answer" })).error.kind, "disabled");
   delete process.env.WIKI_API_FALLBACK;
-  delete process.env.MERLIN_WIKI_API_KEY;
+  delete process.env.EDVA_WIKI_API_KEY;
 });
 
 test("sends Sonnet with server-side default fallbacks, no tools, and writes a priced ledger row", async () => {
@@ -187,12 +187,12 @@ test("rung: an API failure fails the rung with both reasons", async () => {
 test("the key is read from .env without loading the rest of the file into the environment", async () => {
   freshLedger();
   const envFile = path.join(tmp, "dot-env");
-  fs.writeFileSync(envFile, "ANTHROPIC_BASE_URL=https://elsewhere.invalid\nMERLIN_WIKI_API_KEY=sk-test\n");
+  fs.writeFileSync(envFile, "ANTHROPIC_BASE_URL=https://elsewhere.invalid\nEDVA_WIKI_API_KEY=sk-test\n");
   process.env.WIKI_API_ENV_FILE = envFile;
   const before = process.env.ANTHROPIC_BASE_URL;
   assert.equal(af.fallbackEnabled(), true);
   assert.equal(process.env.ANTHROPIC_BASE_URL, before, "other .env lines stay out of process.env (and out of claude -p forks)");
-  assert.equal(process.env.MERLIN_WIKI_API_KEY, undefined);
+  assert.equal(process.env.EDVA_WIKI_API_KEY, undefined);
   delete process.env.WIKI_API_ENV_FILE;
 });
 

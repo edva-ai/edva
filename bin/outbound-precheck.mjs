@@ -7,7 +7,7 @@
 // harvester asked "the planned time slid by — when do you want to do it?"
 // although the user had told the agent minutes earlier that it was already
 // under way. The programmatic harvester had no chat-context awareness. This script makes that
-// awareness universal: any caller of merlin-send-curl pipes its proposed
+// awareness universal: any caller of edva-send-curl pipes its proposed
 // message through here first, and a Sonnet subprocess answers send / suppress
 // / modify based on recent conversation + calendar.
 //
@@ -95,7 +95,7 @@ function tzOffsetMs(tz, ms) {
 // callers failing to pass --intent, but the callers that DO pass one were not
 // recorded either — emit() never looked at anything but its argument. (The two
 // rows that do carry an intent come from a separate appender inside
-// merlin-send-curl, not from here.)
+// edva-send-curl, not from here.)
 //
 // Deliberately narrow: the stdout protocol is untouched and stays exactly
 // {decision, message?, reason}, because callers parse it. Only the LOG row is
@@ -105,7 +105,7 @@ function tzOffsetMs(tz, ms) {
 // separate job for a pre-commit lint, not for this file.
 //
 // (Also deliberately NOT here: deriving a sender from the process tree. It was
-// tried and dropped — the immediate ancestor is always merlin-send-curl, so it
+// tried and dropped — the immediate ancestor is always edva-send-curl, so it
 // records a constant, and the message is in that ancestor's argv, which would
 // put message text one parsing slip away from a log that CLAUDE.md
 // § Financial Operations rule 5 forbids bank content from entering.)
@@ -148,7 +148,7 @@ function emit(obj) {
 // and <=10% rarely closes. Replayed over this log, 25/15 stays silent in a
 // normal week and reports the bad stretch (26-36%).
 const HEALTH_FILE = process.env.OUTBOUND_PRECHECK_HEALTH || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "data", ".outbound-precheck-health.json"); // dotfile: gitignored by data/.*
-const SEND_BIN = process.env.OUTBOUND_PRECHECK_SEND_BIN || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "merlin-send-curl");
+const SEND_BIN = process.env.OUTBOUND_PRECHECK_SEND_BIN || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "edva-send-curl");
 const HEALTH_WINDOW = 50;        // last N relevance decisions
 const HEALTH_MIN_SAMPLE = 20;    // don't judge a rate off a handful
 const HEALTH_ALERT_RATE = 0.25;  // >25% unchecked → one system-channel row
@@ -243,9 +243,9 @@ const intent = (input.intent || "unknown").toString().slice(0, 80);
 // Sender/agent label. Identifies which caller is gating
 // the message so the reasoner can apply origin-aware heuristics:
 //   - "ops"     — ops-agent autonomous push (harvester, digest, cron job).
-//                 Default for merlin-send-curl since nearly all programmatic
+//                 Default for edva-send-curl since nearly all programmatic
 //                 callers are ops-side.
-//   - "chat"    — chat-agent invoked merlin-send-curl (rare; chat-agent
+//   - "chat"    — chat-agent invoked edva-send-curl (rare; chat-agent
 //                 normally uses mcp__phone-channel__reply, which bypasses
 //                 precheck by design).
 //   - "infra"   — supervisor/watchdog/process-manager liveness alerts.
@@ -266,11 +266,11 @@ const supportingData = input.supporting_data || null;
 // through when the first had gone out five hours before the second.
 //
 // SCOPED TO THE CHAT CHANNEL (from a Jev disagreement).
-// merlin_messages holds three channels and this query had no channel filter,
+// edva_messages holds three channels and this query had no channel filter,
 // so every `🔧` Improvements approval card and every `⚠️`/`🔀` system alert
 // arrived below labelled "Phone-channel transcript" — i.e. as something
-// Merlin had said to the user in chat. It had not. Those are separate channels
-// the user has to switch to in the app's top-bar menu, and merlin-send-curl exempts
+// Edva had said to the user in chat. It had not. Those are separate channels
+// the user has to switch to in the app's top-bar menu, and edva-send-curl exempts
 // both from this very gate (§ Outbound Precheck classes 5 and 6), so the gate
 // was reading back, as evidence, traffic it had already been told is not its
 // business.
@@ -298,7 +298,7 @@ const supportingData = input.supporting_data || null;
 // and keeping those was tried first — measured, it moved a
 // should-suppress case from suppress 0.66 to send 0.52, so it did not earn its
 // place. The residual exposure is small and bounded: in every observed case
-// Merlin's chat-channel answer immediately followed and carries the substance.
+// Edva's chat-channel answer immediately followed and carries the substance.
 // Revisit with a real disagreement, not a hypothesis.
 let recentMessages = [];
 const sbKey = readSupabaseKey();
@@ -312,7 +312,7 @@ if (sbKey) {
       order: "created_at.desc",
       limit: "60",
     });
-    const url = `${SUPABASE_URL}/rest/v1/merlin_messages?${qs}`;
+    const url = `${SUPABASE_URL}/rest/v1/edva_messages?${qs}`;
     const resp = await fetch(url, {
       headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
       signal: AbortSignal.timeout(8000),
@@ -632,7 +632,7 @@ try {
     supporting_data: supportingData,
     created_at: input.created_at || null,
     evidence_as_of: input.evidence_as_of || null,
-    // A merlin-send-curl push is proactive by definition — the user did not ask
+    // A edva-send-curl push is proactive by definition — the user did not ask
     // for it — so "drop" is available here. The chat reply path, where the user IS
     // waiting for an answer, passes solicited:true and loses that power.
     solicited: input.solicited === true,
@@ -682,7 +682,7 @@ const sameDayPingsBlock = sameDayPingsText
   : "";
 
 const claimFactsBlock = claimFactsText
-  ? `\nAUTHORITATIVE FACTS (Merlin's live travel timeline — GROUND TRUTH, outranks the message's wording and outranks any wiki page, which can lag).\nEach line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT suppress a message for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:\n${claimFactsText}\n`
+  ? `\nAUTHORITATIVE FACTS (Edva's live travel timeline — GROUND TRUTH, outranks the message's wording and outranks any wiki page, which can lag).\nEach line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT suppress a message for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:\n${claimFactsText}\n`
   : "";
 
 const utterancesBlock = utterancesText
@@ -725,7 +725,7 @@ const utterancesBlock = utterancesText
 // Filed by jev-disagreement-review against THIS mechanism after the same error
 // three times, each a result the user had asked for (in chat minutes earlier,
 // on the System tab, or by email reply), suppressed as "a run report on
-// Merlin's own plumbing". Jev's question already carries the
+// Edva's own plumbing". Jev's question already carries the
 // first half. It is a separate paragraph, not a
 // third rescue inside "EITHER OF TWO THINGS", so the co-equal ask/hook shape
 // above is untouched.
@@ -734,7 +734,7 @@ const utterancesBlock = utterancesText
 // threshold (jev-shadow-report, 7d). The other ~75% are
 // decided by this prompt, and after the shadow window closes it still decides
 // the whole sub-threshold band.
-const prompt = `You are the outbound gate for ${OWNER}'s personal agent ("Merlin"). A programmatic job is about to push a message to ${OWNER}'s phone. Your job is to decide whether the message should go through, be suppressed, or be modified.
+const prompt = `You are the outbound gate for ${OWNER}'s personal agent ("Edva"). A programmatic job is about to push a message to ${OWNER}'s phone. Your job is to decide whether the message should go through, be suppressed, or be modified.
 
 Default to "send". Suppress when ANY of these apply:
 (a) The recent phone-channel transcript shows the message is wrong, redundant, or rude — e.g., it asks them to do something they just said they're doing; it nags about a slot they explained they're skipping; it contradicts something they just told the agent.
@@ -749,20 +749,20 @@ The long-term memory context is the authoritative source for facts about ${P.mem
 
 QUESTIONS ARE FIRST-CLASS (2026-07-19 false-suppression fix). If the proposed message is a QUESTION to ${OWNER} (asks a preference, verifies a premise, captures their intent — typically phrased with "?"), its whole purpose is to grow memory. Do NOT suppress a question under criterion (c) or (e) merely because it shares a person/pet/place/topic word with an earlier info ping or a resolved topic. Only suppress a question if the SAME question — the same subject being asked — was already asked today (same-day pings) or was explicitly answered/settled (resolved-topics or transcript). A question about a genuinely NEW angle on a familiar subject${P.questions_new_angle_example} MUST send.
 
-REPORTING ON MERLIN'S OWN STATE IS NOT NEWS (2026-09-27). A message whose only NEW content is MERLIN'S OWN INTERNAL STATE, and which asks ${OWNER} for nothing and tells them nothing from inside the email, is a SUPPRESS — it belongs in the Improvements channel, not their chat (agent/CLAUDE.md: "Chat is the channel for things about ${OWNER}'s life; a repair story is about Merlin's"; and the Long-form delivery rule: a pointer carries the standout fact or is not sent at all). This is not criterion (a)–(e) territory — such a message contradicts nothing and duplicates nothing, which is exactly why it keeps slipping through. Two shapes carry it. One is a DIGEST POINTER reporting only delivery mechanics: "<job> emailed", "N newsletter(s)/item(s)", "labeled p1", "starred in your inbox" — nothing the push notification did not already say. The other is a RUN REPORT on Merlin's own plumbing: how many pings went out, how many went unreacted, which lane was busiest, which gate misfired or dropped something, that a job fired on schedule, why a bug happened. Suppressing either costs them nothing — the email itself and its APNs push are separate commands in the same job and are untouched.
+REPORTING ON EDVA'S OWN STATE IS NOT NEWS (2026-09-27). A message whose only NEW content is EDVA'S OWN INTERNAL STATE, and which asks ${OWNER} for nothing and tells them nothing from inside the email, is a SUPPRESS — it belongs in the Improvements channel, not their chat (agent/CLAUDE.md: "Chat is the channel for things about ${OWNER}'s life; a repair story is about Edva's"; and the Long-form delivery rule: a pointer carries the standout fact or is not sent at all). This is not criterion (a)–(e) territory — such a message contradicts nothing and duplicates nothing, which is exactly why it keeps slipping through. Two shapes carry it. One is a DIGEST POINTER reporting only delivery mechanics: "<job> emailed", "N newsletter(s)/item(s)", "labeled p1", "starred in your inbox" — nothing the push notification did not already say. The other is a RUN REPORT on Edva's own plumbing: how many pings went out, how many went unreacted, which lane was busiest, which gate misfired or dropped something, that a job fired on schedule, why a bug happened. Suppressing either costs them nothing — the email itself and its APNs push are separate commands in the same job and are untouched.
 
 EITHER OF TWO THINGS TAKES A MESSAGE OUT OF THIS PARAGRAPH ALTOGETHER, AND EACH ONE IS SUFFICIENT BY ITSELF — AN ASK, OR A HOOK. Check for both before you suppress anything under this paragraph; if either is present, the message SENDS. They are not ranked and neither requires the other.
 
-THE ASK. Does the message put ANYTHING to them — to answer, decide, label, confirm, or simply LOOK AT? "needs your eyes", "see email", "details in your inbox", "reply to label", "want me to", or any question at all, however small, counts. If so the message SENDS, even when everything else in it is Merlin's own plumbing, even when it offers no hook whatsoever, and even when it says nothing beyond the fact that a job produced something. An ask does NOT additionally have to be about their own affairs. A run report ending "the situation gate misfired twice today — want me to file an improvement for it?" SENDS, because they were asked something.
+THE ASK. Does the message put ANYTHING to them — to answer, decide, label, confirm, or simply LOOK AT? "needs your eyes", "see email", "details in your inbox", "reply to label", "want me to", or any question at all, however small, counts. If so the message SENDS, even when everything else in it is Edva's own plumbing, even when it offers no hook whatsoever, and even when it says nothing beyond the fact that a job produced something. An ask does NOT additionally have to be about their own affairs. A run report ending "the situation gate misfired twice today — want me to file an improvement for it?" SENDS, because they were asked something.
 
-THE HOOK — equally sufficient, and it does NOT need an ask alongside it. A pointer whose whole merit is naming the one thing worth opening the email for SENDS. A hook is one substantive finding, number or decision from INSIDE the email — the thing that would make them open it now rather than later. Most often it is their own affairs: ${P.hook_affairs}, something they can act on or that changes what they believe about their own life ${P.hook_examples}. But an email whose whole content is OUTSIDE READING they asked to be kept across — a newsletter digest, a press or research roundup, an event or listings scan — hooks on its standout ITEM, and that is a full hook even though the subject is the world rather than them: ${P.outside_reading_hook_example} SENDS, because naming which piece is worth their time is exactly the judgement they wanted from the digest. What is NOT a hook: a bare COUNT of items, and a detail about MERLIN ITSELF however specific — which gate misfired, how long something took to resolve, how many pings went unreacted, what a job got wrong. That IS the run-report shape told at greater length; narrating it in more detail never promotes it to a hook. This paragraph never applies to a PROTECTED INTENT (listed below), and when you are unsure whether the message's new content is really about Merlin rather than about them, SEND.
+THE HOOK — equally sufficient, and it does NOT need an ask alongside it. A pointer whose whole merit is naming the one thing worth opening the email for SENDS. A hook is one substantive finding, number or decision from INSIDE the email — the thing that would make them open it now rather than later. Most often it is their own affairs: ${P.hook_affairs}, something they can act on or that changes what they believe about their own life ${P.hook_examples}. But an email whose whole content is OUTSIDE READING they asked to be kept across — a newsletter digest, a press or research roundup, an event or listings scan — hooks on its standout ITEM, and that is a full hook even though the subject is the world rather than them: ${P.outside_reading_hook_example} SENDS, because naming which piece is worth their time is exactly the judgement they wanted from the digest. What is NOT a hook: a bare COUNT of items, and a detail about EDVA ITSELF however specific — which gate misfired, how long something took to resolve, how many pings went unreacted, what a job got wrong. That IS the run-report shape told at greater length; narrating it in more detail never promotes it to a hook. This paragraph never applies to a PROTECTED INTENT (listed below), and when you are unsure whether the message's new content is really about Edva rather than about them, SEND.
 
-A RESULT THEY ASKED FOR, OR A CHANGE THEY WILL NOTICE, IS NOT THIS PARAGRAPH'S MESSAGE AT ALL (2026-10-07). agent/CLAUDE.md sends repair stories to Improvements "unless ${OWNER} asked for it, or they can observe the difference", and both halves apply here. FIRST: if the transcript shows ${OWNER} asking for this very change or raising this very problem ${P.asked_for_examples}, the account of what was done IS the answer they are waiting for, and it SENDS however much of it is about Merlin. They do not always ask in this chat: a reply to one of Merlin's emails, or a word on the System tab, never appears in the transcript below, so a message that plainly reports back on a change made at their request ("Done — the retime you asked for is live", "Done: the pin audit won't email you anymore") counts on its own word. SECOND: a message telling them about a change they will SEE — an email that stops or starts arriving, a delivery time that moves, something they receive (a daily summary, a digest, a memo) coming back after it failed, anything that will look different on their phone or in their inbox — SENDS, because otherwise the change reaches them as a surprise. Older copies of that email in their inbox, or older pages describing the old behaviour, are the BEFORE of the change, not a contradiction of it. Neither reaches a run report on anything ELSE: a count of pings, a gate that misfired, a job that ran on schedule, a digest delivered as usual, or a bug story whose only effect stays inside Merlin is still SUPPRESS, even in the same evening as their request.
+A RESULT THEY ASKED FOR, OR A CHANGE THEY WILL NOTICE, IS NOT THIS PARAGRAPH'S MESSAGE AT ALL (2026-10-07). agent/CLAUDE.md sends repair stories to Improvements "unless ${OWNER} asked for it, or they can observe the difference", and both halves apply here. FIRST: if the transcript shows ${OWNER} asking for this very change or raising this very problem ${P.asked_for_examples}, the account of what was done IS the answer they are waiting for, and it SENDS however much of it is about Edva. They do not always ask in this chat: a reply to one of Edva's emails, or a word on the System tab, never appears in the transcript below, so a message that plainly reports back on a change made at their request ("Done — the retime you asked for is live", "Done: the pin audit won't email you anymore") counts on its own word. SECOND: a message telling them about a change they will SEE — an email that stops or starts arriving, a delivery time that moves, something they receive (a daily summary, a digest, a memo) coming back after it failed, anything that will look different on their phone or in their inbox — SENDS, because otherwise the change reaches them as a surprise. Older copies of that email in their inbox, or older pages describing the old behaviour, are the BEFORE of the change, not a contradiction of it. Neither reaches a run report on anything ELSE: a count of pings, a gate that misfired, a job that ran on schedule, a digest delivered as usual, or a bug story whose only effect stays inside Edva is still SUPPRESS, even in the same evening as their request.
 
 Proposed message:
 """${workingMessage}"""
 
-Sender (agent label): ${senderLabel}    (ops = autonomous backend / harvester / digest / cron; chat = chat-agent escalating via merlin-send-curl; infra = supervisor liveness alert)
+Sender (agent label): ${senderLabel}    (ops = autonomous backend / harvester / digest / cron; chat = chat-agent escalating via edva-send-curl; infra = supervisor liveness alert)
 Intent (sender's tag): ${intent}
 ${supportingBlock}${claimFactsBlock}${utterancesBlock}${wikiBlock}${resolvedTopicsBlock}${sameDayPingsBlock}
 Phone-channel transcript, last 8h (oldest first):
@@ -807,14 +807,14 @@ function emitSend(reason) {
 // send and suppress. It cannot write text, so a Jev "modify" takes Sonnet's
 // modified message (and Sonnet's verdict). During the shadow week a Sonnet
 // "suppress" beats a Jev "send" (lib/jev-gates.mjs). Intents carrying
-// merlin-model-only data never reach Jev, and everything else passes the
+// edva-model-only data never reach Jev, and everything else passes the
 // fail-closed on-device health/bank screen first. Jev unavailable / unsure →
 // exactly the old Sonnet path.
 //
 // The Sonnet call is now ASYNC (execFile), so the shadow Sonnet turn and the Jev
 // request genuinely overlap; it resolves the parsed verdict or THROWS the old
 // fail-open reason, which becomes an emitSend below — unchanged behavior.
-// Tool-less, Max-only, off the merlin tree's settings: lib/jev-claude.mjs.
+// Tool-less, Max-only, off the edva tree's settings: lib/jev-claude.mjs.
 async function sonnetDecision() {
   const { out: sonnetOut, error } = await runToollessDetailed({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
   if (!sonnetOut) {

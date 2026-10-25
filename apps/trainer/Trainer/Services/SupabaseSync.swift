@@ -4,7 +4,7 @@ import SwiftData
 import Supabase
 #endif
 
-/// Pushes finished WorkoutSessions + their SetLogs to Supabase so Merlin can read them.
+/// Pushes finished WorkoutSessions + their SetLogs to Supabase so Edva can read them.
 /// Idempotent: a session is only pushed once per `updatedAt`; we stamp `remoteSyncedAt` after success.
 @MainActor
 final class SupabaseSync {

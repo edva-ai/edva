@@ -5,7 +5,7 @@
 // to the currently-pending hum question. Appends the answer to TWO append-only
 // logs and clears hum-pending-question.json:
 //   - hum-learnings.jsonl   — the historical answer log (unchanged; still read
-//                             by merlin-context recent_learnings + situation).
+//                             by edva-context recent_learnings + situation).
 //   - hum-responses.jsonl   — the canonical reply-capture log (shared with
 //                             suggestion-classify). The overnight `hum-consolidate`
 //                             job reads this and folds durable preferences/facts

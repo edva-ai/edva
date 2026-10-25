@@ -6,7 +6,7 @@
 # admission rules (repairable error, read-only action, 1/day per action, 4/day
 # overall) were already applied when the item was queued.
 
-STATE_DIR="$HOME/Dev/merlin/data"
+STATE_DIR="$HOME/Dev/edva/data"
 QUEUE="$STATE_DIR/skill-repair-queue.json"
 LOCK="$STATE_DIR/skill-repair.lock"
 

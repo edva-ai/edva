@@ -5,7 +5,7 @@
 # choice-handlers.mjs       lib/choice-reply.mjs — tap handlers for your own
 #   choice-card and checklist kinds:
 #   export default { choices: { <kind>: fn }, checklists: { <kind>: fn } }
-#   (kernel kinds win on a name; MERLIN_CHOICE_HANDLERS overrides the path)
+#   (kernel kinds win on a name; EDVA_CHOICE_HANDLERS overrides the path)
 #
 # watches.mjs               bin/hum-sense — a watch engine offered every fresh
 #   event: export function spoolEvents(events)
@@ -14,10 +14,10 @@
 #   export default { name, describe, async sync({ cm, wiki, run, BIN, DATA }) }
 #   (`context-sync <name>` runs one; `all` runs them after the kernel's)
 #
-# merlin-context.cjs        lib/merlin-context.js — extra context sources:
+# edva-context.cjs        lib/edva-context.js — extra context sources:
 #   module.exports = ({ MEMORY_DIR, DATA, TOOLS, defaults, shSafe, readJsonSafe })
 #     => ({ knowledge?, tasteFiles?, profileFiles?, projectFiles?, counts? })
-#   (MERLIN_CONTEXT_OVERLAY overrides the path)
+#   (EDVA_CONTEXT_OVERLAY overrides the path)
 #
 # presence.mjs              lib/claim-facts.mjs, hum-idea-locality.mjs,
 #   bin/hum-ideas-append — where the user is on a date:

@@ -7,7 +7,7 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 export PATH="/opt/homebrew/bin:$PATH"
 
 resolve_tier_ports hum-review   # tier-routes WEBHOOK_PORT + HEALTH_PORT (was :9092 Opus)
-LOGFILE="$HOME/Dev/merlin/agent/logs/watchdog.log"
+LOGFILE="$HOME/Dev/edva/agent/logs/watchdog.log"
 PAYLOAD='{"job": "hum-review"}'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [hum-review] $1" >> "$LOGFILE"; }

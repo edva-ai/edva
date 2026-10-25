@@ -1,0 +1,1044 @@
+#!/bin/bash
+# edva-send-curl — Insert a message into edva_messages via curl + push notification.
+# Usage: edva-send-curl "Your message here"
+#        edva-send-curl --no-push "Silent message"
+#        edva-send-curl --push-body "Custom push text" "Full message here"
+
+# This installation's identity (EDVA_OWNER_NAME, EDVA_OWNER_EMAIL,
+# EDVA_SUPABASE_PROJECT, …) from agent/local/instance.json; env wins.
+# Resolved next to this script, so a test's throwaway HOME still reads them.
+_GSC_TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$_GSC_TOOLS/agent/scripts/lib/instance.sh"
+# The installation's tree (EDVA_INSTALL_TOOLS: EDVA_HOME, else ~/Dev/edva),
+# where its data, logs, secrets and bins live.
+. "$_GSC_TOOLS/agent/scripts/lib/root.sh"
+OWNER_NAME="${EDVA_OWNER_NAME:-the user}"
+OWNER_NAME_LC=$(printf '%s' "$OWNER_NAME" | tr '[:upper:]' '[:lower:]')
+SUPABASE_URL="https://${EDVA_SUPABASE_PROJECT}.supabase.co"
+
+# Intents whose content is edva-model-only (bank, brokerage, health, net
+# worth, property) — glob patterns. The kernel lists the generic ones; an
+# installation names its own accounts in agent/local/config/send-intents.json
+# (private_data_intents / private_hum_intents, full lists or extend_<key>).
+# Read once, on first use.
+DEFAULT_PRIVATE_DATA_INTENTS="bank-alert bank-* health health:* health-* net-worth net-worth-* property property-*"
+DEFAULT_PRIVATE_HUM_INTENTS="hum:finance hum:finance:* hum:stocks hum:stocks:*"
+# Chat-channel intents an installation lets through with --skip-precheck beyond
+# the kernel's own (send-intents.json chat_bypass_intents, glob patterns), and
+# the pronouns the precheck uses for the owner in its reasons (owner_pronouns,
+# an ERE alternation; see REVOCATION_RE).
+DEFAULT_CHAT_BYPASS_INTENTS=""
+DEFAULT_OWNER_PRONOUNS="he|she|they"
+# The protected hum lanes and the suppress-override belt's revocation
+# vocabulary (see "Protected-intent suppress-override" below) come from
+# agent/local/config/hum-lanes.json: protected_lanes (none by default —
+# then the belt never fires) and protected_revocation {phrases, said,
+# transcript}, ERE alternations written against those lanes' pings. The
+# defaults are lane-neutral.
+DEFAULT_REVOCATION_PHRASES="skip (today|tonight|this|it)|skipping (today|tonight)|not going (today|tonight)|don.?t (need|want) (the |a )?(reminder|nudge|ping)|stop (pinging|nagging|reminding|bugging) me"
+DEFAULT_REVOCATION_SAID="skip|rest|stop|not going|won.?t go|can.?t go"
+DEFAULT_REVOCATION_TRANSCRIPT="skip|rest|not going"
+_SEND_INTENTS_LOADED=false
+_load_send_intents() {
+  [ "$_SEND_INTENTS_LOADED" = true ] && return
+  _SEND_INTENTS_LOADED=true
+  local out
+  out=$(node -e 'const { localConfig } = require(process.argv[1]);
+const words = (s) => s.split(" ").filter(Boolean);
+const c = localConfig("send-intents", { private_data_intents: words(process.argv[2]), private_hum_intents: words(process.argv[3]), chat_bypass_intents: words(process.argv[4]), owner_pronouns: process.argv[5] });
+const l = localConfig("hum-lanes", { protected_lanes: [], protected_revocation: {} });
+const r = { phrases: process.argv[6], said: process.argv[7], transcript: process.argv[8], ...(l.protected_revocation || {}) };
+console.log([].concat(c.private_data_intents).join(" ")); console.log([].concat(c.private_hum_intents).join(" "));
+console.log([].concat(c.chat_bypass_intents).join(" ")); console.log(String(c.owner_pronouns || ""));
+console.log([].concat(l.protected_lanes || []).join("|")); console.log(r.phrases); console.log(r.said); console.log(r.transcript);' \
+    "$_GSC_TOOLS/lib/instance.cjs" "$DEFAULT_PRIVATE_DATA_INTENTS" "$DEFAULT_PRIVATE_HUM_INTENTS" "$DEFAULT_CHAT_BYPASS_INTENTS" "$DEFAULT_OWNER_PRONOUNS" \
+    "$DEFAULT_REVOCATION_PHRASES" "$DEFAULT_REVOCATION_SAID" "$DEFAULT_REVOCATION_TRANSCRIPT" 2>/dev/null)
+  PRIVATE_DATA_INTENTS=$(printf '%s\n' "$out" | sed -n 1p)
+  PRIVATE_HUM_INTENTS=$(printf '%s\n' "$out" | sed -n 2p)
+  CHAT_BYPASS_INTENTS=$(printf '%s\n' "$out" | sed -n 3p)
+  OWNER_PRONOUNS=$(printf '%s\n' "$out" | sed -n 4p)
+  PROTECTED_LANES=$(printf '%s\n' "$out" | sed -n 5p)
+  REVOCATION_PHRASES=$(printf '%s\n' "$out" | sed -n 6p)
+  REVOCATION_SAID=$(printf '%s\n' "$out" | sed -n 7p)
+  REVOCATION_TRANSCRIPT=$(printf '%s\n' "$out" | sed -n 8p)
+  [ -n "$PRIVATE_DATA_INTENTS" ] || PRIVATE_DATA_INTENTS="$DEFAULT_PRIVATE_DATA_INTENTS"
+  [ -n "$PRIVATE_HUM_INTENTS" ] || PRIVATE_HUM_INTENTS="$DEFAULT_PRIVATE_HUM_INTENTS"
+  [ -n "$OWNER_PRONOUNS" ] || OWNER_PRONOUNS="$DEFAULT_OWNER_PRONOUNS"
+  [ -n "$REVOCATION_PHRASES" ] || REVOCATION_PHRASES="$DEFAULT_REVOCATION_PHRASES"
+  [ -n "$REVOCATION_SAID" ] || REVOCATION_SAID="$DEFAULT_REVOCATION_SAID"
+  [ -n "$REVOCATION_TRANSCRIPT" ] || REVOCATION_TRANSCRIPT="$DEFAULT_REVOCATION_TRANSCRIPT"
+}
+# The suppress-override belt's two regexes, from the lists above:
+# PROTECTED_INTENT_RE matches hum:<protected lane>: intents ("" when none),
+# REVOCATION_RE the precheck reasons that cite an explicit user revocation
+# (case-insensitive; the owner is matched as "user", their name or a pronoun).
+_protection_res() {
+  _load_send_intents
+  PROTECTED_INTENT_RE=""
+  [ -n "$PROTECTED_LANES" ] && PROTECTED_INTENT_RE="^hum:(${PROTECTED_LANES}):"
+  REVOCATION_RE="(${REVOCATION_PHRASES}|(user|${OWNER_NAME_LC}|${OWNER_PRONOUNS}) (said|wrote|told|replied|asked) [^.]*(${REVOCATION_SAID})|transcript [^.]*(${REVOCATION_TRANSCRIPT}))"
+}
+# _intent_in <intent> <space-separated glob patterns> → 0 when one matches.
+_intent_in() {
+  local intent="$1" pat
+  local -a pats
+  read -r -a pats <<< "$2"
+  for pat in "${pats[@]}"; do
+    # shellcheck disable=SC2053 # the pattern is a glob on purpose
+    [[ "$intent" == $pat ]] && return 0
+  done
+  return 1
+}
+# EDVA_SEND_PRINT_PROTECTION=1: print the belt's two regexes and exit, sending
+# nothing (tests evaluate exactly what a send would use).
+if [ "${EDVA_SEND_PRINT_PROTECTION:-}" = "1" ]; then
+  _protection_res
+  printf 'PROTECTED_INTENT_RE=%s\nREVOCATION_RE=%s\n' "$PROTECTED_INTENT_RE" "$REVOCATION_RE"
+  exit 0
+fi
+# Load service_role key from .env (required after RLS lockdown)
+ENV_FILE="$EDVA_INSTALL_TOOLS/.env"
+SUPABASE_KEY=$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
+if [ -z "$SUPABASE_KEY" ]; then
+  echo "FATAL: SUPABASE_SERVICE_ROLE_KEY not found in $ENV_FILE" >&2
+  exit 1
+fi
+NOTIFY="$EDVA_INSTALL_TOOLS/bin/edva-notify"
+PRECHECK="$EDVA_INSTALL_TOOLS/bin/outbound-precheck.mjs"
+PRECHECK_LOG="$EDVA_INSTALL_TOOLS/data/outbound-precheck-log.jsonl"
+MSG_STAMP_FILE="$EDVA_INSTALL_TOOLS/data/last-edva-message-at.json"
+
+# A message whose edva_messages INSERT fails is parked here and replayed by
+# SPOOL_FLUSH on the next system-channel send that succeeds. Scoped to
+# --channel system deliberately: that channel is read by no reasoner, so a
+# backfilled past-dated row cannot perturb outbound-precheck's 90-minute chat
+# window or the chat-agent's history. Why: a "database unreachable" page
+# cannot be written while the database is down, so the channel kept only the
+# "Recovered" check that followed it, and system-issue-review (whose only
+# input is this table) was blind to the outage.
+SPOOL_FILE="${EDVA_SEND_SPOOL:-$EDVA_INSTALL_TOOLS/data/system-channel-spool.jsonl}"
+# kernel-closure-ok: optional flusher, run only when executable ([ -x "$SPOOL_FLUSH" ] at the send)
+SPOOL_FLUSH="$EDVA_INSTALL_TOOLS/bin/system-channel-spool-flush"
+SPOOL_MAX_ROWS=200
+
+NO_PUSH=false
+# --push: force a notification for a --channel system row that is not 🔴/🚨.
+# See "System-channel push policy" below.
+FORCE_PUSH=false
+PUSH_BODY=""
+# Image URLs appended to the message on their own lines, AFTER every gate.
+# See the --media block further down for why the position matters.
+MEDIA=()
+CAPTURE_ID_FILE=""
+SKIP_PRECHECK=false
+EVIDENCE_AS_OF=""
+INTENT=""
+# The verbatim captured error text behind a message that asserts a specific
+# technical failure mechanism — see the mechanism-attestation gate below.
+OBSERVED_ERROR=""
+# The Gmail messageId a P1 email pointer is about — see the P1 push fold below.
+P1_MESSAGE=""
+# Sender/agent label threaded to outbound-precheck so the reasoner knows
+# which caller it's gating. Defaults to "ops" since the
+# overwhelming majority of programmatic callers are ops-agent harvesters,
+# crons, and digests. Chat-agent callers (rare — chat normally uses
+# mcp__phone-channel__reply) should pass --agent chat.
+AGENT="ops"
+# Channel routing — 'chat' (default, user-facing) vs 'system' (Edva health /
+# watchdog / supervisor alerts). The Edva app top-bar menu switches between
+# the two; the chat channel must stay clean of infra noise.
+CHANNEL="chat"
+# --suppress-hook is retained as an accepted flag for backward compat with
+# existing callers (jobs, chat-agent invocations). After the 2026-04-14 pulse
+# rewrite it is a no-op — pulse is purely cron-driven and no outbound hook
+# fires from here. Kept so old call sites don't break.
+SUPPRESS_HOOK=false
+
+# Parse flags
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-push)        NO_PUSH=true; shift ;;
+    --push)           FORCE_PUSH=true; shift ;;
+    --push-body)      PUSH_BODY="$2"; shift 2 ;;
+    --media)          MEDIA+=("$2"); shift 2 ;;
+    # A tappable question card riding on this message (client ChoicePrompt):
+    # the JSON-encoded `choices` payload, stored under metadata.choices.
+    --choices-json)   CHOICES_JSON="$2"; shift 2 ;;
+    # Extra string-valued row metadata, a flat JSON object (the client decodes
+    # metadata as [String: String]). hum-ask uses it to tag a question with its
+    # question_id so the app can colour it until answered (lib/open-questions.mjs).
+    --metadata-json)  EXTRA_METADATA_JSON="$2"; shift 2 ;;
+    --capture-id)     CAPTURE_ID_FILE="$2"; shift 2 ;;
+    --suppress-hook)  SUPPRESS_HOOK=true; shift ;;
+    --skip-precheck)  SKIP_PRECHECK=true; shift ;;
+    --intent)         INTENT="$2"; shift 2 ;;
+    --agent)          AGENT="$2"; shift 2 ;;
+    --channel)        CHANNEL="$2"; shift 2 ;;
+    # Event geo-gate (see the block below): the city and date of the dated,
+    # place-bound event this message recommends. Both are required together.
+    --event-city)     EVENT_CITY="$2"; shift 2 ;;
+    --event-date)     EVENT_DATE="$2"; shift 2 ;;
+    --event-artist)   EVENT_ARTIST="$2"; shift 2 ;;
+    # Provenance for the freshness gate (lib/claim-freshness.mjs):
+    # an ISO timestamp for when the evidence behind this message was
+    # observed, or the literal "live" when the caller composed it from work
+    # it just did. Omitting it is safe but not free -- the gate then treats
+    # the claim as undated and searches a wide mailbox window.
+    --evidence-as-of) EVIDENCE_AS_OF="$2"; shift 2 ;;
+    # The verbatim text a caller actually captured (stderr, an error object,
+    # a log line) backing a claim that names a specific technical failure
+    # mechanism. See the mechanism-attestation gate below.
+    --observed-error) OBSERVED_ERROR="$2"; shift 2 ;;
+    # A JSON file the hum senders (hum-ping, hum-ask, hum-deliver-qual) write
+    # with what the message is about — lane, kind, dedup_key, headline finding —
+    # for the resolve-first gate below. Optional; the gate runs without it.
+    --hum-context)    HUM_CONTEXT_FILE="$2"; shift 2 ;;
+    # The Gmail messageId of the P1 email this message points at. Lets the
+    # P1 push fold below send one push per email / per thread burst.
+    --p1-message)     P1_MESSAGE="$2"; shift 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+
+# Fail loud on unknown --flags that landed in POSITIONAL — otherwise they
+# silently become the message body (an agent once improvised an email-send
+# flag that doesn't exist here and the literal flag text reached the chat).
+for arg in "$@"; do
+  if [[ "$arg" == --* ]]; then
+    echo "FATAL: unknown flag: $arg" >&2
+    echo "edva-send-curl accepts: --no-push, --push, --push-body, --media, --choices-json, --metadata-json, --capture-id, --suppress-hook, --skip-precheck, --intent, --evidence-as-of, --observed-error, --hum-context, --agent, --channel, --event-city, --event-date, --event-artist, --p1-message" >&2
+    echo "Message body goes via \$1 (inline) or stdin (pipe). For long/multi-line: cat file.txt | edva-send-curl ..." >&2
+    exit 2
+  fi
+done
+
+if [ $# -gt 0 ]; then
+  MESSAGE="$*"
+elif [ ! -t 0 ]; then
+  MESSAGE=$(cat)
+fi
+if [ -z "$MESSAGE" ]; then
+  echo "Usage: edva-send-curl [--no-push] [--push] [--push-body <text>] [--skip-precheck] [--intent <topic>] [--evidence-as-of <iso|live>] [--observed-error <verbatim captured output>] [--agent ops|chat|infra] [--channel chat|system|improvements] [--event-city <metro> --event-date <YYYY-MM-DD> [--event-artist <name>]] [--p1-message <gmail messageId>] <message>" >&2
+  exit 1
+fi
+
+# ─── Fabricated-outage gate (system channel, infra-claim shape only) ──────
+# Job-scoped agent turns have repeatedly composed a total-outage page ("all
+# supervisors unreachable", "crontab empty, jobs offline") and sent it to the
+# user while the machine was perfectly healthy.
+#
+# The cause is always the same: the agent's Bash tool is sandboxed, and the
+# sandbox masks localhost connections and process listings, so a healthy host
+# looks dead to any self-check run inside a turn. agent/CLAUDE.md
+# § System Channel already forbids this ("only watchdog.sh may author
+# infrastructure/supervisor-health alerts") — but that fix was prose-only, and
+# prose does not hold. This is the technical gate.
+#
+# SCOPE — deliberately narrow. It does NOT gate --channel system generally,
+# because agent turns are explicitly INSTRUCTED to post certain system-channel
+# alerts (ops-agent/CLAUDE.md: pre-labeled-Personal mismatches, intake-skip
+# misses, reclassify-flap). Those are observations about pipeline
+# behavior the turn actually witnessed — not claims about machine health
+# inferred from a sandboxed probe. Only the machine-wide-outage claim shape is
+# gated, and only authorized probers may make it. Authorized = watchdog.sh,
+# chrome-cdp-watch.sh, and the supervisors' own _sendPush, all of which probe
+# from OUTSIDE the agent sandbox and export EDVA_INFRA_PROBE=1.
+#
+# The pattern below is the single source of truth — tests/
+# fabricated-outage-gate.test.mjs extracts this exact line and asserts it
+# against real blocked/allowed messages, so the test cannot drift from it.
+INFRA_CLAIM_RE='all supervisors|supervisors? (are |have been )?(unreachable|down|offline)|crontab (is )?empty|no scheduled jobs|launchd (agents?|services?) (not loaded|not running)|manual restart of|needs? manual restart|jobs offline|everything is down|production host (is )?unreachable'
+# The installation's own name for its host (instance host_title, EDVA_HOST_TITLE
+# from instance.sh) is the same claim: "<host title> is unreachable". Regex
+# metacharacters escaped; a space matches any one separator or none.
+if [ -n "${EDVA_HOST_TITLE:-}" ]; then
+  _GSC_HOST_RE="$(printf '%s' "$EDVA_HOST_TITLE" | sed -e 's/[][\.*^$+?(){}|/]/\\&/g' -e 's/ /.?/g')"
+  INFRA_CLAIM_RE="$INFRA_CLAIM_RE|$_GSC_HOST_RE (is )?unreachable"
+fi
+if [ "$CHANNEL" = "system" ] && [ "${EDVA_INFRA_PROBE:-}" != "1" ]; then
+  if printf '%s' "$MESSAGE" | grep -qiE "$INFRA_CLAIM_RE"; then
+    BLOCK_LOG="$EDVA_INSTALL_TOOLS/data/logs/system-channel-blocked.log"
+    mkdir -p "$(dirname "$BLOCK_LOG")" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${INTENT:-none}" "$MESSAGE" >> "$BLOCK_LOG" 2>/dev/null
+    echo "BLOCKED: this message claims a machine-wide outage, and you are not an authorized prober." >&2
+    echo "Your Bash tool is sandboxed — it masks localhost connections and process listings, so a" >&2
+    echo "healthy host looks dead from inside an agent turn. Four false CRITICAL pages have reached" >&2
+    echo "$OWNER_NAME this way. Only watchdog.sh (which probes from cron, un-sandboxed) may page about" >&2
+    echo "infrastructure health. Log what you saw and move on; do not diagnose the stack from a turn." >&2
+    echo "See agent/CLAUDE.md § System Channel. Logged to $BLOCK_LOG" >&2
+    exit 3
+  fi
+fi
+
+# ─── Mechanism-attestation gate (system channel, unverified-cause claims) ──
+# alert-provenance-audit measured that about one in ten system-channel alerts
+# asserted a SPECIFIC TECHNICAL FAILURE MECHANISM (an error code, a named
+# subsystem declared unavailable), none of them from the deterministic
+# composer built to prevent exactly that (p1-alert-gate), and several were
+# provably impossible for the code path named (e.g. a TLS keychain error from
+# a pure-Node fetch pipeline). Earlier fixes (p1-alert-gate, unstar-scan-run)
+# solved it for their own job by composing the alert from a captured error
+# string with no free-text parameter at all, then told every OTHER caller in
+# prose to do the same. Compliance measured 0%: prose is not enforced.
+#
+# This is the mechanical version, same shape as --attendee-authorized
+# (bin/edva-calendar): a caller whose message asserts a mechanism
+# must pass --observed-error "<verbatim captured output>" — the actual text
+# it captured, not a description of it and not a boolean claiming it captured
+# something. A boolean can be set reflexively by a turn that believes its own
+# narration; a quote cannot be produced unless something was actually
+# captured. This does not prove the quote is genuine (nothing at this layer
+# can) — it raises the cost of fabricating past a reflexive assertion, and it
+# leaves a record (mechanism-attestation-log.jsonl) that ties every claim to
+# what was supposedly observed, for a human or a future audit to check.
+#
+# One open question the audit left, now resolved: whether the ops-haiku Bash
+# sandbox even HAS network, which would mean the underlying action (e.g.
+# p1-downgrade) genuinely cannot run and the alert is wrong about mechanism
+# but right that the work didn't happen. Tested directly from a sandboxed
+# turn on the host: DNS resolution, a plain curl, a Node fetch,
+# and a real OAuth-authenticated `gmail-action labels` call all succeeded.
+# tools/.claude/settings.json confirms why: `sandbox.network.allowedDomains`
+# is `["*"]` — the sandbox restricts filesystem (keychain deny-read) and
+# localhost/process visibility, never general internet egress. So "cannot
+# downgrade in sandboxed context" was itself a fabricated mechanism, not a
+# real capability gap — this gate is sufficient; no separate fix to make the
+# underlying action reachable is needed.
+#
+# Pattern mirrors alert-provenance-audit's own MECHANISM_CLAIM classifier —
+# reused here to gate a claim BEFORE it ships rather than grade it after.
+# THIS is the canonical copy; alert-provenance-audit extracts it from here so
+# the two cannot drift apart. tests/mechanism-attestation-gate.test.mjs
+# pins both the blocked and allowed shapes to this exact line.
+#
+# SCOPE — same narrowing logic as the fabricated-outage gate just above:
+# --channel system only (where the problem was measured), and authorized
+# infra probers (EDVA_INFRA_PROBE=1 — watchdog.sh, chrome-cdp-watch.sh,
+# both supervisors' _sendPush) are exempt, because they already probe from
+# OUTSIDE the agent sandbox with real curl/pgrep and their claims are
+# independently trustworthy by construction — the failure this gate targets
+# is specific to job-scoped agent turns narrating a mechanism inline.
+# ─── P1-sweep alert provenance gate (system channel) ──────────────────────
+# lang-regex-ok: matches the SUBJECT of a Edva-authored alert (which job it
+# is about), never the user's language. Same class as MECHANISM_CLAIM_RE below.
+#
+# WHY PROVENANCE AND NOT ANOTHER CONTENT GATE.
+# The unstar-scan / p1-downgrade sweep has exactly one sanctioned alert author:
+# bin/p1-alert-gate, reached only through bin/unstar-scan-run. It
+# applies a streak + elapsed threshold so a transient, self-correcting Gmail
+# blip stays silent while a genuinely stuck sweep still pages. Over weeks of
+# unstar-scan alerts it sent NONE of them (p1-scan-failure-streak.json never
+# recorded an alert): every one was composed inline by the job turn and handed
+# straight to this script.
+#
+# Repeated fix attempts against the network path and playbook prose all
+# recurred. The mechanism-attestation gate below DOES fire on these — and is
+# then defeated by rewording: each blocked alert is followed seconds later by
+# a delivered one making the same claim with the diagnosis stripped, often in
+# the replacement phrasing the gate's own remediation text suggests.
+# A content gate cannot hold a caller willing to rephrase; only provenance can.
+P1_SWEEP_SUBJECT_RE='unstar.?scan|unstar scan|p1[- ]downgrade|p1 sweep|unstarred p1'
+if [ "$CHANNEL" = "system" ] \
+   && [ "${EDVA_P1_ALERT_GATE:-}" != "1" ] \
+   && [ "${EDVA_INFRA_PROBE:-}" != "1" ]; then
+  if printf '%s' "$MESSAGE" | grep -qiE "$P1_SWEEP_SUBJECT_RE"; then
+    P1_LOG="$EDVA_INSTALL_TOOLS/data/logs/p1-sweep-alert-blocked.log"
+    mkdir -p "$(dirname "$P1_LOG")" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${INTENT:-none}" "$MESSAGE" >> "$P1_LOG" 2>/dev/null
+    echo "BLOCKED: you are not the sanctioned author of an unstar-scan / p1-downgrade alert." >&2
+    echo "Do NOT reword this and send it again. Rewording is the precise failure this gate exists" >&2
+    echo "to stop, and there is no phrasing of it that will pass." >&2
+    echo "The sweep — including whether it pages at all — is owned by one deterministic call:" >&2
+    # kernel-closure-ok: advice text naming the sweep's owner, not a call
+    echo "  ~/Dev/edva/bin/unstar-scan-run <messageId...>    (or --none if nothing to do)" >&2
+    echo "It downgrades, records the real per-step outcome, and lets p1-alert-gate decide whether a" >&2
+    echo "streak of blocked runs has lasted long enough to be worth $OWNER_NAME's attention. One failed" >&2
+    echo "cycle is not — the next one usually clears it. Call unstar-scan-run and stop." >&2
+    echo "See jobs/p1-resolve.md § Unstar scan. Logged to $P1_LOG" >&2
+    exit 7
+  fi
+fi
+
+MECHANISM_CLAIM_RE='enotfound|getaddrinfo|econnrefused|etimedout|econnreset|dns (resolution )?(fail|error)|osstatus|x509|cert(ificate)? error|smtp2go (unreachable|down|error)|api unreachable|unreachable \(|oauth[^.]{0,40}(expired|unauthorized|revoked)|tools? unauthorized|cli unavailable|cli unreachable|data corrupted|all nulls'
+# A quote shorter than this is not a quote, it is a shrug — mirrors
+# edva-calendar's MIN_AUTHORIZATION_CHARS for the identical reason.
+MIN_OBSERVED_ERROR_CHARS=6
+if [ "$CHANNEL" = "system" ] && [ "${EDVA_INFRA_PROBE:-}" != "1" ]; then
+  if printf '%s' "$MESSAGE" | grep -qiE "$MECHANISM_CLAIM_RE"; then
+    if [ "${#OBSERVED_ERROR}" -lt "$MIN_OBSERVED_ERROR_CHARS" ]; then
+      MECH_LOG="$EDVA_INSTALL_TOOLS/data/logs/unattested-mechanism-blocked.log"
+      mkdir -p "$(dirname "$MECH_LOG")" 2>/dev/null
+      printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${INTENT:-none}" "$MESSAGE" >> "$MECH_LOG" 2>/dev/null
+      echo "BLOCKED: this message asserts a specific technical failure mechanism (an error code, a" >&2
+      echo "named subsystem declared unavailable) — that requires --observed-error \"<verbatim" >&2
+      echo "captured output>\", the actual text you captured, not a description of it. Twelve alerts" >&2
+      echo "like this shipped over 14 days with zero real observation behind them, several for" >&2
+      echo "mechanisms the code path could not have produced. If you did not capture the underlying" >&2
+      echo "error yourself, you have not observed the mechanism you are about to name — report what" >&2
+      echo "actually happened instead (e.g. 'p1-downgrade did not complete this cycle') and drop the" >&2
+      echo "diagnosis; do not guess at a cause." >&2
+      echo "See agent/CLAUDE.md § System Channel. Logged to $MECH_LOG" >&2
+      exit 6
+    fi
+    MECH_OK_LOG="$EDVA_INSTALL_TOOLS/data/logs/mechanism-attestation-log.jsonl"
+    mkdir -p "$(dirname "$MECH_OK_LOG")" 2>/dev/null
+    python3 -c '
+import json, sys, datetime
+row = {
+  "ts": datetime.datetime.utcnow().isoformat() + "Z",
+  "intent": sys.argv[1] or "none",
+  "observed_error": sys.argv[2],
+  "message": sys.argv[3],
+}
+print(json.dumps(row))
+' "${INTENT:-none}" "$OBSERVED_ERROR" "$MESSAGE" >> "$MECH_OK_LOG" 2>/dev/null
+  fi
+fi
+
+# ─── Repeat-alert collapse (system channel) ───────────────────────────────
+# A condition that has failed ten times in ten days is one condition, not ten
+# incidents. Measured over ten days: dozens of repeated "Ops turn from X hung"
+# and "unstar-scan gmail fetch failed" messages, while a genuinely actionable
+# one (an expired OAuth token) sat unnoticed among them.
+#
+# First firing pages; repeats inside the day are counted silently; the third
+# distinct day escalates once with the count. 🔴/🚨 and ✅ recovery are never
+# gated — see bin/system-alert-dedup for the full rule. Fails OPEN: if the
+# helper errors, the alert ships.
+if [ "$CHANNEL" = "system" ] && [ "${EDVA_ALERT_NO_DEDUP:-}" != "1" ]; then
+  DEDUP_BIN="$EDVA_INSTALL_TOOLS/bin/system-alert-dedup"
+  if [ -x "$DEDUP_BIN" ]; then
+    DEDUP_SUFFIX=$("$DEDUP_BIN" --intent "${INTENT:-none}" --message "$MESSAGE" 2>/dev/null) || DEDUP_RC=$?
+    DEDUP_RC=${DEDUP_RC:-0}
+    if [ "$DEDUP_RC" -eq 1 ]; then
+      echo "suppressed: repeat of a condition already reported (see \`system-alert-dedup --stats\`)" >&2
+      exit 0
+    fi
+    # Exit 0 with output = an escalation carrying "(N times over M days)".
+    # Any other exit code is the helper failing; ship the alert unchanged.
+    if [ "$DEDUP_RC" -eq 0 ] && [ -n "$DEDUP_SUFFIX" ]; then
+      MESSAGE="$MESSAGE $DEDUP_SUFFIX"
+    fi
+  fi
+fi
+
+# ─── Event geo-gate, at send time ────────────────────────────────────────
+#
+# ops-agent/CLAUDE.md § Travel Timeline: every lane recommending a dated,
+# place-bound event MUST gate on `travel in-city` first. Marked "MANDATORY, no
+# exceptions" — and enforced, until now, by each job's author remembering.
+#
+# Two jobs made the identical omission and both were caught only after firing:
+# each had its own daily ping with no gate and pushed home-city events while
+# the user was travelling elsewhere.
+#
+# Six harvesters get the gate for free from `_common.mjs geoGate`; the jobs with
+# their own direct notify each hand-rolled it, or didn't. Moving it here makes a
+# new job's omission impossible rather than merely discouraged — the send path
+# checks, so there is nothing left to remember.
+#
+# Semantics deliberately mirror geoGate exactly, including FAIL-OPEN: `travel
+# in-city` exits 1 only when the timeline positively says the user is elsewhere. An
+# unknown date, an unpopulated timeline, a broken CLI — all exit 0 and the
+# message ships. A geo-gate that silences a lane because the timeline is empty
+# would be far worse than the misfire it prevents.
+if [ -n "${EVENT_CITY:-}" ] && [ -n "${EVENT_DATE:-}" ]; then
+  GEO_OK=true
+  # The installation's CLIs (EDVA_HEADLINER_BIN / EDVA_TRAVEL_BIN override).
+  # Both optional: a missing headliner CLI is no bypass, a missing travel CLI
+  # exits 127, which is not a verdict (fail-open, below).
+  # kernel-closure-ok: optional installation CLIs, absence handled as described
+  HEADLINER_BIN="${EDVA_HEADLINER_BIN:-$EDVA_INSTALL_TOOLS/bin/headliner}"
+  # kernel-closure-ok: optional installation CLI, absence is fail-open
+  TRAVEL_BIN="${EDVA_TRAVEL_BIN:-$EDVA_INSTALL_TOOLS/bin/travel}"
+  # Tier-1 headliner bypass, same as geoGate: a megastar is worth travelling for.
+  if [ -n "${EVENT_ARTIST:-}" ] && "$HEADLINER_BIN" check "$EVENT_ARTIST" >/dev/null 2>&1; then
+    GEO_OK=true
+  else
+    # Capture the status explicitly. Inside an `if ! cmd` branch $? is the
+    # NEGATED status, not the command's — which would read every gate error as
+    # a definite "the user is elsewhere" and silence the lane on a broken CLI. That is
+    # precisely the failure fail-open exists to prevent.
+    GEO_RC=0
+    "$TRAVEL_BIN" in-city "$EVENT_CITY" "$EVENT_DATE" >/dev/null 2>&1 || GEO_RC=$?
+    # Only a definite "the user is elsewhere" (exit 1) suppresses. Any other non-zero
+    # is a broken gate, not a verdict.
+    if [ "$GEO_RC" -eq 1 ]; then GEO_OK=false; fi
+  fi
+  if [ "$GEO_OK" = false ]; then
+    GEO_LOG="$EDVA_INSTALL_TOOLS/data/logs/event-geo-blocked.log"
+    mkdir -p "$(dirname "$GEO_LOG")" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$EVENT_CITY" "$EVENT_DATE" "$MESSAGE" >> "$GEO_LOG" 2>/dev/null
+    echo "SUPPRESSED: the travel timeline says $OWNER_NAME is not in $EVENT_CITY on $EVENT_DATE." >&2
+    echo "A dated, place-bound event the user cannot reach is not a recommendation." >&2
+    echo "If the user IS going, the timeline is wrong — fix it with \`travel add|edit\`, not by removing this flag." >&2
+    echo "See ops-agent/CLAUDE.md § Travel Timeline. Logged to $GEO_LOG" >&2
+    exit 5
+  fi
+fi
+
+# ─── --skip-precheck is an allowlist, not a free flag ────────────────────
+#
+# agent/CLAUDE.md § Outbound Precheck names the caller classes permitted
+# to bypass the gate and says "never pass --skip-precheck on content-driven
+# sends outside" them. That used to be prose only, and anything could pass
+# it. Given that a whole ping-quality investigation traced back to
+# gates being BYPASSED rather than gates being wrong, an unenforced bypass flag
+# on the one universal outbound chokepoint is the same failure waiting to recur.
+#
+# WHAT AN AUDIT OF THE TREE ACTUALLY FOUND: 19 callers against four
+# documented classes — but almost none of it was abuse. Two whole classes were
+# simply never written down:
+#
+#   * a job reporting its OWN failure (daily-summary-run, run-ephemeral-opus.sh
+#     and other job triggers)
+#   * a Face-ID approval card (self-improve-request, self-improve-approval-poll,
+#     tools-mcp) — load-bearing, since these are the mechanism by which a broken
+#     precheck gets fixed
+#
+# Both live on the `system` and `improvements` channels respectively, and both
+# are legitimate. So the gate keys on CHANNEL first, which is what actually
+# distinguishes them, rather than on an intent allowlist that would have had to
+# enumerate every job that might ever fail:
+#
+#   system channel       — always exempt. These alert about the very
+#                          infrastructure (Supabase, Sonnet) the precheck
+#                          depends on; a supervisor must be able to report
+#                          being stuck.
+#   improvements channel — always exempt. Approval cards.
+#   chat channel         — the user-facing one, and the one the rule exists to
+#                          protect. Requires an allowlisted intent.
+#
+# Exactly one caller had to move: trigger-hum-metrics-collect.sh was sending a
+# job-failure report to `chat`. That is a system-channel message; it now says so.
+if [ "$SKIP_PRECHECK" = true ] && [ "$CHANNEL" = "chat" ] && [ "${EDVA_PRECHECK_BYPASS:-}" != "1" ]; then
+  # Edva-model-only data (PRIVATE_DATA_INTENTS) — exempt because the
+  # precheck's own log would otherwise carry bank/health rows (see the block
+  # below, which sets the flag for these automatically; allowed here so an
+  # explicit caller isn't refused).
+  _load_send_intents
+  # An installation's own bypass intents (send-intents.json chat_bypass_intents):
+  # alerts the user asked for that a relevance gate must not silently drop.
+  if ! _intent_in "${INTENT:-}" "$PRIVATE_DATA_INTENTS" && ! _intent_in "${INTENT:-}" "$CHAT_BYPASS_INTENTS"; then
+  case "${INTENT:-}" in
+    # The 48h hum debug line, which must bypass the very gate it is watching.
+    hum-debug) ;;
+    # The outcome of a purchase the user approved with Face ID (purchase-approval-
+    # poll, no LLM): "placed" / "not placed, page changed". A receipt for an
+    # action the user just took must never be suppressed or rewritten.
+    purchase-result) ;;
+    # The channel diagnostic — we are testing delivery; Sonnet must not rewrite it.
+    resilience-test) ;;
+    *)
+      BYPASS_LOG="$EDVA_INSTALL_TOOLS/data/logs/precheck-bypass-blocked.log"
+      mkdir -p "$(dirname "$BYPASS_LOG")" 2>/dev/null
+      printf '%s\t%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${INTENT:-none}" "$MESSAGE" >> "$BYPASS_LOG" 2>/dev/null
+      echo "REFUSED: --skip-precheck is not available for chat-channel intent '${INTENT:-none}'." >&2
+      echo "" >&2
+      echo "The precheck is what stops a message contradicting something $OWNER_NAME just said." >&2
+      echo "Content-driven sends — findings, pings, digests, confirmations — must pass through it." >&2
+      echo "" >&2
+      echo "If this is an infrastructure or job-failure report, it belongs on --channel system." >&2
+      echo "If it is an approval card, --channel improvements. Both are exempt automatically." >&2
+      echo "See agent/CLAUDE.md § Outbound Precheck. Logged to $BYPASS_LOG" >&2
+      exit 4
+      ;;
+  esac
+  fi
+fi
+
+# ─── Edva-model-only content never reaches the precheck ───────────────
+# Bank transactions, brokerage positions and health data are edva-model-only
+# (agent/CLAUDE.md § Financial Operations rule 5, § Health Data). Passing
+# one into outbound-precheck would feed it to the Sonnet reasoner AND write it
+# verbatim into outbound-precheck-log.jsonl — which is exactly what the rule
+# forbids.
+#
+# That was previously held together by each caller remembering to pass
+# --skip-precheck alongside its --intent. A forgotten flag leaks the row
+# silently, and nothing in the system would notice. So the intent now IMPLIES
+# the exemption: a caller cannot forget it, because there is nothing to
+# remember. A bank-sync caller that still passes the flag explicitly is now redundant
+# rather than load-bearing.
+#
+# Deliberately keyed on --intent rather than on message content: reading the
+# message to decide whether it looks financial would mean pattern-matching the
+# very text we are trying not to inspect.
+#
+# `hum:finance` and `hum:stocks` are on this list for the same reason and were
+# the gap that proved it (caught in the live debug trace). The
+# finance harvester reads bank and brokerage tables directly — its own header says
+# "Bank data is edva-model-only (health-data tier)" — so its findings may not
+# pass through the precheck. But `hum-ping` labels every lane `hum:<lane>` and
+# has no skip-precheck path of its own, so the lane could not ship at all: a
+# genuine duplicate-charge finding scored 0.69, the highest of its tick, and was
+# dropped with the note "architectural gap, not a relevance/dedup call". The
+# rule forbade the only route it had.
+#
+# `hum:health` is deliberately NOT here. Health pings are a protected lane
+# INSIDE the precheck (hum-ping relies on that protection to override a
+# suppress), so exempting them would remove a guarantee rather than add one.
+# The health harvester surfaces patterns, not raw clinical rows.
+if [ -n "${INTENT:-}" ]; then
+  _load_send_intents
+  if _intent_in "$INTENT" "$PRIVATE_DATA_INTENTS $PRIVATE_HUM_INTENTS"; then
+    if [ "$SKIP_PRECHECK" = false ]; then
+      echo "note: --intent '${INTENT}' carries edva-model-only data; skipping precheck automatically (see agent/CLAUDE.md § Financial Operations rule 5)" >&2
+      SKIP_PRECHECK=true
+    fi
+  fi
+fi
+
+# ─── Hum resolve-first gate ───────────────────────────────────────────────
+# Work out the answer before asking: this applies to EVERY question and hum
+# comment before it is floated, regardless of type or context — floating
+# something the system should already know the answer to is unhelpful.
+#
+# Every hum send reaches this line with a `hum:` intent: hum-ping (info pings,
+# every lane), hum-ask (questions) and hum-deliver-qual (queued lane-diagnosis
+# questions). So this is the one place the rule is enforced, instead of one
+# patch per lane. bin/hum-resolve-first reads Edva's own records
+# (travel timeline, bookings, calendar, tasks, chat, memory, location, and any
+# sources the installation adds)
+# and has Opus decide whether they already answer what the message floats:
+#   send    — not answerable from the records (or nothing to answer): unchanged
+#   rewrite — partly answered: ask only the gap; or answered and worth a heads-up:
+#             a short FYI replaces it. The precheck below still reads the new text.
+#   drop    — answered and the answer adds nothing: nothing is sent. With
+#             --capture-id the gate writes the {"suppressed":true} sentinel
+#             (by: hum-resolve-first) so hum-ping / hum-ask record no ping.
+# Runs before the precheck and ignores --skip-precheck: the finance/stocks lanes
+# that skip the precheck above are still resolved here, on Edva's own model
+# (Max-session Opus, no API key), with no text in the gate's log, because the
+# gate never reads bank or health rows itself. FAILS OPEN — any error, timeout or missing
+# binary sends the message as written. Off switch: data/.hum-resolve-first-off.
+# Design: docs/hum-resolve-first.md.
+HUM_RESOLVE="${HUM_RESOLVE_BIN:-$EDVA_INSTALL_TOOLS/bin/hum-resolve-first}"
+case "${INTENT:-}" in
+  hum:*)
+    if [ "$CHANNEL" = "chat" ] && [ -f "$HUM_RESOLVE" ]; then
+      RESOLVE_INPUT=$(python3 -c '
+import json, sys
+p = {"message": sys.argv[1], "intent": sys.argv[2]}
+if sys.argv[3]: p["evidence_as_of"] = sys.argv[3]
+if sys.argv[4]: p["context_file"] = sys.argv[4]
+if sys.argv[5]:
+    try: p["choices"] = json.loads(sys.argv[5])
+    except Exception: pass
+print(json.dumps(p))
+' "$MESSAGE" "$INTENT" "$EVIDENCE_AS_OF" "${HUM_CONTEXT_FILE:-}" "${CHOICES_JSON:-}" 2>/dev/null)
+      if [ -n "$RESOLVE_INPUT" ]; then
+        RESOLVE_ARGS=()
+        [ -n "$CAPTURE_ID_FILE" ] && RESOLVE_ARGS=(--capture-id "$CAPTURE_ID_FILE")
+        RESOLVE_OUT=$(printf '%s' "$RESOLVE_INPUT" | node "$HUM_RESOLVE" "${RESOLVE_ARGS[@]}" 2>/dev/null)
+        RESOLVE_ACTION=$(printf '%s' "$RESOLVE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("action") or "send")
+except Exception: print("send")' 2>/dev/null)
+        case "$RESOLVE_ACTION" in
+          drop)
+            echo "hum-resolve-first: not sent — Edva's records already answer it (see \`hum-resolve-first tail\`)" >&2
+            exit 0
+            ;;
+          rewrite)
+            RESOLVE_TEXT=$(printf '%s' "$RESOLVE_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("text") or "")
+except Exception: print("")' 2>/dev/null)
+            RESOLVE_KEEP_CHOICES=$(printf '%s' "$RESOLVE_OUT" | python3 -c 'import json,sys
+try: print("1" if json.load(sys.stdin).get("keep_choices") else "0")
+except Exception: print("0")' 2>/dev/null)
+            if [ -n "$RESOLVE_TEXT" ]; then
+              echo "hum-resolve-first: rewrote the message to what is still open (or to the answer)" >&2
+              MESSAGE="$RESOLVE_TEXT"
+              # Tappable choices belong to the original question; keep them only
+              # when the gate says they still answer the rewritten one.
+              [ "$RESOLVE_KEEP_CHOICES" = "1" ] || CHOICES_JSON=""
+              # A caller's custom banner described the original; let the push
+              # preview come from the new text instead.
+              PUSH_BODY=""
+            fi
+            ;;
+        esac
+      fi
+    fi
+    ;;
+esac
+
+# ─── Outbound precheck (architecture invariant) ───────────────────────────
+# Every agent-originated message to the user passes through outbound-precheck
+# unless the caller passes --skip-precheck. The precheck reads last 90 min of
+# phone-channel chat + active calendar and decides send / suppress / modify.
+# Fail-open: any precheck error path emits decision=send, so this never
+# silences the agent due to its own bug. Critical infrastructure alerts
+# (supervisor auth outage, watchdog liveness, location-confirm — which has its
+# own resolver) pass --skip-precheck. See system/architecture.md
+# § Outbound Precheck.
+if [ "$SKIP_PRECHECK" = false ] && [ -x "$PRECHECK" ]; then
+  PRECHECK_INPUT=$(python3 -c '
+import json, sys, os
+payload = {
+  "message": sys.argv[1],
+  "intent": sys.argv[2] or "unknown",
+  "agent": sys.argv[3] or "ops",
+}
+if len(sys.argv) > 4 and sys.argv[4]:
+    payload["evidence_as_of"] = sys.argv[4]
+print(json.dumps(payload))
+' "$MESSAGE" "$INTENT" "$AGENT" "$EVIDENCE_AS_OF" 2>/dev/null)
+  if [ -n "$PRECHECK_INPUT" ]; then
+    PRECHECK_OUT=$(printf '%s' "$PRECHECK_INPUT" | node "$PRECHECK" 2>/dev/null)
+    if [ -n "$PRECHECK_OUT" ]; then
+      DECISION=$(printf '%s' "$PRECHECK_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("decision",""))
+except: print("")' 2>/dev/null)
+      case "$DECISION" in
+        suppress)
+          REASON=$(printf '%s' "$PRECHECK_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("reason",""))
+except: print("")' 2>/dev/null)
+          # Protected-intent suppress-override. After diagnosing 75%+
+          # false-positive suppression on protected-lane pings, the
+          # soft "PROTECTED INTENTS" rule in the Sonnet precheck
+          # prompt was found insufficient — Sonnet kept applying its own
+          # judgment ("nagging is wrong", "something else scheduled", "redundant") in
+          # cases where the playbook had already protected the ping. This
+          # is the code-level enforcement: for hum:<protected lane>:*
+          # intents (protected_lanes), a precheck suppress is OVERRIDDEN unless
+          # its reason cites an explicit user revocation. The override is
+          # logged with override_reason so audit is clean.
+          #
+          # p1-email was REMOVED from this list. Not because
+          # the override misfired occasionally — because of WHAT it was
+          # overriding. Of the 39 p1-email suppressions this belt reversed
+          # (data/outbound-precheck-log.jsonl), 24 were `stale premise:`
+          # verdicts from the claim-freshness gate, which runs in
+          # outbound-precheck.mjs BEFORE the Sonnet prompt. That gate is Rule
+          # #2, and it postdates this belt by weeks: the belt was silently
+          # outranking a rule written after
+          # it, on the one intent where the two overlap. The remaining 15 were
+          # Sonnet dedup/resolved-thread calls, and reading all 39 back, every
+          # one looks like a suppression the precheck got right.
+          #
+          # The cost: the precheck saw the user settle a repeated alert in
+          # chat, suppressed the repeat, and the belt sent it anyway minutes
+          # later. (The log stamps UTC; the app shows local time, so correlate
+          # on the delta, not the hour.)
+          #
+          # Be precise about the mechanism, because the tempting story is
+          # wrong. REVOCATION_RE below is lane-SHAPED but not
+          # lane-ONLY: `stop (pinging|nagging|…) me` is intent-neutral, and
+          # `rest`/`stop` appear there as unbounded substrings, so "the user
+          # replied they are not inte(rest)ed" does match. The belt was therefore
+          # genuinely conditional for p1-email — it simply never tripped across
+          # those 39 observations, so in practice it force-sent every one. The
+          # fix is scope, not vocabulary: this belt exists to stop Sonnet
+          # second-guessing the protected lanes' playbooks, and those are the
+          # only lanes whose revocation phrases it was written and validated
+          # against.
+          #
+          # p1-email keeps whatever protection the reasoning layers give it —
+          # outbound-precheck.mjs still lists it under PROTECTED INTENTS, so
+          # Sonnet applies the highest-bar suppression rule there. Note that
+          # covers only the 15; the 24 claim-freshness drops are now simply
+          # respected, which is the point. A suppressed ping is not a lost
+          # email: P1 mail is still labelled, starred and left UNREAD in the
+          # inbox, so what is lost is a duplicate pointer, not the alert.
+          #
+          # Do not add a lane to protected_lanes without revocation vocabulary
+          # written and validated against its pings (and read Rule #0b first).
+          _protection_res
+          OVERRIDE_DECISION=0
+          if [ -n "$PROTECTED_INTENT_RE" ] && [[ "$INTENT" =~ $PROTECTED_INTENT_RE ]]; then
+            # REVOCATION_RE matches explicit user phrases the precheck would
+            # quote when actually catching a legitimate revocation. If NONE of
+            # these appear, the suppress is paternalistic/inferred and we
+            # override it.
+            if ! printf '%s' "$REASON" | grep -qiE "$REVOCATION_RE"; then
+              OVERRIDE_DECISION=1
+              echo "outbound-precheck: SUPPRESS OVERRIDDEN (intent=$INTENT; reason lacked user-revocation phrase): $REASON" >&2
+              # Log the override to the decision log so attribution is clean.
+              # Reads the JSONL file the precheck already writes; appends an
+              # `override` event keyed off the same ts.
+              python3 -c "
+import json, sys, os, pathlib, datetime
+log = pathlib.Path('$EDVA_INSTALL_TOOLS') / 'data/outbound-precheck-log.jsonl'
+row = {
+  'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+  'decision': 'send',
+  'overridden_from': 'suppress',
+  'override_reason': 'protected_intent_no_user_revocation',
+  'intent': '$INTENT',
+  'original_precheck_reason': $(printf '%s' "$REASON" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+}
+with log.open('a') as f:
+  f.write(json.dumps(row) + chr(10))
+" 2>/dev/null
+              # Fall through to send — don't exit.
+            fi
+          fi
+          if [ "$OVERRIDE_DECISION" -eq 0 ]; then
+            echo "outbound-precheck: suppressed ($REASON)" >&2
+            # If --capture-id was requested, write a sentinel so callers (e.g.,
+            # hum-ping) can detect suppression and skip downstream side-effects
+            # like feedback-row logging.
+            if [ -n "$CAPTURE_ID_FILE" ]; then
+              TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+              printf '{"suppressed":true,"reason":%s}\n' "$(printf '%s' "$REASON" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" > "$TMP_ID" \
+                && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+            fi
+            exit 0
+          fi
+          # OVERRIDE_DECISION=1 — fall through to the normal send path.
+          ;;
+        modify)
+          MODIFIED=$(printf '%s' "$PRECHECK_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("message",""))
+except: print("")' 2>/dev/null)
+          if [ -n "$MODIFIED" ]; then
+            MESSAGE="$MODIFIED"
+          fi
+          ;;
+        send|"")
+          : # send as-is
+          ;;
+      esac
+    fi
+  fi
+fi
+
+# ─── P1 push fold ─────────────────────────────────────────────────────────
+# Two P1 pings seconds apart about one email: it was triaged twice (the
+# watchdog's stuck-unread RECLASSIFY and the delayed Gmail push dispatch), and
+# each turn sent its own pointer. A sender can also burst on its own: several
+# "New Mail" notices on one thread, minutes apart, were several pushes.
+#
+# A pointer that names its email with --p1-message <messageId> asks
+# bin/p1-push-fold, AFTER every gate above has decided to send, whether
+# the user already got a push for it: the same message in the last 24 h, or the
+# same Gmail thread from the same sender in the last 15 min while that earlier
+# email is still unread. If so nothing is posted and the email stays as triage
+# left it (P1, starred, unread; its task already merges by thread). Keyed on
+# Gmail structure only — message id, thread id, From address, UNREAD — never on
+# the text (Rule #0b). Chat channel only. FAILS OPEN: a missing binary, a Gmail
+# error or a timeout sends. Off switch: data/.p1-push-fold-off.
+P1_FOLD="${P1_PUSH_FOLD_BIN:-$EDVA_INSTALL_TOOLS/bin/p1-push-fold}"
+P1_FOLD_CLAIMED=false
+if [ -n "$P1_MESSAGE" ] && [ "$CHANNEL" = "chat" ] && [ -f "$P1_FOLD" ]; then
+  P1_FOLD_OUT=$(node "$P1_FOLD" claim --message "$P1_MESSAGE" 2>/dev/null)
+  P1_FOLD_RC=$?
+  if [ "$P1_FOLD_RC" -eq 3 ]; then
+    P1_FOLD_REASON=$(printf '%s' "$P1_FOLD_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("reason",""))
+except Exception: print("")' 2>/dev/null)
+    echo "p1-push-fold: not sent — $OWNER_NAME already got a push for this email (${P1_FOLD_REASON:-folded}). Not an error; do not resend. See \`p1-push-fold tail\`." >&2
+    if [ -n "$CAPTURE_ID_FILE" ]; then
+      TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+      printf '{"suppressed":true,"by":"p1-push-fold","reason":"%s"}\n' "${P1_FOLD_REASON:-folded}" > "$TMP_ID" \
+        && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+    fi
+    exit 0
+  elif [ "$P1_FOLD_RC" -eq 0 ]; then
+    P1_FOLD_CLAIMED=true
+  fi
+elif [ -z "$P1_MESSAGE" ] && [ "${INTENT:-}" = "p1-email" ]; then
+  echo "note: --intent p1-email without --p1-message <messageId>; a duplicate push for this email cannot be folded" >&2
+fi
+
+# ─── --media: pictures ride BEHIND the gates, not through them ───────────
+#
+# Hum `nearby` pings are often seen after the fact, when the user no longer
+# knows what they refer to. A photo of the place and a map of where it was
+# relative to the user answers that; a sentence cannot.
+#
+# The client renders a bare URL on its own line as an inline image
+# (MessageContentParser.isImageURL — upload.wikimedia.org and Supabase Storage
+# are both already matched), so an attachment is just a trailing line. That
+# makes WHERE the line is added the entire design question, and the answer is:
+# last, after everything.
+#
+#   - The precheck can return `modify`, which REPLACES the whole message with a
+#     rewrite capped at 400 characters. Appending earlier means Sonnet is handed
+#     a URL to preserve, and any rewrite silently drops the picture.
+#   - claim-freshness can rewrite for vintage, with the same consequence.
+#   - The dedup suffix appends its own text; media must sit after that too, so
+#     the image stays the last thing in the bubble.
+#
+# They are also kept out of the push preview below: a lock-screen banner reading
+# "https://upload.wikimedia.org/wikipedia/commons/thumb/..." is worse than one
+# that simply ends early. PUSH_TEXT is the message as the gates left it.
+PUSH_TEXT="$MESSAGE"
+if [ ${#MEDIA[@]} -gt 0 ]; then
+  for media_url in "${MEDIA[@]}"; do
+    # Only http(s). Anything else would land in the bubble as literal text.
+    case "$media_url" in
+      http://*|https://*) MESSAGE="${MESSAGE}"$'\n'"${media_url}" ;;
+      "") : ;;
+      *) echo "edva-send-curl: ignoring non-http --media value" >&2 ;;
+    esac
+  done
+fi
+
+# Escape JSON
+JSON_MESSAGE=$(printf '%s' "$MESSAGE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+JSON_CHANNEL=$(printf '%s' "$CHANNEL" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+# If --capture-id was passed, ask PostgREST for the inserted row so we can
+# capture edva_messages.id and link the outbound ping to subsequent
+# tapback-reaction UPDATEs. Otherwise stay on the default return=minimal for
+# the cheaper path most callers want.
+if [ -n "$CAPTURE_ID_FILE" ]; then
+  PREFER="return=representation"
+else
+  PREFER="return=minimal"
+fi
+
+# _spool_append — park an undeliverable system-channel row. Best-effort and
+# silent by contract: this runs on a path that has ALREADY fallen back to
+# email, so a spool failure must never change what the caller sees. Returns 0
+# unconditionally for that reason.
+_spool_append() {
+  [ "$CHANNEL" = "system" ] || return 0
+  [ -n "$SPOOL_FILE" ] || return 0
+  mkdir -p "$(dirname "$SPOOL_FILE")" 2>/dev/null || return 0
+  printf '{"created_at":"%s","role":"assistant","content":%s,"channel":%s,"http_code":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$JSON_MESSAGE" "$JSON_CHANNEL" "$1" \
+    >> "$SPOOL_FILE" 2>/dev/null || return 0
+  # Bound the file so a multi-day outage cannot grow it without limit.
+  local n
+  n=$(wc -l < "$SPOOL_FILE" 2>/dev/null | tr -d ' ')
+  if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$SPOOL_MAX_ROWS" ]; then
+    tail -n "$SPOOL_MAX_ROWS" "$SPOOL_FILE" > "${SPOOL_FILE}.tmp.$$" 2>/dev/null \
+      && mv -f "${SPOOL_FILE}.tmp.$$" "$SPOOL_FILE" 2>/dev/null
+  fi
+  return 0
+}
+
+# metadata.choices is a JSON STRING (the client decodes metadata as
+# [String: String] — see client/Edva/ChoicePrompt.swift), so the payload is
+# encoded twice: once as the object, once as the string that carries it.
+JSON_METADATA=""
+if [ -n "${CHOICES_JSON:-}" ] || [ -n "${EXTRA_METADATA_JSON:-}" ]; then
+  JSON_METADATA=$(CHOICES_JSON="${CHOICES_JSON:-}" EXTRA_METADATA_JSON="${EXTRA_METADATA_JSON:-}" python3 -c '
+import json, os
+m = {}
+extra = os.environ.get("EXTRA_METADATA_JSON") or ""
+if extra:
+    o = json.loads(extra)
+    if isinstance(o, dict):
+        m.update({str(k): str(v) for k, v in o.items() if v is not None})
+choices = os.environ.get("CHOICES_JSON") or ""
+if choices:
+    m["choices"] = json.dumps(json.loads(choices), ensure_ascii=False)
+print(",\"metadata\":" + json.dumps(m, ensure_ascii=False) if m else "")' 2>/dev/null) || JSON_METADATA=""
+fi
+
+RESP_BODY_FILE=""
+if [ -n "$CAPTURE_ID_FILE" ]; then
+  RESP_BODY_FILE=$(mktemp -t edva-send.XXXXXX)
+  HTTP_CODE=$(curl -s -o "$RESP_BODY_FILE" -w '%{http_code}' --max-time 10 \
+    -X POST "${SUPABASE_URL}/rest/v1/edva_messages" \
+    -H "apikey: ${SUPABASE_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_KEY}" \
+    -H "Content-Type: application/json" \
+    -H "Prefer: ${PREFER}" \
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_METADATA}}")
+else
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X POST "${SUPABASE_URL}/rest/v1/edva_messages" \
+    -H "apikey: ${SUPABASE_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_KEY}" \
+    -H "Content-Type: application/json" \
+    -H "Prefer: ${PREFER}" \
+    -d "{\"role\":\"assistant\",\"content\":${JSON_MESSAGE},\"read\":false,\"channel\":${JSON_CHANNEL}${JSON_METADATA}}")
+fi
+
+if [ "$HTTP_CODE" = "201" ]; then
+  echo "Message sent to Edva."
+
+  # Write the inserted row id when requested. PostgREST returns a JSON array
+  # ([{...row...}]) under return=representation, so extract data[0].id.
+  if [ -n "$CAPTURE_ID_FILE" ] && [ -s "$RESP_BODY_FILE" ]; then
+    MSG_ID=$(python3 -c 'import json,sys
+try:
+  data = json.load(open(sys.argv[1]))
+  rows = data if isinstance(data, list) else [data]
+  print(rows[0].get("id",""))
+except Exception:
+  pass' "$RESP_BODY_FILE")
+    if [ -n "$MSG_ID" ]; then
+      TMP_ID="${CAPTURE_ID_FILE}.tmp.$$"
+      printf '%s\n' "$MSG_ID" > "$TMP_ID" && mv -f "$TMP_ID" "$CAPTURE_ID_FILE"
+    fi
+  fi
+  [ -n "$RESP_BODY_FILE" ] && rm -f "$RESP_BODY_FILE"
+
+  # ─── System-channel push policy ───────────────────────────────────────
+  # The system channel is a log the user reads when they choose to; a push is a
+  # demand on their attention. Every system row used to push, so routine traffic
+  # (Jev disagreement notices, hung-turn retries, recoveries) arrived as plain
+  # "Edva" banners indistinguishable from chat and read aloud on headphones.
+  # Now a system row pushes only when it needs the user: a 🔴/🚨
+  # critical (same severity marker system-alert-dedup keys on) or a caller
+  # that passes --push because the message asks the user to act. The row is still
+  # written either way — only the banner is withheld.
+  if [ "$CHANNEL" = "system" ] && [ "$FORCE_PUSH" = false ]; then
+    case "$(printf '%s' "$MESSAGE" | sed 's/^[[:space:]]*//')" in
+      🔴*|🚨*) ;;
+      *) NO_PUSH=true ;;
+    esac
+  fi
+
+  # Send push notification (unless --no-push).
+  if [ "$NO_PUSH" = false ] && [ -x "$NOTIFY" ]; then
+    # Use custom push body if provided, otherwise truncate message.
+    # Pass --channel so system/infra alerts never touch the app icon badge.
+    if [ -n "$PUSH_BODY" ]; then
+      "$NOTIFY" --channel "$CHANNEL" "$PUSH_BODY" > /dev/null 2>&1 &
+    else
+      TRUNCATED=$(printf '%s' "$PUSH_TEXT" | head -c 100)
+      [ ${#PUSH_TEXT} -gt 100 ] && TRUNCATED="${TRUNCATED}..."
+      "$NOTIFY" --channel "$CHANNEL" "$TRUNCATED" > /dev/null 2>&1 &
+    fi
+  fi
+
+  # Stamp the last-outbound-message timestamp. Consumed by pulse's context
+  # harvest (time since the user last heard from Edva).
+  NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  TMP_STAMP="${MSG_STAMP_FILE}.tmp.$$"
+  printf '{"ts": "%s"}\n' "$NOW_ISO" > "$TMP_STAMP" && mv -f "$TMP_STAMP" "$MSG_STAMP_FILE"
+
+  # The insert just succeeded, so the connection is known good — replay
+  # anything parked by an earlier failure. Backgrounded with output discarded
+  # and guarded on -x: a missing or broken flush binary degrades this line to
+  # exactly today's behaviour and can never delay or fail a live send.
+  if [ "$CHANNEL" = "system" ] && [ -x "$SPOOL_FLUSH" ] && [ -s "$SPOOL_FILE" ]; then
+    EDVA_SEND_SPOOL="$SPOOL_FILE" "$SPOOL_FLUSH" > /dev/null 2>&1 &
+  fi
+else
+  [ -n "$RESP_BODY_FILE" ] && rm -f "$RESP_BODY_FILE"
+  # The row never posted, so the P1 push it claimed never happened: forget the
+  # claim, or a retry (or the email's other triage turn) would fold into nothing.
+  if [ "$P1_FOLD_CLAIMED" = true ]; then
+    node "$P1_FOLD" release --message "$P1_MESSAGE" > /dev/null 2>&1
+  fi
+  # Park the row BEFORE the email fallback. The email tells the user; the spool is
+  # what keeps the channel (and system-issue-review's only input) complete.
+  _spool_append "$HTTP_CODE"
+  echo "Edva push failed (HTTP $HTTP_CODE) — falling back to email" >&2
+  EMAIL_SEND="$EDVA_INSTALL_TOOLS/bin/email-send"
+  if [ -x "$EMAIL_SEND" ]; then
+    "$EMAIL_SEND" --to "$EDVA_OWNER_EMAIL" \
+      --subject "Edva notification (push failed)" \
+      --body "$MESSAGE" 2>/dev/null
+    if [ $? -eq 0 ]; then
+      echo "Fallback email sent." >&2
+    else
+      echo "Email fallback also failed." >&2
+      exit 1
+    fi
+  else
+    echo "No email-send binary found at $EMAIL_SEND" >&2
+    exit 1
+  fi
+fi

@@ -3,7 +3,7 @@
 //
 // Reads the trailing 24h of hum-runs (via hum-run-log, never a tolerant
 // parser), hum-feedback, hum-learnings, the pending question and the
-// `merlin hum audit` drift check; aggregates with lib/hum-daily-report.mjs
+// `edva hum audit` drift check; aggregates with lib/hum-daily-report.mjs
 // and APPENDS one record per day to data/hum-daily.jsonl.
 //
 // No email, no phone pointer, no push (the user's call: track the information
@@ -46,7 +46,7 @@ function readRuns(startMs) {
 }
 
 function audit() {
-  const r = spawnSync(BIN("merlin"), ["hum", "audit", "--window", "24h", "--json"], { encoding: "utf8" });
+  const r = spawnSync(BIN("edva"), ["hum", "audit", "--window", "24h", "--json"], { encoding: "utf8" });
   try { return JSON.parse(r.stdout); } catch { return null; }
 }
 

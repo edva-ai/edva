@@ -4,14 +4,14 @@
 # tick when data/hum-qual-delivery-queue.json holds one.
 #
 # Same reason as run-hum-explore.sh: the question is sent through
-# merlin-send-curl, whose resolve-first gate and outbound precheck need the
+# edva-send-curl, whose resolve-first gate and outbound precheck need the
 # Max login, which only the GUI session can read. Without a verified login
 # the question stays queued for a later tick (hum-deliver-qual drops it itself
 # once past its deliver_by); nothing goes out unchecked and nobody is paged
 # (watchdog.sh owns Max-outage alerts).
 export PATH="$HOME/.local/bin:$HOME/.local/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-LOGFILE="$MERLIN_INSTALL_TOOLS/agent/logs/watchdog.log"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+LOGFILE="$EDVA_INSTALL_TOOLS/agent/logs/watchdog.log"
 
 source "$(dirname "$0")/lib/max-auth-guard.sh"   # CLAUDE.md § Auth Model
 max_auth_scrub
@@ -21,4 +21,4 @@ if ! max_auth_check "${CLAUDE_BIN:-$HOME/.local/bin/claude}"; then
 fi
 
 # Fail-safe by design: hum-deliver-qual logs its own outcome and exits 0.
-node "$MERLIN_INSTALL_TOOLS/bin/hum-deliver-qual" >> "$LOGFILE" 2>&1
+node "$EDVA_INSTALL_TOOLS/bin/hum-deliver-qual" >> "$LOGFILE" 2>&1

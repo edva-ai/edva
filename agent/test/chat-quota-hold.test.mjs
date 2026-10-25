@@ -6,8 +6,8 @@
 // never answered. Part 1 covers the pure pieces; part 2 runs
 // the real chat supervisor against a fake CLI that refuses in exactly that
 // shape, under a throwaway HOME with no Supabase key and a fake
-// merlin-send-curl, so nothing can reach the real chat or system channel.
-// The sandbox holds whatever the caller exports: MERLIN_HOME, which outranks
+// edva-send-curl, so nothing can reach the real chat or system channel.
+// The sandbox holds whatever the caller exports: EDVA_HOME, which outranks
 // HOME in lib/root.cjs, is removed from the child's environment, and
 // SUPABASE_URL points at a closed local port (see the "never posts" test).
 //
@@ -61,12 +61,12 @@ describe("chat quota: pure pieces", () => {
   it("PriorityDispatcher sends nothing while held, keeps a requeued item first, and drains on release", () => {
     const s = new EventEmitter(); s.sent = []; s.send = (c) => s.sent.push(c);
     const d = new PriorityDispatcher(s, { coalesce: false });
-    d.dispatch("first", "merlin", { priority: "high" });
-    d.dispatch("later", "merlin", { priority: "high" });
+    d.dispatch("first", "edva", { priority: "high" });
+    d.dispatch("later", "edva", { priority: "high" });
     d.hold(Date.now() + 60_000);
     d.requeueInFlight({ front: true });
     assert.deepEqual(d.queue.map((i) => i.content), ["first", "later"], "refused item keeps its place");
-    d.dispatch("third", "merlin", { priority: "high" });
+    d.dispatch("third", "edva", { priority: "high" });
     assert.equal(s.sent.length, 1, "nothing sent while held");
     assert.ok(d.snapshot().rateLimitHoldUntil);
     d.releaseHold();
@@ -232,10 +232,10 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
   // process the test starts in it.
   function sandbox() {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "chat-quota-"));
-    const root = path.join(tmp, "Dev/merlin/tools");
+    const root = path.join(tmp, "Dev/edva/tools");
     for (const d of ["bin", "data", "agent/chat-agent", "agent/logs"]) fs.mkdirSync(path.join(root, d), { recursive: true });
     const sends = path.join(tmp, "sends.log");
-    fs.writeFileSync(path.join(root, "bin/merlin-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(root, "bin/edva-send-curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${sends}"\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(root, "data/user-timezone.json"), JSON.stringify({ timezone: "Africa/Nairobi" }));
     const mock = path.join(tmp, "quota-claude.mjs");
     fs.writeFileSync(mock, QUOTA_CLAUDE);
@@ -258,7 +258,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     } } }));
     const childEnv = { ...process.env, HOME: tmp, SUPABASE_SERVICE_ROLE_KEY: "", SUPABASE_URL: "http://127.0.0.1:9", CHAT_SUBSTRATE: "loop", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env };
     // Never the caller's installation, even when a test passes one in.
-    delete childEnv.MERLIN_HOME;
+    delete childEnv.EDVA_HOME;
     proc = spawn(NODE, [CHAT_SUPERVISOR, "--agent", "test-chat", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--record", record, ...claudeArgs])], {
       cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env: childEnv,
@@ -272,7 +272,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     // The supervisor logs each notice as "quota notice to <user>: <text>".
     const NOTICE = /quota notice to [^:]+: (.*)$/;
     const notices = () => log().split("\n").map((l) => l.match(NOTICE)).filter(Boolean).map((m) => m[1]);
-    const dispatch = (content, msgId, source = "merlin", priority = "high") => httpJson("POST", port, "/dispatch", { content, source, priority, msgId });
+    const dispatch = (content, msgId, source = "edva", priority = "high") => httpJson("POST", port, "/dispatch", { content, source, priority, msgId });
     return { port, log, sent, notices, dispatch, box };
   }
 
@@ -289,7 +289,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     let h = await httpJson("GET", port, "/health");
     assertNoRawRelay(log());
     assert.ok(log().includes('RATE LIMIT: {"status":"rejected"'), "logs the RATE LIMIT line index.mjs writes");
-    assert.ok(log().includes("QUOTA REFUSED: merlin ("), "logs the refusal");
+    assert.ok(log().includes("QUOTA REFUSED: edva ("), "logs the refusal");
     assert.ok(log().includes("put back at the front of the queue"));
     assert.equal(h.inFlight, null);
     assert.ok(h.queueDepth >= 1, "the refused message is queued again");
@@ -368,7 +368,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
   });
 
   it("never posts to a real chat, even when the caller's environment names an installation with a key", async () => {
-    // A caller that exports MERLIN_HOME (a scratch copy of the repo, say)
+    // A caller that exports EDVA_HOME (a scratch copy of the repo, say)
     // would otherwise make the child read that installation's .env and
     // post the test's notices for real. A decoy installation with a key and a
     // local stand-in for the Supabase endpoint show whether anything goes out.
@@ -382,7 +382,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     try {
       for (const d of ["data", "agent/chat-agent", "agent/logs"]) fs.mkdirSync(path.join(decoy, "tools", d), { recursive: true });
       fs.writeFileSync(path.join(decoy, ".env"), "SUPABASE_SERVICE_ROLE_KEY=decoy-key\n");
-      const { log, notices, dispatch } = await boot(["--mode", "reset"], { MERLIN_HOME: decoy, SUPABASE_URL: `http://127.0.0.1:${sink.address().port}` });
+      const { log, notices, dispatch } = await boot(["--mode", "reset"], { EDVA_HOME: decoy, SUPABASE_URL: `http://127.0.0.1:${sink.address().port}` });
       await dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
       assert.ok(await waitFor(() => notices().length === 1, 8000), `no notice: ${log().slice(-2000)}`);
       await sleep(500);
@@ -413,11 +413,11 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     // attached would run this retry with no currentTurn.
     const { port, log, sent, dispatch } = await boot(["--mode", "noreset", "--refusals", "1"], { DISPATCHER_RATE_LIMIT_FALLBACK_HOLD_MS: "800" });
     await dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
-    assert.ok(await waitFor(() => log().includes("QUOTA REFUSED: merlin"), 8000), `never refused: ${log().slice(-2000)}`);
+    assert.ok(await waitFor(() => log().includes("QUOTA REFUSED: edva"), 8000), `never refused: ${log().slice(-2000)}`);
     await httpJson("POST", port, "/restart");   // 2 s backoff: the 0.8 s hold expires mid-restart
     assert.ok(await waitFor(() => log().includes("quota cleared"), 15000), `retry not tracked: ${log().slice(-2500)}`);
     assert.equal(sent().length, 2, "refused once, then answered once");
-    assert.equal(log().split("\n").filter((l) => l.includes("dispatch → merlin")).length, 2, "both sends are tracked turns");
+    assert.equal(log().split("\n").filter((l) => l.includes("dispatch → edva")).length, 2, "both sends are tracked turns");
     assertNoRawRelay(log());
   });
 
@@ -427,7 +427,7 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
     // (written without the reply tool) is never posted.
     const { port, log, dispatch } = await boot([]);
     await dispatch("PHANTOM-TEST Where did I leave the umbrella?", "p1");
-    assert.ok(await waitFor(() => log().includes("dispatch → merlin"), 8000), `never dispatched: ${log().slice(-1500)}`);
+    assert.ok(await waitFor(() => log().includes("dispatch → edva"), 8000), `never dispatched: ${log().slice(-1500)}`);
     await sleep(300);
     await httpJson("POST", port, "/restart");   // stops the turn mid-flight; it is requeued and retried on --resume
     assert.ok(await waitFor(() => log().includes("ignored resume-handshake result"), 15000), `no handshake result: ${log().slice(-2500)}`);

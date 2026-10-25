@@ -112,7 +112,7 @@ describe("append writes exactly one line, whatever is in the payload", () => {
 });
 
 describe("read does not abort at the first bad line, and never hides the skip", () => {
-  // jq aborts here; the JS readers in bin/merlin drop silently. Neither
+  // jq aborts here; the JS readers in bin/edva drop silently. Neither
   // is acceptable: the caller must get the good records AND the damage count.
   const damaged = [
     '{"tick_id":"t-1","ts":"2026-09-15T10:00:00Z"}',

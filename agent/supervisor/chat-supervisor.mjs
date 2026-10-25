@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// chat-supervisor.mjs — Merlin chat agent supervisor.
+// chat-supervisor.mjs — Edva chat agent supervisor.
 //
-// Manages a Claude session for real-time Merlin conversations with a
+// Manages a Claude session for real-time Edva conversations with a
 // priority dispatch queue. Messages arrive from phone-channel via HTTP POST.
 //
 // Architecture:
 //   phone-channel (MCP) → HTTP POST :9094/dispatch → PriorityDispatcher → ClaudeSession
-//   Claude calls phone-channel reply tool → Supabase → Merlin app
+//   Claude calls phone-channel reply tool → Supabase → Edva app
 //
 // Flags:
 //   --agent chat          agent name from agents.json (default: chat)
@@ -116,7 +116,7 @@ const SUBSTRATE_LOOP = CHAT_SUBSTRATE === "loop";
 // Multiplier 2 (2026-07-18): check-later dueWakes (WP14 core/check-later.mjs)
 // drained on a chat-supervisor tick — the one multiplier that IS live end to
 // end. The model schedules its own follow-ups with `mcp__tools__check_later`
-// (exposed via tools-mcp, keyed to MERLIN_AGENT_ID — it never needed the WP1
+// (exposed via tools-mcp, keyed to EDVA_AGENT_ID — it never needed the WP1
 // registry, which is why it survived the 2026-07-29 retirement above); this is
 // the other half. Every tick, any due wake whose session_id matches this chat
 // Agent's id gets re-dispatched into the normal priority queue as a
@@ -149,11 +149,11 @@ const FORK_CONTEXT_MESSAGES = 20;
 // Write, …, Skill". A sub-agent whose entire job is reading untrusted web
 // content had shell and filesystem write access — exactly the prompt-injection
 // surface CLAUDE.md § Prompt Injection & Input Safety exists to prevent, since a
-// delegated research task is by definition pointed at content Merlin does not
+// delegated research task is by definition pointed at content Edva does not
 // control.
 //
 // Skill is included deliberately and is the one non-obvious member: forks CAN
-// load Merlin's real skills (verified — a fork invoked a skill and quoted a
+// load Edva's real skills (verified — a fork invoked a skill and quoted a
 // command that appears only in its body), so a delegated task inherits
 // the actual methodology instead of improvising. It gets the JUDGMENT half of a
 // skill, not the pipeline half: with no Bash, a skill step that says "run
@@ -163,10 +163,10 @@ const FORK_TOOLS = "WebSearch,WebFetch,Skill";
 const FORK_TIMEOUT_MS = 10 * 60_000;
 
 const HOME = process.env.HOME;
-const MERLIN_ROOT = installRoot();
+const EDVA_ROOT = installRoot();
 // The operator's own rules (agent/local/; see claude-session.mjs § Local
 // agent rules). Overridable for tests.
-const LOCAL_DIR = process.env.MERLIN_LOCAL_DIR || path.join(MERLIN_ROOT, "agent/local");
+const LOCAL_DIR = process.env.EDVA_LOCAL_DIR || path.join(EDVA_ROOT, "agent/local");
 
 
 // Turn-count cap for the cold-start guard (per-agent override via agents.json
@@ -308,11 +308,11 @@ class ChatSupervisor {
       onHigh: (depth) => {
         console.error(`[chat-supervisor] QUEUE ALARM: depth=${depth} — chat dispatch backing up`);
         this.eventLog.append({ kind: "queue_alarm.high", depth });
-        this._sendSystemAlert(`⚠️ Merlin chat queue depth=${depth} — the turn engine may be stuck and messages are piling up. Check \`merlin status\`.`);
+        this._sendSystemAlert(`⚠️ Edva chat queue depth=${depth} — the turn engine may be stuck and messages are piling up. Check \`edva status\`.`);
       },
       onClear: (depth) => {
         this.eventLog.append({ kind: "queue_alarm.clear", depth });
-        this._sendSystemAlert(`✅ Merlin chat recovered: queue drained (depth=${depth}) — dispatch caught up.`);
+        this._sendSystemAlert(`✅ Edva chat recovered: queue drained (depth=${depth}) — dispatch caught up.`);
       },
     });
     this.activeToolMap = new Map(); // tool_use_id → tool name
@@ -340,7 +340,7 @@ class ChatSupervisor {
     this.quotaDroppedNoticeSent = false;
     this._restoreQuotaState();
     attachClaudeMdWatcher(this, {
-      claudeMdPath: path.join(MERLIN_ROOT, this.cfg.cwd, "CLAUDE.md"),
+      claudeMdPath: path.join(EDVA_ROOT, this.cfg.cwd, "CLAUDE.md"),
       logPrefix: "[chat-supervisor]",
     });
   }
@@ -367,7 +367,7 @@ class ChatSupervisor {
     this.sessionStartedAt = Date.now();
     const cfg = this.cfg;
     const healthPort = cfg.supervisor?.healthPort || 9094;
-    const mcpConfigPath = path.join(MERLIN_ROOT, "agent/supervisor/chat-mcp-config.json");
+    const mcpConfigPath = path.join(EDVA_ROOT, "agent/supervisor/chat-mcp-config.json");
     const localRulesFile = this._buildLocalRules();
 
     const sessionOpts = {
@@ -383,11 +383,11 @@ class ChatSupervisor {
       disallowedTools: (cfg.disallowedTools || []).join(" ") || undefined,
       // Reply streaming (GET /reply-draft). CHAT_REPLY_STREAM=0 turns it off.
       includePartialMessages: process.env.CHAT_REPLY_STREAM !== "0",
-      cwd: path.join(MERLIN_ROOT, cfg.cwd),
-      addDirs: [MERLIN_ROOT],
+      cwd: path.join(EDVA_ROOT, cfg.cwd),
+      addDirs: [EDVA_ROOT],
       claudeBin: this.args.claudeBin,
       resume,
-      env: { MERLIN_DISPATCH_URL: `http://127.0.0.1:${healthPort}/dispatch` },
+      env: { EDVA_DISPATCH_URL: `http://127.0.0.1:${healthPort}/dispatch` },
       // Chat agent MUST use the Max subscription. Hide ANTHROPIC_API_KEY from
       // the child so claude -p uses the Max credentials in
       // ~/.claude/.credentials.json; the API key is reserved exclusively for
@@ -430,7 +430,7 @@ class ChatSupervisor {
             // strict mode leaves it with zero MCP servers.
             strictMcpConfig: true,
             timeoutMs: FORK_TIMEOUT_MS,
-            cwd: path.join(MERLIN_ROOT, this.cfg.cwd || "agent/chat-agent"),
+            cwd: path.join(EDVA_ROOT, this.cfg.cwd || "agent/chat-agent"),
             // The fork loads chat-agent's CLAUDE.md files from that cwd; it
             // gets the same local rules as the session beside them.
             appendSystemPromptFile: localRulesFile || undefined,
@@ -539,7 +539,7 @@ class ChatSupervisor {
         this.authErrorCount = 0;
       }
       // Safety net: agent emitted text but never called reply → recover.
-      // Only applies to user-initiated `merlin` dispatches; init / system
+      // Only applies to user-initiated `edva` dispatches; init / system
       // pings are allowed to end without a reply.
       const t = this.currentTurn;
       // Usage-limit refusal (ops' half is dispatcher.mjs),
@@ -550,19 +550,19 @@ class ChatSupervisor {
       // result is not this turn's end (the turn is still running), so it never
       // reads as a refusal.
       const quota = !authFail && t && (t.quotaInfo || t.quotaError) && !isPhantomResult(ev) ? this._onQuotaRefusal(ev, t) : null;
-      if (t && t.source === "merlin" && !t.replyCalled && authFail) {
+      if (t && t.source === "edva" && !t.replyCalled && authFail) {
         // Never hand the user the CLI's error string as their reply. They asked
         // something and are waiting, so they still hear back, in plain words.
         this.safetyNetFireCount++;
         console.error(`[chat-supervisor] SAFETY NET: turn failed Max auth — posting the offline notice instead of the raw CLI error`);
         this.eventLog.append({ kind: "safety_net.auth_offline_reply", source: t.source });
         this._postOrphanedReply(CHAT_AUTH_OFFLINE_REPLY).catch((e) => console.error(`[chat-supervisor] safety net post failed: ${e.message}`));
-      } else if (t && t.source === "merlin" && !t.replyCalled && !quota?.noWork) {
+      } else if (t && t.source === "edva" && !t.replyCalled && !quota?.noWork) {
         // A refused turn that did no work has no answer in it to rescue.
         const orphaned = t.text.join("\n").trim();
         // Any non-empty text. This was `>= 20` chars, which silently dropped
         // short real answers — a one-word answer (9 chars) once never
-        // reached the user. A merlin turn's text IS the answer to them.
+        // reached the user. A edva turn's text IS the answer to them.
         if (orphaned.length > 0) {
           this.safetyNetFireCount++;
           console.error(`[chat-supervisor] SAFETY NET: orphaned assistant text (${orphaned.length} chars), no reply tool call — auto-posting`);
@@ -570,13 +570,13 @@ class ChatSupervisor {
           this._postOrphanedReply(orphaned).catch((e) => console.error(`[chat-supervisor] safety net post failed: ${e.message}`));
         }
       }
-      if (quota && t.source === "merlin") {
+      if (quota && t.source === "edva") {
         if (quota.dropped) this._maybeQuotaDroppedNotice({ info: quota.info, several: quota.merged > 0 });
         else if (quota.requeued || !t.replyCalled) this._maybeQuotaNotice({ requeued: quota.requeued });
       } else if (quota) {
         // A background turn (a wake, init, the context guard's /compact) hit the
         // limit while their message waits behind it: they hear why, once.
-        if (this.dispatcher?.queue.some((i) => i.source === "merlin")) this._maybeQuotaNotice();
+        if (this.dispatcher?.queue.some((i) => i.source === "edva")) this._maybeQuotaNotice();
       } else if (!authFail && !isPhantomResult(ev) && this.quotaOutage && t && t.source !== "context-guard" && !this.dispatcher?.isHeld()) {
         // The first real turn after a hold: the limit has actually cleared.
         console.error(`[chat-supervisor] quota cleared — ${t.source} turn completed after the hold`);
@@ -667,7 +667,7 @@ class ChatSupervisor {
     this.dispatcher.on("enqueued", (item) => {
       this.eventLog.append({ kind: "dispatcher.enqueued", item });
       // They wrote while dispatch is held for the usage limit: say why, once.
-      if (item.source === "merlin" && this.dispatcher.isHeld()) this._maybeQuotaNotice();
+      if (item.source === "edva" && this.dispatcher.isHeld()) this._maybeQuotaNotice();
       this._checkQueueAlarm();
     });
     // Several same-source, same-priority queued items merged into one turn (e.g.
@@ -698,7 +698,7 @@ class ChatSupervisor {
     });
     this.dispatcher.on("turn_complete", (info) => {
       this.eventLog.append({ kind: "dispatcher.turn_complete", id: info.message?.id, durationMs: info.result.duration_ms, costUsd: info.result.total_cost_usd });
-      if (info.message?.source === "merlin") this.lastConversationAt = Date.now();
+      if (info.message?.source === "edva") this.lastConversationAt = Date.now();
       // After a context-guard /compact, optimistically reset the tracked context so
       // the guard doesn't immediately re-fire; the next real turn re-measures it.
       if (info.message?.source === "context-guard") {
@@ -789,11 +789,11 @@ class ChatSupervisor {
   // outbound precheck, which needs the agent up to run.
   _sendSystemAlert(text) {
     try {
-      const bin = path.join(MERLIN_ROOT, "bin/merlin-send-curl");
-      // MERLIN_INFRA_PROBE=1 — see the fabricated-outage gate in
-      // bin/merlin-send-curl. The supervisor reports its own process
+      const bin = path.join(EDVA_ROOT, "bin/edva-send-curl");
+      // EDVA_INFRA_PROBE=1 — see the fabricated-outage gate in
+      // bin/edva-send-curl. The supervisor reports its own process
       // state from outside the agent sandbox, so it may page on machine health.
-      const p = spawn(bin, ["--suppress-hook", "--skip-precheck", "--intent", "supervisor-alert", "--channel", "system", text], { stdio: "ignore", detached: true, env: { ...process.env, MERLIN_INFRA_PROBE: "1" } });
+      const p = spawn(bin, ["--suppress-hook", "--skip-precheck", "--intent", "supervisor-alert", "--channel", "system", text], { stdio: "ignore", detached: true, env: { ...process.env, EDVA_INFRA_PROBE: "1" } });
       p.unref();
     } catch (err) {
       console.error(`[chat-supervisor] _sendSystemAlert failed: ${err.message}`);
@@ -815,7 +815,7 @@ class ChatSupervisor {
           const priority = payload.priority || "normal";
           const msgId = payload.msgId || undefined;
 
-          if (source === "merlin") this.lastConversationAt = Date.now();
+          if (source === "edva") this.lastConversationAt = Date.now();
           const id = this.dispatcher.dispatch(String(content), source, { priority, msgId });
           json(res, 200, { id: id || "deduped" });
         } catch (err) {
@@ -1074,7 +1074,7 @@ class ChatSupervisor {
       // and the watchdog restarts a supervisor whose queue waits.
       if (this.dispatcher && !this.dispatcher.queue.some((i) => i.source === "init")) {
         this.dispatcher.dispatch(
-          "Session started. Standing by for Merlin messages.",
+          "Session started. Standing by for Edva messages.",
           "init",
           { priority: "low" }
         );
@@ -1135,7 +1135,7 @@ class ChatSupervisor {
     if (requeued) {
       item.quotaRetried = true;
       item.quotaSeveral = (item.mergedCount || 0) > 0;   // mergedCount is recomputed when it drains again
-      if (item.source === "merlin") item.content = `${QUOTA_RETRY_HEADER}\n\n${item.content}`;   // never in front of a /compact
+      if (item.source === "edva") item.content = `${QUOTA_RETRY_HEADER}\n\n${item.content}`;   // never in front of a /compact
       this.dispatcher.requeueInFlight({ front: true });
     }
     const dropped = noWork && !requeued;
@@ -1236,7 +1236,7 @@ class ChatSupervisor {
   _getSupabaseKey() {
     if (process.env.SUPABASE_SERVICE_ROLE_KEY) return process.env.SUPABASE_SERVICE_ROLE_KEY;
     try {
-      const env = fs.readFileSync(path.join(MERLIN_ROOT, ".env"), "utf8");
+      const env = fs.readFileSync(path.join(EDVA_ROOT, ".env"), "utf8");
       const m = env.match(/^SUPABASE_SERVICE_ROLE_KEY=(.+)$/m);
       if (m) return m[1].trim();
     } catch {}
@@ -1253,7 +1253,7 @@ class ChatSupervisor {
     const project = instanceValue("supabase_project");
     const SUPABASE_URL = process.env.SUPABASE_URL || (project ? `https://${project}.supabase.co` : "");
     if (!SUPABASE_URL) throw new Error("no Supabase project configured (instance supabase_project / SUPABASE_URL)");
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/merlin_messages`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/edva_messages`, {
       method: "POST",
       headers: {
         "apikey": key,
@@ -1315,10 +1315,10 @@ class ChatSupervisor {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const configPath = args.config || path.join(MERLIN_ROOT, "agent/config/agents.json");
+  const configPath = args.config || path.join(EDVA_ROOT, "agent/config/agents.json");
   const agentCfg = loadAgentConfig(configPath, args.agent);
-  const dataDir = args.stateDir || path.join(MERLIN_ROOT, `agent/supervisor/state/${args.agent}`);
-  const eventDir = path.join(MERLIN_ROOT, `agent/logs/supervisor-${args.agent}`);
+  const dataDir = args.stateDir || path.join(EDVA_ROOT, `agent/supervisor/state/${args.agent}`);
+  const eventDir = path.join(EDVA_ROOT, `agent/logs/supervisor-${args.agent}`);
 
   const supervisor = new ChatSupervisor({ args, agentCfg, dataDir, eventDir });
   let shouldResume = args.resume && supervisor.state.canResume;

@@ -100,7 +100,7 @@ const reply = (text, conversation) => cf.checkFreshness({ text, solicited: true,
 
 const MATCH_DAY = {
   text: "Got it, you and Dana were at the book fair downtown. I've added that to the Saturday summary fix. Two more questions on that day are still open: whether Sam was with you the whole day, and whether the 2:10 and 4:45 stops by the library were just parking.",
-  conversation: "Merlin: Were you and Dana at the book fair downtown on Saturday?\nUser: Yes, we were.",
+  conversation: "Edva: Were you and Dana at the book fair downtown on Saturday?\nUser: Yes, we were.",
   rewrite: "Got it, you and Dana were at the book fair downtown, and the 2:10 and 4:45 stops by the library were just parking. I've added both to the Saturday summary fix. One question is still open on that day: was Sam with you the whole day?",
 };
 

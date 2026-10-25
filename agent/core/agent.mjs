@@ -5,9 +5,9 @@
 // messages sent to the model. Everything else (deferred tools, snipping, forks,
 // steering) is only possible on top of a loop you control the context of.
 //
-// MERLIN ADAPTATION — Max-only auth (hard invariant, agent/CLAUDE.md
+// EDVA ADAPTATION — Max-only auth (hard invariant, agent/CLAUDE.md
 // § Auth Model): Conway's Agent runs a direct Anthropic Messages-API loop via
-// the SDK + API key. Merlin may NEVER make an API-key-billed call. So the turn
+// the SDK + API key. Edva may NEVER make an API-key-billed call. So the turn
 // EXECUTOR is an injected strategy, not a hardcoded SDK call. The Agent owns the
 // context array (the real point of WP0); the executor is what actually produces
 // an assistant turn — the default is Max-compliant (claude -p, key stripped),

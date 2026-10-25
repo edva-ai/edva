@@ -14,7 +14,7 @@ reusing the `TradeApproval` signing flow) — decision (5)'s "Face-ID Swift UI =
 primary path. Only HIGH-RISK needs the user's face; low/moderate keeps auto-applying. The `bin/self-improve`
 CLI is demoted to **break-glass**; `self-improve-email-poll` is **retired**. Verifier: `core/app-approval.mjs`
 (10/10 with `self-improve-unified`); host applier: `bin/self-improve-approval-poll`. Swift:
-`client/Merlin/SelfImproveApproval{,View}.swift`. See the two 2026-07-19 architecture.md entries. The rest
+`client/Edva/SelfImproveApproval{,View}.swift`. See the two 2026-07-19 architecture.md entries. The rest
 of this doc is the original rationale, still accurate.
 
 **DECISION QUEUE (2026-07-28).** The card is now the whole interaction surface, via one right-click /
@@ -42,14 +42,14 @@ WP11 is the highest-risk work package in the Conway substrate (self-authored
 code running live on a box with financial rails, a logged-in browser, and smart-home control — the
 exact RCE / supply-chain surface OpenCLAW documents). Per the roadmap it ships **last** and **opt-in**.
 
-Source spec: `merlin-conway-substrate.md` § WP11. This doc translates its "non-negotiable" mitigations
-into a concrete Merlin design and calls out the decisions that are yours to make.
+Source spec: `edva-conway-substrate.md` § WP11. This doc translates its "non-negotiable" mitigations
+into a concrete Edva design and calls out the decisions that are yours to make.
 
 ---
 
 ## 1. What WP11 actually adds (and how it differs from what we already have)
 
-**Goal (spec):** let Merlin read its own source and **author / hot-reload capability modules at
+**Goal (spec):** let Edva read its own source and **author / hot-reload capability modules at
 runtime** — add a skill, a tool, or a job-plugin **without a human redeploy** — behind strict gates.
 Mechanism mirrors Conway: write a plugin under `ext/<name>/` (`manifest.json` + `index.mjs` whose
 default export is `(api) => {…}`), then `reloadModule('name')` to load it live via the WP5 loader.
@@ -60,7 +60,7 @@ default export is `(api) => {…}`), then `reloadModule('name')` to load it live
 |---|---|---|
 | What it changes | **repo source** (playbooks, config, bugfixes), git-committed | **new runtime capability modules** in `ext/`, hot-loaded |
 | When it runs | nightly, batch | on demand, when the agent hits a recurring gap |
-| Gate | **automated** — rubric + path rails + critic subagent + `node --test` + `merlin doctor`; low/moderate auto-apply **without waking the user**; high-risk deferred | **human-in-the-loop** — every module is inert until **owner approval via the Swift app**; nothing loads autonomously |
+| Gate | **automated** — rubric + path rails + critic subagent + `node --test` + `edva doctor`; low/moderate auto-apply **without waking the user**; high-risk deferred | **human-in-the-loop** — every module is inert until **owner approval via the Swift app**; nothing loads autonomously |
 | Trust model | reviewed diff on the trusted git path; a bad change is revertable via git | **live code execution** — a bad module *runs*, so the gate must be *before* execution, not after |
 | Reversibility | `git revert` | `unloadModule` + delete `ext/<name>/` |
 
@@ -94,7 +94,7 @@ is read-only to WP11 — see gate 2). They share the WP4 audit log and the risk 
   WP5 plugin `api`. Static analysis at stage time flags a module whose `index.mjs` imports or references
   financial rails (bank-sync tools, brokerage, a payment provider, ticket purchases, transfer/withdraw), destructive
   ops (`rm`, `git push`, `--force`, keychain, `op `), or the outbound channels
-  (`email-send`, `gmail-action`, `imsg`, `whatsapp`, `merlin-send`). Any hit ⇒ the approval requires a
+  (`email-send`, `gmail-action`, `imsg`, `whatsapp`, `edva-send`). Any hit ⇒ the approval requires a
   **second, separate owner confirm** ("this module can reach FINANCIAL/DESTRUCTIVE surfaces — confirm
   again") and is recorded as `risk:"critical"`. This composes with the absolute bans, which still hold:
   transfers/withdrawals stay forbidden (no transfer tool exists to register), purchases stay under the configured cap and
@@ -128,7 +128,7 @@ agent hits a recurring gap it has no skill/tool for
   approval-gate: pending_approvals row (self_improve.load) + WP4 audit event
         │
         ▼
-  APNs → Swift app: "Merlin wrote a module: <name> — <summary>. Review?"
+  APNs → Swift app: "Edva wrote a module: <name> — <summary>. Review?"
         │                        (Face-ID; shows the diff; approve / deny)
         │   critical (rails hit) → SECOND confirm required
         ▼

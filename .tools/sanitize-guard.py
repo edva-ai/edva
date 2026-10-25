@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 sanitize-guard — refuse to land personal-identifier content in the public
-Merlin tree.
+Edva tree.
 
 Runs as a pre-commit hook (staged files), in CI (`--all`, see
-.github/workflows/sanitize-guard.yml) and from `merlin audit`.
+.github/workflows/sanitize-guard.yml) and from `edva audit`.
 
 Patterns
 --------
@@ -16,8 +16,8 @@ Two sets are matched, case-insensitively, against every line:
 2. The operator's identity patterns — their names, handles, homes, project
    refs, hosts, addresses. That list is itself personal data, so it is never
    committed. It is loaded at run time from, in order:
-       $MERLIN_SANITIZE_PATTERNS_JSON   the JSON itself (e.g. a CI secret)
-       $MERLIN_SANITIZE_PATTERNS        a path to the JSON file
+       $EDVA_SANITIZE_PATTERNS_JSON   the JSON itself (e.g. a CI secret)
+       $EDVA_SANITIZE_PATTERNS        a path to the JSON file
        agent/local/sanitize-patterns.json   (gitignored)
    The JSON is an object of {"<pattern_name>": "<python regex>"}. Only the
    regexes are private; the names are public, because baseline entries are
@@ -86,16 +86,16 @@ LINE_MARKERS = ("sanitize-guard-ok:", "kernel-guard-ok:")
 
 def _overlay_source() -> tuple[str, str | None]:
     """→ (description, json text or None when absent)."""
-    inline = os.environ.get("MERLIN_SANITIZE_PATTERNS_JSON", "").strip()
+    inline = os.environ.get("EDVA_SANITIZE_PATTERNS_JSON", "").strip()
     if inline:
-        return "$MERLIN_SANITIZE_PATTERNS_JSON", inline
-    explicit = os.environ.get("MERLIN_SANITIZE_PATTERNS", "").strip()
+        return "$EDVA_SANITIZE_PATTERNS_JSON", inline
+    explicit = os.environ.get("EDVA_SANITIZE_PATTERNS", "").strip()
     path = Path(explicit) if explicit else DEFAULT_OVERLAY
     try:
         return str(path), path.read_text()
     except FileNotFoundError:
         if explicit:
-            print(f"sanitize-guard: MERLIN_SANITIZE_PATTERNS points at a missing file: {path}", file=sys.stderr)
+            print(f"sanitize-guard: EDVA_SANITIZE_PATTERNS points at a missing file: {path}", file=sys.stderr)
             sys.exit(2)
         return str(path), None
     except OSError as e:
@@ -254,7 +254,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if not OVERLAY_PATTERNS:
-        print("sanitize-guard: warning: no identity patterns loaded (set MERLIN_SANITIZE_PATTERNS or "
+        print("sanitize-guard: warning: no identity patterns loaded (set EDVA_SANITIZE_PATTERNS or "
               "create agent/local/sanitize-patterns.json); checking generic patterns only", file=sys.stderr)
 
     flagged = collect_hits(files)

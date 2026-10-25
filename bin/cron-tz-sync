@@ -14,7 +14,7 @@
  * Timezone resolution, in priority order:
  *   1. data/user-timezone.json, if updated within the last 36h — the
  *      phone's own self-reported IANA timezone, refreshed on every inbound
- *      Merlin message. This is the "confirm via actual location" signal.
+ *      Edva message. This is the "confirm via actual location" signal.
  *   2. the installation's travel plan (its `travel where` mapped through its
  *      metro → zone table), when it has one —
  *      the forward-looking travel-plan signal, used when the phone hasn't
@@ -42,8 +42,8 @@ const { loadClockJobs, resolveTz, localToHomeZone, homeZoneLabel } = require("..
 const { installRoot } = require("../lib/root.cjs");
 
 const HOME = os.homedir();
-const MERLIN = installRoot();
-const LOG_FILE = path.join(MERLIN, "data/logs/cron-tz-sync.log");
+const EDVA = installRoot();
+const LOG_FILE = path.join(EDVA, "data/logs/cron-tz-sync.log");
 
 // lang-regex-ok: matches a crontab SCHEDULE FIELD, which is machine-generated
 // structure (digits, * , - / and the JAN/MON name forms), never natural language.

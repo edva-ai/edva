@@ -105,7 +105,7 @@ if (interpDir && pathParts.length && !pathParts.includes(interpDir)) {
 
 let args = process.argv.slice(2);
 let label = null;
-// (MERLIN_JOB is set below, once the label is known.)
+// (EDVA_JOB is set below, once the label is known.)
 while (args[0]?.startsWith("--")) {
   if (args[0] === "--") { args.shift(); break; }
   if (args[0] === "--label") { label = args[1]; args = args.slice(2); continue; }
@@ -120,8 +120,8 @@ if (!label) label = basename(args[0]).replace(/\.(sh|js|mjs|py)$/, "");
 
 // Which job this is, for anything below that records who called it (the
 // Places call log, 2026-10-20). A cron-run inside a cron-run extends the chain.
-childEnv.MERLIN_JOB = label;
-childEnv.MERLIN_JOB_CHAIN = process.env.MERLIN_JOB_CHAIN ? `${process.env.MERLIN_JOB_CHAIN}>${label}` : label;
+childEnv.EDVA_JOB = label;
+childEnv.EDVA_JOB_CHAIN = process.env.EDVA_JOB_CHAIN ? `${process.env.EDVA_JOB_CHAIN}>${label}` : label;
 
 const start = new Date();
 const child = spawn(args[0], args.slice(1), { stdio: "inherit", env: childEnv });

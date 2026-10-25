@@ -12,9 +12,9 @@ export const meta = { name: "weather", lanes: ["weather", "situation", "exercise
 
 export default async function detect(ctx) {
   const { memo, setMemo } = ctx;
-  // The installation's weather CLI (MERLIN_WEATHER_BIN, else bin/_ext/ or
+  // The installation's weather CLI (EDVA_WEATHER_BIN, else bin/_ext/ or
   // bin/apple-weather); none installed → no events.
-  const bin = optionalBin(BIN, "apple-weather", "MERLIN_WEATHER_BIN");
+  const bin = optionalBin(BIN, "apple-weather", "EDVA_WEATHER_BIN");
   if (!bin) return [];
   const w = await shJson(bin, ["--findme", "--json"], { timeout: 15000 });
   const cur = w?.currentWeather || w?.current || null;

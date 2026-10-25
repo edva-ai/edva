@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+// edva-notify — Send a push notification about Edva messages (no DB write).
+// Usage:
+//   edva-notify "Your morning briefing for Apr 5 is ready"
+//   edva-notify --message-id <uuid> "P1 email ready for review"
+//   edva-notify --title "Edva" "Short summary body"
+//   edva-notify --channel system "Watchdog: Ollama restarted"  (no badge)
+//   edva-notify --urgent "Leave now — tunnel is backing up"     (pierces Focus)
+
+import { createClient } from "@supabase/supabase-js";
+import { createRequire } from "node:module";
+import { sendApnsPush } from "../lib/apns-push.mjs";
+
+const require = createRequire(import.meta.url);
+require("../lib/load-env.js").loadEnv();
+
+// This installation's Supabase project (agent/local/instance.json) and
+// its public anon key (agent/local/config/supabase.json anon_key).
+const { instance, supabaseAnonKey } = require("../lib/instance.cjs");
+const SUPABASE_URL = `https://${instance().supabase_project}.supabase.co`;
+const SUPABASE_ANON_KEY = supabaseAnonKey();
+
+const args = process.argv.slice(2);
+let messageId = null;
+let title = "Edva";
+let channel = "chat";
+let urgent = false;
+const positional = [];
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--message-id" || a === "-m") messageId = args[++i];
+  else if (a === "--title" || a === "-t") title = args[++i];
+  else if (a === "--channel" || a === "-c") channel = args[++i];
+  else if (a === "--urgent" || a === "-u") urgent = true;
+  else positional.push(a);
+}
+
+const body = positional.join(" ").trim();
+if (!body) {
+  console.error("Usage: edva-notify [--message-id <uuid>] [--title <title>] <body>");
+  process.exit(1);
+}
+
+// The push path reads device_tokens, edva_messages and location_history.
+// Those tables are closed to the anon role, so use the service-role key from
+// .env; the anon key is only a fallback for a host without it.
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("edva-notify: SUPABASE_SERVICE_ROLE_KEY not set in .env; falling back to the anon key");
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+try {
+  const res = await sendApnsPush(supabase, { body, title, messageId, channel, urgent });
+  if (res?.held) console.log(`Push held (${res.reason}) — ping-flush will deliver it.`);
+  else console.log("Push notification sent.");
+} catch (e) {
+  console.error(`Push failed: ${e.message}`);
+  process.exit(1);
+}
+process.exit(0);

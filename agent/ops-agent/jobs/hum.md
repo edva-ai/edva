@@ -18,7 +18,7 @@ Most dispatches end silently. That's the design.
 ```
 dispatch (an event bundle from hum-sense, or the idle/watchdog fallback)
 ├─ Step 0: gates (already applied by the hum-sense gate pre-dispatch)
-├─ Step 1: SITUATION snapshot        merlin hum situation --json
+├─ Step 1: SITUATION snapshot        edva hum situation --json
 ├─ Step 2: TOPIC HARVEST              hum-harvest-all.mjs (parallel fan-out + pre-rank vetoes)
 │    └─ meta.no_eligible / perishable_no_local → silent trace, NO Step 3 (no model call)
 ├─ Step 3: RANK + decide              in this turn (the hum model)
@@ -48,7 +48,7 @@ Increment `state.today.runs` in `data/hum-state.json`.
 Single cached composite (2-min TTL), input to every harvester and the ranker:
 
 ```bash
-~/Dev/merlin/bin/merlin hum situation --json
+~/Dev/edva/bin/edva hum situation --json
 ```
 
 Shape:
@@ -74,11 +74,11 @@ If the snapshot fails (empty/invalid JSON), log `run:error:no_situation` to `hum
 **Set `HUM_FOCUS_LANES` from the dispatch payload's `lanes`.** Not optional — it is the whole point of an event dispatch. Without it the lanes the triggering event implicated are skipped by their own cadence and hum harvests something unrelated. (Incident: hum-detail.md § Step 2.)
 
 ```bash
-SIT=$(~/Dev/merlin/bin/merlin hum situation --json 2>/dev/null)
+SIT=$(~/Dev/edva/bin/edva hum situation --json 2>/dev/null)
 # LANES = the payload's `lanes`, comma-joined. Empty for an idle/watchdog
 # dispatch — then simply omit the env var and take the full cadence-gated fan-out.
 echo "$SIT" | HUM_FOCUS_LANES="location_context,weather,calendar,situation" \
-  node ~/Dev/merlin/agent/scripts/hum-harvest-all.mjs
+  node ~/Dev/edva/agent/scripts/hum-harvest-all.mjs
 ```
 
 Substitute the real lanes from *this* dispatch — the value above is illustrative. When `lanes` is absent or empty, drop the `HUM_FOCUS_LANES=` prefix entirely and run the bare command.
@@ -114,7 +114,7 @@ The output also carries `claim_check` — `{dropped: [...], flagged: [...]}` (St
 
 ### Pre-rank vetoes and the no-model short-circuit (2026-10-04)
 
-`hum-harvest-all` applies `hum-ping`'s refusals before ranking (`lib/hum-vetoes.mjs`): `history_blocked`, `cross_send_dedup` (24h; 180 days for a sticky `nearby:*` key; and, commit harvests only, a dining pick or dining / taste-match idea that re-recommends a place already recommended in the last 21 days under any key, unless they deferred it: a model judgment, Jev site `hum-place-repeat`, checks in parallel under a 20 s deadline that fails open, and a vetoed idea is retired via `hum-reservoir-prune --expire`), `novelty_duplicate`, `retrospective_ask_cap` (3/day), and — once the shared daily ping budget is spent (6 today, or the last one < 45 min ago) — every remaining candidate (`rate_limited`; a `nearby` local explanation is checked against its own pool instead, 10/day, 15 min apart). Also `resolved_first` (2026-10-15): a candidate whose `dedup_key` the resolve-first gate (Step 4) already answered from Merlin's records in the last 7 days, with no carve-out. Same carve-outs as `hum-ping`: exercise/health lanes and harvester `urgency` ≥ 0.9 bypass dedup, novelty and budget — but nothing bypasses a sticky `nearby:*` key. Refused candidates move to `meta.pre_rank_vetoes` — copy it into the trace's `harvest.pre_rank_vetoes`. Exits 7/8/9/10/11 at send time should therefore be rare; if they are not, something is bypassing the filter. (Exit 12 is different: the gate judges the final wording, so it can fire on a candidate no veto knew about.)
+`hum-harvest-all` applies `hum-ping`'s refusals before ranking (`lib/hum-vetoes.mjs`): `history_blocked`, `cross_send_dedup` (24h; 180 days for a sticky `nearby:*` key; and, commit harvests only, a dining pick or dining / taste-match idea that re-recommends a place already recommended in the last 21 days under any key, unless they deferred it: a model judgment, Jev site `hum-place-repeat`, checks in parallel under a 20 s deadline that fails open, and a vetoed idea is retired via `hum-reservoir-prune --expire`), `novelty_duplicate`, `retrospective_ask_cap` (3/day), and — once the shared daily ping budget is spent (6 today, or the last one < 45 min ago) — every remaining candidate (`rate_limited`; a `nearby` local explanation is checked against its own pool instead, 10/day, 15 min apart). Also `resolved_first` (2026-10-15): a candidate whose `dedup_key` the resolve-first gate (Step 4) already answered from Edva's records in the last 7 days, with no carve-out. Same carve-outs as `hum-ping`: exercise/health lanes and harvester `urgency` ≥ 0.9 bypass dedup, novelty and budget — but nothing bypasses a sticky `nearby:*` key. Refused candidates move to `meta.pre_rank_vetoes` — copy it into the trace's `harvest.pre_rank_vetoes`. Exits 7/8/9/10/11 at send time should therefore be rare; if they are not, something is bypassing the filter. (Exit 12 is different: the gate judges the final wording, so it can fire on a candidate no veto knew about.)
 
 **Read two flags before Step 3, and skip Step 3 entirely when either is set:**
 
@@ -125,7 +125,7 @@ Art/music/dining/crossref harvesters may fork a `claude -p` Sonnet subagent with
 
 ## Step 2b — Context bundle (unified knowledge access)
 
-Harvesters get `{situation, context}` on stdin; `context` is `lib/merlin-context.js` (`merlin context --json`):
+Harvesters get `{situation, context}` on stdin; `context` is `lib/edva-context.js` (`edva context --json`):
 
 ```json
 {
@@ -138,7 +138,7 @@ Harvesters get `{situation, context}` on stdin; `context` is `lib/merlin-context
 }
 ```
 
-Adding a data source = one entry in `lib/merlin-context.js` (+ optional lazy fetch in `recent`); harvesters don't change. Field-by-field use: hum-detail.md § Step 2b.
+Adding a data source = one entry in `lib/edva-context.js` (+ optional lazy fetch in `recent`); harvesters don't change. Field-by-field use: hum-detail.md § Step 2b.
 
 ## Step 2c — Wiki recall (consult the entire wiki per candidate)
 
@@ -177,7 +177,7 @@ You are ranking candidate findings for the user's hum tick. One shot — no foll
 SITUATION (where/environment/time/now/next/working_on):
 <inject situation JSON>
 
-CONTEXT (compact — tastes + active projects + recent learnings; do NOT inject the full merlin-context bundle):
+CONTEXT (compact — tastes + active projects + recent learnings; do NOT inject the full edva-context bundle):
 <inject { tastes: context.tastes, projects: context.projects, recent_learnings: context.recent.recent_learnings } only>
 
 CANDIDATES (harvesters already ran; candidates whose premise the authorities refuted were already dropped in Step 2d):
@@ -258,9 +258,9 @@ Pick the winner candidate. Then run **ASK-FIRST** before settling on info/silent
 2. **PREFERENCE-CAPTURE.** If the winner touches a domain where the user's taste/intent is NOT yet in CONTEXT or LEARNINGS (a cuisine, genre, venue, or person not on file), prefer a question that captures it. Questions grow memory.
 3. **A FORWARD-LOOKING question does NOT have to out-score the info candidates.** If the best info candidate is a guess-flavored surface and a genuine clarifying / preference-capture question exists this tick, the QUESTION wins — even at a lower raw score — provided it isn't in LEARNINGS / RECENT RUNS and no pending question is active. Asking beats guessing.
 
-   **This rule applies ONLY to questions whose answer changes what Merlin can do NEXT** — a taste they haven't expressed, an ambiguous plan, a preference, "does that timing still hold". Those buy them something.
+   **This rule applies ONLY to questions whose answer changes what Edva can do NEXT** — a taste they haven't expressed, an ambiguous plan, a preference, "does that timing still hold". Those buy them something.
 
-3a. **RETROSPECTIVE-ASK — the opposite rule for confirmation questions.** A candidate whose `supporting_data.ask_kind` is `retrospective_confirmation`, or whose `dedup_key` starts with `location_ask:` — "were you at X?", "did you actually stop?", "was that lunch?" — is **excluded from rule 3 entirely**. It does not get the ASK-FIRST bypass, it does not get the rule-4 backstop, and it does not win ties. The user was physically there — the information gap is Merlin's, not theirs, and the interrupt buys *us* data rather than buying *them* anything. Specifically:
+3a. **RETROSPECTIVE-ASK — the opposite rule for confirmation questions.** A candidate whose `supporting_data.ask_kind` is `retrospective_confirmation`, or whose `dedup_key` starts with `location_ask:` — "were you at X?", "did you actually stop?", "was that lunch?" — is **excluded from rule 3 entirely**. It does not get the ASK-FIRST bypass, it does not get the rule-4 backstop, and it does not win ties. The user was physically there — the information gap is Edva's, not theirs, and the interrupt buys *us* data rather than buying *them* anything. Specifically:
 
    - It must clear the 0.45 threshold **on its own raw score**, like any info candidate.
    - **It loses every tie — but only while `freshness_min < 45`.** If any other candidate is within 0.10 of it, that candidate wins — including a `nearby` factoid or a dining suggestion that scores lower. Once `freshness_min` (on the candidate itself) reaches 45, this tie-loss lifts and it competes on raw score like any other candidate (the user: location questions belong while they're there or shortly after, not hours later). `location_context.mjs` raises the candidate's own urgency cap (0.6 → 0.75) at the same 45-min mark.
@@ -270,7 +270,7 @@ Pick the winner candidate. Then run **ASK-FIRST** before settling on info/silent
 
 4. **QUESTION BACKSTOP.** Read `DAYS SINCE LAST QUESTION` (injected above). If it is ≥ 3, treat the best clarifying / preference-capture opportunity this tick as the winner and ASK it — UNLESS a genuinely urgent info/safety candidate or a Rule #1 exercise nudge must win this tick. **A `retrospective_confirmation` ask does NOT satisfy this backstop** and does not reset the counter.
 
-5. **NEVER ASK THE USER TO VERIFY MERLIN'S OWN STATE.** If the winning candidate's ask is about Merlin's internals — a queue, a pending ping, whether a job ran, whether a scan is current, what's in a cache or in its own memory — it is **silent**, always, at any score. Merlin can read its own files. Examples that must never ship:
+5. **NEVER ASK THE USER TO VERIFY EDVA'S OWN STATE.** If the winning candidate's ask is about Edva's internals — a queue, a pending ping, whether a job ran, whether a scan is current, what's in a cache or in its own memory — it is **silent**, always, at any score. Edva can read its own files. Examples that must never ship:
 
    - *"As of the last watchlist scan (Jul 18), 4 candidates were queued for hum approval — worth checking if you've already answered any of those pings since."*
    - *"As of when I found it on July 18, the artist was touring that venue — worth double-checking it's still on."*
@@ -285,7 +285,7 @@ Output EXACTLY one JSON object, no prose:
 
   {"decision":"silent"}
 
-  {"decision":"info","text":"<≤5 lines, Merlin voice, URLs on own lines. NOTE: if Step 3.5 evaluator produced decision_aids, render them below the headline like:\n  <headline>\n  ❤️ Why yes: <for[0]>; <for[1]>\n  ⚠️ Why no: <against[0]>\n  Next: <steps_to_act[0]>\n  (primer line goes between headline and Why-yes when present, terse, no label)>",
+  {"decision":"info","text":"<≤5 lines, Edva voice, URLs on own lines. NOTE: if Step 3.5 evaluator produced decision_aids, render them below the headline like:\n  <headline>\n  ❤️ Why yes: <for[0]>; <for[1]>\n  ⚠️ Why no: <against[0]>\n  Next: <steps_to_act[0]>\n  (primer line goes between headline and Why-yes when present, terse, no label)>",
    "subject":"<kebab-case>","rationale":"<one sentence>",
    "urgency":"low|med|high","based_on_topic":"<topic>"}
 
@@ -295,7 +295,7 @@ Output EXACTLY one JSON object, no prose:
    "rationale":"<one sentence on the future decision this sharpens>"}
 
 TEXT FORMATTING RULES:
-- **Pre-show dining (`supporting_data.nearby_restaurants` is present and non-empty):** After the headline (e.g. "The Show 7:30pm — dinner by 6:30"), list each restaurant as its own line starting with a bullet. Put the Google Maps URL on the NEXT line immediately after its restaurant line so the Merlin app renders it as a preview card. Example format:
+- **Pre-show dining (`supporting_data.nearby_restaurants` is present and non-empty):** After the headline (e.g. "The Show 7:30pm — dinner by 6:30"), list each restaurant as its own line starting with a bullet. Put the Google Maps URL on the NEXT line immediately after its restaurant line so the Edva app renders it as a preview card. Example format:
   ```
   The Show 7:30pm — dinner by 6:30
   • Example Thai (4.8★, 3 min walk)
@@ -380,9 +380,9 @@ Every tick — silent, info, or question — writes ONE enriched line to `hum-ru
 
 ### Resolve-first: every send is worked out before it is floated (2026-10-15)
 
-The user's rule: work out the answer before asking applies to EVERY question and hum comment before floating, whatever its type or context — not to hide anything from the user, but because floating something Merlin should already know the answer to is unhelpful. (Trigger: a question whose answer the user's own records already held.)
+The user's rule: work out the answer before asking applies to EVERY question and hum comment before floating, whatever its type or context — not to hide anything from the user, but because floating something Edva should already know the answer to is unhelpful. (Trigger: a question whose answer the user's own records already held.)
 
-You do not run this; it runs inside the send. Every info ping (`hum-ping`) and every question (`hum-ask`, below) carries a `hum:` intent, and `merlin-send-curl` hands each one to `bin/hum-resolve-first`, which reads Merlin's own records (travel timeline, bookings in `flights.json`, calendar, tasks, recent chat, memory recall, email memory, location history, its own earlier answers, and any source the installation adds) and has Opus decide:
+You do not run this; it runs inside the send. Every info ping (`hum-ping`) and every question (`hum-ask`, below) carries a `hum:` intent, and `edva-send-curl` hands each one to `bin/hum-resolve-first`, which reads Edva's own records (travel timeline, bookings in `flights.json`, calendar, tasks, recent chat, memory recall, email memory, location history, its own earlier answers, and any source the installation adds) and has Opus decide:
 
 - **nothing open** (a fact, a heads-up, a reminder) → sent exactly as you wrote it;
 - **a question the records can't answer** → asked as the specific unknown, with one line on what was checked (or as you wrote it, if the model offers no rewrite);
@@ -407,7 +407,7 @@ Do **not** retire an idea that merely lost this tick — a lower score, a cooldo
 For each entry, before writing the trace:
 
 ```bash
-~/Dev/merlin/bin/hum-reservoir-prune --expire "<idea_id>" --reason "<why>"
+~/Dev/edva/bin/hum-reservoir-prune --expire "<idea_id>" --reason "<why>"
 ```
 
 The `idea_id` is the ideas candidate's `dedup_key` (also `supporting_data.idea_id`). One append per call, safe mid-tick. Leave `retire_ideas` as `[]` on ticks where nothing qualifies — which is most of them.
@@ -470,7 +470,7 @@ The `idea_id` is the ideas candidate's `dedup_key` (also `supporting_data.idea_i
 Write it by piping the record to the log tool, which serializes it to exactly one line:
 
 ```bash
-printf '%s' '<the trace JSON above>' | ~/Dev/merlin/bin/hum-run-log append
+printf '%s' '<the trace JSON above>' | ~/Dev/edva/bin/hum-run-log append
 ```
 
 It refuses anything that is not a JSON object. To read the log back, use `hum-run-log read [--tail N] [--since ISO] [--json]` rather than `jq` (it reports skipped lines). `hum-run-log check` prints the file's integrity.
@@ -482,7 +482,7 @@ Even on errors, write a trace row with `sonnet.decision: "error"` and `harvest.e
 As the LAST action of Step 4, once the real outcome is known (published, or hidden by `outbound-precheck`/`claim-freshness`), call:
 
 ```bash
-~/Dev/merlin/bin/hum-debug-line \
+~/Dev/edva/bin/hum-debug-line \
   --lane "<sonnet.based_on_topic, or the top near_miss topic if the ranker had no winner>" \
   --subject "<sonnet.subject, or the top near_miss signal (short), or 'none'>" \
   --decision "<published if outcome.sent==true, else hidden>" \
@@ -495,15 +495,15 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
 
 1. Write the tick trace with `outcome.sent: false`. **Always populate `sonnet.silent_root_cause`** from the schema enum (`pre_rank_vetoed` / `perishable_no_local` = Step 2 short-circuits; `history_blocked` / `cross_send_dedup` / `novelty_duplicate` / `retrospective_ask_cap` / `rate_limited` / `resolved_first` = `hum-ping` exits 7 / 8 / 9 / 10 / 11 / 12 (`resolved_first` also = `hum-ask` exit 12, and the pre-rank veto of that name); `wiki_settled` = Step 3 settled-subject gate) — hum-review uses it to flag ideation gaps. **Always populate `sonnet.near_miss_candidates`** with the top 3 candidates that came closest to firing (even if all were below threshold).
 2. Update `state.last_run_at`.
-3. **Reservoir refill trigger (reservoir-health-gated since 2026-10-04):** increment `state.silent_streak` (consecutive silent ticks since the last `info`/`question` ping). When it reaches 6, run `node ~/Dev/merlin/agent/scripts/hum-tick.mjs reservoir-health --json` (counts live unconsumed, unexpired ideas in `hum-ideas.jsonl`). **Only when it returns `"refill": true` (fewer than 15 live ideas)**, dispatch a fresh `HUM IDEATION` run via webhook (`POST localhost:9082` with `{"task":"HUM IDEATION","source":"silent-streak-refill"}`) and reset the streak counter to 0. **Port 9082 (ops-light), not 9092 (ops).** When `refill` is false, leave the streak counting and do nothing. (History: hum-detail.md § Step 4.)
+3. **Reservoir refill trigger (reservoir-health-gated since 2026-10-04):** increment `state.silent_streak` (consecutive silent ticks since the last `info`/`question` ping). When it reaches 6, run `node ~/Dev/edva/agent/scripts/hum-tick.mjs reservoir-health --json` (counts live unconsumed, unexpired ideas in `hum-ideas.jsonl`). **Only when it returns `"refill": true` (fewer than 15 live ideas)**, dispatch a fresh `HUM IDEATION` run via webhook (`POST localhost:9082` with `{"task":"HUM IDEATION","source":"silent-streak-refill"}`) and reset the streak counter to 0. **Port 9082 (ops-light), not 9092 (ops).** When `refill` is false, leave the streak counting and do nothing. (History: hum-detail.md § Step 4.)
 
 ### `info`
 
 1. The daily ping budget (6/day, 45 min apart) and the sleep window are enforced in code — the budget by `hum-ping` exit 11 and the pre-rank filter, the sleep window upstream (Step 0) — never by re-checking a clock or a counter here. No protected time-of-day windows (removed 2026-04-15). Non-silent findings proceed to send. `state.max_pings_per_day` / `state.min_ping_interval_minutes` in `hum-state.json` are ignored; the budget is `lib/ping-budget.mjs` (override with `HUM_MAX_PINGS_PER_DAY` / `HUM_MIN_PING_INTERVAL_MIN`).
-2. Send + log in one step via `~/Dev/merlin/bin/hum-ping`:
+2. Send + log in one step via `~/Dev/edva/bin/hum-ping`:
 
    ```bash
-   printf '%s' "<text>" | ~/Dev/merlin/bin/hum-ping \
+   printf '%s' "<text>" | ~/Dev/edva/bin/hum-ping \
      --ping-id "<p-YYYYMMDD-HHMM-hex>" \
      --lane "<lane>" \
      --score "<score_at_ping>" \
@@ -512,9 +512,9 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
      --suppress-hook --message-from-stdin
    ```
 
-   `hum-ping` atomically (a) posts to `merlin_messages` via `merlin-send-curl --capture-id`, (b) appends the `hum-feedback.jsonl` row with the captured `message_id` under an advisory lock, (c) for advisory lanes, appends a `surfaced` event per finding (canonical `subject_key`) to `suggestion-history.jsonl`. Do not call `merlin-send-curl` directly for info pings.
+   `hum-ping` atomically (a) posts to `edva_messages` via `edva-send-curl --capture-id`, (b) appends the `hum-feedback.jsonl` row with the captured `message_id` under an advisory lock, (c) for advisory lanes, appends a `surfaced` event per finding (canonical `subject_key`) to `suggestion-history.jsonl`. Do not call `edva-send-curl` directly for info pings.
 
-   **Pictures ride along automatically.** `hum-ping` forwards `supporting_data.media` (`{image_url, map_url}`) to `merlin-send-curl --media`. So **(i)** copy candidates into `--findings` with `supporting_data` intact, never a summary; **(ii)** never paste an image URL into the text. (hum-detail.md § Step 4.)
+   **Pictures ride along automatically.** `hum-ping` forwards `supporting_data.media` (`{image_url, map_url}`) to `edva-send-curl --media`. So **(i)** copy candidates into `--findings` with `supporting_data` intact, never a summary; **(ii)** never paste an image URL into the text. (hum-detail.md § Step 4.)
 
    <!-- geo-gate-ok: hum-ping is the generic publish path for every lane, not an event-specific send — a dated place-bound finding is already geo-gated upstream, at the harvester (`_common.mjs geoGate`) per ops-agent/CLAUDE.md § Travel Timeline & Event Geo-Gating, before it ever becomes a candidate this step can surface. -->
 
@@ -528,7 +528,7 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
 
    - **11** → `rate_limited`: daily ping budget spent — 6 pings today (larger of `hum-state.json` `today.pings` and today's `hum-feedback.jsonl` rows) or the last under 45 minutes ago. Carve-outs as exit 8.
 
-   - **12** → `resolved_first`: the resolve-first gate found the answer in Merlin's records and it was not worth a message, so nothing was sent and no row written. A reservoir idea behind it is already retired and a queued location ask dropped; do not mark it consumed or re-send it. (When the answer *was* worth sending, the gate turned the ping into a short FYI or into just the remaining gap and `hum-ping` exits 0 as a normal send.)
+   - **12** → `resolved_first`: the resolve-first gate found the answer in Edva's records and it was not worth a message, so nothing was sent and no row written. A reservoir idea behind it is already retired and a queued location ask dropped; do not mark it consumed or re-send it. (When the answer *was* worth sending, the gate turned the ping into a short FYI or into just the remaining gap and `hum-ping` exits 0 as a normal send.)
    **Exit codes 9 and 10 — novelty and retrospective-ask cap.** Exit 9: the headline is a semantic near-duplicate of a ping sent in the last 72h (`silent_root_cause: "novelty_duplicate"`). **The cosine threshold is per-lane since 2026-10-06** (`THRESHOLD_BY_LANE` in `lib/hum-novelty.mjs`): 0.93 by default, **0.90 for `nearby`**, because that lane keys its `dedup_key` on a standing SUBJECT so all facts about one landmark share a key — which makes telling a NEW fact from a RESTATED one this gate's job, not exit-8's. Calibrated against the user's own tapbacks: of three sends about one landmark, the one they ignored scored 0.9047 and the two they answered "more" scored 0.8597 and 0.6446, so 0.90 blocks exactly the repeat. Precedence is specific-beats-general: `HUM_NOVELTY_THRESHOLD_<LANE>`, then the table, then `HUM_NOVELTY_THRESHOLD`, then 0.93. Exit 10: three "were you at X?" asks already went out today (`"retrospective_ask_cap"`). Both are recoverable silents, traced like exit 7. All four refusals (7/8/9/10) are now also applied pre-rank in Step 2, so seeing one here means a candidate reached `hum-ping` without passing through `hum-harvest-all`.
 
    - **13** → `local_history_out_of_range`: a `nearby` local explanation, and their newest fix is more than 300 m from its subject or older than 30 min (2026-10-20). Nothing sent, no row. Expected while they walk fast; not a fault. A local explanation already told (same QID / page / OSM id, or the same spot within 30 m) exits **8** from the identity ledger.
@@ -536,7 +536,7 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
    Exit 8 for a **sticky** `nearby:*` key uses `HUM_STICKY_DEDUP_WINDOW_D` days (default 180) instead of 24h, with no score carve-out — a fact about a place is told once. All five are also applied pre-rank (Step 2), so one here means a candidate bypassed `hum-harvest-all`.
 
 3. Update `hum-seen.json` (subject key), `state.last_ping_at`, and `state.today.pings += 1`. `hum-feedback.jsonl` is handled by `hum-ping` in step 2 — do not append to it here.
-4. **If `sonnet.based_on_topic` is `"ideas"` or `"dream_asks"`** — whether it went out as info OR as a question — mark the source idea consumed: `~/Dev/merlin/bin/hum-mark-idea-consumed <idea_id> <ping_id>` — where `idea_id` is the `dedup_key` of the winning candidate (same as `supporting_data.idea_id`). The reaction half of the loop is closed by `merlin hum feedback` (see `system/hum-ideas-reservoir.md`).
+4. **If `sonnet.based_on_topic` is `"ideas"` or `"dream_asks"`** — whether it went out as info OR as a question — mark the source idea consumed: `~/Dev/edva/bin/hum-mark-idea-consumed <idea_id> <ping_id>` — where `idea_id` is the `dedup_key` of the winning candidate (same as `supporting_data.idea_id`). The reaction half of the loop is closed by `edva hum feedback` (see `system/hum-ideas-reservoir.md`).
 
 4a. **Sibling sweep (task-ID dedup)**: immediately after step 4, if the winning idea has a `supporting_data.task_id` (look it up in the collapsed `hum-ideas.jsonl` by `idea_id`), scan for any other unconsumed ideas with the same `task_id`. For each sibling found, append a consumed marker to `hum-ideas.jsonl`:
     ```
@@ -554,20 +554,20 @@ Every tick, including silent. It self-expires (no-op after the window or if `dat
 
 ### `question`
 
-0. **A `decisions` winner is sent by code, never by `hum-ask`:** after the pending-question check in step 1, run `~/Dev/merlin/bin/decision-ask --ref "<supporting_data.decision_ref>"` (Bash `timeout: 300000`; it builds the card — a header chip, the bold question, numbered options with a grey one-line description, the recommended option first marked "(Recommended)", and "Type something" — sends it through `merlin-send-curl` with the outbound precheck, and counts one ping in the shared budget with `ping-budget record`). Exit **0** → trace `outcome.sent: true`, `outcome.question_id: "<decision_ref>"`, and stamp `state.last_question_at` / `state.today.questions` (step 4); **5** (already answered, or one already went out today) → silent, `silent_root_cause: "all_below_threshold"`; **6** precheck held it → `outcome.sent: false`, `downgrade_reason: "precheck_suppressed"`; **3** → `decision: "error"`. Do not write `hum-pending-question.json` and do not record it in the open-questions ledger: their tap is filed by `choice-reply` (`decision-answer`), a typed answer by the chat agent, and the lane itself keeps an unanswered decision from being re-asked for 7 days. Skip steps 2–3 for it.
+0. **A `decisions` winner is sent by code, never by `hum-ask`:** after the pending-question check in step 1, run `~/Dev/edva/bin/decision-ask --ref "<supporting_data.decision_ref>"` (Bash `timeout: 300000`; it builds the card — a header chip, the bold question, numbered options with a grey one-line description, the recommended option first marked "(Recommended)", and "Type something" — sends it through `edva-send-curl` with the outbound precheck, and counts one ping in the shared budget with `ping-budget record`). Exit **0** → trace `outcome.sent: true`, `outcome.question_id: "<decision_ref>"`, and stamp `state.last_question_at` / `state.today.questions` (step 4); **5** (already answered, or one already went out today) → silent, `silent_root_cause: "all_below_threshold"`; **6** precheck held it → `outcome.sent: false`, `downgrade_reason: "precheck_suppressed"`; **3** → `decision: "error"`. Do not write `hum-pending-question.json` and do not record it in the open-questions ledger: their tap is filed by `choice-reply` (`decision-answer`), a typed answer by the chat agent, and the lane itself keeps an unanswered decision from being re-asked for 7 days. Skip steps 2–3 for it.
 1. If an unexpired pending question exists in `hum-pending-question.json`, downgrade to silent with `downgrade_reason: "pending_question_active"`. Write the trace. (This slot only ever holds a question **actually delivered** and awaiting a reply; undelivered lane-diagnosis questions wait in `hum-qual-delivery-queue.json`.)
-2. `id = q-YYYYMMDD-HHMM-<4hexchars>` — **except a re-ask from the `open_questions` lane: use `supporting_data.question_id` as the id, and its `memory_hook` / `subject` / `original_lane` as `--memory-hook` / `--subject` / `--lane`**, so an answer to any copy files against the same question. Retire the ones you judged no longer relevant with `~/Dev/merlin/bin/open-questions retire <question_id> --why "<one line>"`.
-3. Send AND hold the slot in one step with `hum-ask` (since 2026-10-15; never a bare `merlin-send-curl` for a question — that skipped the resolve-first gate and, on a precheck hold, wrote the slot anyway). Pass the winning candidate as `--findings` so the gate sees what the question was based on. Bash `timeout: 300000`.
+2. `id = q-YYYYMMDD-HHMM-<4hexchars>` — **except a re-ask from the `open_questions` lane: use `supporting_data.question_id` as the id, and its `memory_hook` / `subject` / `original_lane` as `--memory-hook` / `--subject` / `--lane`**, so an answer to any copy files against the same question. Retire the ones you judged no longer relevant with `~/Dev/edva/bin/open-questions retire <question_id> --why "<one line>"`.
+3. Send AND hold the slot in one step with `hum-ask` (since 2026-10-15; never a bare `edva-send-curl` for a question — that skipped the resolve-first gate and, on a precheck hold, wrote the slot anyway). Pass the winning candidate as `--findings` so the gate sees what the question was based on. Bash `timeout: 300000`.
 
    ```bash
-   printf '%s' "<question text>" | ~/Dev/merlin/bin/hum-ask \
+   printf '%s' "<question text>" | ~/Dev/edva/bin/hum-ask \
      --id "<q-YYYYMMDD-HHMM-hex>" --lane "<lane>" \
      --subject "<subject>" --memory-hook "<memory_hook>" --rationale "<rationale>" \
      --findings '<JSON array: the winning candidate>' --ttl-min 15 \
      --message-from-stdin
    ```
 
-   It sends with intent `hum:<lane>:question` and `--capture-id`, and writes `hum-pending-question.json` (`{id, asked_at, question, subject, memory_hook, rationale, lane, delivered_msg_id, expires_at}`) **only for what landed as a question**, holding the text they actually saw. The captured `merlin_messages.id` is what routes a threaded reply back to *this* question (`lib/hum-reply-target.mjs`). (15-min TTL policy: hum-detail.md § Step 4.) Exit codes:
+   It sends with intent `hum:<lane>:question` and `--capture-id`, and writes `hum-pending-question.json` (`{id, asked_at, question, subject, memory_hook, rationale, lane, delivered_msg_id, expires_at}`) **only for what landed as a question**, holding the text they actually saw. The captured `edva_messages.id` is what routes a threaded reply back to *this* question (`lib/hum-reply-target.mjs`). (15-min TTL policy: hum-detail.md § Step 4.) Exit codes:
    - **0** asked (possibly narrowed by the gate to just the remaining gap) → steps 4–5.
    - **13** the records answered it and a short FYI went out instead; no slot → trace it as `info` (`outcome.sent: true`, `outcome.resolved_first: "fyi"`) and do the `info` step-3 updates (`hum-seen.json`, `state.last_ping_at`, `state.today.pings += 1`, so the FYI counts against the daily ping budget); do NOT stamp the question counters.
    - **12** the records answered it and nothing was sent → silent, `silent_root_cause: "resolved_first"`.
@@ -650,7 +650,7 @@ Full descriptions: hum-detail.md § State files.
 | `data/hum-interests.json` | topic registry (editable config) |
 | `data/open-questions.jsonl` | every question hum asked and whether they have answered it (append-only events: asked / answered / retired; `lib/open-questions.mjs`, CLI `open-questions list|due|show|retire`). Written by `hum-ask`, `hum-answer`, `open-questions retire`; read by the `open_questions` lane and the chat agent's `[Hum state]` block |
 | `data/hum-interests-state.json` | per-topic `last_run_at` / `last_signal_at` |
-| `data/hum-lane-quiesce-state.json` | auto-quiesce streaks (`lib/hum-lane-quiesce.mjs`); `merlin hum lane enable <name>` re-enables a lane |
+| `data/hum-lane-quiesce-state.json` | auto-quiesce streaks (`lib/hum-lane-quiesce.mjs`); `edva hum lane enable <name>` re-enables a lane |
 | `data/hum-cache/<topic>.json` | per-topic harvester cache (incl. `situation-memo.json`) |
 | `data/hum-last-harvest.json` | latest COMMIT-mode harvest — `hum-run-log append` copies its candidates into the trace |
 | `data/decision-lane-state.json` | `decisions` lane: `asked[]` (`{ref, at, message_id, prompt_id, answered_at?}`) and the built card per ref (`cards`); written by `decision-ask` / `decision-answer` (`lib/decision-queue.mjs`). The decisions themselves live in `improvement-plan-state.json` / `cost-efficiency-review-state.json` `questions[]`, and the answer is written back there |
@@ -659,7 +659,7 @@ Full descriptions: hum-detail.md § State files.
 | `data/hum-runs.jsonl` | append-only decision log |
 | `data/hum-pending-question.json` | single **delivered** pending question (tick: 15min TTL; lane-diagnosis: 24h). Needs `id`/`question` + parseable `expires_at`; clear by writing `null`, never `{}` |
 | `data/hum-qual-delivery-queue.json` | queued lane-diagnosis question awaiting delivery by `hum-deliver-qual` |
-| `data/hum-resolve-first.jsonl` | answers the resolve-first gate worked out from Merlin's records (`lib/hum-resolve-first-store.mjs`); a fully answered `dedup_key` is vetoed pre-rank for 7 days as `resolved_first`. Merlin's conclusions, never rendered as the user's words. `hum-resolve-first forget <id\|key>` withdraws one |
+| `data/hum-resolve-first.jsonl` | answers the resolve-first gate worked out from Edva's records (`lib/hum-resolve-first-store.mjs`); a fully answered `dedup_key` is vetoed pre-rank for 7 days as `resolved_first`. Edva's conclusions, never rendered as the user's words. `hum-resolve-first forget <id\|key>` withdraws one |
 | `data/hum-resolve-first-log.jsonl` | one row per resolve-first decision (verdict, action, sources, latency); finance/stocks/health rows carry a hash instead of text. `hum-resolve-first stats` / `tail` |
 | `data/hum-learnings.jsonl` | append-only answer log (questions) |
 | `data/hum-responses.jsonl` | every reply to a ping (any lane); read by `hum-consolidate` and `hum-wiki-recall` |

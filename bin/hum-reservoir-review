@@ -21,7 +21,7 @@
 //   hum-reservoir-review --topic "<short phrase naming the topic>" [--reason "text"] [--dry-run] [--json]
 //   hum-reservoir-review <word> [word ...] [--reason "text"] [--dry-run]     (legacy form)
 // Exit: 0 ok (0+ consumed) · 2 no topic · 3 refused (too broad / embedder down)
-// Env (tests): MERLIN_DATA_DIR, HUM_TOPIC_SWEEP_THRESHOLD, HUM_TOPIC_SWEEP_MAX.
+// Env (tests): EDVA_DATA_DIR, HUM_TOPIC_SWEEP_THRESHOLD, HUM_TOPIC_SWEEP_MAX.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -48,7 +48,7 @@ if (!topic) {
   process.exit(2);
 }
 
-const DIR = process.env.MERLIN_DATA_DIR || installTools("data");
+const DIR = process.env.EDVA_DATA_DIR || installTools("data");
 const file = path.join(DIR, "hum-ideas.jsonl");
 if (!fs.existsSync(file)) {
   out({ topic, consumed: [], reason: "no reservoir" }, "0 matches (reservoir file not found)");

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // rollback-guard — Claude Code PreToolUse hook (matcher "Bash") for
-// Merlin's own sessions: snapshot uncommitted work to
-// refs/merlin/pre-destructive/<stamp> before a destructive git command, or
+// Edva's own sessions: snapshot uncommitted work to
+// refs/edva/pre-destructive/<stamp> before a destructive git command, or
 // block it (exit 2) when the snapshot fails. Logic and rationale:
 // lib/rollback-guard.mjs. Wired in by the supervisors' --settings
 // (lib/rollback-guard-settings.mjs) and the fork launchers.

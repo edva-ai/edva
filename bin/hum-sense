@@ -55,11 +55,11 @@ let spoolWatchEvents = () => {};
 import { installRoot } from "../lib/root.cjs";
 
 const HOME = os.homedir();
-const MERLIN = installRoot();
-const LOGFILE = path.join(MERLIN, "agent/logs/hum-sense.log");
+const EDVA = installRoot();
+const LOGFILE = path.join(EDVA, "agent/logs/hum-sense.log");
 // Names this daemon in any paid call its sensors make (the excursion sensor
 // runs `places`); launchd starts it outside cron-run, which sets this for jobs.
-if (!process.env.MERLIN_JOB) process.env.MERLIN_JOB = "hum-sense";
+if (!process.env.EDVA_JOB) process.env.EDVA_JOB = "hum-sense";
 
 // Load .env before anything runs. `gog` (calendar + tasks sensors) reads
 // its OAuth token from a file-backed keyring that needs GOG_KEYRING_PASSWORD in
@@ -80,7 +80,7 @@ function log(msg) {
 // ─── situational gates ─────────────────────────────────────────────────────
 //
 // Everything the gate needs to know about the user's availability, assembled
-// from files the rest of Merlin already maintains. Only `activity` costs a
+// from files the rest of Edva already maintains. Only `activity` costs a
 // subprocess, and it is cached — the rest is free.
 
 let activityCache = { ts: 0, value: null };
@@ -89,7 +89,7 @@ async function readActivityState() {
   if (Date.now() - activityCache.ts < 5 * 60_000) return activityCache.value;
   const { execFile } = await import("node:child_process");
   const value = await new Promise((resolve) => {
-    const child = execFile(path.join(MERLIN, "bin/merlin"), ["activity", "--state-only"],
+    const child = execFile(path.join(EDVA, "bin/edva"), ["activity", "--state-only"],
       { timeout: 10000, env: { ...process.env, PATH: `/opt/homebrew/bin:${process.env.PATH || ""}` } },
       (err, stdout) => resolve(err && !stdout ? null : String(stdout || "").trim() || null));
     child.on("error", () => resolve(null));
@@ -132,10 +132,10 @@ async function gatherGates(state, config, nowMs) {
   const cal = state.sensors?.calendar?.memo || {};
   const inMeeting = Boolean(Object.hasOwn(cal, "hold_id") ? cal.hold_id : cal.current_id);
 
-  // Mid-conversation: if the user just messaged Merlin, the chat agent is
+  // Mid-conversation: if the user just messaged Edva, the chat agent is
   // answering the user. An ambient ping on top of that is interruption, not
   // ambience — hold until the exchange settles.
-  const cursor = readJson(path.join(MERLIN, "data/phone-channel-cursor.json"), null);
+  const cursor = readJson(path.join(EDVA, "data/phone-channel-cursor.json"), null);
   const inConversation = Boolean(
     cursor?.lastSeenAt &&
     (nowMs - new Date(cursor.lastSeenAt).getTime()) / 60000 < (config.conversation_grace_min ?? 4)
@@ -233,7 +233,7 @@ function sensorIsDue(entry, state, nowMs) {
 
 // ─── outcome reconciliation ────────────────────────────────────────────────
 
-const RUNS_FILE = path.join(MERLIN, "data/hum-runs.jsonl");
+const RUNS_FILE = path.join(EDVA, "data/hum-runs.jsonl");
 
 /**
  * Join each dispatch to the hum run it produced and append the outcome to the
@@ -418,7 +418,7 @@ function kickWatch(hasEvents) {
   const gap = now - lastWatchKick;
   if (!(gap >= 60_000 || (hasEvents && gap >= 10_000))) return;
   lastWatchKick = now;
-  const watchBin = path.join(MERLIN, "bin/watch");
+  const watchBin = path.join(EDVA, "bin/watch");
   if (!fs.existsSync(watchBin)) return; // no watch engine in this installation
   import("node:child_process").then(({ spawn }) => {
     const child = spawn(process.execPath, [watchBin, "tick"], { detached: true, stdio: "ignore", env: process.env });

@@ -1,11 +1,11 @@
 {
-  "_comment": "Host registry for `merlin whereami` (lib/host-identity.js). Copy to system/hosts.json (gitignored). Resolution order: hostname/alias match first (instant), then the immutable hardware UUID as a fallback for renamed hosts. Get a Mac's UUID with: ioreg -rd1 -c IOPlatformExpertDevice | awk -F '\"' '/IOPlatformUUID/{print $4}'. A host is production when \"production\": true (or role \"production\"); anything not listed resolves to role 'unknown'.",
+  "_comment": "Host registry for `edva whereami` (lib/host-identity.js). Copy to system/hosts.json (gitignored). Resolution order: hostname/alias match first (instant), then the immutable hardware UUID as a fallback for renamed hosts. Get a Mac's UUID with: ioreg -rd1 -c IOPlatformExpertDevice | awk -F '\"' '/IOPlatformUUID/{print $4}'. A host is production when \"production\": true (or role \"production\"); anything not listed resolves to role 'unknown'.",
   "hosts": [
     {
       "id": "server",
       "role": "production",
       "production": true,
-      "label": "always-on host running the Merlin stack",
+      "label": "always-on host running the Edva stack",
       "hostname": "my-server.local",
       "aliases": ["my-server"],
       "uuid": "00000000-0000-0000-0000-000000000000",

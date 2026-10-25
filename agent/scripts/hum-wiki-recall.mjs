@@ -98,7 +98,7 @@ function candidateSubject(c) {
 // Prepending the `topic` ("dining <restaurant> …") on the theory that it pulls
 // in the matching preference page does the opposite twice over: under FTS5's
 // implicit AND it adds one more token that every page has to contain, and
-// under semantic search it drags the query toward Merlin's own hum-machinery
+// under semantic search it drags the query toward Edva's own hum-machinery
 // pages instead of anything about the subject. Subject only.
 export function candidateQuery(c) {
   return candidateSubject(c).slice(0, 120);

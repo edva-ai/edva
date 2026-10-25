@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// open-questions — read or settle the ledger of Merlin questions the user has
+// open-questions — read or settle the ledger of Edva questions the user has
 // not answered yet (lib/open-questions.mjs; questions are repeated until
 // they're answered).
 //

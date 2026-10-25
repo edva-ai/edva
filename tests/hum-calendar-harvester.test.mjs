@@ -16,7 +16,7 @@ import path from "node:path";
 const LOCAL = fs.mkdtempSync(path.join(os.tmpdir(), "hum-calendar-"));
 fs.mkdirSync(path.join(LOCAL, "config"));
 fs.writeFileSync(path.join(LOCAL, "config", "hum-calendar.json"), JSON.stringify({ ignore_summary_prefixes: ["[Shared]"] }));
-process.env.MERLIN_LOCAL_DIR = LOCAL;
+process.env.EDVA_LOCAL_DIR = LOCAL;
 test.after(() => fs.rmSync(LOCAL, { recursive: true, force: true }));
 const {
   overlaps,

@@ -2,7 +2,7 @@
 //
 // Conway's edge is that an agent is a persistent, addressable object that owns
 // its own message array AND a durable store behind it (messages.db). This module
-// is Merlin's equivalent: a single append-only message store over the SAME
+// is Edva's equivalent: a single append-only message store over the SAME
 // memory-index.db the wiki + events_fts already live in (one DB, one backup, one
 // durability regime — a user directive).
 //

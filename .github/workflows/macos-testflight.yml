@@ -1,10 +1,10 @@
-name: Merlin Companion - macOS TestFlight
+name: Edva Companion - macOS TestFlight
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: merlin-companion-macos-${{ github.ref }}
+  group: edva-companion-macos-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -53,7 +53,7 @@ jobs:
           # Prepend under the host-wide mutex shared by every signing repo on the
           # host. This read-modify-write of the user search list was unsynchronized:
           # two concurrent jobs lose each other's entry, and a list written from a
-          # stale read can drop login.keychain-db — which takes a Merlin agent on
+          # stale read can drop login.keychain-db — which takes a Edva agent on
           # this same host fully auth-down (Max OAuth token lives there, no API-key
           # fallback by design; see docs/agent-auth-model.md).
           source "$GITHUB_WORKSPACE/.github/scripts/ci-keychain-lock.sh"
@@ -96,16 +96,16 @@ jobs:
         run: |
           BUILD_NUMBER=${{ github.run_number }}
           echo "Build number: $BUILD_NUMBER"
-          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Merlin.xcodeproj/project.pbxproj
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Edva.xcodeproj/project.pbxproj
 
       - name: Clean DerivedData
-        run: rm -rf ~/Library/Developer/Xcode/DerivedData/Merlin-*
+        run: rm -rf ~/Library/Developer/Xcode/DerivedData/Edva-*
 
       - name: Resolve packages
         run: |
           xcodebuild -resolvePackageDependencies \
-            -project Merlin.xcodeproj \
-            -scheme Merlin
+            -project Edva.xcodeproj \
+            -scheme Edva
 
       - name: Configure macOS signing
         run: |
@@ -113,28 +113,28 @@ jobs:
           import sys
           app_profile = sys.argv[1]
           ext_profile = sys.argv[2]
-          with open('Merlin.xcodeproj/project.pbxproj', 'r') as f:
+          with open('Edva.xcodeproj/project.pbxproj', 'r') as f:
               content = f.read()
           content = content.replace('CODE_SIGN_STYLE = Automatic;',
               'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Distribution";')
           content = content.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
           content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "{ext_profile}";')
           content = content.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;',
-              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
-          with open('Merlin.xcodeproj/project.pbxproj', 'w') as f:
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva;',
+              f'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva; PROVISIONING_PROFILE_SPECIFIER = "{app_profile}";')
+          with open('Edva.xcodeproj/project.pbxproj', 'w') as f:
               f.write(content)
           PYEOF
 
       - name: Archive macOS (native)
         run: |
           xcodebuild archive \
-            -project Merlin.xcodeproj \
-            -scheme Merlin \
+            -project Edva.xcodeproj \
+            -scheme Edva \
             -configuration Release \
-            -archivePath $RUNNER_TEMP/Merlin-macOS.xcarchive \
+            -archivePath $RUNNER_TEMP/Edva-macOS.xcarchive \
             -destination 'generic/platform=macOS' \
             DEVELOPMENT_TEAM=TEAMID_PLACEHOLDER
 
@@ -159,9 +159,9 @@ jobs:
               <string>3rd Party Mac Developer Installer</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>com.example.Merlin</key>
+                  <key>com.example.Edva</key>
                   <string>${mac_profile_name}</string>
-                  <key>com.example.Merlin.NotificationService</key>
+                  <key>com.example.Edva.NotificationService</key>
                   <string>${ext_profile_name}</string>
               </dict>
           </dict>
@@ -169,7 +169,7 @@ jobs:
           EOPLIST
           echo "Generated ExportOptions with profile: $mac_profile_name"
           xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/Merlin-macOS.xcarchive \
+            -archivePath $RUNNER_TEMP/Edva-macOS.xcarchive \
             -exportPath $RUNNER_TEMP/export-macos \
             -exportOptionsPlist $RUNNER_TEMP/ExportOptions-macOS.plist
 
@@ -187,9 +187,9 @@ jobs:
 
           PKG_PATH=$(find $RUNNER_TEMP/export-macos -name "*.pkg" -o -name "*.ipa" -o -name "*.app" | head -1)
           if [[ "$PKG_PATH" == *.app ]]; then
-            productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Merlin.pkg \
+            productbuild --component "$PKG_PATH" /Applications $RUNNER_TEMP/export-macos/Edva.pkg \
               --sign "${MAC_INSTALLER_IDENTITY:?set the MAC_INSTALLER_IDENTITY repo secret}"
-            PKG_PATH=$RUNNER_TEMP/export-macos/Merlin.pkg
+            PKG_PATH=$RUNNER_TEMP/export-macos/Edva.pkg
           fi
 
           xcrun altool --upload-app \
@@ -221,6 +221,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: merlin-companion-macos-build
+          name: edva-companion-macos-build
           path: ${{ runner.temp }}/export-macos/*
           retention-days: 3

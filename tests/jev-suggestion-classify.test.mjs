@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(HERE, "../bin/suggestion-classify");
 const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "jev-sugg-"));
-const DATA = path.join(fixture, "Dev/merlin/data");
+const DATA = path.join(fixture, "Dev/edva/data");
 fs.mkdirSync(DATA, { recursive: true });
 const SHADOW = path.join(fixture, "shadow");
 const CONFIG = path.join(fixture, "jev-config.json");

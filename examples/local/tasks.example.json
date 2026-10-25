@@ -1,5 +1,5 @@
 {
-  "_comment": "This installation's own scheduled tasks. Copy to agent/local/tasks.json (gitignored). lib/registry.cjs merges it with system/tasks.json: an entry with a new `name` is added, an entry whose `name` is a kernel task overrides only the fields it lists (so { \"name\": \"hum-review\", \"paused\": true } pauses a kernel task). `merlin tasks pause|resume` and `merlin doctor --repair` write here, never to the kernel file. The same merge applies to agent/local/services.json, agent/local/job-routing.json (key: jobs.<job>) and agent/local/chrome-jobs.json.",
+  "_comment": "This installation's own scheduled tasks. Copy to agent/local/tasks.json (gitignored). lib/registry.cjs merges it with system/tasks.json: an entry with a new `name` is added, an entry whose `name` is a kernel task overrides only the fields it lists (so { \"name\": \"hum-review\", \"paused\": true } pauses a kernel task). `edva tasks pause|resume` and `edva doctor --repair` write here, never to the kernel file. The same merge applies to agent/local/services.json, agent/local/job-routing.json (key: jobs.<job>) and agent/local/chrome-jobs.json.",
   "tasks": [
     {
       "name": "weekly-report",

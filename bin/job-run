@@ -19,7 +19,7 @@
 // Example:
 //   job-run --name report-build-<area> --tier ops \
 //     --notify-task "Background job {{name}} ({{id}}) finished with status {{status}}. Read its log and report what landed." \
-//     -- ~/Dev/merlin/bin/<some-builder> --area <area>
+//     -- ~/Dev/edva/bin/<some-builder> --area <area>
 
 import { startJob } from "../lib/job-runner.mjs";
 

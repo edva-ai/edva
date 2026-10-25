@@ -45,9 +45,9 @@ export const HOME = os.homedir();
 const { instance, localConfig } = createRequire(import.meta.url)("../../../lib/instance.cjs");
 export const GOG_ACCOUNT = instance().owner_email;
 export { localConfig };
-export const MERLIN = installRoot();
-export const BIN = path.join(MERLIN, "bin");
-export const DATA = path.join(MERLIN, "data");
+export const EDVA = installRoot();
+export const BIN = path.join(EDVA, "bin");
+export const DATA = path.join(EDVA, "data");
 
 /** Async exec that never throws. Returns stdout (trimmed) or "" on any failure. */
 export function sh(cmd, args = [], { timeout = 8000, env } = {}) {

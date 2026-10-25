@@ -14,7 +14,7 @@
 # Why (2026-10-20): `crontab -l | grep -v TAG | crontab -` installs whatever the
 # read produced. When `crontab -l` fails or hangs (it has hung on a macOS
 # permission prompt on this machine), that is an empty or cut-off crontab and
-# every Merlin job (~250 lines) is gone. So the read goes to a file under a
+# every Edva job (~250 lines) is gone. So the read goes to a file under a
 # timeout; a failed, timed-out or empty read is a skip; what gets installed is
 # recounted first (lines read, minus the tagged ones, plus the new ones, never
 # empty); and only then does anything reach `crontab -`.
@@ -35,7 +35,7 @@ for l in "$@"; do
 done
 
 TIMEOUT="${CRONTAB_SAFE_TIMEOUT:-20}"
-LOG="${CRONTAB_SAFE_LOG:-$HOME/Dev/merlin/data/logs/crontab-safe.log}"
+LOG="${CRONTAB_SAFE_LOG:-$HOME/Dev/edva/data/logs/crontab-safe.log}"
 PERL=/usr/bin/perl; [ -x "$PERL" ] || PERL=perl
 
 skip() {

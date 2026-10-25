@@ -2,9 +2,9 @@
 # launchd-render.sh — render a launchd plist template from the repo.
 #
 # The kernel's plists in agent/launch-agents/ carry no machine paths:
-#   __MERLIN_HOME__   the checkout launchd runs from (default the installation,
-#                      $HOME/Dev/merlin; override with MERLIN_LAUNCHD_ROOT)
-#   __MERLIN_TOOLS__  the kernel tree in that checkout (__MERLIN_HOME__/tools
+#   __EDVA_HOME__   the checkout launchd runs from (default the installation,
+#                      $HOME/Dev/edva; override with EDVA_LAUNCHD_ROOT)
+#   __EDVA_TOOLS__  the kernel tree in that checkout (__EDVA_HOME__/tools
 #                      here; lib/root.sh). A path below the kernel is written
 #                      with this one, so the template is the same in every layout.
 #   __HOME__           the user's home directory ($HOME)
@@ -25,9 +25,9 @@ _LAUNCHD_RENDER_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launchd_render_plist() {
   local src="$1" dst="$2" root tools home sub install
   # The installation and the layout (root.sh, in a subshell: nothing leaks).
-  install="$(source "$_LAUNCHD_RENDER_LIB/root.sh" && printf '%s' "$MERLIN_INSTALL")"
-  sub="$(source "$_LAUNCHD_RENDER_LIB/root.sh" && printf '%s' "$MERLIN_KERNEL_SUBDIR")"
-  root="${MERLIN_LAUNCHD_ROOT:-$install}"
+  install="$(source "$_LAUNCHD_RENDER_LIB/root.sh" && printf '%s' "$EDVA_INSTALL")"
+  sub="$(source "$_LAUNCHD_RENDER_LIB/root.sh" && printf '%s' "$EDVA_KERNEL_SUBDIR")"
+  root="${EDVA_LAUNCHD_ROOT:-$install}"
   tools="$root${sub:+/$sub}"
   home="$HOME"
   # Escape the sed replacement (\, &, and the # delimiter).
@@ -35,8 +35,8 @@ launchd_render_plist() {
   tools=$(printf '%s' "$tools" | sed -e 's/[\\&#]/\\&/g')
   home=$(printf '%s' "$home" | sed -e 's/[\\&#]/\\&/g')
   if [ "$dst" = "-" ]; then
-    sed -e "s#__MERLIN_TOOLS__#${tools}#g" -e "s#__MERLIN_HOME__#${root}#g" -e "s#__HOME__#${home}#g" "$src"
+    sed -e "s#__EDVA_TOOLS__#${tools}#g" -e "s#__EDVA_HOME__#${root}#g" -e "s#__HOME__#${home}#g" "$src"
   else
-    sed -e "s#__MERLIN_TOOLS__#${tools}#g" -e "s#__MERLIN_HOME__#${root}#g" -e "s#__HOME__#${home}#g" "$src" > "$dst"
+    sed -e "s#__EDVA_TOOLS__#${tools}#g" -e "s#__EDVA_HOME__#${root}#g" -e "s#__HOME__#${home}#g" "$src" > "$dst"
   fi
 }

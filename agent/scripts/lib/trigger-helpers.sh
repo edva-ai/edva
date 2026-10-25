@@ -10,7 +10,7 @@
 
 HEALTH_PORT=${HEALTH_PORT:-9093}
 WEBHOOK_PORT=${WEBHOOK_PORT:-9092}
-LOGFILE="$HOME/Dev/merlin/agent/logs/watchdog.log"
+LOGFILE="$HOME/Dev/edva/agent/logs/watchdog.log"
 
 trigger_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$TRIGGER_JOB] $1" >> "$LOGFILE"; }
 

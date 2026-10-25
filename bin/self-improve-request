@@ -255,7 +255,7 @@ const u = createUnifiedApproval({
     async findByItemHash(hash) { const res = await fetch(`${BASE}/rest/v1/self_improve_approvals?item_hash=eq.${encodeURIComponent(hash)}&select=id,status,skipped,risk,expires_at,expires_at_ms`, { headers: H }); if (!res.ok) throw new Error(`lookup ${res.status}`); return res.json(); },
   },
   deviceKeys: { getKey: async () => null },
-  postSuggestion: async (s, r) => { try { await exec(path.join(ROOT, "bin/merlin-send-curl"), ["--channel", "improvements", "--skip-precheck", `🔧 ${s}\n${r || ""}\n\nApprove in the app (Face ID) to apply.`], { timeout: 15000 }); } catch {} },
+  postSuggestion: async (s, r) => { try { await exec(path.join(ROOT, "bin/edva-send-curl"), ["--channel", "improvements", "--skip-precheck", `🔧 ${s}\n${r || ""}\n\nApprove in the app (Face ID) to apply.`], { timeout: 15000 }); } catch {} },
   applyItem: async () => ({ ok: false }),
 });
 

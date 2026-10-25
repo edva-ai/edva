@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history, so `bin/merlin audit` (which also scans recent
+          # Full history, so `bin/edva audit` (which also scans recent
           # commit messages) works on the same checkout.
           fetch-depth: 0
 
@@ -32,7 +32,7 @@ jobs:
         # Forks without the secret still run the generic detectors, and the
         # guard says so in the log.
         env:
-          MERLIN_SANITIZE_PATTERNS_JSON: ${{ secrets.MERLIN_SANITIZE_PATTERNS_JSON }}
+          EDVA_SANITIZE_PATTERNS_JSON: ${{ secrets.EDVA_SANITIZE_PATTERNS_JSON }}
         # --all walks every tracked file rather than only staged diff. PR
         # context doesn't have a "staged" concept and we'd rather catch
         # regressions from main's baseline drift too.

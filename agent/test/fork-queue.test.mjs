@@ -151,7 +151,7 @@ describe("a fork's tool surface is bounded by --tools, not --allowedTools", asyn
     // The second half of the same hole. `claude -p` auto-discovers .mcp.json
     // from its cwd, and the fork's cwd is the chat-agent dir — so after --tools
     // correctly stripped Bash/Edit/Write, the probe STILL reported
-    // mcp__chrome-devtools (which drives Merlin's already-logged-in Chrome, i.e.
+    // mcp__chrome-devtools (which drives Edva's already-logged-in Chrome, i.e.
     // real bank/brokerage cookies) and mcp__claude_ai_Gmail with create_draft.
     // --strict-mcp-config plus no --mcp-config leaves zero MCP servers.
     assert.match(EXEC, /args\.push\("--strict-mcp-config"\)/);

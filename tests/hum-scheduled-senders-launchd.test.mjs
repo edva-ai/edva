@@ -25,13 +25,13 @@ test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 function sandbox({ loaded = true, maxOk = true, queue = "", runningFor = 0 } = {}) {
   const home = fs.mkdtempSync(path.join(TMP, "home-"));
   const calls = path.join(home, "calls.log");
-  const tools = path.join(home, "Dev/merlin/tools");
+  const tools = path.join(home, "Dev/edva/tools");
   fs.mkdirSync(path.join(tools, "agent/logs"), { recursive: true });
   if (queue) write(path.join(tools, "data/hum-qual-delivery-queue.json"), queue);
   write(path.join(tools, "bin/hum-explore-run"),
     `#!/bin/bash\necho "hum-explore-run key=\${ANTHROPIC_API_KEY:-} $*" >> "${calls}"\necho "hum-explore-run: sent p-1 (news)"\n`);
   write(path.join(tools, "bin/hum-deliver-qual"), "// stub; the stubbed node below records the call\n");
-  write(path.join(tools, "bin/merlin-send-curl"), `#!/bin/bash\necho "merlin-send-curl $*" >> "${calls}"\n`);
+  write(path.join(tools, "bin/edva-send-curl"), `#!/bin/bash\necho "edva-send-curl $*" >> "${calls}"\n`);
   write(path.join(home, ".local/bin/claude"), `#!/bin/bash\necho "claude $*" >> "${calls}"\n` +
     `echo '{"loggedIn": ${maxOk}, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"}'\n`);
   write(path.join(home, ".local/bin/node"), `#!/bin/bash\necho "node $*" >> "${calls}"\n`);
@@ -79,7 +79,7 @@ test("agent not installed: nothing is sent, and the System tab gets the install 
   const sb = sandbox({ loaded: false });
   assert.notEqual(sb.script("trigger-hum-explore.sh").status, 0);
   assert.doesNotMatch(sb.calls(), /hum-explore-run/);
-  assert.match(sb.calls(), /merlin-send-curl --channel system --skip-precheck --intent hum-explore .*ai\.claude\.hum-explore\.plist/);
+  assert.match(sb.calls(), /edva-send-curl --channel system --skip-precheck --intent hum-explore .*ai\.claude\.hum-explore\.plist/);
 });
 
 test("under launchd the pick runs only after the Max check passes, with Anthropic keys scrubbed", () => {
@@ -92,7 +92,7 @@ test("under launchd the pick runs only after the Max check passes, with Anthropi
 test("no verified Max login: the pick is held, not sent unchecked, and nobody is paged", () => {
   const sb = sandbox({ maxOk: false });
   assert.equal(sb.script("run-hum-explore.sh").status, 0);
-  assert.doesNotMatch(sb.calls(), /hum-explore-run|merlin-send-curl/);
+  assert.doesNotMatch(sb.calls(), /hum-explore-run|edva-send-curl/);
   assert.match(sb.log(), /\[hum-explore\] held: Max login check failed \(loggedIn=false .*\); no pick goes out without the resolve-first check\n$/);
 });
 
@@ -111,7 +111,7 @@ test("a fallback tick kicks the lane-question agent only when a question is queu
   assert.equal(manual.calls(), "");
   const missing = sandbox({ queue: QUEUED, loaded: false });
   assert.equal(missing.qualBlock().status, 0, "a missing agent never breaks the tick");
-  assert.match(missing.calls(), /merlin-send-curl --channel system .*ai\.claude\.hum-deliver-qual\.plist/);
+  assert.match(missing.calls(), /edva-send-curl --channel system .*ai\.claude\.hum-deliver-qual\.plist/);
   assert.doesNotMatch(missing.calls(), /sleep/, "no wait on a run that never started");
 });
 
@@ -128,7 +128,7 @@ test("the fallback tick waits for the delivery to finish before hum is dispatche
 test("under launchd the queued question is delivered only after the Max check; otherwise it stays queued", () => {
   const ok = sandbox({ queue: QUEUED });
   assert.equal(ok.script("run-hum-deliver-qual.sh").status, 0);
-  assert.match(ok.calls(), /^claude auth status --json\nnode \S+\/dev\/merlin\/tools\/bin\/hum-deliver-qual$/m);
+  assert.match(ok.calls(), /^claude auth status --json\nnode \S+\/dev\/edva\/tools\/bin\/hum-deliver-qual$/m);
   const held = sandbox({ queue: QUEUED, maxOk: false });
   assert.equal(held.script("run-hum-deliver-qual.sh").status, 0);
   assert.doesNotMatch(held.calls(), /^node /m);

@@ -56,7 +56,7 @@ const QUEUE = path.join(DATA, "hum-qual-delivery-queue.json");
 const PENDING = path.join(DATA, "hum-pending-question.json");
 const STATE = path.join(DATA, "hum-state.json");
 const RUNS = path.join(DATA, "hum-runs.jsonl");
-const SEND = process.env.HUM_SEND_BIN || installTools("bin/merlin-send-curl");
+const SEND = process.env.HUM_SEND_BIN || installTools("bin/edva-send-curl");
 
 const REPLY_WINDOW_H = 24;   // how long the delivered question stays answerable
 const DELIVER_HOUR_LO = 9;   // courtesy window (local); trigger-hum already >= 9
@@ -101,8 +101,8 @@ function main() {
   const hr = localHour(now());
   if (hr < DELIVER_HOUR_LO || hr >= DELIVER_HOUR_HI) return 0;
 
-  // Send via merlin-send-curl. --capture-id writes the inserted
-  // merlin_messages.id to a file ONLY on HTTP 201. When a gate holds the
+  // Send via edva-send-curl. --capture-id writes the inserted
+  // edva_messages.id to a file ONLY on HTTP 201. When a gate holds the
   // message it writes a {"suppressed":true} JSON sentinel there instead (the
   // precheck, or the resolve-first gate with by: hum-resolve-first). So
   // (status 0 AND a non-JSON id) == actually landed. Before 2026-10-15 the
@@ -128,7 +128,7 @@ function main() {
     let sentinel = {};
     try { sentinel = JSON.parse(msgId); } catch {}
     if (sentinel.by === "hum-resolve-first") {
-      // Merlin's own records already answer it: nothing to ask, nothing to retry.
+      // Edva's own records already answer it: nothing to ask, nothing to retry.
       try { fs.unlinkSync(QUEUE); } catch {}
       log(`queued question ${q.id} resolved before asking — dropped from the queue, slot left free`);
       return 0;

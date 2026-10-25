@@ -6,10 +6,10 @@ import os from "node:os";
 import path from "node:path";
 // _fetchMessageMeta registers each sender in triage_decisions; keep that out of the repo's DB.
 process.env.TRIAGE_DECISIONS_DB = path.join(os.tmpdir(), `td-sent-skip-${process.pid}.db`);
-import { isOwnSentToThirdParty, isAddressedToMerlin, MERLIN_INBOUND_ADDRESSES, GmailSource } from "../agent/supervisor/gmail-source.mjs";
+import { isOwnSentToThirdParty, isAddressedToEdva, EDVA_INBOUND_ADDRESSES, GmailSource } from "../agent/supervisor/gmail-source.mjs";
 
 const OWNER = "Alex Owner <owner@example.com>";
-const MERLIN = MERLIN_INBOUND_ADDRESSES[0];
+const EDVA = EDVA_INBOUND_ADDRESSES[0];
 const VENDOR = "support@vendor.example";
 
 // Regression guard for the own-sent intake leak. When the user replies inside
@@ -17,7 +17,7 @@ const VENDOR = "support@vendor.example";
 // messagesAdded record for the OUTGOING message too — the same path
 // isDraftMessage already guards one step earlier. A follow-up to a third party
 // was classified and had `personal` written onto the user's own sent mail.
-// Mail addressed to Merlin's inbound address MUST keep reaching triage: that
+// Mail addressed to Edva's inbound address MUST keep reaching triage: that
 // is the approve/RECLASSIFY/freeform-instruction channel.
 
 test("a reply to a third party is skipped", () => {
@@ -26,11 +26,11 @@ test("a reply to a third party is skipped", () => {
   assert.equal(isOwnSentToThirdParty(["SENT"], ""), true);
 });
 
-test("a reply addressed to Merlin is NEVER skipped — that is the command channel", () => {
-  for (const addr of MERLIN_INBOUND_ADDRESSES) {
+test("a reply addressed to Edva is NEVER skipped — that is the command channel", () => {
+  for (const addr of EDVA_INBOUND_ADDRESSES) {
     assert.equal(isOwnSentToThirdParty(["SENT"], addr), false);
     assert.equal(isOwnSentToThirdParty(["SENT"], addr.toUpperCase()), false);
-    assert.equal(isOwnSentToThirdParty(["SENT"], `someone@x.com, Merlin <${addr}>`), false);
+    assert.equal(isOwnSentToThirdParty(["SENT"], `someone@x.com, Edva <${addr}>`), false);
   }
 });
 
@@ -73,35 +73,35 @@ test("_fetchMessageMeta drops the user's outgoing mail and logs why", async () =
   assert.match(src._fetchedUrl, /metadataHeaders=To/);
 });
 
-test("_fetchMessageMeta still returns meta for the user's reply to Merlin", async () => {
+test("_fetchMessageMeta still returns meta for the user's reply to Edva", async () => {
   const { src, logged } = sourceWithMessage({
     labelIds: ["SENT"],
-    ...hdrs({ From: OWNER, Subject: "Re: Cost review", To: MERLIN }),
+    ...hdrs({ From: OWNER, Subject: "Re: Cost review", To: EDVA }),
   });
   const meta = await src._fetchMessageMeta("fake-msg-a02");
-  assert.deepEqual(meta, { messageId: "fake-msg-a02", from: OWNER, subject: "Re: Cost review", to: MERLIN, date: "", rfcMessageId: "", rfcReferences: "", toMerlin: true });
+  assert.deepEqual(meta, { messageId: "fake-msg-a02", from: OWNER, subject: "Re: Cost review", to: EDVA, date: "", rfcMessageId: "", rfcReferences: "", toEdva: true });
   assert.equal(logged.length, 0);
 });
 
 // Command-channel guard. Keeping this mail out of the own-sent skip was only
 // half the job: the cascade's auto-handling filters then filed it at P3 and
 // skipped the dispatch, swallowing instructions the user had addressed to
-// Merlin.
+// Edva.
 
-test("isAddressedToMerlin matches every inbound address, any case, among many recipients", () => {
-  for (const addr of MERLIN_INBOUND_ADDRESSES) {
-    assert.equal(isAddressedToMerlin(addr), true);
-    assert.equal(isAddressedToMerlin(addr.toUpperCase()), true);
-    assert.equal(isAddressedToMerlin(`someone@x.com, Merlin <${addr}>`), true);
+test("isAddressedToEdva matches every inbound address, any case, among many recipients", () => {
+  for (const addr of EDVA_INBOUND_ADDRESSES) {
+    assert.equal(isAddressedToEdva(addr), true);
+    assert.equal(isAddressedToEdva(addr.toUpperCase()), true);
+    assert.equal(isAddressedToEdva(`someone@x.com, Edva <${addr}>`), true);
   }
 });
 
-test("isAddressedToMerlin is false for ordinary recipients and for nothing at all", () => {
-  assert.equal(isAddressedToMerlin(VENDOR), false);
-  assert.equal(isAddressedToMerlin("owner@example.com, friend@example.org"), false);
-  assert.equal(isAddressedToMerlin(""), false);
-  assert.equal(isAddressedToMerlin(null), false);
-  assert.equal(isAddressedToMerlin(undefined), false);
+test("isAddressedToEdva is false for ordinary recipients and for nothing at all", () => {
+  assert.equal(isAddressedToEdva(VENDOR), false);
+  assert.equal(isAddressedToEdva("owner@example.com, friend@example.org"), false);
+  assert.equal(isAddressedToEdva(""), false);
+  assert.equal(isAddressedToEdva(null), false);
+  assert.equal(isAddressedToEdva(undefined), false);
 });
 
 test("the flag rides on the meta for ordinary inbound mail too, as false", async () => {
@@ -110,16 +110,16 @@ test("the flag rides on the meta for ordinary inbound mail too, as false", async
     ...hdrs({ From: "Example Store <hello@store.example>", Subject: "Onboarding reminders", To: OWNER }),
   });
   const meta = await src._fetchMessageMeta("fake-msg-a03");
-  assert.equal(meta.toMerlin, false);
+  assert.equal(meta.toEdva, false);
 });
 
-test("a Cc to Merlin on inbound mail still counts as the command channel", async () => {
+test("a Cc to Edva on inbound mail still counts as the command channel", async () => {
   const { src } = sourceWithMessage({
     labelIds: ["INBOX", "UNREAD"],
-    ...hdrs({ From: OWNER, Subject: "Fwd: backup issue", To: "someone@x.com", Cc: MERLIN }),
+    ...hdrs({ From: OWNER, Subject: "Fwd: backup issue", To: "someone@x.com", Cc: EDVA }),
   });
   const meta = await src._fetchMessageMeta("fake-msg-a04");
-  assert.equal(meta.toMerlin, true);
+  assert.equal(meta.toEdva, true);
 });
 
 test("_fetchMessageMeta still returns meta for ordinary inbound mail", async () => {

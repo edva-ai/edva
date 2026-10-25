@@ -40,7 +40,7 @@
 //   wiki-recall-eval-gen stats
 //
 // Needs the Max login for the Sonnet rung (run it from an interactive Claude
-// session or the launchd agent, not cron). Page text goes only to Merlin's own
+// session or the launchd agent, not cron). Page text goes only to Edva's own
 // models, so health and finance pages are in scope.
 
 import fs from "node:fs";

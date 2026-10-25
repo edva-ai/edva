@@ -15,7 +15,7 @@ If you only want inbound triage + chat replies on the phone, you can skip this e
 1. Sign up at [smtp2go.com](https://smtp2go.com). Free tier: 1,000 emails/month, plenty for personal use.
 2. Verify the sending domain (or use their `smtp2go.com` subdomain initially).
 3. Create an API key with **Send Email** permission.
-4. Add the key to `.env`, and the addresses to `agent/local/instance.json` (`merlin init` asks for them; `MERLIN_AGENT_FROM_EMAIL` / `MERLIN_OWNER_EMAIL` / `MERLIN_DOMAIN` in `.env` override):
+4. Add the key to `.env`, and the addresses to `agent/local/instance.json` (`edva init` asks for them; `EDVA_AGENT_FROM_EMAIL` / `EDVA_OWNER_EMAIL` / `EDVA_DOMAIN` in `.env` override):
    ```
    # .env
    SMTP2GO_API_KEY=api-...
@@ -29,9 +29,9 @@ If you only want inbound triage + chat replies on the phone, you can skip this e
    - DKIM + DMARC — SMTP2Go generates these in their console; copy into your DNS.
 6. Test:
    ```bash
-   "$MERLIN_HOME/bin/email-send" \
+   "$EDVA_HOME/bin/email-send" \
      --to someone@example.com \
-     --subject "Merlin test" \
+     --subject "Edva test" \
      --body "If you see this, outbound mail works."
    ```
 
@@ -57,7 +57,7 @@ email-send --to <to> --subject <subj> [--body <text> | --body-file <path>] [--ht
 
 ## Option C — use Gmail directly (on-behalf-of)
 
-If you want some emails sent FROM the user's actual Gmail (not from a Merlin sender), that's a separate path — see the `gmail-action send --from <your address> ...` pattern in `agent/CLAUDE.md` § Outbound Email Policy. Requires the same Gmail OAuth flow as inbound triage (`docs/integrations/gmail.md`). Strict rule: only used when the user explicitly asks the agent to email a third party as themselves.
+If you want some emails sent FROM the user's actual Gmail (not from a Edva sender), that's a separate path — see the `gmail-action send --from <your address> ...` pattern in `agent/CLAUDE.md` § Outbound Email Policy. Requires the same Gmail OAuth flow as inbound triage (`docs/integrations/gmail.md`). Strict rule: only used when the user explicitly asks the agent to email a third party as themselves.
 
 ## House style
 

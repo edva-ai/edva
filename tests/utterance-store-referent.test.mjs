@@ -23,11 +23,11 @@ fs.writeFileSync(files.responses, [
   JSON.stringify({
     ts: "2026-03-05T00:30:00.000Z", ping_id: "p-boiler", lane: "ideas", subject: "(idea)",
     ping_text: "(idea)", reply_text: "it's scheduled for tomorrow, not today",
-    disposition: null, source: "tapback_merlin_cli",
+    disposition: null, source: "tapback_edva_cli",
   }),
   JSON.stringify({
     ts: "2026-03-06T10:00:00.000Z", ping_id: "p-unknown", lane: "ideas", subject: "(idea)",
-    ping_text: "(idea)", reply_text: "not interested in that one", source: "tapback_merlin_cli",
+    ping_text: "(idea)", reply_text: "not interested in that one", source: "tapback_edva_cli",
   }),
 ].join("\n") + "\n");
 fs.writeFileSync(files.resolved, "");

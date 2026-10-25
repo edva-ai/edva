@@ -173,7 +173,7 @@ All three can land on one short outing: the visit row is written minutes after a
 * **re-survey** — only after 150m of new ground and 12 minutes. This is a **cache key, not a rate limit**: standing still cannot change what is around the user, so re-querying the same circle would return the same places.
 * **moving** — inferred from displacement, not the `activity` column, which can read `unknown` on half the rows of a walk.
 
-**The feed underneath it had to be fixed too (client build 163).** None of this works if the phone doesn't report position while the user is out, and it didn't: a walk there and back could produce no rows at all, leaving the feed silent for over an hour. `client/Merlin/LocationTracker.swift` now drops a **120m geofence** on the base at every `CLVisit` arrival — iOS wakes the app on region exit reliably, even after termination, so *leaving* is an event rather than an inference. While out it runs `HundredMeters` accuracy, 60s pings regardless of the motion classifier, and no stationary skip (that skip alone could hold GPS off for 20 minutes). Re-entering restores the cheap profile, so the battery cost is bounded to time out of the house.
+**The feed underneath it had to be fixed too (client build 163).** None of this works if the phone doesn't report position while the user is out, and it didn't: a walk there and back could produce no rows at all, leaving the feed silent for over an hour. `client/Edva/LocationTracker.swift` now drops a **120m geofence** on the base at every `CLVisit` arrival — iOS wakes the app on region exit reliably, even after termination, so *leaving* is an event rather than an inference. While out it runs `HundredMeters` accuracy, 60s pings regardless of the motion classifier, and no stationary skip (that skip alone could hold GPS off for 20 minutes). Re-entering restores the cheap profile, so the battery cost is bounded to time out of the house.
 
 The sensor also **throws when the newest fix is older than 25 minutes**, rather than doing geometry on a stale position and reporting success — which is how an unclosed visit accrued 85 minutes of phantom dwell and became "base" while the user was back at base.
 
@@ -301,7 +301,7 @@ hum-sense once                # one full pass, dry run — prints the verdict an
 hum-sense once --sensor desk  # run one sensor and see exactly what it detects
 hum-sense once --dispatch     # …and actually ping
 hum-sense tail -n 30          # raw ledger rows
-merlin hum sense log         # same thing, from the hum CLI
+edva hum sense log         # same thing, from the hum CLI
 ```
 
 ### The ledger (`data/hum-events.jsonl`)
@@ -328,7 +328,7 @@ When the user asks "why didn't you say anything all afternoon?", this answers pr
 * **A sensor whose data source is unreachable must THROW, not return `[]`.** This is the one rule that reads as pedantic and isn't. `[]` means "nothing happened", which is indistinguishable from "I can't see" — so a broken sensor looks perfectly healthy in `hum-sense status` precisely because it is doing nothing. Three of the original ten shipped this way and sat blind for hours reporting no errors (`gog` had no `GOG_KEYRING_PASSWORD` under launchd; a personal tool's `--json` output had a shape the sensor never matched). If a quiet source still returns *something* on a quiet day — `gog` prints valid JSON for an empty calendar — then empty output means the probe failed. Throw. Where a genuinely empty result is legitimate, record a `probed_at` in the memo so an idle sensor can still be told from a broken one.
 * **The daemon loads `.env` at startup**, because `gog` needs `GOG_KEYRING_PASSWORD` to read its OAuth token from the file-backed keyring and there is no TTY under launchd. Cron-launched triggers get this injected by `cron-run`; a launchd daemon has to do it itself. Any sensor shelling out to a tool that needs a secret depends on this.
 * **The supervisor is unhealthy at dispatch time** → the events are *held*, not burned, and retried next tick.
-* **The daemon dies** → `trigger-hum.sh` sees a heartbeat older than 5 minutes and reverts to the plain 20-minute cron tick it used to be (`trigger: "watchdog-fallback"`). Hum degrades to quieter and dumber, never to silent. `hum-sense status` says `daemon DOWN`; `merlin status` reports the launchagent.
+* **The daemon dies** → `trigger-hum.sh` sees a heartbeat older than 5 minutes and reverts to the plain 20-minute cron tick it used to be (`trigger: "watchdog-fallback"`). Hum degrades to quieter and dumber, never to silent. `hum-sense status` says `daemon DOWN`; `edva status` reports the launchagent.
 
 ## State
 

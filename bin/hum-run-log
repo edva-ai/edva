@@ -10,7 +10,7 @@
 //   jq-based hum analysis therefore reads lines 1-80 — April 2026 — and exits
 //   0 believing it read the week.
 //
-//   The JS readers in bin/merlin are tolerant in the worst way:
+//   The JS readers in bin/edva are tolerant in the worst way:
 //   `try { JSON.parse(l) } catch { return null }` then `.filter(Boolean)`.
 //   They silently DROP 9.6% of hum's history and report a number as if it
 //   were complete.

@@ -30,7 +30,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import { installRoot } from "../lib/root.cjs";
 
-const ROOT = process.env.MERLIN_ROOT || installRoot();
+const ROOT = process.env.EDVA_ROOT || installRoot();
 for (const l of (() => { try { return fs.readFileSync(path.join(ROOT, ".env"), "utf8").split("\n"); } catch { return []; } })()) {
   const m = l.match(/^([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
 }

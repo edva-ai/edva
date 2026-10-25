@@ -1,0 +1,1227 @@
+#!/usr/bin/env node
+// edva-cost-report — per-job usage rollup from job-costs.ndjson.
+// NOTE: in by_tier, `opus` and `local` can read 0 because this report cannot
+// SEE them, not because they ran nothing — see "WHAT A ZERO IN by_tier MEANS"
+// below, and `edva-allowance-coverage` for the tiers it misses.
+//
+// Added 2026-04-23 alongside the supervisor's per-turn job attribution.
+// Consumed by nightly-review's cost-optimization lens and by interactive
+// queries ("which jobs spent the most yesterday?").
+//
+// Usage:
+//   edva-cost-report                          last 24h, table by job (desc cost)
+//   edva-cost-report --since 7d               last 7d
+//   edva-cost-report --since 2026-04-20       since a specific date (local midnight)
+//   edva-cost-report --json                   structured output for nightly-review
+//   edva-cost-report --job hum                filter to one job, per-dispatch detail
+//   edva-cost-report --trend 7d               per-day cost/job grid for the window
+//   edva-cost-report --outliers               flag jobs whose last-24h weighted cost is >1.5x their 6d avg
+//                                                 (add --show-phantom to use the SDK estimate instead)
+//   edva-cost-report --since 2d --push        push per-day rollups to hosted /usage (central monitor)
+//   edva-cost-report --efficiency             is spend buying WORK or buying CONTEXT? cost split by
+//                                                 token type + measured context floor per supervisor +
+//                                                 compact/rotate counts. Add --json for the review job.
+//
+// Reads: agent/logs/supervisor-ops/job-costs.ndjson
+// (chat-agent has no job field — chat-supervisor writes cost.ndjson only.)
+//
+// THE FORK LEDGER (2026-10-06, Self Improvement Review item 11). This rolls up
+// the three SUPERVISOR ledgers PLUS agent/logs/ephemeral-forks/
+// job-costs.ndjson, written by bin/fork-cost-record (lib/
+// fork-cost-ledger.cjs) from each fork's own `claude -p --output-format json`
+// usage, in the supervisors' row format (+ `runner: "ephemeral-fork"`).
+// Writers: agent/scripts/lib/run-ephemeral-opus.sh (nightly-review,
+// system-issue-review, improvement-plan, cost-efficiency-review,
+// jev-disagreement-review and the installation's own forks), any trigger with
+// its own `claude -p` line, and the supervisor's web-read helper (source
+// `web-read`).
+//
+// Before that the `opus` tier read 0 in weeks where four Opus jobs ran: no
+// supervisor has run Opus since 2026-07-02 ("model": "opus" in job-routing.json
+// is only a tier LABEL routing to a Sonnet supervisor), and every Opus job is an
+// ephemeral launchd fork outside all three.
+//
+// What is STILL invisible, so an opus 0 is not automatically "nothing ran":
+//   * any window before 2026-10-06 — no fork ever wrote a row;
+//   * a fork killed by its turn cap — the JSON envelope is written at exit;
+//   * Opus-tier calls that bypass both scripts: an installation's own fork
+//     runners and escalation tiers that do not call fork-cost-record,
+//     and `job-run` forks. A new fork that does not call fork-cost-record is
+//     silently off-ledger again.
+// `local` can never be non-zero at all: modelTier() only reaches `local` on
+// /gemma|local/i inside a ledger row's models[], and local Gemma runs through
+// lib/local-llm.mjs, which writes no row. 0 rows in 42,924, ever. It
+// stays in LEDGER_BLIND_TIERS below.
+//
+// Per-model rates: RATES is per TIER, which would price Opus 5.5 ($4/$20, cache
+// read $0.20) at Opus 5's $5/$25/$0.50. MODEL_RATES overrides the tier rate for
+// ids whose price differs; ratesFor() applies it. Add a row when a new id ships
+// (ids are pinned in agent/config/models.env), and when a price CHANGES
+// add a dated period rather than editing the old one, so rows from before the
+// change keep the price they were billed at (Sonnet 5.5 cache reads, 2026-10-07).
+//
+// edva-allowance-coverage (reads ~/.claude/projects) now counts a fork
+// workload as ON-ledger when the fork ledger has rows for it in the window,
+// instead of calling every "(ephemeral fork)" bucket off-ledger by label.
+//
+// Two caveats on that tool, both load-bearing if you compare the numbers:
+//   1. It is NOT exhaustive either. Its workload-probe table has 7 entries
+//      against ~12 fork plists, so an unprobed fork (jev-disagreement-review,
+//      job-run harness sessions, …) is labelled `ops` and counted as
+//      ON-ledger. Its off_ledger_pct is therefore understated.
+//   2. Sonnet rates now agree with it ($2/$10/$0.20/$2.50 per Mtok — this
+//      file was on Sonnet 4.6's $3/$15 until 2026-10-06, overstating Sonnet
+//      spend by ~50%). Figures from before that date are not comparable.
+//      Since 2026-10-07 a Sonnet 5.5 cache read is $0.10 (both tools carry
+//      the dated change; claude-sonnet-5 stays $0.20).
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { estimateFloor } = require(path.join(__dirname, '../lib/context-floor.cjs'));
+const { instance, localConfig } = require(path.join(__dirname, '../lib/instance.cjs'));
+const { installTools } = require("../lib/root.cjs");
+// The installation's own wording in the coverage note
+// (agent/local/config/cost-report.json): extra_fork_sources is appended to
+// the list of ephemeral-fork writers (", <source>"), extra_opus_blind names its
+// own Opus calls that write no row ("<what>, ").
+const COST_CFG = localConfig('cost-report', { extra_fork_sources: '', extra_opus_blind: '' });
+
+// The instant of 00:00 on `ymd` (YYYY-MM-DD) in IANA zone `tz`, DST-aware.
+function zoneMidnight(ymd, tz) {
+  const offsetAt = (ms) => {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+    return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ms;
+  };
+  const wall = Date.parse(`${ymd}T00:00:00Z`);
+  let t = wall - offsetAt(wall);
+  t = wall - offsetAt(t);
+  return new Date(t);
+}
+
+const HOME = os.homedir();
+// Each supervisor writes a per-agent ledger (logs/supervisor-<agent>/job-costs.ndjson).
+// Union them so the rollup attributes ops + ops-light + ops-haiku together
+// — ops-light exists since the 2026-06-17 Lever-B split. NOTE: `ops` is NOT the
+// Opus tier, despite the name. It ran Opus until 2026-07-02 (19,933 rows here
+// carry claude-opus-4-7 / claude-opus-4-8, all on or before that date) and has
+// run claude-sonnet-5 since. See the blind-spot note in the header.
+const JOB_COSTS_FILES = [
+  installTools("agent/logs/supervisor-ops/job-costs.ndjson"),
+  installTools("agent/logs/supervisor-ops-light/job-costs.ndjson"),
+  installTools("agent/logs/supervisor-ops-haiku/job-costs.ndjson"),
+  // Ephemeral forks (Opus jobs, web-read, the installation's own) — see THE FORK LEDGER above.
+  installTools("agent/logs/ephemeral-forks/job-costs.ndjson"),
+];
+function ledgerLines() {
+  const out = [];
+  for (const f of JOB_COSTS_FILES) {
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) out.push(line);
+  }
+  return out;
+}
+
+// --- model-weighted real-rate cost ----------------------------------------
+// Claude API published rates, USD per token (fetched 2026-06-17 from
+// platform.claude.com/docs pricing). The ledger's `total_cost_usd` is the SDK's
+// phantom estimate; the REAL bill (post-2026-06-15 metered Agent-SDK billing) is
+// tokens × per-model rate, so this is what actually values the Opus→Sonnet→Haiku
+// →local moves that a raw token count can't see (a Sonnet token is 5× cheaper
+// than an Opus one, a Haiku token 5× cheaper again, a local Gemma token $0).
+// A turn may list multiple models (supervisor + a cheaper subagent); we price at
+// the most-expensive tier PRESENT, which is always the supervisor/primary model
+// since subagents are cheaper-or-equal — so this attributes the turn to its
+// driving model without per-model token splits the ledger doesn't record.
+const RATES = { // USD per token: in=input, out=output, cr=cache-read, cw=5m cache-write
+  opus:   { in: 5 / 1e6, out: 25 / 1e6, cr: 0.50 / 1e6, cw: 6.25 / 1e6 },
+  sonnet: { in: 2 / 1e6, out: 10 / 1e6, cr: 0.20 / 1e6, cw: 2.50 / 1e6 }, // Sonnet 5 (was Sonnet 4.6's $3/$15 until 2026-10-06); Sonnet 5.5 is in MODEL_RATES
+  haiku:  { in: 1 / 1e6, out: 5 / 1e6,  cr: 0.10 / 1e6, cw: 1.25 / 1e6 }, // Haiku 4.5; Haiku 5.5 is in MODEL_RATES
+  local:  { in: 0, out: 0, cr: 0, cw: 0 },
+};
+function modelTier(models) {
+  const s = JSON.stringify(models || []);
+  if (/opus/i.test(s)) return 'opus';
+  if (/sonnet/i.test(s)) return 'sonnet';
+  if (/haiku/i.test(s)) return 'haiku';
+  if (/gemma|local/i.test(s)) return 'local';
+  return 'opus'; // unknown / missing model → price conservatively as opus
+}
+// Per-MODEL overrides of the tier rate, for ids priced differently from the
+// rest of their tier. Each id holds its price PERIODS, oldest first: a period
+// with `until` applies to rows stamped before that instant, the last one to
+// everything after. Sources: platform.claude.com/docs/en/about-claude/pricing
+// and the release notes (checked 2026-10-13).
+//   Opus 5.5 (2026-10-06): $4/$20 per Mtok, cache read $0.20, 5m write $5.
+//   Sonnet 5.5: "We've lowered the price of prompt cache reads on Claude Sonnet
+//     5.5 from $0.20 USD to $0.10 USD per million tokens ... Cache writes and
+//     all other prices are unchanged." (release notes, October 7, 2026).
+//   Haiku 5.5 (claude-haiku-5-5, launched 2026-10-07): $0.10/$0.50, cache read
+//     $0.01, 5m write $0.125 for a prompt up to 100,000 tokens. A request whose
+//     prompt (input + cache reads + cache writes) is over that pays `long`
+//     ($0.50/$2.50/$0.05/$0.625) for the whole request.
+const M = 1e6;
+const MODEL_RATES = {
+  'claude-opus-5-5': [{ in: 4 / M, out: 20 / M, cr: 0.20 / M, cw: 5 / M }],
+  'claude-sonnet-5-5': [
+    { until: '2026-10-07T00:00:00Z', in: 2 / M, out: 10 / M, cr: 0.20 / M, cw: 2.50 / M },
+    { in: 2 / M, out: 10 / M, cr: 0.10 / M, cw: 2.50 / M },
+  ],
+  'claude-haiku-5-5': [{ in: 0.10 / M, out: 0.50 / M, cr: 0.01 / M, cw: 0.125 / M,
+    long: { over: 100000, in: 0.50 / M, out: 2.50 / M, cr: 0.05 / M, cw: 0.625 / M } }],
+  'claude-sonnet-4-6': [{ in: 3 / M, out: 15 / M, cr: 0.30 / M, cw: 3.75 / M }],
+};
+// One id's rate for one ledger row: the period in force at row.ts (no or bad
+// ts → the current price). A ledger row sums EVERY request of a dispatch and
+// does not record each request's prompt length, so a prompt-length price can
+// only be proven short when the row's whole prompt total is under the
+// threshold; otherwise the long price is charged, an upper bound.
+function modelRate(id, row) {
+  const t = Date.parse(row.ts);
+  const r = MODEL_RATES[id].find((p) => !p.until || t < Date.parse(p.until));
+  if (!r.long) return r;
+  const prompt = (row.input_tokens || 0) + (row.cache_read_tokens || 0) + (row.cache_creation_tokens || 0);
+  return prompt > r.long.over ? r.long : r;
+}
+// The rate for a row: its tier's, unless EVERY model of that driving tier in
+// models[] has a per-model entry (then the dearest of those). A row mixing an
+// overridden id with an unknown one of the same tier keeps the tier rate.
+function ratesFor(row) {
+  const models = row.models;
+  const tier = modelTier(models);
+  const ids = (models || []).map((m) => String(m).split('[')[0]);
+  const tierIds = ids.filter((id) => modelTier([id]) === tier);
+  if (tierIds.length && tierIds.every((id) => MODEL_RATES[id])) {
+    return tierIds.map((id) => modelRate(id, row)).sort((a, b) => b.in - a.in)[0];
+  }
+  return RATES[tier];
+}
+function weightedCost(row) {
+  const r = ratesFor(row);
+  return (row.input_tokens || 0) * r.in
+       + (row.output_tokens || 0) * r.out
+       + (row.cache_read_tokens || 0) * r.cr
+       + (row.cache_creation_tokens || 0) * r.cw;
+}
+
+// --- arg parsing ---
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const arg = (name, def = null) => {
+  const i = args.indexOf(name);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : def;
+};
+
+if (flag('--help') || flag('-h')) {
+  console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(0, 20).filter(l => l.startsWith('//')).map(l => l.slice(3)).join('\n'));
+  process.exit(0);
+}
+
+const SINCE_STR = arg('--since', '24h');
+const ASJSON = flag('--json');
+const TRENDFLAG = flag('--trend');
+const OUTLIERS = flag('--outliers');
+const PUSH = flag('--push');
+const JOB_FILTER = arg('--job', null);
+
+// Per the Max-only auth invariant (agent/CLAUDE.md § Auth Model), no
+// component should be making API-key-billed Anthropic calls. The
+// `total_cost_usd` field in job-costs.ndjson comes from the Claude SDK's
+// own usage estimate and is therefore phantom — never actual billed spend.
+// Treat the dollar figures as informational ratios only; suppress them by
+// default in user-facing output, surface explicitly with --show-phantom.
+// Triggered by 4/27, 4/28, 4/29, 4/30 nightly reviews repeatedly flagging
+// "$20K/day for webhook" outlier alerts on synthetic numbers.
+const API_KEY_BILLED = !!process.env.ANTHROPIC_API_KEY;
+const PHANTOM = !API_KEY_BILLED;
+const SHOW_PHANTOM = flag('--show-phantom');
+const PHANTOM_BANNER = "[!] dollar figures are SDK-estimated (Max-only auth — no actual API spend). Use ratios for relative attribution only.";
+
+// --- parse --since ---
+function parseSince(s) {
+  // "24h" | "7d" | "14d" | "2026-04-20" | "24h"
+  const m = /^(\d+)([hd])$/.exec(s);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const ms = m[2] === 'h' ? n * 3600_000 : n * 86400_000;
+    return new Date(Date.now() - ms);
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    // anchor to local midnight (the instance's zone) so day boundaries are
+    // human-sensible
+    return zoneMidnight(s, instance().tz);
+  }
+  throw new Error(`unrecognized --since value: ${s} (use "24h", "7d", or "YYYY-MM-DD")`);
+}
+const SINCE = parseSince(SINCE_STR);
+
+// --- job FAMILY key ---
+// A Gmail push dispatch carries source `gmail:<messageId>`, so every triaged
+// email is its own source string. Rolling up on the raw source therefore
+// shatters email triage into one singleton row per message and it can never
+// rank: measured 2026-09-09, most of the singleton sources in a 7-day
+// window were `gmail:*`, together about a quarter of fleet spend and the
+// LARGEST line there is — while `top_jobs` (a top-12 cut)
+// showed twelve rows none of which was email triage. It had been 16-25% of
+// spend for five consecutive weeks and had never once appeared in the cost
+// review's headline table. Same defect family as two earlier cost-review
+// findings: a rollup that renders a real condition as absence.
+//
+// Deliberately NARROW. Only `gmail:` folds, because only `gmail:` is
+// per-instance; the other singletons in that window were genuine
+// once-a-week jobs (weekly watchers and the like) and collapsing them
+// by prefix would hide real distinctions. Add a family here only when the
+// suffix is a per-run identifier.
+//
+// Declared HERE, above the row-load loop, and not down with the other
+// formatting helpers: the loop's JOB_FILTER check calls jobFamily(), and that
+// loop's parse is wrapped in `catch {}`. A const in the temporal dead zone
+// throws a ReferenceError that the catch swallows, so every row is silently
+// dropped and the report prints "no job-cost rows" — which is exactly what a
+// first draft of this change did on 2026-09-09.
+const JOB_FAMILIES = [
+  { test: (s) => s.startsWith('gmail:'), label: 'gmail:* (email triage)' },
+];
+function jobFamily(src) {
+  for (const f of JOB_FAMILIES) if (f.test(src)) return f.label;
+  return src;
+}
+
+// --- load + filter rows ---
+if (!JOB_COSTS_FILES.some(f => fs.existsSync(f))) {
+  console.error(`no job-costs.ndjson under logs/supervisor-ops[-light]/ — supervisors haven't written any turns yet (or restart pending)`);
+  process.exit(1);
+}
+
+const rows = [];
+for (const line of ledgerLines()) {
+  const t = line.trim();
+  if (!t) continue;
+  try {
+    const row = JSON.parse(t);
+    if (new Date(row.ts) < SINCE) continue;
+    if (JOB_FILTER && row.source !== JOB_FILTER && jobFamily(row.source || '(unknown)') !== JOB_FILTER) continue;
+    rows.push(row);
+  } catch { /* skip bad lines */ }
+}
+
+if (rows.length === 0) {
+  console.error(`no job-cost rows since ${SINCE.toISOString()}${JOB_FILTER ? ` for job=${JOB_FILTER}` : ''}`);
+  process.exit(0);
+}
+
+// --- aggregation helpers ---
+function emptyStats() {
+  return {
+    dispatches: 0,
+    total_cost_usd: 0,
+    weighted_cost_usd: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    web_search_requests: 0,
+    total_duration_ms: 0,
+    total_turns: 0,
+    legacy_cumulative_rows: 0,
+    first_ts: null,
+    last_ts: null,
+  };
+}
+// Rows written before 2026-07-20 stored the SDK's SESSION-CUMULATIVE
+// `total_cost_usd` (and cumulative token counters) as if they were per-dispatch,
+// so summing them double-counts — daily spend came out ~2.8x real (measured
+// 2026-07-20). The supervisor now diffs against a per-session
+// cursor and emits true per-dispatch deltas, tagging each row with
+// `session_cumulative_cost_usd`. That tag is the version marker: present =
+// delta row (safe to sum), absent = legacy cumulative row.
+//
+// Legacy rows can't be corrected retroactively — they carry no session_id, so
+// there's no way to group them by session and take per-session maxima. They're
+// summed as-is and the count is reported, so an inflated historical window is
+// visible as such instead of quietly skewing a trend line.
+const isLegacyCumulativeRow = (row) => row.session_cumulative_cost_usd === undefined;
+
+function add(stats, row) {
+  stats.dispatches += 1;
+  if (isLegacyCumulativeRow(row)) stats.legacy_cumulative_rows += 1;
+  stats.total_cost_usd += row.total_cost_usd || 0;
+  stats.weighted_cost_usd += weightedCost(row);
+  stats.input_tokens += row.input_tokens || 0;
+  stats.output_tokens += row.output_tokens || 0;
+  stats.cache_read_tokens += row.cache_read_tokens || 0;
+  stats.cache_creation_tokens += row.cache_creation_tokens || 0;
+  stats.web_search_requests += row.web_search_requests || 0;
+  stats.total_duration_ms += row.duration_ms || 0;
+  stats.total_turns += row.num_turns || 0;
+  if (!stats.first_ts || row.ts < stats.first_ts) stats.first_ts = row.ts;
+  if (!stats.last_ts || row.ts > stats.last_ts) stats.last_ts = row.ts;
+}
+function fmt(n) { return n.toLocaleString('en-US'); }
+function hum(n) { if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'; if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'; return String(n); }
+
+// --- by-job rollup (default view) ---
+const byJob = new Map();
+for (const row of rows) {
+  const src = jobFamily(row.source || '(unknown)');
+  if (!byJob.has(src)) byJob.set(src, emptyStats());
+  add(byJob.get(src), row);
+}
+const jobSummary = [...byJob.entries()]
+  .map(([source, stats]) => ({
+    source,
+    dispatches: stats.dispatches,
+    total_cost_usd: +stats.total_cost_usd.toFixed(4),
+    weighted_cost_usd: +stats.weighted_cost_usd.toFixed(4),
+    avg_cost_per_dispatch: +(stats.total_cost_usd / stats.dispatches).toFixed(4),
+    input_tokens: stats.input_tokens,
+    output_tokens: stats.output_tokens,
+    cache_read_tokens: stats.cache_read_tokens,
+    cache_creation_tokens: stats.cache_creation_tokens,
+    web_search_requests: stats.web_search_requests,
+    total_duration_ms: stats.total_duration_ms,
+    total_turns: stats.total_turns,
+    first_ts: stats.first_ts,
+    last_ts: stats.last_ts,
+  }))
+  .sort((a, b) => b.weighted_cost_usd - a.weighted_cost_usd);
+
+// --- by-model-tier rollup (shows the Opus→Sonnet→Haiku→local shift) ---
+const byTier = { opus: emptyStats(), sonnet: emptyStats(), haiku: emptyStats(), local: emptyStats() };
+for (const row of rows) add(byTier[modelTier(row.models)], row);
+
+// --- push per-day rollups to the hosted /usage endpoint (central monitoring) ---
+// Batched daily snapshots (not a per-turn hook) so the supervisor's hot path
+// stays network-free. Idempotent server-side per (host, day): safe to re-run.
+// Sends the model-WEIGHTED real cost (not the SDK phantom estimate) as the cost
+// value, with phantom=false, so the central monitor reflects true metered spend.
+// Intended for the nightly usage-push job: `edva-cost-report --since 2d --push`.
+if (PUSH) {
+  // Load .env if the caller didn't already export the token / endpoint.
+  try { require(path.join(__dirname, '..', 'lib', 'load-env.js')).loadEnv(); } catch { /* optional */ }
+
+  const token = process.env.EDVA_USAGE_TOKEN || process.env.STATS_TOKEN || '';
+  if (!token) {
+    console.error('edva-cost-report --push: set EDVA_USAGE_TOKEN (or STATS_TOKEN) — refusing to push cost data unauthenticated');
+    process.exit(1);
+  }
+  const usageUrl = process.env.EDVA_USAGE_URL || 'https://edva-telemetry.vercel.app/usage';
+
+  const crypto = require('crypto');
+  const hostFp = crypto.createHash('sha256')
+    .update(`${os.hostname()}|${os.userInfo().username || ''}`)
+    .digest('hex').slice(0, 16);
+
+  // Derive the repo root from this script's location (bin/), not a
+  // hardcoded ~/Dev/edva, so path casing/location differences don't bite.
+  const { REPO_ROOT: EDVA_ROOT, toolsPath } = require(path.join(__dirname, '../lib/root.cjs'));
+  let ver = '';
+  try { ver = require(toolsPath('package.json')).version || ''; } catch { /* optional */ }
+  let sha = '';
+  try {
+    sha = require('child_process')
+      .execSync('git rev-parse --short HEAD', { cwd: EDVA_ROOT, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+  } catch { /* optional */ }
+
+  // Group the loaded window into per-day → per-job snapshots (the idempotent unit).
+  const byDayPush = new Map();
+  for (const row of rows) {
+    const d = (row.ts || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+    if (!byDayPush.has(d)) byDayPush.set(d, new Map());
+    const m = byDayPush.get(d);
+    const src = row.source || '(unknown)';
+    if (!m.has(src)) m.set(src, emptyStats());
+    add(m.get(src), row);
+  }
+
+  const postJson = (urlStr, payload) => new Promise((resolve) => {
+    try {
+      const u = new URL(urlStr);
+      const lib = u.protocol === 'https:' ? require('https') : require('http');
+      const req = lib.request({
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        timeout: 5000,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+          authorization: `Bearer ${token}`,
+        },
+      }, (res) => { res.resume(); resolve(res.statusCode || 0); });
+      req.on('error', () => resolve(0));
+      req.on('timeout', () => { req.destroy(); resolve(0); });
+      req.write(payload);
+      req.end();
+    } catch { resolve(0); }
+  });
+
+  // The rolling --since window cuts its OLDEST day at the boundary, so that
+  // day's rollup here is partial. It was already captured in full on the prior
+  // run; re-pushing it would SHRINK the stored day (the server HSET-overwrites,
+  // it doesn't merge). Drop the oldest day — unless it's the only one, in which
+  // case it's just "today" (partial-but-current, re-pushed in full tomorrow).
+  const sortedDays = [...byDayPush.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const toPush = sortedDays.length > 1 ? sortedDays.slice(1) : sortedDays;
+
+  (async () => {
+    let pushed = 0;
+    const failures = [];
+    for (const [day, m] of toPush) {
+      const jobs = {};
+      for (const [src, st] of m) {
+        jobs[src] = {
+          dispatches: st.dispatches,
+          input_tokens: st.input_tokens,
+          output_tokens: st.output_tokens,
+          cache_read_tokens: st.cache_read_tokens,
+          cache_creation_tokens: st.cache_creation_tokens,
+          web_search_requests: st.web_search_requests,
+          total_turns: st.total_turns,
+          total_duration_ms: st.total_duration_ms,
+          // Send the REAL model-weighted cost as the endpoint's cost field.
+          total_cost_usd: +st.weighted_cost_usd.toFixed(4),
+        };
+      }
+      // phantom:false — edva reports the metered weighted cost, not the SDK estimate.
+      const payload = JSON.stringify({ host_fp: hostFp, day, phantom: false, ver, sha, jobs });
+      const status = await postJson(usageUrl, payload);
+      if (status >= 200 && status < 300) pushed++;
+      else failures.push(`${day}:HTTP ${status || 'network-error'}`);
+    }
+    const failed = failures.length;
+    const skipped = sortedDays.length - toPush.length;
+    if (ASJSON) {
+      console.log(JSON.stringify({ pushed, failed, days: toPush.length, skipped_partial_oldest: skipped, failures, url: usageUrl }, null, 2));
+    } else {
+      console.log(`pushed ${pushed}/${toPush.length} day-snapshot(s) to ${usageUrl}${skipped ? ` (skipped ${skipped} partial oldest)` : ''}${failed ? ` (${failed} failed: ${failures.join(', ')})` : ''}`);
+    }
+    process.exit(failed && !pushed ? 1 : 0);
+  })();
+  return; // CommonJS module — top-level return stops the default table output
+}
+
+// --- outlier detection (24h vs 7d avg) ---
+function loadWindow(startMs, endMs) {
+  const all = new Map();
+  for (const line of ledgerLines()) {
+    const t = line.trim(); if (!t) continue;
+    try {
+      const row = JSON.parse(t);
+      const ts = new Date(row.ts).getTime();
+      if (ts < startMs || ts >= endMs) continue;
+      const src = jobFamily(row.source || '(unknown)');
+      if (!all.has(src)) all.set(src, emptyStats());
+      add(all.get(src), row);
+    } catch {}
+  }
+  return all;
+}
+
+if (OUTLIERS) {
+  // Outlier detection runs on weighted_cost_usd — real per-model rates x
+  // measured tokens — NOT on total_cost_usd, which is the SDK's own phantom
+  // estimate. That distinction is why this branch used to return nothing:
+  // the ratios were computed on the phantom figure, so a guard suppressed
+  // them whenever PHANTOM was true, and under the Max-only auth invariant
+  // (ANTHROPIC_API_KEY is stripped from every child) PHANTOM is ALWAYS true.
+  // The detector therefore reported "no outliers" unconditionally, which
+  // reads exactly like a healthy system — nightly-review's primary cost
+  // signal (jobs/nightly-review.md Step 2d) was silently blind. The weighted
+  // basis has no such problem: it is the same number this tool already pushes
+  // to central telemetry with phantom:false. --show-phantom still selects the
+  // old SDK basis for anyone who wants the raw estimate. Fixed 2026-08-04.
+  const basis = SHOW_PHANTOM ? 'phantom-sdk' : 'weighted';
+  const costOf = (st) => (SHOW_PHANTOM ? st.total_cost_usd : st.weighted_cost_usd);
+  const now = Date.now();
+  const last24 = loadWindow(now - 86400_000, now);
+  const prev6d = loadWindow(now - 7 * 86400_000, now - 86400_000);
+  // Per-day slices of the same window, so the baseline is a job's average on
+  // the days it RAN. Dividing every job's 6-day total by a flat 6 made any
+  // job that runs less often than daily look like it spiked: a weekly job
+  // that costs the same every run scores 6x and gets flagged "up" every
+  // single night. nightly-review.md tells the agent to git-log-investigate
+  // each up-outlier, so that arithmetic turns straight into wasted turns.
+  const prevDays = [];
+  for (let d = 7; d > 1; d--) {
+    prevDays.push(loadWindow(now - d * 86400_000, now - (d - 1) * 86400_000));
+  }
+  const outliers = [];
+  for (const [source, today] of last24.entries()) {
+    const prev = prev6d.get(source);
+    if (!prev || prev.dispatches === 0) continue;
+    const activeDays = prevDays.filter(m => (m.get(source)?.dispatches ?? 0) > 0).length;
+    if (activeDays === 0) continue;
+    const prevDailyAvg = costOf(prev) / activeDays;
+    if (prevDailyAvg < 0.01) continue; // noise floor
+    const ratio = costOf(today) / prevDailyAvg;
+    if (ratio >= 1.5 || ratio <= 0.5) {
+      outliers.push({
+        source,
+        last_24h_cost_usd: +costOf(today).toFixed(4),
+        prev_6d_daily_avg_usd: +prevDailyAvg.toFixed(4),
+        prev_active_days: activeDays,
+        ratio: +ratio.toFixed(2),
+        direction: ratio >= 1.5 ? 'up' : 'down',
+        dispatches_24h: today.dispatches,
+      });
+    }
+  }
+  outliers.sort((a, b) => Math.abs(b.ratio - 1) - Math.abs(a.ratio - 1));
+  if (ASJSON) { console.log(JSON.stringify({ window: '24h vs 6d avg', basis, outliers, phantom: SHOW_PHANTOM && PHANTOM, note: SHOW_PHANTOM && PHANTOM ? PHANTOM_BANNER : null }, null, 2)); process.exit(0); }
+  if (outliers.length === 0) { console.log(`no cost outliers in the last 24h (basis: ${basis}; threshold: 1.5x or 0.5x of prior 6-day daily avg)`); process.exit(0); }
+  if (SHOW_PHANTOM && PHANTOM) console.log(PHANTOM_BANNER);
+  console.log(`COST OUTLIERS (last 24h vs prior 6-day avg)`);
+  console.log(`${'job'.padEnd(24)} ${'24h $'.padStart(10)} ${'6d avg $/d'.padStart(12)} ${'ratio'.padStart(7)} ${'dir'.padStart(5)} ${'runs'.padStart(5)}`);
+  for (const o of outliers) {
+    console.log(`${o.source.padEnd(24)} ${o.last_24h_cost_usd.toFixed(4).padStart(10)} ${o.prev_6d_daily_avg_usd.toFixed(4).padStart(12)} ${o.ratio.toFixed(2).padStart(7)} ${o.direction.padStart(5)} ${String(o.dispatches_24h).padStart(5)}`);
+  }
+  process.exit(0);
+}
+
+// --- trend grid (per-day × per-job) ---
+if (TRENDFLAG) {
+  const byDay = new Map(); // day → Map<source, stats>
+  for (const row of rows) {
+    const d = row.ts.slice(0, 10);
+    if (!byDay.has(d)) byDay.set(d, new Map());
+    const day = byDay.get(d);
+    const src = jobFamily(row.source || '(unknown)');
+    if (!day.has(src)) day.set(src, emptyStats());
+    add(day.get(src), row);
+  }
+  if (ASJSON) {
+    const out = {};
+    for (const [d, m] of byDay) out[d] = Object.fromEntries([...m].map(([s, v]) => [s, { dispatches: v.dispatches, cost_usd: +v.total_cost_usd.toFixed(4) }]));
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(0);
+  }
+  const allSources = [...new Set([...byDay.values()].flatMap(m => [...m.keys()]))].sort();
+  const days = [...byDay.keys()].sort();
+  console.log(`COST TREND (since ${SINCE.toISOString().slice(0, 10)}) — $ per job per day`);
+  console.log(`${'job'.padEnd(24)} ${days.map(d => d.slice(5).padStart(7)).join(' ')}`);
+  for (const src of allSources) {
+    const cells = days.map(d => {
+      const st = byDay.get(d).get(src);
+      return st ? st.total_cost_usd.toFixed(2).padStart(7) : '     -.';
+    });
+    console.log(`${src.padEnd(24)} ${cells.join(' ')}`);
+  }
+  process.exit(0);
+}
+
+// --- per-dispatch detail (with --job) ---
+if (JOB_FILTER) {
+  if (ASJSON) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+  console.log(`DISPATCHES for job=${JOB_FILTER} since ${SINCE.toISOString().slice(0, 16).replace('T', ' ')} UTC`);
+  console.log(`${'ts'.padEnd(20)} ${'id'.padEnd(6)} ${'cost $'.padStart(8)} ${'dur'.padStart(6)} ${'turns'.padStart(5)} ${'in'.padStart(7)} ${'out'.padStart(7)} ${'cache_r'.padStart(8)} ${'cache_c'.padStart(8)} ${'web'.padStart(4)}`);
+  for (const r of rows.sort((a, b) => a.ts.localeCompare(b.ts))) {
+    console.log(`${r.ts.slice(0, 19).replace('T', ' ').padEnd(20)} ${(r.short_id || '').padEnd(6)} ${(r.total_cost_usd || 0).toFixed(4).padStart(8)} ${((r.duration_ms || 0) / 1000).toFixed(1).padStart(6)} ${String(r.num_turns || 0).padStart(5)} ${hum(r.input_tokens || 0).padStart(7)} ${hum(r.output_tokens || 0).padStart(7)} ${hum(r.cache_read_tokens || 0).padStart(8)} ${hum(r.cache_creation_tokens || 0).padStart(8)} ${String(r.web_search_requests || 0).padStart(4)}`);
+  }
+  const total = rows.reduce((s, r) => s + (r.total_cost_usd || 0), 0);
+  console.log(`\n${rows.length} dispatches, total $${total.toFixed(4)}`);
+  process.exit(0);
+}
+
+// --- default: by-job summary ---
+const tierSummary = ['opus', 'sonnet', 'haiku', 'local'].map((t) => ({
+  tier: t,
+  dispatches: byTier[t].dispatches,
+  weighted_cost_usd: +byTier[t].weighted_cost_usd.toFixed(4),
+  input_tokens: byTier[t].input_tokens,
+  output_tokens: byTier[t].output_tokens,
+  cache_read_tokens: byTier[t].cache_read_tokens,
+}));
+
+// A 0 in this table means one of two very different things, and the table alone
+// cannot tell them apart: "that tier ran nothing" or "this report cannot see
+// that tier". Name the second kind, so a reader (usually an agent) cannot
+// mistake it for the first. Header note has the mechanism and the incident.
+//
+// NOTE the `opus` row is genuinely three things at once, which is why the
+// caveat below fires only on a ZERO: (1) real pre-2026-07-02 Opus measurements,
+// (2) rows whose models[] is empty — 2,026 of them, newest 2026-09-17 — which
+// modelTier() prices conservatively as opus on purpose, and (3) the blind spot.
+// On a window that includes (1) or (2) the number is real and must not be
+// disclaimed; on a window where it is 0, it is (3).
+const LEDGER_BLIND_TIERS = ['local']; // opus left this list 2026-10-06 — forks now write rows
+const COVERAGE = {
+  source: `job-costs.ndjson ledgers: supervisors (ops, ops-light, ops-haiku) + ephemeral-forks (Opus launchd forks, web-read${COST_CFG.extra_fork_sources} — since 2026-10-06)`,
+  blind_tiers: LEDGER_BLIND_TIERS,
+  blind_reason: {
+    local: 'Structurally unreachable, not merely unmeasured: modelTier() only yields `local` for /gemma|local/i inside a ledger row models[], and local Gemma writes no row. 0 rows ever.',
+  },
+  partial: {
+    opus: `Measured since 2026-10-06 via the ephemeral-forks ledger. Still invisible: windows before that date, forks killed by their turn cap, ${COST_CFG.extra_opus_blind}and job-run forks.`,
+  },
+  zero_means: 'A 0 for a tier in blind_tiers is a BLIND SPOT, not a measurement. An opus 0 on a window before 2026-10-06 is the same blind spot.',
+  see: 'edva-allowance-coverage --since <window> [--json] — reads ~/.claude/projects. Caveats: its workload probes cover ~7 of ~12 forks (an unprobed fork is labelled `ops` and counted as on-ledger), and its Sonnet rates differ from this file, so do NOT add dollars across the two.',
+};
+
+// --- --efficiency: is the spend buying work, or buying context? -----------
+// Added 2026-08-06 after a 20h window showed 85% of spend was cache traffic
+// (45% write / 40% read) against 13% output. The by-job table above answers
+// "which job spent the most"; it cannot answer "was any of that spend
+// useful", because a job whose every dispatch re-writes a 100k-token prefix
+// looks identical to one doing real work. This view separates the two and
+// surfaces the mechanism: the context FLOOR (the irreducible prefix — system
+// prompt + CLAUDE.md chain + MCP schemas — re-sent on every turn), the
+// working window left above it, and how often the guard is compacting or
+// rotating as a result. Consumed by the cost-efficiency-review job.
+if (flag('--efficiency')) {
+  const R = (row) => ratesFor(row);
+  const split = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const row of rows) {
+    const r = R(row);
+    split.input     += (row.input_tokens || 0) * r.in;
+    split.output    += (row.output_tokens || 0) * r.out;
+    split.cacheRead += (row.cache_read_tokens || 0) * r.cr;
+    split.cacheWrite += (row.cache_creation_tokens || 0) * r.cw;
+  }
+  const grand = split.input + split.output + split.cacheRead + split.cacheWrite;
+  const overhead = split.cacheRead + split.cacheWrite;
+  const pct = (n) => grand > 0 ? (100 * n / grand) : 0;
+
+  // Per-supervisor context health. The floor is measured, not assumed: it is
+  // the prefix (cache_read + cache_creation) carried by the FIRST dispatch of
+  // each session, before any conversation has accumulated. Median over the
+  // window, so one pathological session can't move it.
+  const SUPERVISORS = ['supervisor-ops', 'supervisor-ops-light', 'supervisor-ops-haiku'];
+  // Keep in step with CONTEXT_ROTATE_THRESHOLD_TOKENS in
+  // agent/supervisor/context-guard.mjs — same env var, same default.
+  const ROTATE_THRESHOLD = Number(process.env.OPS_CONTEXT_ROTATE_TOKENS) || 185_000;
+  const perSup = [];
+  for (const d of SUPERVISORS) {
+    const costFile = installTools("agent/logs", d, 'job-costs.ndjson');
+    const evFile = installTools("agent/logs", d, 'events.ndjson');
+    if (!fs.existsSync(costFile)) continue;
+    const seen = new Set(); const sessionIds = new Set(); const floors = []; let disp = 0; let handoffs = 0;
+    let floorsRejected = 0;
+    for (const line of fs.readFileSync(costFile, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let row; try { row = JSON.parse(line); } catch { continue; }
+      if (new Date(row.ts) < SINCE) continue;
+      disp++;
+      if (row.source === 'session-handoff') handoffs++;
+      // A session's floor is only readable from its TRUE first dispatch. Taking
+      // "first row seen inside the window" instead counts a session that began
+      // BEFORE the window as if its mid-life dispatch were a session start, so
+      // the accumulated conversation gets reported as floor. That contaminated
+      // the 7d view badly (ops read 433k, i.e. a negative working window) while
+      // 24h looked fine, because a longer window catches more straddling
+      // sessions. Found by the first cost-efficiency-review run, 2026-08-06.
+      //
+      // The supervisor's per-session cost cursor gives an exact marker: on a
+      // session's first dispatch the cumulative total IS that dispatch's cost.
+      // Legacy rows (pre-2026-07-20) carry no cumulative field at all — skip
+      // them rather than guess, since they also predate reliable session ids.
+      const isSessionStart = row.session_cumulative_cost_usd !== undefined
+        && Math.abs((row.session_cumulative_cost_usd || 0) - (row.total_cost_usd || 0)) < 1e-9;
+      // AND it must be a SINGLE-TURN dispatch. The ledger's cache counters are
+      // per-DISPATCH, summed across the turns inside it, and every turn re-reads
+      // the whole prefix — so `cache_read + cache_creation` on an n-turn
+      // dispatch is n x floor, not floor. Measured over 7d it is dead linear:
+      // ops read 143k at turns=1, 287k at 2, 434k at 3, 588k at 4. Taking the
+      // median across all first dispatches is what reported a 431k "floor" for
+      // ops — larger than the entire 200k context window, which is the tell.
+      // Single-turn starts are plentiful (43 / 147 / 60 per supervisor over 7d),
+      // mostly session-handoff acks, so filtering costs nothing.
+      //
+      // The same relationship is why cache-READ dominates spend once churn is
+      // fixed: it is turns x floor, so it falls only when one of those falls.
+      const isSingleTurn = (row.num_turns || 0) === 1;
+      if (row.session_id && isSessionStart && isSingleTurn && !seen.has(row.session_id)) {
+        seen.add(row.session_id);
+        // One turn cannot read more prefix than the context holds, and the
+        // guard rotates at ROTATE_THRESHOLD, so a "floor" above it is not a
+        // reading — it is another dispatch's usage landing on this row (the
+        // 2026-09-08 misattribution class). Left in, it wins outright: the
+        // estimator reads the MOST RECENT agreeing run, so one such row on
+        // ops-light (hum:moment 2026-10-06T09:41Z, 1 turn, 1,208,454
+        // cache-read + 332,318 write) reported a 7d floor of 1,540,772 and a
+        // working window of 0 for the seven days it stayed in range.
+        // Counted, not silently dropped, so a REAL floor that ever outgrows
+        // the rotate threshold shows up as rejections instead of vanishing.
+        const sample = (row.cache_read_tokens || 0) + (row.cache_creation_tokens || 0);
+        if (sample > ROTATE_THRESHOLD) floorsRejected++;
+        else floors.push(sample);
+      }
+      if (row.session_id) sessionIds.add(row.session_id);
+    }
+    if (!disp) continue;
+    // floors[] is in file order, i.e. chronological — estimateFloor depends on
+    // that. It reports the CURRENT floor (most recent agreeing run), not the
+    // window median, so a config change landing mid-window is read correctly
+    // rather than averaged into a value that is neither the old nor the new
+    // one. Rationale + regression repro: lib/context-floor.cjs and
+    // tests/context-floor.test.mjs.
+    // The churn counters come from events.ndjson, which the supervisor ROTATES
+    // ON SIZE (logs/supervisor-*/events.ndjson.<ts>.gz alongside it). A window
+    // that starts before the live file does therefore sees only the tail of its
+    // own window — and the old code reported that shortfall as zeros, which is
+    // indistinguishable from a supervisor that genuinely never compacted.
+    // Measured 2026-08-14: ops-light rotated at 00:45Z and reported "0 compacts,
+    // 1 rotate" for a 24h window it covered 79 minutes of, while its 7d view
+    // claimed 0 compacts across 197 sessions. That undercount had already been
+    // misread for days as compacts_skipped "migrating between tiers".
+    // We deliberately do NOT read the .gz archives (ops's is 649MB) — the cost
+    // of an honest answer here is one timestamp, so report coverage instead and
+    // let the consumer tell "no churn" apart from "no data".
+    let compacts = 0, rotates = 0, skipped = 0, coverageFrom = null;
+    // The supervisor's own floor reading (first usage-bearing call of each
+    // session). Used only when the ledger yields too few single-turn session
+    // starts: those were mostly session-handoff acks, and since 2026-10-04 the
+    // handoff rides on the first real dispatch (often multi-turn) instead.
+    const measuredFloors = [];
+    // A skip is a POLL, not a condition. The guard re-checks on a fixed tick, so
+    // one session it cannot compact emits an identical event every ~90s until
+    // something else moves it. Measured 2026-08-19 on ops-light: 19 skips inside
+    // 27 minutes, every one reading context 180533 / floor 162232 / compactable
+    // 18301, then a rotate cleared it. Counting polls made a single stuck
+    // session read as the documented "skipped is high AND rotates are high"
+    // tripwire — which claims the floor has outgrown compaction fleet-wide, a
+    // structural finding rather than one session having a bad half hour.
+    // So collapse consecutive skips sharing a (context, floor, compactable)
+    // signature into one EPISODE. The raw count stays for continuity; episodes
+    // and stuck minutes are what a reader should actually reason about. Same
+    // class of defect as the churn-coverage one above: a counter whose units
+    // are not the units of the question will always be read as a finding.
+    let skipEpisodes = 0, skipStuckMs = 0, curSig = null, curStart = 0, curEnd = 0;
+    const closeSkipEpisode = () => {
+      if (curSig === null) return;
+      skipEpisodes++;
+      skipStuckMs += Math.max(0, curEnd - curStart);
+      curSig = null;
+    };
+    if (fs.existsSync(evFile)) {
+      for (const line of fs.readFileSync(evFile, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let e; try { e = JSON.parse(line); } catch { continue; }
+        if (e.ts && (coverageFrom === null || e.ts < coverageFrom)) coverageFrom = e.ts;
+        if (e.ts && new Date(e.ts) < SINCE) continue;
+        if (e.kind === 'context_guard.compact') { compacts++; closeSkipEpisode(); }
+        else if (e.kind === 'context_guard.rotate') { rotates++; closeSkipEpisode(); }
+        else if (e.kind === 'session_handoff.injected') handoffs++;
+        else if (e.kind === 'context.floor_measured' && e.floorTokens > 0) measuredFloors.push(e.floorTokens);
+        else if (e.kind === 'context_guard.compact_skipped') {
+          skipped++;
+          const sig = `${e.contextTokens}|${e.floorTokens}|${e.compactableTokens}`;
+          const t = new Date(e.ts).getTime();
+          if (sig !== curSig) { closeSkipEpisode(); curSig = sig; curStart = t; }
+          curEnd = t;
+        }
+      }
+      closeSkipEpisode();
+    }
+    const floorSource = floors.length >= 3 || !measuredFloors.length ? floors : measuredFloors;
+    const est = estimateFloor(floorSource);
+    const floor = est.floor;
+    const churnPartial = coverageFrom === null || new Date(coverageFrom) > SINCE;
+    perSup.push({
+      supervisor: d.replace('supervisor-', ''),
+      dispatches: disp,
+      // Sessions ACTIVE in the window (any dispatch) vs sessions STARTED in it
+      // (a measurable floor). They differ by the straddlers, and conflating
+      // them is what produced the bad 7d floor. disp/session uses active.
+      sessions: sessionIds.size,
+      sessions_measured: seen.size,
+      dispatches_per_session: +(disp / Math.max(sessionIds.size, 1)).toFixed(1),
+      floor_tokens: floor,
+      // Diagnostics for the estimator above. floor_samples is how many session
+      // starts the window actually yielded (a floor from 2 starts is a hint,
+      // not a measurement); the half-medians make a mid-window shift legible.
+      floor_samples: est.samples,
+      floor_samples_used: est.samplesUsed,
+      floor_samples_rejected: floorsRejected,
+      floor_window_median: est.windowMedian,
+      floor_first_half: est.firstHalf,
+      floor_second_half: est.secondHalf,
+      // Room for real conversation before a hard rotate — the number that
+      // actually bounds how much work a session does per cache write. Read
+      // from the same env var the supervisor's guard uses; the default must
+      // track CONTEXT_ROTATE_THRESHOLD_TOKENS in supervisor/context-guard.mjs
+      // (that module is the source of truth; this file is CommonJS and can't
+      // import it). Null when no session started in the window, rather than a
+      // fabricated number computed off a contaminated floor.
+      working_window_tokens: floorSource.length
+        ? Math.max(0, ROTATE_THRESHOLD - floor)
+        : null,
+      compacts, rotates, compacts_skipped: skipped, handoffs,
+      // Distinct stuck EPISODES behind compacts_skipped, and how long the guard
+      // spent unable to compact. compacts_skipped counts polls; these count
+      // conditions. Reason about these two, not the raw count — a high skip
+      // count with episodes == 1 is one session, not a fleet-wide floor problem.
+      compacts_skipped_episodes: skipEpisodes,
+      compacts_skipped_stuck_min: +(skipStuckMs / 60000).toFixed(1),
+      // How much of the window the churn counters above actually saw. When
+      // churn_partial is true they are a FLOOR, not a count — do not read a
+      // zero as "this supervisor never compacts".
+      events_coverage_from: coverageFrom,
+      churn_partial: churnPartial,
+    });
+  }
+
+  // ── The Max allowance, as Anthropic actually meters it ───────────────────
+  // Every dollar figure in this report is an ESTIMATE (per-model published
+  // rates x measured tokens) and is documented as such. The one number that is
+  // NOT an estimate is the utilization Anthropic returns on every turn, in the
+  // rate_limit_event the SDK emits — and until 2026-09-02 this report threw it
+  // away entirely.
+  //
+  // What that cost us, measured that morning: the seven-day window ran to 0.83
+  // on 09-01 (after 0.84 in the window before it) and spent roughly ten hours
+  // returning status="allowed_warning" against the seven_day limit. None of it
+  // appeared in any report, any state row or any alert; it was only visible by
+  // hand-grepping events.ndjson, which the supervisor rotates on size, so the
+  // evidence expires.
+  //
+  // It matters more than the estimates do, because the weekly allowance is a
+  // CLIFF and not a slope. overageStatus has read "rejected"
+  // (overageDisabledReason "out_of_credits") on every sample we hold, so there
+  // is no degraded mode above 1.0 — per the auth model in
+  // agent/CLAUDE.md, Edva is simply down, and routing around it is
+  // forbidden. A spend estimate that looks normal tells you nothing about how
+  // close that cliff is; this does.
+  //
+  // Account-wide rather than per-tier, so it scans EVERY supervisor log
+  // including chat. Same rotation caveat as the churn counters above: report
+  // the coverage instead of letting a rotated-away log read as a low peak.
+  const usage = {
+    seven_day_peak: null, five_hour_peak: null,
+    seven_day_warn_samples: 0, samples: 0,
+    // ── WHERE the warning fired, added 2026-09-04 ────────────────────────
+    // The warn COUNT was wired to a tripwire on the premise that a seven-day
+    // allowed_warning means "near the ceiling". That premise expired. Measured
+    // over the full event coverage: every seven-day warning from 2026-08-26 to
+    // 2026-09-01 fired at utilization 0.75-0.84, and then on 2026-09-03T22:30Z
+    // they began firing at 0.25-0.28 — on all four supervisors, 60 samples in
+    // one night, in a window whose peak was 0.29. Read as "near the ceiling"
+    // that is nonsense; read as a PACE warning it matches this report's own
+    // segment.window_needs of 1.80 exactly.
+    // So the count alone can no longer be interpreted. Record the utilization
+    // band the warnings actually fired in, so a reader can tell a ceiling
+    // warning from a pace warning without re-grepping the event log.
+    seven_day_warn_min_util: null, seven_day_warn_max_util: null,
+    seven_day_warn_first_at: null,
+    overage_available: null, coverage_from: null, partial: null,
+    // ── allowance ACCRUAL, added 2026-09-03 ──────────────────────────────
+    // The peak answers "how close did we get". It cannot answer "how close are
+    // we going to get", and across a window boundary it stops answering even
+    // the first question: the counter zeroes at the boundary, so a window that
+    // ran to 100% and reset three hours before the measurement ends reports
+    // whatever it re-accrued since — near zero. On 2026-09-03 that is exactly
+    // what happened and seven_day_peak read a reassuring 0.33.
+    resets_at: null, boundary_inside_window: false, unexplained_reset: false,
+    segments: [], segment: null,
+  };
+  // Every seven-day sample in range, kept so the accrual segments below can be
+  // reconstructed. Small: a few hundred per day.
+  const sevenDay = [];
+  for (const d of fs.readdirSync(installTools("agent/logs"))) {
+    if (!d.startsWith('supervisor-') || d.startsWith('supervisor-test')) continue;
+    const evFile = installTools("agent/logs", d, 'events.ndjson');
+    if (!fs.existsSync(evFile)) continue;
+    for (const line of fs.readFileSync(evFile, 'utf8').split('\n')) {
+      // Cheap prefilter — these files run to hundreds of MB and only a few
+      // percent of lines are rate-limit events.
+      if (!line.includes('rate_limit_event')) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      if (e.kind !== 'rate_limit_event' || !e.ts) continue;
+      if (usage.coverage_from === null || e.ts < usage.coverage_from) usage.coverage_from = e.ts;
+      if (new Date(e.ts) < SINCE) continue;
+      const info = e.rate_limit_info || {};
+      const w = info.unifiedWindows || {};
+      const sd = w.seven_day && w.seven_day.utilization;
+      const fh = w.five_hour && w.five_hour.utilization;
+      usage.samples++;
+      if (typeof sd === 'number' && (usage.seven_day_peak === null || sd > usage.seven_day_peak)) usage.seven_day_peak = sd;
+      if (typeof fh === 'number' && (usage.five_hour_peak === null || fh > usage.five_hour_peak)) usage.five_hour_peak = fh;
+      if (typeof sd === 'number') sevenDay.push({ ts: e.ts, u: sd, resetsAt: (w.seven_day && w.seven_day.resetsAt) || null });
+      if (info.status === 'allowed_warning' && info.rateLimitType === 'seven_day') {
+        usage.seven_day_warn_samples++;
+        if (typeof sd === 'number') {
+          if (usage.seven_day_warn_min_util === null || sd < usage.seven_day_warn_min_util) usage.seven_day_warn_min_util = sd;
+          if (usage.seven_day_warn_max_util === null || sd > usage.seven_day_warn_max_util) usage.seven_day_warn_max_util = sd;
+        }
+        if (usage.seven_day_warn_first_at === null || e.ts < usage.seven_day_warn_first_at) usage.seven_day_warn_first_at = e.ts;
+      }
+      // "rejected" means there is no paid overage to fall through to, which is
+      // what turns a soft ceiling into a hard outage. Latest sample wins.
+      if (info.overageStatus) usage.overage_available = info.overageStatus !== 'rejected';
+    }
+  }
+  usage.partial = usage.coverage_from === null || new Date(usage.coverage_from) > SINCE;
+
+  // ── The exchange rate: how many tokens buy 1.0 of the weekly allowance ───
+  // This is the durable quantity, and it is NOT a constant. It halved at
+  // 2026-09-01T18:00Z — 1,340M ledger tokens per 1.0 allowance before, 649M
+  // after — while Edva's own token volume FELL 23% and its model mix barely
+  // moved, so the change was on the metering side, not in the workload. Every
+  // number in this report except the peak looked completely normal through it;
+  // it took a hand computation to see. Hence this.
+  //
+  // Utilization is monotonic WITHIN a window and drops to zero at the boundary,
+  // so a drop splits the series into accrual segments. When `resetsAt` moves
+  // with the drop it is the scheduled boundary; when it does not, something
+  // else zeroed the counter (seen once) and the window's real consumption is
+  // the SUM of the segments either side, not the last peak.
+  sevenDay.sort((a, b) => (a.ts < b.ts ? -1 : 1));
+  if (sevenDay.length >= 2) {
+    usage.resets_at = sevenDay[sevenDay.length - 1].resetsAt || null;
+    const cuts = [0];
+    for (let i = 1; i < sevenDay.length; i++) {
+      // Utilization is reported to 2dp, so only a drop well past quantization
+      // counts as a reset.
+      if (sevenDay[i].u < sevenDay[i - 1].u - 0.02) {
+        usage.boundary_inside_window = true;
+        if (sevenDay[i].resetsAt === sevenDay[i - 1].resetsAt) usage.unexplained_reset = true;
+        cuts.push(i);
+      }
+    }
+    cuts.push(sevenDay.length);
+    for (let c = 0; c < cuts.length - 1; c++) {
+      const seg = sevenDay.slice(cuts[c], cuts[c + 1]);
+      if (seg.length < 2) continue;
+      const lo = seg[0].ts, hi = seg[seg.length - 1].ts;
+      const gained = seg[seg.length - 1].u - seg[0].u;
+      const days = (new Date(hi) - new Date(lo)) / 86400000;
+      // Ledger tokens inside the same span. An UNDERCOUNT — the ephemeral Opus
+      // forks (the improvement family, this report's own job, the installation's
+      // research forks) write no job-costs row but do consume allowance — so the exchange
+      // rate is a FLOOR, and only comparable to itself.
+      let tok = 0;
+      for (const r of rows) {
+        if (r.ts >= lo && r.ts <= hi) {
+          tok += (r.input_tokens || 0) + (r.cache_creation_tokens || 0)
+               + (r.cache_read_tokens || 0) + (r.output_tokens || 0);
+        }
+      }
+      usage.segments.push({
+        from: lo, to: hi, days: +days.toFixed(2),
+        util_from: seg[0].u, util_to: seg[seg.length - 1].u,
+        util_per_day: days >= 0.25 && gained > 0 ? +(gained / days).toFixed(3) : null,
+        ledger_tokens: tok,
+        mtok_per_full_allowance: gained > 0.02 ? Math.round((tok / 1e6) / gained) : null,
+      });
+    }
+    usage.segment = usage.segments[usage.segments.length - 1] || null;
+    // Project from the newest segment long enough to mean anything. A boundary
+    // three hours ago leaves the current segment far too short to rate, and
+    // falling silent there would blind the report on the one morning it matters
+    // most — so borrow the previous segment's rate and SAY that is what it is.
+    if (usage.segment) {
+      const usable = [...usage.segments].reverse().find(x => x.util_per_day !== null && x.days >= 0.5);
+      const rate = usable ? usable.util_per_day : null;
+      usage.segment.rate_per_day = rate;
+      usage.segment.rate_from = usable ? (usable === usage.segment ? 'this segment' : `earlier segment ${usable.from.slice(0, 16)}Z`) : null;
+      usage.segment.window_needs = rate ? +(rate * 7).toFixed(2) : null;
+      usage.segment.projected_exhaustion = null;
+      usage.segment.exhausts_early_by_days = null;
+      if (rate && rate > 0 && usage.resets_at) {
+        const at = new Date(usage.segment.to).getTime() + ((1 - usage.segment.util_to) / rate) * 86400000;
+        usage.segment.projected_exhaustion = new Date(at).toISOString();
+        // Positive = the allowance runs out BEFORE the window resets.
+        usage.segment.exhausts_early_by_days = +((usage.resets_at * 1000 - at) / 86400000).toFixed(1);
+      }
+    }
+  }
+
+  const totalOut = rows.reduce((s, r) => s + (r.output_tokens || 0), 0);
+  // Turns are the other multiplicand: cache-read is turns x floor, verified
+  // linear (ops reads 143k at 1 turn, 287k at 2, 434k at 3). Once churn is
+  // fixed, cache-read dominates and it falls only when turns or floor falls —
+  // so the review job needs to watch turns/dispatch as a first-class metric,
+  // not just cost. ~$0.043 per round trip at a 146k floor.
+  const totalTurns = rows.reduce((s, r) => s + (r.num_turns || 0), 0);
+  const turnsPerDispatch = rows.length ? totalTurns / rows.length : 0;
+  const costPerKOutput = totalOut > 0 ? grand / (totalOut / 1000) : 0;
+
+  const payload = {
+    since: SINCE.toISOString(),
+    dispatches: rows.length,
+    weighted_cost_usd: +grand.toFixed(2),
+    cost_split: {
+      output_usd: +split.output.toFixed(2), output_pct: +pct(split.output).toFixed(1),
+      input_usd: +split.input.toFixed(2), input_pct: +pct(split.input).toFixed(1),
+      cache_read_usd: +split.cacheRead.toFixed(2), cache_read_pct: +pct(split.cacheRead).toFixed(1),
+      cache_write_usd: +split.cacheWrite.toFixed(2), cache_write_pct: +pct(split.cacheWrite).toFixed(1),
+    },
+    // The single headline number: share of spend that bought context rather
+    // than work. Baseline on 2026-08-06 was 85%.
+    context_overhead_usd: +overhead.toFixed(2),
+    context_overhead_pct: +pct(overhead).toFixed(1),
+    cost_per_1k_output_usd: +costPerKOutput.toFixed(3),
+    total_turns: totalTurns,
+    turns_per_dispatch: +turnsPerDispatch.toFixed(2),
+    // What this payload cannot see. cost-efficiency-review reads ONLY the
+    // pre-fetched --efficiency --json files and is explicitly told not to
+    // re-run this tool, so without this key the job whose entire purpose is
+    // finding where the budget went never meets the caveat.
+    coverage: COVERAGE,
+    // Anthropic's own metering — the only non-estimated budget signal here.
+    max_usage: usage,
+    supervisors: perSup,
+    top_jobs: jobSummary.slice(0, 12).map((j) => ({
+      job: j.source, runs: j.dispatches,
+      weighted_cost_usd: +j.weighted_cost_usd.toFixed(2),
+      usd_per_run: +(j.weighted_cost_usd / Math.max(j.dispatches, 1)).toFixed(3),
+      turns_per_run: +((j.total_turns || 0) / Math.max(j.dispatches, 1)).toFixed(1),
+      cache_write_per_run: Math.round((j.cache_creation_tokens || 0) / Math.max(j.dispatches, 1)),
+      output_per_run: Math.round((j.output_tokens || 0) / Math.max(j.dispatches, 1)),
+    })),
+  };
+
+  if (ASJSON) { console.log(JSON.stringify(payload, null, 2)); process.exit(0); }
+
+  if (PHANTOM) console.log(PHANTOM_BANNER);
+  console.log(`CONTEXT & COST EFFICIENCY (since ${SINCE.toISOString().slice(0, 16).replace('T', ' ')} UTC) — ${rows.length} dispatches, $${grand.toFixed(2)} model-weighted\n`);
+  console.log('WHERE THE MONEY GOES');
+  const bar = (p) => '█'.repeat(Math.round(p / 3)).padEnd(34);
+  console.log(`  ${'output (real work)'.padEnd(22)} $${split.output.toFixed(2).padStart(8)}  ${pct(split.output).toFixed(0).padStart(3)}%  ${bar(pct(split.output))}`);
+  console.log(`  ${'input'.padEnd(22)} $${split.input.toFixed(2).padStart(8)}  ${pct(split.input).toFixed(0).padStart(3)}%  ${bar(pct(split.input))}`);
+  console.log(`  ${'cache read'.padEnd(22)} $${split.cacheRead.toFixed(2).padStart(8)}  ${pct(split.cacheRead).toFixed(0).padStart(3)}%  ${bar(pct(split.cacheRead))}`);
+  console.log(`  ${'cache write'.padEnd(22)} $${split.cacheWrite.toFixed(2).padStart(8)}  ${pct(split.cacheWrite).toFixed(0).padStart(3)}%  ${bar(pct(split.cacheWrite))}`);
+  console.log(`  ${''.padEnd(22)} ${'—'.repeat(16)}`);
+  console.log(`  ${'CONTEXT OVERHEAD'.padEnd(22)} $${overhead.toFixed(2).padStart(8)}  ${pct(overhead).toFixed(0).padStart(3)}%   (2026-08-06 baseline: 85% — lower is better)`);
+  console.log(`\n  $${costPerKOutput.toFixed(2)} per 1k output tokens`);
+  console.log(`  ${turnsPerDispatch.toFixed(1)} turns per dispatch — cache-read is turns x floor, so this is the other multiplicand\n`);
+
+  if (usage.samples > 0) {
+    const asPct = (v) => (v === null ? 'n/a' : (v * 100).toFixed(0) + '%');
+    console.log('MAX ALLOWANCE — Anthropic\'s own metering (not an estimate)');
+    console.log(`  seven-day window peak  ${asPct(usage.seven_day_peak).padStart(5)}${usage.partial ? '  (LOWER BOUND — event log rotated inside this window)' : ''}`);
+    console.log(`  five-hour window peak  ${asPct(usage.five_hour_peak).padStart(5)}`);
+    if (usage.seven_day_warn_samples > 0) {
+      const lo = usage.seven_day_warn_min_util, hi = usage.seven_day_warn_max_util;
+      const band = lo === null ? '' : ` at ${asPct(lo)}-${asPct(hi)} utilization`;
+      console.log(`  ${usage.seven_day_warn_samples} sample(s) came back allowed_warning on the SEVEN-DAY limit${band},`);
+      console.log(`  first at ${usage.seven_day_warn_first_at || 'n/a'}.`);
+      // A warning well below the ceiling is a PACE warning, not a proximity
+      // one — read it against segment.window_needs, never against the peak.
+      if (lo !== null && lo < 0.7) {
+        console.log('  That is FAR below the ceiling, so it is not a proximity warning. Read it');
+        console.log('  against window_needs below: the metering is flagging the BURN RATE.');
+      }
+    }
+    if (usage.boundary_inside_window) {
+      console.log('  A window boundary fell INSIDE this measurement window, so the peak above is');
+      console.log('  NOT that window\'s consumption - it reset and re-accrued. Read the segments.');
+    }
+    if (usage.unexplained_reset) {
+      console.log('  One reset zeroed the counter WITHOUT moving resetsAt - not a scheduled');
+      console.log('  boundary. That window\'s real consumption is the SUM of its segments.');
+    }
+    const sg = usage.segment;
+    if (sg) {
+      for (const x of usage.segments) {
+        const rt = x.mtok_per_full_allowance ? `${x.mtok_per_full_allowance}M tok per 1.0` : 'rate n/a';
+        console.log(`  segment  ${x.from.slice(5, 16)}Z -> ${x.to.slice(5, 16)}Z  ${String(x.days).padStart(5)}d  ${x.util_from.toFixed(2)} -> ${x.util_to.toFixed(2)}  ${(x.util_per_day === null ? 'n/a' : x.util_per_day + '/day').padStart(10)}  ${rt}`);
+      }
+      if (sg.window_needs) {
+        console.log(`  at ${sg.rate_per_day}/day (${sg.rate_from}) a 7-day window needs ${sg.window_needs} allowances`);
+      }
+      if (sg.exhausts_early_by_days !== null) {
+        console.log(sg.exhausts_early_by_days > 0
+          ? `  PROJECTION: hits 1.0 ${sg.projected_exhaustion.slice(0, 16)}Z - ${sg.exhausts_early_by_days}d BEFORE the window resets`
+          : `  projection: survives to reset with ${(-sg.exhausts_early_by_days).toFixed(1)}d of headroom`);
+      }
+    }
+    if (usage.overage_available === false) {
+      console.log('  Overage is REJECTED (out_of_credits): at 100% there is no degraded mode,');
+      console.log('  the agents stop. Treat the weekly peak as a cliff, not a slope.');
+    }
+    console.log('');
+  }
+
+  console.log('CONTEXT FLOOR — irreducible prefix re-sent on every turn (no /compact can shrink it)');
+  console.log(`  ${'supervisor'.padEnd(12)} ${'floor'.padStart(7)} ${'shift'.padStart(9)} ${'window'.padStart(7)} ${'sess'.padStart(5)} ${'disp/s'.padStart(7)} ${'compact'.padStart(8)} ${'skipped'.padStart(9)} ${'rotate'.padStart(7)}`);
+  for (const s of perSup) {
+    const floorTxt = s.floor_tokens ? Math.round(s.floor_tokens / 1000) + 'k' : 'n/a';
+    const winTxt = s.working_window_tokens === null ? 'n/a' : Math.round(s.working_window_tokens / 1000) + 'k';
+    // Only call it a shift when it is bigger than session-to-session jitter.
+    const d = (s.floor_second_half || 0) - (s.floor_first_half || 0);
+    const shiftTxt = s.floor_samples >= 4 && Math.abs(d) >= 5000
+      ? (d > 0 ? '+' : '') + Math.round(d / 1000) + 'k'
+      : '-';
+    // A trailing ">" marks churn counts the event log could only partly cover.
+    const pt = s.churn_partial ? '>' : ' ';
+    // Skips are polls; show the episode count beside them so a stuck half hour
+    // cannot be read as a fleet-wide compaction failure.
+    const skipTxt = s.compacts_skipped === 0
+      ? '0'
+      : `${s.compacts_skipped}/${s.compacts_skipped_episodes}ep`;
+    console.log(`  ${s.supervisor.padEnd(12)} ${floorTxt.padStart(7)} ${shiftTxt.padStart(9)} ${winTxt.padStart(7)} ${String(s.sessions).padStart(5)} ${String(s.dispatches_per_session).padStart(7)} ${(pt + String(s.compacts)).padStart(8)} ${(pt + skipTxt).padStart(9)} ${(pt + String(s.rotates)).padStart(7)}`);
+  }
+  if (perSup.some((s) => s.compacts_skipped > 0)) {
+    const worst = perSup.reduce((a, b) => (b.compacts_skipped_stuck_min > (a?.compacts_skipped_stuck_min ?? -1) ? b : a), null);
+    console.log(`\n  skipped = polls/EPISODES. The guard re-checks on a fixed tick, so one session`);
+    console.log(`            it cannot compact emits an identical event every ~90s. Reason about`);
+    console.log(`            episodes, not polls — longest stuck stretch here: ${worst.compacts_skipped_stuck_min} min on ${worst.supervisor}.`);
+  }
+  if (perSup.some((s) => s.churn_partial)) {
+    console.log('\n  >      = events.ndjson rotated inside this window, so compact/skipped/rotate');
+    console.log('           are a LOWER BOUND for that supervisor, not a count. The floor is');
+    console.log('           unaffected — it is measured from job-costs.ndjson, which is intact.');
+  }
+  console.log('\n  floor  = median prefix on the TRUE first dispatch of the 8 most RECENT');
+  console.log('           sessions started in the window (n/a = none started). Recent, not');
+  console.log('           window-median: a config change mid-window otherwise reports a');
+  console.log('           floor that is neither the old nor the new one.');
+  console.log('  shift  = second-half median minus first-half, when >=5k. A big value means');
+  console.log('           the floor MOVED during the window — read `floor` as the new one.');
+  console.log('  window = tokens of real conversation available before a hard rotate (185k)');
+  console.log('  A small window means most spend is re-loading context. Cut the floor:');
+  console.log('  CLAUDE.md chain size, MCP servers loaded per agent, always-on skills.\n');
+
+  console.log('TOP JOBS — cost per run vs what each run produced');
+  console.log(`  ${'job'.padEnd(26)} ${'runs'.padStart(5)} ${'$'.padStart(8)} ${'$/run'.padStart(8)} ${'turns/run'.padStart(10)} ${'cacheW/run'.padStart(11)} ${'out/run'.padStart(8)}`);
+  for (const j of payload.top_jobs) {
+    console.log(`  ${j.job.slice(0, 26).padEnd(26)} ${String(j.runs).padStart(5)} ${j.weighted_cost_usd.toFixed(2).padStart(8)} ${j.usd_per_run.toFixed(2).padStart(8)} ${j.turns_per_run.toFixed(1).padStart(10)} ${hum(j.cache_write_per_run).padStart(11)} ${hum(j.output_per_run).padStart(8)}`);
+  }
+  console.log('\n  A job with a large cacheW/run and a small out/run is paying full freight to do very little.');
+  process.exit(0);
+}
+
+if (ASJSON) { console.log(JSON.stringify({ since: SINCE.toISOString(), phantom: PHANTOM, note: PHANTOM ? PHANTOM_BANNER : null, weighted_cost_note: 'weighted_cost_usd = real per-model API rates (platform.claude.com 2026-06-17) × measured tokens; the trustworthy cost signal under metered billing. total_cost_usd is the SDK phantom estimate.', coverage: COVERAGE, by_tier: tierSummary, jobs: jobSummary }, null, 2)); process.exit(0); }
+
+const totalCost = jobSummary.reduce((s, j) => s + j.total_cost_usd, 0);
+const totalWeighted = jobSummary.reduce((s, j) => s + j.weighted_cost_usd, 0);
+const totalDispatches = jobSummary.reduce((s, j) => s + j.dispatches, 0);
+if (PHANTOM) console.log(PHANTOM_BANNER);
+console.log(`USAGE BY JOB (since ${SINCE.toISOString().slice(0, 16).replace('T', ' ')} UTC) — ${totalDispatches} dispatches, real $${totalWeighted.toFixed(2)} (model-weighted)${PHANTOM ? `, [$est ${totalCost.toFixed(2)}]` : ''}`);
+const dollarHeader = PHANTOM ? '[$est]' : '$';
+console.log(`${'job'.padEnd(26)} ${'runs'.padStart(5)} ${'$wt'.padStart(9)} ${(`${dollarHeader} tot`).padStart(9)} ${'in'.padStart(8)} ${'out'.padStart(8)} ${'cache_r'.padStart(9)} ${'web'.padStart(4)}`);
+for (const j of jobSummary) {
+  console.log(`${j.source.padEnd(26)} ${String(j.dispatches).padStart(5)} ${j.weighted_cost_usd.toFixed(2).padStart(9)} ${j.total_cost_usd.toFixed(2).padStart(9)} ${hum(j.input_tokens).padStart(8)} ${hum(j.output_tokens).padStart(8)} ${hum(j.cache_read_tokens).padStart(9)} ${String(j.web_search_requests).padStart(4)}`);
+}
+console.log(`\nBY MODEL TIER (real model-weighted $):`);
+console.log(`${'tier'.padEnd(8)} ${'runs'.padStart(5)} ${'$wt'.padStart(9)} ${'in'.padStart(8)} ${'out'.padStart(8)} ${'cache_r'.padStart(9)}`);
+for (const t of tierSummary) {
+  console.log(`${t.tier.padEnd(8)} ${String(t.dispatches).padStart(5)} ${t.weighted_cost_usd.toFixed(2).padStart(9)} ${hum(t.input_tokens).padStart(8)} ${hum(t.output_tokens).padStart(8)} ${hum(t.cache_read_tokens).padStart(9)}`);
+}
+console.log(`\n[$wt] = real per-model API rates (platform.claude.com 2026-06-17) × measured tokens — the trustworthy cost signal under metered billing. [$est] is the SDK phantom estimate.`);
+// Only when the figure IS the blind spot. A non-zero opus number is real
+// (pre-2026-07-02 history, or empty-models[] rows priced as opus), and
+// disclaiming it would be the very defect this caveat exists to prevent.
+// `opus` only. `local` stays in COVERAGE for a machine reader, but printing a
+// caveat under it every run would be noise: no reviewer has ever misread it, and
+// a row that CAN never be non-zero does not need an apology beside it each time.
+// Two disclaimers under four rows also dilutes the one that earned its place.
+const FOOTER_BLIND_TIERS = ['opus'];
+for (const t of FOOTER_BLIND_TIERS) {
+  const b = byTier[t];
+  if (b.dispatches === 0) {
+    console.log(`[!] ${t} reads 0. Opus forks write the ephemeral-forks ledger only since 2026-10-06; before that, or for a fork killed by its cap, this is a blind spot rather than "nothing ran". Cross-check: edva-allowance-coverage --since <window> (different rate table — do not add its dollars to these).`);
+  } else if (!(b.input_tokens + b.output_tokens + b.cache_read_tokens)) {
+    // A real dispatch count with no usage at all: these are rows whose models[]
+    // was empty, which modelTier() prices as opus on purpose. The COUNT is
+    // real; the tier attribution is not, so say which part to trust.
+    console.log(`[!] ${t} shows ${b.dispatches} dispatches with zero tokens — those are rows with no model recorded, bucketed to ${t} by the conservative fallback. The count is real; the tier is not.`);
+  }
+}

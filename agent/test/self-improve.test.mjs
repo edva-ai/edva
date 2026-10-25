@@ -16,7 +16,7 @@ process.env.MEMORY_INDEX_DB = TMP_DB;
 const LOCAL_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "si-local-"));
 fs.mkdirSync(path.join(LOCAL_DIR, "config"));
 fs.writeFileSync(path.join(LOCAL_DIR, "config", "self-improve-rails.json"), JSON.stringify({ forbidden_names: ["acmebroker"] }));
-process.env.MERLIN_LOCAL_DIR = LOCAL_DIR;
+process.env.EDVA_LOCAL_DIR = LOCAL_DIR;
 const { createApprovalGate } = await import("../core/approval-gate.mjs");
 const { createSelfImprove, analyzeModule, FORBIDDEN_PATTERNS } = await import("../core/self-improve.mjs");
 

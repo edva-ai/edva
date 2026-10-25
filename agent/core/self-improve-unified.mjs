@@ -83,11 +83,11 @@ export function createUnifiedApproval({
   // re-read-the-source-of-record pass, and that pass is specified for a
   // stateful claim SOMEONE ELSE controls ("has X enrolled / paid / replied").
   // A code change has no such claim and no source of record, so the test
-  // degenerates into topic-matching against Merlin's own recent output — and
+  // degenerates into topic-matching against Edva's own recent output — and
   // since the reviews that generate these cards also email the user nightly
   // about what they found, the better they report, the harder their own
   // follow-up work becomes to land (a sound fix refused again and again, each
-  // time citing a Merlin message that had settled a DIFFERENT claim).
+  // time citing a Edva message that had settled a DIFFERENT claim).
   //
   // This narrows nothing the gate was built for. A card surfacing something
   // STORED must still not claim live (claim-freshness's own rule), and

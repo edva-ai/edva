@@ -28,8 +28,8 @@
 #                         [--model <id>] [--effort <level>] [--cwd <dir>]
 #
 # --model/--effort/--cwd: the defaults are
-# MERLIN_MODEL_OPUS from agent/config/models.env, xhigh, and the ops-agent dir. --cwd runs the agent inside another repo so THAT repo's
-# CLAUDE.md is loaded; the merlin root is still added with --add-dir.
+# EDVA_MODEL_OPUS from agent/config/models.env, xhigh, and the ops-agent dir. --cwd runs the agent inside another repo so THAT repo's
+# CLAUDE.md is loaded; the edva root is still added with --add-dir.
 #
 # The task line is prepended to the job file's text on stdin. `claude -p` reads
 # the prompt from stdin — a positional prompt argument is NOT reliably picked up.
@@ -43,29 +43,29 @@ set -uo pipefail
 # fork-cost-record below.
 export PATH="$HOME/.local/node/bin:/opt/homebrew/bin:$PATH"
 CLAUDE="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
-source "$(dirname "${BASH_SOURCE[0]}")/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-ROOT="$MERLIN_INSTALL"
-CWD="$MERLIN_INSTALL_TOOLS/agent/ops-agent"
-ENV_FILE="$MERLIN_INSTALL_TOOLS/.env"
-LOGDIR="$MERLIN_INSTALL_TOOLS/agent/logs"
+source "$(dirname "${BASH_SOURCE[0]}")/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+ROOT="$EDVA_INSTALL"
+CWD="$EDVA_INSTALL_TOOLS/agent/ops-agent"
+ENV_FILE="$EDVA_INSTALL_TOOLS/.env"
+LOGDIR="$EDVA_INSTALL_TOOLS/agent/logs"
 
 # Model ids are pinned in ONE place:
 # agent/config/models.env. Re-read on every run, so a flip needs no restart.
-MODELS_ENV="$MERLIN_INSTALL_TOOLS/agent/config/models.env"
+MODELS_ENV="$EDVA_INSTALL_TOOLS/agent/config/models.env"
 # shellcheck source=../../config/models.env
 [ -f "$MODELS_ENV" ] && source "$MODELS_ENV"
 
 JOB="${1:-}"; JOB_MD="${2:-}"; shift 2 2>/dev/null || true
 TASK=""
 TIMEOUT_MIN=0
-MODEL="${MERLIN_MODEL_OPUS:-}"
+MODEL="${EDVA_MODEL_OPUS:-}"
 EFFORT="xhigh"
 
 # Connector deny. The ops supervisors don't carry the claude.ai connectors they
 # never call (agents.json disallowedTools); without an equivalent here every
 # Opus turn would still re-read all of their tool names. The denied servers had
 # ZERO calls across hundreds of fork and subagent transcripts over 30 days;
-# merlin-tools is a second registration of the `tools` server the forks do
+# edva-tools is a second registration of the `tools` server the forks do
 # call. Measured on this cwd with Haiku: prefix 84,676 -> 77,231 tokens,
 # 1,091 -> 658 tool names. A per-run deny, not an account change: the user's
 # own sessions keep every connector. A job that needs one back sets
@@ -73,13 +73,13 @@ EFFORT="xhigh"
 # The list itself lives in lib/fork-connector-deny.sh, shared by
 # every launcher with its own `claude -p` line.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fork-connector-deny.sh"
-FORK_DISALLOWED_TOOLS="${FORK_DISALLOWED_TOOLS-${MERLIN_FORK_CONNECTOR_DENY-}}"
+FORK_DISALLOWED_TOOLS="${FORK_DISALLOWED_TOOLS-${EDVA_FORK_CONNECTOR_DENY-}}"
 # Skills hidden from the fork: the same file's skill list, passed
 # with --settings so it binds this run only. Set FORK_SKILL_SETTINGS="" in a
 # trigger to give a job every skill back.
-FORK_SKILL_SETTINGS="${FORK_SKILL_SETTINGS-${MERLIN_FORK_SKILL_SETTINGS-}}"
+FORK_SKILL_SETTINGS="${FORK_SKILL_SETTINGS-${EDVA_FORK_SKILL_SETTINGS-}}"
 # + the git-rollback guard hook (D2), merged into the same --settings.
-FORK_SKILL_SETTINGS="$(merlin_fork_settings "$FORK_SKILL_SETTINGS")"
+FORK_SKILL_SETTINGS="$(edva_fork_settings "$FORK_SKILL_SETTINGS")"
 while [ $# -gt 0 ]; do
   case "$1" in
     --task)        TASK="${2:-}"; shift 2 ;;
@@ -105,7 +105,7 @@ if [ ! -f "$JOB_MD" ]; then
   exit 1
 fi
 if [ -z "$MODEL" ]; then
-  log "ERROR: no model — MERLIN_MODEL_OPUS missing from $MODELS_ENV and no --model given"
+  log "ERROR: no model — EDVA_MODEL_OPUS missing from $MODELS_ENV and no --model given"
   exit 1
 fi
 
@@ -123,7 +123,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/max-auth-guard.sh"
 # lib/local-rules.sh.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local-rules.sh"
 # How the refusal names this machine: the instance host_label (lib/instance.sh).
-[ -n "${MERLIN_HOST_LABEL:-}" ] || source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/instance.sh"
+[ -n "${EDVA_HOST_LABEL:-}" ] || source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/instance.sh"
 max_auth_scrub
 if ! max_auth_check "$CLAUDE"; then
   # Hand-run over SSH: the keychain is out of reach, not Max. Refuse the same
@@ -132,7 +132,7 @@ if ! max_auth_check "$CLAUDE"; then
   if max_auth_from_ssh; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$JOB] REFUSED: not on the Max subscription ($MAX_AUTH_SUMMARY) (SSH session; not paged)" >> "$LOG"
     {
-      echo "$JOB: refused to start from an SSH session. An SSH shell cannot reach the Max login in ${MERLIN_HOST_LABEL:-the host}'s keychain, so \`claude auth status\` reads as signed out. Nothing ran, nothing was billed, nobody was paged."
+      echo "$JOB: refused to start from an SSH session. An SSH shell cannot reach the Max login in ${EDVA_HOST_LABEL:-the host}'s keychain, so \`claude auth status\` reads as signed out. Nothing ran, nothing was billed, nobody was paged."
       echo "Start it through its launchd agent instead, e.g.: launchctl kickstart gui/\$(id -u)/ai.claude.$JOB"
     } >&2
   elif max_auth_outage_owned_by_watchdog; then
@@ -143,8 +143,8 @@ if ! max_auth_check "$CLAUDE"; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$JOB] REFUSED: not on the Max subscription ($MAX_AUTH_SUMMARY) (confirmed Max sign-in outage — watchdog.sh owns that page; not paged)" >> "$LOG"
   else
     echo "$(date '+%Y-%m-%d %H:%M:%S') [$JOB] REFUSED: not on the Max subscription ($MAX_AUTH_SUMMARY)" >> "$LOG"
-    "$HOME/Dev/merlin/bin/merlin-send-curl" --skip-precheck --channel system --observed-error "$MAX_AUTH_SUMMARY" \
-      "⚠️ $JOB refused to start: this run's \`claude auth status\` was not the Max subscription ($MAX_AUTH_SUMMARY), and these runs use nothing else. Nothing ran and nothing was billed. Remedy: sign Claude Code in to the Max account from a GUI session on ${MERLIN_HOST_LABEL:-the host}." >> "$LOG" 2>&1 || true
+    "$HOME/Dev/edva/bin/edva-send-curl" --skip-precheck --channel system --observed-error "$MAX_AUTH_SUMMARY" \
+      "⚠️ $JOB refused to start: this run's \`claude auth status\` was not the Max subscription ($MAX_AUTH_SUMMARY), and these runs use nothing else. Nothing ran and nothing was billed. Remedy: sign Claude Code in to the Max account from a GUI session on ${EDVA_HOST_LABEL:-the host}." >> "$LOG" 2>&1 || true
   fi
   exit "$MAX_AUTH_REFUSED_RC"
 fi
@@ -162,15 +162,15 @@ log "start (ephemeral ${MODEL#claude-}, $EFFORT${TIMEOUT_MIN:+, ${TIMEOUT_MIN}m 
 
 # Prompt = task line + the playbook, exactly what the webhook server used to
 # assemble for the supervisor.
-{ [ -n "$TASK" ] && printf '%s\n\n' "$TASK"; merlin_job_prompt "$JOB_MD"; } > "$OUT_TMP.prompt"
+{ [ -n "$TASK" ] && printf '%s\n\n' "$TASK"; edva_job_prompt "$JOB_MD"; } > "$OUT_TMP.prompt"
 # + the local rules as --append-system-prompt-file (what the supervisors pass
-# their own sessions); none when the cwd loads no Merlin CLAUDE.md.
+# their own sessions); none when the cwd loads no Edva CLAUDE.md.
 LOCAL_RULES_FILE="$OUT_TMP.local-rules"
-merlin_local_rules_file "$(merlin_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
+edva_local_rules_file "$(edva_local_rules_role "$CWD")" "$LOCAL_RULES_FILE" || LOCAL_RULES_FILE=""
 
 # --output-format json: the run's own usage is the
 # only cost record an ephemeral fork can have — it runs outside every
-# supervisor, so without it merlin-cost-report reads "opus: 0" in weeks where
+# supervisor, so without it edva-cost-report reads "opus: 0" in weeks where
 # Opus jobs ran. stdout is the JSON envelope; stderr is kept apart so it cannot
 # corrupt it. After exit, fork-cost-record appends the ledger row and hands back
 # the envelope's plain text into $OUT_TMP, so the guards below and the log see
@@ -212,7 +212,7 @@ rm -f "$OUT_TMP.prompt" "$OUT_TMP.local-rules"
 # Ledger row + plain text. Unparseable output (a crash, a plain-text auth error)
 # passes through unchanged and writes no row; if node itself is unavailable the
 # raw envelope is used, so the guards still see SOMETHING rather than nothing.
-node "$MERLIN_INSTALL_TOOLS/bin/fork-cost-record" "$JOB" "$OUT_TMP.json" --model "$MODEL" > "$OUT_TMP" 2>> "$LOG" \
+node "$EDVA_INSTALL_TOOLS/bin/fork-cost-record" "$JOB" "$OUT_TMP.json" --model "$MODEL" > "$OUT_TMP" 2>> "$LOG" \
   || cat "$OUT_TMP.json" > "$OUT_TMP"
 cat "$OUT_TMP.err" >> "$OUT_TMP" 2>/dev/null
 rm -f "$OUT_TMP.json" "$OUT_TMP.err"
@@ -250,7 +250,7 @@ if (( RC > 128 )); then
   # fabricated-outage gate has nothing to catch. --observed-error carries text
   # this script really captured (its own timeout log line, or the status `wait`
   # returned), which is what the mechanism-attestation gate is satisfied by.
-  "$MERLIN_INSTALL_TOOLS/bin/merlin-send-curl" --skip-precheck --channel system --observed-error "$OBSERVED" \
+  "$EDVA_INSTALL_TOOLS/bin/edva-send-curl" --skip-precheck --channel system --observed-error "$OBSERVED" \
     "⚠️ $JOB $WHAT — interrupted, not an auth failure, so re-login is not the remedy. Nothing was produced by this invocation; if this was the scheduled run, the pass is missing." >> "$LOG" 2>&1 || true
   log "exit 1 (guard: $LOGGED)"
   rm -f "$OUT_TMP" "$TIMEOUT_MARKER"
@@ -316,10 +316,10 @@ if auth_or_empty_run "$OUT_TMP"; then
   #
   # --observed-error: this line already quotes real captured output ($FIRST,
   # the claude -p run's own first line) — the flag is required by
-  # merlin-send-curl's mechanism-attestation gate whenever that text names a
+  # edva-send-curl's mechanism-attestation gate whenever that text names a
   # specific failure (e.g. "OAuth session expired"), and passing the same
   # string back costs nothing since it's already captured.
-  "$MERLIN_INSTALL_TOOLS/bin/merlin-send-curl" --skip-precheck --channel system --observed-error "$FIRST" \
+  "$EDVA_INSTALL_TOOLS/bin/edva-send-curl" --skip-precheck --channel system --observed-error "$FIRST" \
     "⚠️ $JOB exited without producing output — auth/empty (\"${FIRST}\"). Nothing was generated by this invocation; if this was the scheduled run, the pass is missing." >> "$LOG" 2>&1 || true
   log "exit 1 (guard: auth/empty run)"
   rm -f "$OUT_TMP" "$TIMEOUT_MARKER"

@@ -1,4 +1,4 @@
-// email-inbound-oneshot.test.mjs — the Merlin inbound address's one-off responder's
+// email-inbound-oneshot.test.mjs — the Edva inbound address's one-off responder's
 // pure helpers (lib/email-inbound-oneshot.mjs), the runner's tool grant,
 // and the playbook sections the prompts are cut from.
 //
@@ -43,7 +43,7 @@ test("every marker block of a name is used: the kernel's first, then the local c
 });
 
 test("the email is fenced inside <untrusted_email>, with resolved context outside it", () => {
-  const b = untrustedEmailBlock(email, { allowlisted: true, reply_to_merlin: null });
+  const b = untrustedEmailBlock(email, { allowlisted: true, reply_to_edva: null });
   const open = b.indexOf("<untrusted_email>"), close = b.indexOf("</untrusted_email>");
   assert.ok(open >= 0 && close > open);
   assert.ok(b.indexOf("evil@x.com") > open && b.indexOf("evil@x.com") < close);
@@ -64,10 +64,10 @@ function withLocalConfig(cfg, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "eio-local-"));
   fs.mkdirSync(path.join(dir, "config"));
   if (cfg) fs.writeFileSync(path.join(dir, "config", "email-inbound.json"), JSON.stringify(cfg));
-  const prev = process.env.MERLIN_LOCAL_DIR;
-  process.env.MERLIN_LOCAL_DIR = dir;
+  const prev = process.env.EDVA_LOCAL_DIR;
+  process.env.EDVA_LOCAL_DIR = dir;
   try { return fn(); } finally {
-    if (prev === undefined) delete process.env.MERLIN_LOCAL_DIR; else process.env.MERLIN_LOCAL_DIR = prev;
+    if (prev === undefined) delete process.env.EDVA_LOCAL_DIR; else process.env.EDVA_LOCAL_DIR = prev;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -122,7 +122,7 @@ test("parseDecision keeps the model's answered_fully verdict: true, false, or nu
 
 // A deflection: the one-shot could not see why something was left out of an
 // email the agent sent, said so, offered to look later, and logged `answered`.
-const DEFLECTION = "I don't have a clear answer — the write-up for that day shows the lunch at the Harbor Cafe with one photo included, but I don't have visibility into why any additional photos from that stop might have been left out (could be they weren't tagged to that location/time, or just weren't part of what got pulled in for the summary). If there are specific photos you're missing, let me know and I can try to track down why.\n\nMerlin";
+const DEFLECTION = "I don't have a clear answer — the write-up for that day shows the lunch at the Harbor Cafe with one photo included, but I don't have visibility into why any additional photos from that stop might have been left out (could be they weren't tagged to that location/time, or just weren't part of what got pulled in for the summary). If there are specific photos you're missing, let me know and I can try to track down why.\n\nEdva";
 
 test("an answer the model marks answered_fully:false is escalated to ops, and the draft is never sent", () => {
   const decision = parseDecision(JSON.stringify({ outcome: "answered", reply: DEFLECTION, answered_fully: false }));

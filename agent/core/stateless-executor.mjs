@@ -117,7 +117,7 @@ export function makeStatelessExecutor({
   // `claude -p` auto-discovers `.mcp.json` from its cwd — so a fork given
   // cwd=<chat-agent dir> silently inherited the chat agent's ENTIRE MCP surface.
   // A probe found a supposedly read-only research fork holding
-  // mcp__chrome-devtools (which drives Merlin's already-logged-in Chrome, i.e.
+  // mcp__chrome-devtools (which drives Edva's already-logged-in Chrome, i.e.
   // the real bank/brokerage cookies) and mcp__claude_ai_Gmail (create_draft,
   // labels). `--tools` does NOT cover MCP tools; only this does.
   strictMcpConfig = false,

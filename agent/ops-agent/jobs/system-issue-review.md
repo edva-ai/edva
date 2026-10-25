@@ -2,9 +2,9 @@ SYSTEM ISSUE REVIEW — root-cause pass over the system channel, delivering fixe
 
 > **This instance's additions** to this playbook (its own people, places and decisions) are in `agent/local/jobs/system-issue-review.md`; the supervisor appends them to the dispatched playbook. If they are not at the end of what you were given (an ephemeral or by-hand run), `Read` that file before you start.
 
-Reads every alert Merlin posted to its own **system channel**, clusters them into distinct issues, root-causes each one, and ships a fix through the **unified self-improvement pipeline**: low/moderate fixes are implemented + critic-reviewed + committed autonomously and shown as a green-check card in the Improvements channel; high-risk fixes are staged and filed as a Face-ID approval card. Silent when there is nothing to say.
+Reads every alert Edva posted to its own **system channel**, clusters them into distinct issues, root-causes each one, and ships a fix through the **unified self-improvement pipeline**: low/moderate fixes are implemented + critic-reviewed + committed autonomously and shown as a green-check card in the Improvements channel; high-risk fixes are staged and filed as a Face-ID approval card. Silent when there is nothing to say.
 
-**Runtime (2026-07-28).** Runs as a dedicated ephemeral `claude -p --model $MERLIN_MODEL_OPUS --effort xhigh` (`claude-opus-5-5` since 2026-10-06; id pinned in `agent/config/models.env`) (launchd agents `ai.claude.system-issue-review` / `-critical`), not as a webhook dispatch to the ops supervisor — which has run `claude-sonnet-5` since 2026-07-02, so this job's root-causing and the code fixes it authors were Sonnet work despite `"model": "opus"` in `job-routing.json` (a tier label, not a model id). The user's standing rule: every improvement-related process runs on the Opus tier. Two consequences: the supervisor's 35-min turn watchdog is replaced by a **45-min cap in the runner** (Critical Rule 7's budget still stands — it is now enforced by a kill, not a requeue), and there is no dispatch queue, so a run that would have been queued behind a busy supervisor simply starts. The trigger's gate is unchanged and does all the work of deciding whether to run at all, which matters more now that each run is an Opus run.
+**Runtime (2026-07-28).** Runs as a dedicated ephemeral `claude -p --model $EDVA_MODEL_OPUS --effort xhigh` (`claude-opus-5-5` since 2026-10-06; id pinned in `agent/config/models.env`) (launchd agents `ai.claude.system-issue-review` / `-critical`), not as a webhook dispatch to the ops supervisor — which has run `claude-sonnet-5` since 2026-07-02, so this job's root-causing and the code fixes it authors were Sonnet work despite `"model": "opus"` in `job-routing.json` (a tier label, not a model id). The user's standing rule: every improvement-related process runs on the Opus tier. Two consequences: the supervisor's 35-min turn watchdog is replaced by a **45-min cap in the runner** (Critical Rule 7's budget still stands — it is now enforced by a kill, not a requeue), and there is no dispatch queue, so a run that would have been queued behind a busy supervisor simply starts. The trigger's gate is unchanged and does all the work of deciding whether to run at all, which matters more now that each run is an Opus run.
 
 **Two cadences:**
 
@@ -40,7 +40,7 @@ The user had been closing this loop by hand — the system channel holds their o
 6. **Cap the night — two separate budgets.** At most **3** clusters get a **fix attempt** per run, and at most **1** of those may be high-risk (one Face-ID card per night keeps the Improvements channel a decision queue, not an inbox). On top of that, at most **3** clusters get a **review-only pass** (Step 4 root-cause, no implementer, no critic, no commit — see Step 3b). The budgets are separate on purpose: the review-only lane exists so a self-healed or quiet issue can never be starved out by a loud active defect, and it is cheap enough that it does not threaten the 35-minute turn budget. Everything else waits for tomorrow; recurrence weighting means the loudest unfixed thing surfaces first anyway.
 7. **Budget the turn: ~35 minutes, hard.** The supervisor arms a 35-min turn watchdog for this source (`TURN_WATCHDOG_MS_BY_SOURCE` in `supervisor/index.mjs`); overrun means the child is killed mid-work and the dispatch is requeued, which on a second hang gets **dropped entirely**. So treat it as a real budget: finish and persist the clusters you have rather than starting an investigation you cannot land. If Step 4 has already consumed ~20 minutes, skip straight to Step 8 with whatever is done — an unwritten state file is the only genuinely unrecoverable outcome here. This is not hypothetical: the job's first dispatch (2026-07-22) tripped the then-10-min default.
 8. **Never re-attempt a cluster that already has an unresolved fix in flight** — an unsigned Face-ID card, or a committed fix still inside its verification window. Re-proposing is how the channel fills with duplicates.
-9. **Never re-propose a fix the user SKIPPED** (2026-07-28). Check `~/Dev/merlin/bin/self-improve-skip list` before filing any card; if a skipped card covers this cluster, close the cluster `wontfix` with `resolution: "owner-skipped"` and move on. A skip that comes back next week is not a skip, it's a snooze, and it teaches them the button doesn't work. Skip is their decision and outranks this job's judgment — unlike a `reviewed-no-fix`, it does not reopen on recurrence; if the issue recurs, escalate it (Step 7) rather than re-filing the same card.
+9. **Never re-propose a fix the user SKIPPED** (2026-07-28). Check `~/Dev/edva/bin/self-improve-skip list` before filing any card; if a skipped card covers this cluster, close the cluster `wontfix` with `resolution: "owner-skipped"` and move on. A skip that comes back next week is not a skip, it's a snooze, and it teaches them the button doesn't work. Skip is their decision and outranks this job's judgment — unlike a `reviewed-no-fix`, it does not reopen on recurrence; if the issue recurs, escalate it (Step 7) rather than re-filing the same card.
 
 ## Pipeline
 
@@ -75,20 +75,20 @@ If Step 2 concludes the escalated alert actually matches an existing in-flight c
 ## Step 0 — Pre-flight
 
 ```bash
-~/Dev/merlin/bin/doctor-preflight-check system-issue-review
+~/Dev/edva/bin/doctor-preflight-check system-issue-review
 ```
 
 Never hand-roll a doctor check and never page on its result (`agent/CLAUDE.md` § System Channel — the shared helper always exits 0 and cannot ping).
 
 ## Step 1 — Load state and the pending batch
 
-Read `~/Dev/merlin/data/system-issue-review-state.json`. If missing, initialize:
+Read `~/Dev/edva/data/system-issue-review-state.json`. If missing, initialize:
 
 ```json
 {"schema_version": 1, "last_run": null, "cursor_ts": null, "clusters": []}
 ```
 
-Read the batch the trigger wrote to `~/Dev/merlin/data/system-issue-review-pending.json` — an array of `{id, role, content, created_at}` covering the last 14 days of `merlin_messages` rows with `channel = 'system'`. The trigger does this fetch (un-sandboxed cron has real network; the agent's sandboxed Bash does not — same reason `chat-consolidate` fetches in its trigger). Do not re-query Supabase for this data.
+Read the batch the trigger wrote to `~/Dev/edva/data/system-issue-review-pending.json` — an array of `{id, role, content, created_at}` covering the last 14 days of `edva_messages` rows with `channel = 'system'`. The trigger does this fetch (un-sandboxed cron has real network; the agent's sandboxed Bash does not — same reason `chat-consolidate` fetches in its trigger). Do not re-query Supabase for this data.
 
 Two row kinds, handled differently:
 
@@ -130,7 +130,7 @@ New cluster shape:
 A `✅ Recovered: <X>` / `✅ … restored` / `✅ … back up` message closes the *incident*, **never the issue**. A recovery is evidence for the root-cause pass, not a substitute for it.
 
 - Recovery seen and the condition has **not** recurred → the cluster stays eligible for review. Set `self_healed: true` and `disposition: "review-only"`, keep `status: "open"`. It is now a first-class candidate in the Step 3b review lane. **Do not mark it `resolved` here** — that is the shortcut the user removed on 2026-07-25, and it is why an alert could fire, clear, and leave no trace of anyone having looked.
-- Recovery seen but the alert-recover pair has repeated **≥3 times** (the crash-loop shape: 5 `⚠️ Merlin ops crash-loop` / `✅ recovered` pairs in 8 hours on 2026-07-16) → this is **not** healthy. It is a flapping defect wearing a recovery badge. `severity: "degraded"`, `disposition: "fix"` — it belongs in the fix lane, not the review lane.
+- Recovery seen but the alert-recover pair has repeated **≥3 times** (the crash-loop shape: 5 `⚠️ Edva ops crash-loop` / `✅ recovered` pairs in 8 hours on 2026-07-16) → this is **not** healthy. It is a flapping defect wearing a recovery badge. `severity: "degraded"`, `disposition: "fix"` — it belongs in the fix lane, not the review lane.
 
 **The occurrence count no longer decides whether to look; it decides which lane.** A one-off self-healed blip gets a cheap review-only pass (Step 3b) that usually concludes in a handful of tool calls. A repeating one gets the full fix treatment. Either way a root cause is recorded before anything closes.
 
@@ -189,7 +189,7 @@ For each:
 
 1. **Read `attempts[]` first.** If a previous fix recurred, the previous diagnosis was wrong. Say so explicitly in the new rationale and pick a different layer (if last time you fixed the caller, look at the callee; if you widened a timeout, question whether the operation should happen at all).
 
-2. **Verify the condition is real right now** (CRITICAL RULE 4). Cheap probes, all read-only: the relevant `data/logs/<job>.log`, `agent/logs/watchdog.log`, the state file the job writes, `git log --oneline --since=…` on the implicated paths. If the current state contradicts the alert, **the monitor is the bug** — root-cause the monitor instead, and note the contradiction concretely (e.g. "alert claims crontab empty; `crontab -l` shows a full set of merlin entries").
+2. **Verify the condition is real right now** (CRITICAL RULE 4). Cheap probes, all read-only: the relevant `data/logs/<job>.log`, `agent/logs/watchdog.log`, the state file the job writes, `git log --oneline --since=…` on the implicated paths. If the current state contradicts the alert, **the monitor is the bug** — root-cause the monitor instead, and note the contradiction concretely (e.g. "alert claims crontab empty; `crontab -l` shows a full set of edva entries").
 
 3. **Find the mechanism, not the symptom.** Trace to a specific file and line. A root cause is a sentence of the form *"`<file>:<line>` does X, which under condition Y produces the observed failure"*. If you cannot get there, that is a legitimate outcome — record `root_cause_confidence: "low"` with what you ruled out, and route it to Step 7 rather than shipping a guess.
 
@@ -218,17 +218,17 @@ Per `auto_actionable` cluster, in score order:
 
 1. Snapshot: `PRE_SHA=$(git rev-parse HEAD)`; `git status --porcelain | sed 's/^...//' | sort -u > /tmp/dirty-pre-<id>.txt`. **A dirty tree is expected and safe** — the host always carries runtime drift. Never skip on account of it.
 2. Dispatch the implementer subagent using the **verbatim preamble** in `self-improvement-executor.md` § Step 4b (forbidden outbound CLIs, write radius, scoped staging, commit template). Add this job's extra line: *"You are fixing a recurring system-channel alert. Include a regression guard — a test, an assertion, or a comment naming the alert — so the next reader knows what this defends against."*
-3. Post-implementer gate: `$OWN_FILES` = changed set minus pre-existing drift; scan the turn for forbidden CLI calls; run `node --test` on any `*.test.mjs` in the touched directories; run `merlin doctor --json`. Any failure → **file-scoped revert of `$OWN_FILES` only**, record `outcome: "blocked"` with the reason, move on. Never `git checkout -- .`, never `git clean -fd`.
+3. Post-implementer gate: `$OWN_FILES` = changed set minus pre-existing drift; scan the turn for forbidden CLI calls; run `node --test` on any `*.test.mjs` in the touched directories; run `edva doctor --json`. Any failure → **file-scoped revert of `$OWN_FILES` only**, record `outcome: "blocked"` with the reason, move on. Never `git checkout -- .`, never `git clean -fd`.
 4. Critic subagent per the executor playbook. `SAFE` → commit; anything else → scoped revert.
 5. Commit with the shared wrapper — never a bare `git add`:
    ```bash
-   ~/Dev/merlin/bin/merlin-commit -m "<message>" -- <file> [<file> ...]
+   ~/Dev/edva/bin/edva-commit -m "<message>" -- <file> [<file> ...]
    ```
    `githooks/pre-commit` rejects undeclared staging, so a raw `git add` + `git commit` fails silently (that exact bug made every unified-approval apply report success while committing nothing, 2026-07-21 → fixed 07-22). Commit message body must name the cluster id and the alert it stops.
-   **Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary): run `bin/kernel-guard` first. The same hook refuses personal data in a staged kernel file (`system/kernel-manifest.json`) and a new file the manifest does not classify. Move the content — the incident narrative to the commit message and a `system/changelog.md` entry, this installation's values to `agent/local/config/`, its behaviour to an `_ext/` hook — or classify the file; never `MERLIN_ALLOW_KERNEL_GUARD_SKIP=1`. A regression-guard comment names the alert, never the day it fired or who saw it.
+   **Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary): run `bin/kernel-guard` first. The same hook refuses personal data in a staged kernel file (`system/kernel-manifest.json`) and a new file the manifest does not classify. Move the content — the incident narrative to the commit message and a `system/changelog.md` entry, this installation's values to `agent/local/config/`, its behaviour to an `_ext/` hook — or classify the file; never `EDVA_ALLOW_KERNEL_GUARD_SKIP=1`. A regression-guard comment names the alert, never the day it fired or who saw it.
 6. Surface it in the Improvements channel as an applied item:
    ```bash
-   ~/Dev/merlin/bin/self-improve-feed-log --type code-fix --risk <low|moderate> \
+   ~/Dev/edva/bin/self-improve-feed-log --type code-fix --risk <low|moderate> \
      --summary "<what changed, one line, plain language>" \
      --rationale "<the recurring alert + the root cause + why this stops it>" \
      --commit <sha> --status applied
@@ -248,7 +248,7 @@ cat > /tmp/sic-<id>-files.json <<'JSON'
 {"<repo-relative-path>": "<full new file content>", "...": "..."}
 JSON
 
-~/Dev/merlin/bin/self-improve-request --type code-fix \
+~/Dev/edva/bin/self-improve-request --type code-fix \
   --summary "<the issue + the fix, one line, plain language>" \
   --problem "<what is going wrong, as the user would notice it>" \
   --impact "<N alerts since <date>, and what that costs them>" \
@@ -302,7 +302,7 @@ By the time you reach this step the load-bearing records should already be on di
 
 ## State file
 
-`~/Dev/merlin/data/system-issue-review-state.json` — written only by this job (and read by its trigger for the gate). Cluster statuses:
+`~/Dev/edva/data/system-issue-review-state.json` — written only by this job (and read by its trigger for the gate). Cluster statuses:
 
 | status | meaning | Step 3 picks it? |
 |---|---|---|
@@ -318,17 +318,17 @@ Per-cluster fields added 2026-07-25: `disposition` (`"fix"` | `"review-only"`), 
 
 **`resolution: "self-healed"` is retired.** It was the marker for "closed without looking." A recovered incident is now either `reviewed` + `reviewed-no-fix` (looked, nothing to change) or `resolved` (looked, fixed). Any cluster still carrying `self-healed` from before this change is treated as unreviewed: set `disposition: "review-only"`, `status: "open"`, and let it through the review lane once.
 
-`~/Dev/merlin/data/system-issue-review-pending.json` — transient batch written fresh by the trigger each run. Not authoritative; safe to delete.
+`~/Dev/edva/data/system-issue-review-pending.json` — transient batch written fresh by the trigger each run. Not authoritative; safe to delete.
 
-`~/Dev/merlin/data/system-issue-review-critical-dispatched.json` — `{signature: ISO}` of same-day escalations, written by the **trigger** (not this job) after a confirmed dispatch, so the hourly lane can't re-fire on a condition it already escalated. 24h dedup window, entries pruned at 7 days. Never edit it from an agent turn; deleting it only costs one duplicate escalation.
+`~/Dev/edva/data/system-issue-review-critical-dispatched.json` — `{signature: ISO}` of same-day escalations, written by the **trigger** (not this job) after a confirmed dispatch, so the hourly lane can't re-fire on a condition it already escalated. 24h dedup window, entries pruned at 7 days. Never edit it from an agent turn; deleting it only costs one duplicate escalation.
 
 ## Guardrails
 
 - **Read-only on the system channel.** Never posts to it, never marks its messages read, never deletes.
-- **Outbound surface is exactly two commands:** `self-improve-feed-log` and `self-improve-request`. No `merlin-send-curl`, no `merlin-notify`, no `email-send`, no `gmail-action send`, no iMessage, no WhatsApp — this job has no business messaging anyone.
+- **Outbound surface is exactly two commands:** `self-improve-feed-log` and `self-improve-request`. No `edva-send-curl`, no `edva-notify`, no `email-send`, no `gmail-action send`, no iMessage, no WhatsApp — this job has no business messaging anyone.
 - **No operating the machine** (CRITICAL RULE 2): no restarts, no `launchctl`, no `kill`, no crontab edits, no re-dispatching failed jobs.
-- **Scoped commits only** via `merlin-commit`. Never `git add -A` / `.` / `-u` / `tools/`. Never `git push` from the implementer. Files it did not edit are not its to commit.
-- **Never touches** `secrets/`, `credentials/`, any `.env*`, `~/.claude/`, or anything outside `~/Dev/merlin/`.
+- **Scoped commits only** via `edva-commit`. Never `git add -A` / `.` / `-u` / `tools/`. Never `git push` from the implementer. Files it did not edit are not its to commit.
+- **Never touches** `secrets/`, `credentials/`, any `.env*`, `~/.claude/`, or anything outside `~/Dev/edva/`.
 - **≤3 fix attempts + ≤3 review-only passes per run, ≤1 Face-ID card per run.** A critical-escalation run does exactly 1 cluster and files at most 1 card.
 - **Nothing closes unreviewed.** No cluster reaches `reviewed` / `resolved` without a recorded `root_cause`. A recovery is evidence, never a close (§ Step 2c).
 - **A no-fix review is silent.** `reviewed-no-fix` writes state and posts nothing — no card, no feed-log entry. Visibility is the weekly `nightly-review` roundup.

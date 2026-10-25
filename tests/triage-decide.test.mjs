@@ -8,7 +8,7 @@ writeLocalConfig("triage-decide", {
   code_tags: [{ tag: "receipt-scan", webhook: { job: "receipt-scan", source: "receipt-email" }, help: "receipt-scan = a purchase receipt to file;" }],
 });
 const {
-  validateDecision, planActions, dueDate, evidenceAsOf, senderName, decide, compare, cutoverReady, MERLIN_SENDER, buildPrompt,
+  validateDecision, planActions, dueDate, evidenceAsOf, senderName, decide, compare, cutoverReady, EDVA_SENDER, buildPrompt,
 } = await import("../lib/triage-decide.mjs");
 
 const ctx = { messageId: "fake-msg-c01", from: "Acme Legal <docs@acme-legal.example>", subject: "Contract docs", date: "Sat, 3 Oct 2026 20:05:00 +0200" };
@@ -29,8 +29,8 @@ test("an intake-stamped P1 stays P1 whatever the model says", () => {
   assert.equal(r.decision.priority, "P1");
 });
 
-test("Merlin's own mail never gets a pointer or a task", () => {
-  const r = validateDecision({ label: "personal", priority: "P1", notify: true, task: { action: "read" } }, { from: `Merlin <${MERLIN_SENDER}>` });
+test("Edva's own mail never gets a pointer or a task", () => {
+  const r = validateDecision({ label: "personal", priority: "P1", notify: true, task: { action: "read" } }, { from: `Edva <${EDVA_SENDER}>` });
   assert.equal(r.decision.notify, false);
   assert.equal(r.decision.task, null);
 });
@@ -68,11 +68,11 @@ test("dueDate: weekday today, weekend next Monday, urgent today (the installatio
   assert.equal(dueDate(new Date("2026-10-03T15:00:00Z"), true), "2026-10-03"); // Sat urgent
   assert.equal(dueDate(new Date("2026-10-05T23:30:00Z")), "2026-10-05");   // Mon 23:30 local (UTC)
   // The day is the instance zone's, not UTC's: Sunday 16:00Z is already Monday in Tokyo.
-  process.env.MERLIN_TZ = "Asia/Tokyo";
+  process.env.EDVA_TZ = "Asia/Tokyo";
   try {
     assert.equal(dueDate(new Date("2026-10-04T16:00:00Z")), "2026-10-05");
   } finally {
-    delete process.env.MERLIN_TZ;
+    delete process.env.EDVA_TZ;
   }
 });
 

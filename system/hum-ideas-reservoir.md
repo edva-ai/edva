@@ -86,7 +86,7 @@ When hum picks an idea and sends the ping:
 
 1. Append a `consumed` record to `hum-ideas.jsonl` with the `ping_id`.
 
-When `merlin hum feedback <ping-id> <reaction>` is called (chat-agent
+When `edva hum feedback <ping-id> <reaction>` is called (chat-agent
 handles this per existing rules):
 
 2. The CLI checks if the ping originated from an idea (by looking up
@@ -189,7 +189,7 @@ a minimum-urgency floor (0.35).
 
 **Boundaries** (same as hum):
 - Read-only on all external systems
-- Never sends email, iMessage, or Merlin pings directly
+- Never sends email, iMessage, or Edva pings directly
 - Never modifies tasks, calendar, email
 - Only write is appending to `hum-ideas.jsonl`
 
@@ -282,7 +282,7 @@ nomination.
 
 The hum pre-rank filter (`lib/hum-vetoes.mjs` `findSamePlacePitch`, Jev
 site `hum-place-repeat`, see `docs/jev.md`) vetoes a dining / taste-match
-idea that re-recommends a place Merlin already recommended in the last 21 days
+idea that re-recommends a place Edva already recommended in the last 21 days
 under another idea id (the motivating case: one restaurant pitched under two
 idea ids, nine days apart). The
 veto fires only on Jev at ≥ 0.85, or on Sonnet when Jev is below that, and only
@@ -318,5 +318,5 @@ always starts with `hum-place-repeat:`.
 - `data/hum-interests.json` — register `ideas` topic (edit)
 - `system/tasks.json` — register `hum-ideation` cron (edit)
 - `agent/ops-agent/jobs/hum.md` — document consumption marker + pass ping_id from idea candidates (edit)
-- `bin/merlin` (hum feedback subcommand) — write reaction record to `hum-ideas.jsonl` when ping originated from an idea (edit)
+- `bin/edva` (hum feedback subcommand) — write reaction record to `hum-ideas.jsonl` when ping originated from an idea (edit)
 - `agent/ops-agent/jobs/hum-review.md` — add weekly pruning step + surface scorecard in weekly memo (edit)

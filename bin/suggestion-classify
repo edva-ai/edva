@@ -66,7 +66,7 @@ function die(msg, code = 2) { console.error(msg); process.exit(code); }
 function debug(...m) { if (process.env.SUGGESTION_CLASSIFY_DEBUG) console.error("[classify]", ...m); }
 
 const messageId = flag("--message-id");
-// The merlin_messages.id this reply is THREADED to, when the user used the app's
+// The edva_messages.id this reply is THREADED to, when the user used the app's
 // Reply action. Pins the ping instead of guessing by recency (see §4).
 const replyTo = flag("--reply-to");
 const fromStdin = flag("--stdin", false);
@@ -178,12 +178,12 @@ function findRecentOpenPing(now = Date.now()) {
 async function saidSince(ping, msgId) {
   if (!ping?.sent_at || !msgId) return null;
   try {
-    const me = await request(`/rest/v1/merlin_messages?id=eq.${encodeURIComponent(msgId)}&select=created_at`, { timeoutMs: 3000 });
+    const me = await request(`/rest/v1/edva_messages?id=eq.${encodeURIComponent(msgId)}&select=created_at`, { timeoutMs: 3000 });
     const at = me?.[0]?.created_at;
     if (!at) return null;
     const from = new Date(ping.sent_at).toISOString();
     const rows = await request(
-      `/rest/v1/merlin_messages?select=id,content,channel&role=eq.assistant` +
+      `/rest/v1/edva_messages?select=id,content,channel&role=eq.assistant` +
       `&created_at=gt.${encodeURIComponent(from)}&created_at=lt.${encodeURIComponent(at)}` +
       `&order=created_at.desc&limit=10`, { timeoutMs: 3000 });
     const hit = (rows || []).find((r) => (!r.channel || r.channel === "chat") && r.id !== ping.message_id && r.content);
@@ -600,7 +600,7 @@ if (!result.disposition) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Tapbacks already write the reaction via the existing `merlin hum
+// 5. Tapbacks already write the reaction via the existing `edva hum
 //    feedback` path — don't double-record. If the ping already has a
 //    structured reaction recorded, only write a free-text reaction when it
 //    adds new information (e.g. price reason on top of a generic 👎). The

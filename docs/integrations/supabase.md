@@ -7,7 +7,7 @@ Wire Supabase if you want any of:
 - **Persistent message + command history** that survives supervisor restarts.
 - **APNs push routing** through a Supabase edge function.
 
-Without Supabase, Merlin still works for cron-driven jobs + email triage + the wiki/memory layer. The phone-channel + companion app are the only features that hard-require it.
+Without Supabase, Edva still works for cron-driven jobs + email triage + the wiki/memory layer. The phone-channel + companion app are the only features that hard-require it.
 
 ## 1. Create a Supabase project
 
@@ -18,7 +18,7 @@ At https://supabase.com:
 - Service-role key → Settings → API → `service_role` (this is the secret one).
 - Anon key → Settings → API → `anon` `public`.
 
-Record the project in `agent/local/instance.json` (`"supabase_project": "<ref>"` — `merlin init` asks for it; `MERLIN_SUPABASE_PROJECT` in `.env` overrides), the public anon key in `agent/local/config/supabase.json` (`{"anon_key": "..."}`), and the secret in `.env`:
+Record the project in `agent/local/instance.json` (`"supabase_project": "<ref>"` — `edva init` asks for it; `EDVA_SUPABASE_PROJECT` in `.env` overrides), the public anon key in `agent/local/config/supabase.json` (`{"anon_key": "..."}`), and the secret in `.env`:
 
 ```
 SUPABASE_SERVICE_ROLE_KEY=...
@@ -31,13 +31,13 @@ For the MCP server's Management-API access (creating/inspecting projects via the
 SUPABASE_ACCESS_TOKEN=sbp_...    # generate at supabase.com/dashboard/account/tokens
 ```
 
-## 2. Tables Merlin expects
+## 2. Tables Edva expects
 
 The phone-channel + companion-app pipeline expects these tables. Apply via the Supabase SQL editor or by adding migration files to your fork:
 
 ```sql
 -- Messages between the user (via companion app) and the agent
-create table merlin_messages (
+create table edva_messages (
   id uuid primary key default gen_random_uuid(),
   role text not null check (role in ('user','assistant','system')),
   content text not null,
@@ -45,13 +45,13 @@ create table merlin_messages (
   ack boolean default false,
   reaction text,
   device_token text,
-  parent_id uuid references merlin_messages(id),
+  parent_id uuid references edva_messages(id),
   created_at timestamptz not null default now()
 );
-alter table merlin_messages enable row level security;
+alter table edva_messages enable row level security;
 
 -- Commands from the agent to the phone (e.g. get_location requests)
-create table merlin_commands (
+create table edva_commands (
   id uuid primary key default gen_random_uuid(),
   command text not null,
   payload jsonb,
@@ -59,7 +59,7 @@ create table merlin_commands (
   response jsonb,
   created_at timestamptz not null default now()
 );
-alter table merlin_commands enable row level security;
+alter table edva_commands enable row level security;
 
 -- Phone context (motion + Wi-Fi + audio class) — one row per device
 create table phone_context (
@@ -83,30 +83,30 @@ create table device_tokens (
 alter table device_tokens enable row level security;
 ```
 
-Enable Realtime on `merlin_messages` (Database → Replication → toggle on for the merlin_messages table). Without this, the phone-channel can't subscribe.
+Enable Realtime on `edva_messages` (Database → Replication → toggle on for the edva_messages table). Without this, the phone-channel can't subscribe.
 
 If you also want location/health/photos sync (the companion app's full feature set), add the corresponding tables — see the iOS app's `SupabaseManager.swift` for the exact schemas. For a minimal setup, the four tables above are enough.
 
 ## 3. Verify
 
-Start the agent (`./bin/merlin up`), check the logs:
+Start the agent (`./bin/edva up`), check the logs:
 
 ```
-[phone-channel] subscribed to merlin_messages realtime
+[phone-channel] subscribed to edva_messages realtime
 [phone-channel] subscribed to phone_context realtime
 [phone-channel] ready
 ```
 
-If you see `FATAL: SUPABASE_SERVICE_ROLE_KEY not set in .env`, the env var didn't propagate — check that `.env` sits at `$MERLIN_HOME/.env` and that `process-manager.mjs` loaded it (it logs a warning when it cannot).
+If you see `FATAL: SUPABASE_SERVICE_ROLE_KEY not set in .env`, the env var didn't propagate — check that `.env` sits at `$EDVA_HOME/.env` and that `process-manager.mjs` loaded it (it logs a warning when it cannot).
 
 ## 4. Companion app pairing
 
 For the iOS/macOS companion app at `apps/companion/`:
 
 1. Build per [`apps/companion/CODE-SIGNING.md`](../../apps/companion/CODE-SIGNING.md).
-2. The app sources carry placeholders, not a project: replace `${MERLIN_SUPABASE_PROJECT}` and `${MERLIN_SUPABASE_ANON_KEY}` in `apps/companion/Merlin/SupabaseManager.swift` (and, for Trainer, `apps/trainer/Trainer/Services/TrainerSupabase.swift` plus the `SupabaseURL` / `SupabaseAnonKey` keys in `apps/trainer/Trainer/Info.plist`) with your project ref and anon key in your local build — or inject them at build time — and don't commit the filled-in values (`.tools/sanitize-guard.py` flags a committed JWT).
+2. The app sources carry placeholders, not a project: replace `${EDVA_SUPABASE_PROJECT}` and `${EDVA_SUPABASE_ANON_KEY}` in `apps/companion/Edva/SupabaseManager.swift` (and, for Trainer, `apps/trainer/Trainer/Services/TrainerSupabase.swift` plus the `SupabaseURL` / `SupabaseAnonKey` keys in `apps/trainer/Trainer/Info.plist`) with your project ref and anon key in your local build — or inject them at build time — and don't commit the filled-in values (`.tools/sanitize-guard.py` flags a committed JWT).
 3. Run the app, sign in (Google Sign-In is the default; the app exchanges the Google credential for a Supabase session).
-4. The app subscribes to `merlin_messages` and posts new user messages there. The phone-channel daemon on your host sees them via Realtime and routes them to the chat-supervisor.
+4. The app subscribes to `edva_messages` and posts new user messages there. The phone-channel daemon on your host sees them via Realtime and routes them to the chat-supervisor.
 
 ## RLS policies
 
@@ -116,12 +116,12 @@ A reasonable starting policy:
 
 ```sql
 create policy "users can see their own messages"
-  on merlin_messages for select
+  on edva_messages for select
   to authenticated
   using (auth.uid() is not null);
 
 create policy "users can insert their own messages"
-  on merlin_messages for insert
+  on edva_messages for insert
   to authenticated
   with check (role = 'user');
 ```

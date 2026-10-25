@@ -6,21 +6,21 @@
 # macOS TCC permission prompts (Screen Recording / Accessibility / Automation)
 # and chrome-devtools-mcp re-signs can silently drop the grant and break
 # browser-automation jobs. This script probes the CDP port and fires exactly
-# one Merlin ping on each UP→DOWN transition; DOWN→UP is silent (self-heal).
+# one Edva ping on each UP→DOWN transition; DOWN→UP is silent (self-heal).
 #
-# Install via crontab: */15 * * * * $HOME/Dev/merlin/agent/scripts/chrome-cdp-watch.sh
+# Install via crontab: */15 * * * * $HOME/Dev/edva/agent/scripts/chrome-cdp-watch.sh
 #
 # State: data/chrome-cdp-state.json {state, since, last_notified}
 # Log:   agent/logs/watchdog.log  (single source of truth for ops alerts)
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-STATE_FILE="$HOME/Dev/merlin/data/chrome-cdp-state.json"
-LOG="$HOME/Dev/merlin/agent/logs/watchdog.log"
+STATE_FILE="$HOME/Dev/edva/data/chrome-cdp-state.json"
+LOG="$HOME/Dev/edva/agent/logs/watchdog.log"
 NOW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-# chrome-cdp LaunchAgent + Chrome details (mirror com.merlin.chrome-cdp.plist).
-PLIST="$HOME/Library/LaunchAgents/com.merlin.chrome-cdp.plist"
+# chrome-cdp LaunchAgent + Chrome details (mirror com.edva.chrome-cdp.plist).
+PLIST="$HOME/Library/LaunchAgents/com.edva.chrome-cdp.plist"
 CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE="$HOME/.cache/chrome-devtools-mcp/chrome-profile"
 
@@ -30,10 +30,10 @@ CHROME_PROFILE="$HOME/.cache/chrome-devtools-mcp/chrome-profile"
 # state transitions are recorded; only the ping is suppressed. If CDP is still
 # down at 09:00 local, the next post-09:00 tick notifies. Base-10 normalize to
 # avoid octal parse of "08"/"09".
-USER_TZ_FILE="$HOME/Dev/merlin/data/user-timezone.json"
-# Fallback: the home timezone (lib/instance.cjs tz, as MERLIN_TZ).
+USER_TZ_FILE="$HOME/Dev/edva/data/user-timezone.json"
+# Fallback: the home timezone (lib/instance.cjs tz, as EDVA_TZ).
 source "$(dirname "$0")/lib/instance.sh"
-USER_TZ="${MERLIN_TZ:-UTC}"
+USER_TZ="${EDVA_TZ:-UTC}"
 if [ -f "$USER_TZ_FILE" ]; then
   PARSED_TZ=$(jq -r '.timezone // empty' "$USER_TZ_FILE" 2>/dev/null)
   if [ -n "$PARSED_TZ" ] && TZ="$PARSED_TZ" date +%H >/dev/null 2>&1; then
@@ -49,7 +49,7 @@ if [ "$HOUR_LOCAL" -lt 9 ]; then IN_QUIET_HOURS=1; fi
 # Uses `localhost` (not 127.0.0.1) — Chrome 147 silently binds an IPv4 stub
 # to :9222 from the user's interactive profile that 404s on every CDP path.
 # `localhost` resolves to ::1 first on macOS, hitting the LaunchAgent-managed
-# automation Chrome (com.merlin.chrome-cdp) which binds IPv6 :9222.
+# automation Chrome (com.edva.chrome-cdp) which binds IPv6 :9222.
 HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9222/json/version 2>/dev/null || echo "000")
 if [ "$HTTP_CODE" = "200" ]; then
   CURR="up"
@@ -70,7 +70,7 @@ fi
 # full interval of grace; a leaked tab is reaped on the next tick. about:blank is
 # always kept so the window (and the CDP port) stays alive.
 if [ "$CURR" = "up" ]; then
-  TAB_SNAP="$HOME/Dev/merlin/data/chrome-tab-snapshot.json"
+  TAB_SNAP="$HOME/Dev/edva/data/chrome-tab-snapshot.json"
   CLOSE_IDS=$(curl -s --max-time 5 "http://localhost:9222/json/list" | TAB_SNAP="$TAB_SNAP" python3 -c '
 import json, os, sys
 try:
@@ -149,7 +149,7 @@ write_state() {
 #          browser-automation jobs can run; not KeepAlive-managed until a later
 #          bootstrap succeeds, but better than staying dark.
 self_heal_chrome_cdp() {
-  local svc="gui/$UID/com.merlin.chrome-cdp"
+  local svc="gui/$UID/com.edva.chrome-cdp"
   if launchctl print "$svc" >/dev/null 2>&1; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] heal tier1: kickstart $svc" >> "$LOG"
     launchctl kickstart -k "$svc" >> "$LOG" 2>&1
@@ -190,7 +190,7 @@ fi
 # until the NEXT tick. If the kickstart recovers Chrome before we re-probe,
 # the next tick reads "up" and the alert never fires.
 if [ "$PREV" = "up" ] && [ "$CURR" = "down" ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] transition up→down (HTTP $HTTP_CODE) — kickstarting com.merlin.chrome-cdp" >> "$LOG"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [chrome-cdp-watch] transition up→down (HTTP $HTTP_CODE) — kickstarting com.edva.chrome-cdp" >> "$LOG"
   self_heal_chrome_cdp
   write_state "down" "" "$NOW_ISO"
   exit 0
@@ -215,10 +215,10 @@ if [ "$PREV" = "down" ] && [ "$CURR" = "down" ] && [ -z "$PREV_NOTIFIED" ]; then
     # --skip-precheck: chrome-cdp liveness alert is infrastructure-critical;
     # bypass the Sonnet-gated outbound precheck for the same reasons as
     # watchdog.sh (see system/architecture.md § Outbound Precheck).
-    # MERLIN_INFRA_PROBE=1 — cron-run, un-sandboxed HTTP probe of :9222, so
-    # it may make a machine-health claim (see merlin-send-curl's gate).
-    MERLIN_INFRA_PROBE=1 "$HOME/Dev/merlin/bin/merlin-send-curl" --suppress-hook --skip-precheck --intent chrome-cdp-down --channel system \
-      "🔌 Chrome DevTools port 9222 unreachable (HTTP $HTTP_CODE) — auto-restart of com.merlin.chrome-cdp didn't recover it. Likely TCC permission prompt (Screen Recording / Accessibility / Automation) or chrome-devtools-mcp re-signed. Browser-automation jobs will skip until this clears. Manual intervention needed." \
+    # EDVA_INFRA_PROBE=1 — cron-run, un-sandboxed HTTP probe of :9222, so
+    # it may make a machine-health claim (see edva-send-curl's gate).
+    EDVA_INFRA_PROBE=1 "$HOME/Dev/edva/bin/edva-send-curl" --suppress-hook --skip-precheck --intent chrome-cdp-down --channel system \
+      "🔌 Chrome DevTools port 9222 unreachable (HTTP $HTTP_CODE) — auto-restart of com.edva.chrome-cdp didn't recover it. Likely TCC permission prompt (Screen Recording / Accessibility / Automation) or chrome-devtools-mcp re-signed. Browser-automation jobs will skip until this clears. Manual intervention needed." \
       > /dev/null 2>&1
     write_state "down" "$NOW_ISO" "keep"
   fi

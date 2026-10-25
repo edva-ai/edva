@@ -7,7 +7,7 @@
  *   1. gcloud CLI authenticated: gcloud auth application-default login
  *   2. Pub/Sub topic created: gcloud pubsub topics create gmail-new-messages
  *   3. Gmail API enabled in Google Cloud Console
- *   4. OAuth credentials saved to ~/Dev/merlin/credentials/gmail-oauth.json
+ *   4. OAuth credentials saved to ~/Dev/edva/credentials/gmail-oauth.json
  *
  * Usage: node scripts/setup-gmail-watch.mjs
  */
@@ -24,10 +24,10 @@ const CREDS_PATH = join(ROOT, "..", "credentials", "gmail-oauth.json");
 const TOKEN_PATH = join(ROOT, "..", "data", "gmail-push-token.json");
 
 // This installation's Google Cloud project (lib/instance.cjs gcp_project;
-// MERLIN_GCP_PROJECT overrides).
+// EDVA_GCP_PROJECT overrides).
 const PROJECT_ID = createRequire(import.meta.url)("../../lib/instance.cjs").instanceValue("gcp_project");
 if (!PROJECT_ID) {
-  console.error("No GCP project configured: set gcp_project in agent/local/instance.json or MERLIN_GCP_PROJECT.");
+  console.error("No GCP project configured: set gcp_project in agent/local/instance.json or EDVA_GCP_PROJECT.");
   process.exit(1);
 }
 const TOPIC_NAME = `projects/${PROJECT_ID}/topics/gmail-new-messages`;

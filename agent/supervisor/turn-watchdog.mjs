@@ -119,7 +119,7 @@ export function isProgressEvent(ev) {
 
 // Sources where a human is waiting on the turn, so a stalled queue is felt
 // immediately and the short leash is worth its false-positive rate:
-//   merlin     — the user's live phone-channel messages (chat supervisor)
+//   edva     — the user's live phone-channel messages (chat supervisor)
 //   gmail:<id>  — a single email triage; runs in seconds, and the dispatcher's
 //                 poison-message guard already drops it after two hangs
 // Everything else — cron jobs, watchers, digests, supervisor maintenance — is
@@ -132,7 +132,7 @@ export function isProgressEvent(ev) {
 // retry is killed again and dropped, and the request is lost; these turns
 // routinely run 5-6 minutes and longer, so 10 minutes is under the normal
 // runtime of the work.
-export const INTERACTIVE_SOURCES = new Set(["merlin"]);
+export const INTERACTIVE_SOURCES = new Set(["edva"]);
 
 export function isInteractiveSource(source) {
   // A missing source is a bug, not a job: keep it on the short leash so it can

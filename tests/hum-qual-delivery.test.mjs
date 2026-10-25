@@ -18,7 +18,7 @@ import { spawnSync } from "node:child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HELPER = path.join(__dirname, "..", "bin", "hum-deliver-qual");
 
-// A fake merlin-send-curl. Modes via env FAKE_MODE:
+// A fake edva-send-curl. Modes via env FAKE_MODE:
 //   ok       -> writes id file after --capture-id, prints "Message sent", exit 0
 //   suppress -> prints a precheck line to stderr, no id file, exit 0
 // Shebang points at the interpreter running the tests, NOT `/usr/bin/env node`:
@@ -50,13 +50,13 @@ if (process.env.FAKE_MODE === "resolve-fyi" || process.env.FAKE_MODE === "resolv
   fs.writeFileSync(idFile + ".resolve.json", JSON.stringify({ by: "hum-resolve-first", decision_id: "hr-2", action: "rewrite", verdict: gap ? "partial" : "resolved", still_question: gap, text: gap ? "Only the gap?" : "Here is the answer." }));
 }
 if (idFile) fs.writeFileSync(idFile, "msg-abc-123\\n");
-process.stdout.write("Message sent to Merlin.\\n");
+process.stdout.write("Message sent to Edva.\\n");
 process.exit(0);
 `;
 
 function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "hum-qual-"));
-  const data = path.join(root, "Dev/merlin/data");
+  const data = path.join(root, "Dev/edva/data");
   fs.mkdirSync(data, { recursive: true });
   const sender = path.join(root, "fake-send");
   fs.writeFileSync(sender, FAKE_SENDER);
@@ -193,7 +193,7 @@ test("outside courtesy hours → waits (queue kept, no send)", () => {
 });
 
 // ── resolve-first gate ───────────────────────────────────────
-// The send now passes bin/hum-resolve-first inside merlin-send-curl.
+// The send now passes bin/hum-resolve-first inside edva-send-curl.
 
 function queued(env) {
   fs.writeFileSync(p(env.data, "hum-qual-delivery-queue.json"), JSON.stringify(QUEUE_ENTRY));

@@ -359,7 +359,7 @@ describe("chat-supervisor end-to-end", { skip: !canChildListen() && "child proce
     await httpPost(port, "/dispatch", { content: "log-test", source: "test", priority: "high" });
     await sleep(500);
 
-    const logDir = path.join(os.homedir(), "Dev/merlin/agent/logs/supervisor-test-chat");
+    const logDir = path.join(os.homedir(), "Dev/edva/agent/logs/supervisor-test-chat");
     // Events and cost logs should exist (or in the stateDir — let's check both).
     // The EventLog uses eventDir which is constructed from the agent name.
     const eventsPath = path.join(logDir, "events.ndjson");

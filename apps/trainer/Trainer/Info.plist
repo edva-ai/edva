@@ -43,19 +43,19 @@
     <key>NSFaceIDUsageDescription</key>
     <string>Unlock Trainer with Face ID so only you can see your training history.</string>
     <key>NSHealthShareUsageDescription</key>
-    <string>Trainer reads the workouts and health metrics you choose to share (such as heart rate, sleep, and activity) to track your training and recovery. If you connect Merlin in Settings, they are also synced to your Merlin assistant.</string>
+    <string>Trainer reads the workouts and health metrics you choose to share (such as heart rate, sleep, and activity) to track your training and recovery. If you connect Edva in Settings, they are also synced to your Edva assistant.</string>
     <key>NSHealthUpdateUsageDescription</key>
     <string>Save your completed workouts to the Health app.</string>
     <key>NSHealthClinicalHealthRecordsShareUsageDescription</key>
-    <string>Trainer reads the health records you choose to share. If you connect Merlin in Settings, they are synced to your Merlin assistant so it can take your medical history into account alongside your training.</string>
+    <string>Trainer reads the health records you choose to share. If you connect Edva in Settings, they are synced to your Edva assistant so it can take your medical history into account alongside your training.</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>com.example.trainer.merlin.auth</string>
+            <string>com.example.trainer.edva.auth</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>com.example.trainer.merlin</string>
+                <string>com.example.trainer.edva</string>
             </array>
         </dict>
     </array>
@@ -64,8 +64,8 @@
         <string>audio</string>
     </array>
     <key>SupabaseURL</key>
-    <string>https://${MERLIN_TRAINER_SUPABASE_PROJECT}.supabase.co</string>
+    <string>https://${EDVA_TRAINER_SUPABASE_PROJECT}.supabase.co</string>
     <key>SupabaseAnonKey</key>
-    <string>${MERLIN_TRAINER_SUPABASE_ANON_KEY}</string>
+    <string>${EDVA_TRAINER_SUPABASE_ANON_KEY}</string>
 </dict>
 </plist>

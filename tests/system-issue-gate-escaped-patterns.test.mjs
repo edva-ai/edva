@@ -3,7 +3,7 @@
 // nothing at all.
 //
 // The alert shapes these defend against come from the system channel:
-//   ⚠️ 58 calendar event(s) with attendees Merlin cannot account for: ...
+//   ⚠️ 58 calendar event(s) with attendees Edva cannot account for: ...
 //   ⚠️ ... gmail.googleapis.com unreachable ...
 // Neither had ever matched its own cluster. A cluster sat in `verifying` and
 // due for closure while its flagship wording went unrecognised — a silent
@@ -19,12 +19,12 @@ import {
 } from "../lib/system-issue-gate.mjs";
 
 // Verbatim shapes as they sit in the state file today.
-const OVER_ESCAPED_CALENDAR = "calendar event\\\\(s\\\\) with attendees Merlin cannot account for";
+const OVER_ESCAPED_CALENDAR = "calendar event\\\\(s\\\\) with attendees Edva cannot account for";
 const OVER_ESCAPED_DNS = "gmail\\\\.googleapis\\\\.com unreachable";
 const CORRECT_DNS = "gmail\\.googleapis\\.com unreachable";
 
 const CALENDAR_ALERT =
-  "⚠️ 58 calendar event(s) with attendees Merlin cannot account for:\n\n" +
+  "⚠️ 58 calendar event(s) with attendees Edva cannot account for:\n\n" +
   "• Team sync — guest@example.com (no row in the write log covers this event)";
 const DNS_ALERT = "⚠️ p1 unstar-scan: gmail.googleapis.com unreachable (getaddrinfo ENOTFOUND)";
 
@@ -82,7 +82,7 @@ test("end to end: a repeat critical alert no longer buys a duplicate same-day di
   };
   assert.equal(isBeingWorked(cluster), true);
 
-  const critical = "🔴 58 calendar event(s) with attendees Merlin cannot account for: • Team sync";
+  const critical = "🔴 58 calendar event(s) with attendees Edva cannot account for: • Team sync";
   const { escalate, suppressed } = selectCriticalEscalations({
     rows: [{ role: "assistant", content: critical, created_at: "2026-09-20T09:17:02Z" }],
     cursor: "2026-09-19T00:00:00Z",

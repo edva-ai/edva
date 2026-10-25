@@ -23,13 +23,13 @@
 # run, so the gate matters.
 
 set -uo pipefail
-export PATH="/opt/homebrew/bin:$PATH:$HOME/Dev/merlin/bin"
+export PATH="/opt/homebrew/bin:$PATH:$HOME/Dev/edva/bin"
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # MERLIN_INSTALL, MERLIN_INSTALL_TOOLS
-ROOT="$MERLIN_INSTALL"
-DATA="$MERLIN_INSTALL_TOOLS/data"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_INSTALL, EDVA_INSTALL_TOOLS
+ROOT="$EDVA_INSTALL"
+DATA="$EDVA_INSTALL_TOOLS/data"
 LOG="$DATA/logs/cost-efficiency-review.log"
-REPORT="$MERLIN_INSTALL_TOOLS/bin/merlin-cost-report"
+REPORT="$EDVA_INSTALL_TOOLS/bin/edva-cost-report"
 TODAY_JSON="$DATA/cost-efficiency-today.json"
 WEEK_JSON="$DATA/cost-efficiency-7d.json"
 STATE="$DATA/cost-efficiency-review-state.json"
@@ -86,7 +86,7 @@ if [ ! -f "$STATE" ]; then
     const state = { baseline: seed_baseline, history: [], proposals: [], silent_streak_days: 0, last_run_at: null };
     require("fs").writeFileSync(process.argv[2], JSON.stringify(state, null, 2) + "\n");
     process.stdout.write(String(seed_baseline.captured_at || "no"));
-  ' "$MERLIN_INSTALL_TOOLS/lib/instance.cjs" "$STATE" > "$DATA/.cost-review-seed.tmp" 2>>"$LOG" \
+  ' "$EDVA_INSTALL_TOOLS/lib/instance.cjs" "$STATE" > "$DATA/.cost-review-seed.tmp" 2>>"$LOG" \
     && log "seeded state file with the $(cat "$DATA/.cost-review-seed.tmp") baseline"
   rm -f "$DATA/.cost-review-seed.tmp"
 fi
@@ -98,7 +98,7 @@ fi
 # un-sandboxed process already holds, so none of it needs a model. The agent
 # ANNOTATES this row (job_cost_index, attribution, verdicts) rather than
 # creating it. Idempotent, and can never block the dispatch.
-node "$MERLIN_INSTALL_TOOLS/agent/scripts/lib/cost-review-seed-history.mjs" \
+node "$EDVA_INSTALL_TOOLS/agent/scripts/lib/cost-review-seed-history.mjs" \
   "$TODAY_JSON" "$STATE" >>"$LOG" 2>&1 || true
 
 # --- Prune settled memory out of the state file ----------------------------
@@ -108,7 +108,7 @@ node "$MERLIN_INSTALL_TOOLS/agent/scripts/lib/cost-review-seed-history.mjs" \
 # entries, the prose on history rows older than 7 days, and detail on
 # proposals applied over 14 days ago. Deterministic, idempotent, fails open —
 # it can never block the night's review.
-node "$MERLIN_INSTALL_TOOLS/agent/scripts/lib/cost-review-state-prune.mjs" \
+node "$EDVA_INSTALL_TOOLS/agent/scripts/lib/cost-review-state-prune.mjs" \
   "$STATE" "$DATA/cost-efficiency-review-archive.json" >>"$LOG" 2>&1 || true
 
 # --- Derive what the agent turn would otherwise re-derive ------------------
@@ -120,12 +120,12 @@ node "$MERLIN_INSTALL_TOOLS/agent/scripts/lib/cost-review-state-prune.mjs" \
 # is deterministic arithmetic over files this process already holds. Doing it
 # here turns ~6-8 tool-calling turns plus their follow-ups into one read.
 # Same rationale as the report pre-fetch above. Fails open.
-node "$MERLIN_INSTALL_TOOLS/bin/cost-review-prefetch.mjs" \
+node "$EDVA_INSTALL_TOOLS/bin/cost-review-prefetch.mjs" \
   "$TODAY_JSON" "$WEEK_JSON" "$DATA/cost-efficiency-derived.json" >>"$LOG" 2>&1 || true
 
 log "dispatching (${DISPATCHES} dispatches in window)"
-exec "$MERLIN_INSTALL_TOOLS/agent/scripts/lib/run-ephemeral-opus.sh" \
+exec "$EDVA_INSTALL_TOOLS/agent/scripts/lib/run-ephemeral-opus.sh" \
   cost-efficiency-review \
-  "$MERLIN_INSTALL_TOOLS/agent/ops-agent/jobs/cost-efficiency-review.md" \
-  --task "COST EFFICIENCY REVIEW (daily). Today's measurement is already fetched at data/cost-efficiency-today.json (24h) and data/cost-efficiency-7d.json (7d) — read those, do NOT re-run merlin-cost-report. The mechanical derivations are ALSO pre-computed at data/cost-efficiency-derived.json — the per-job ledger rollup (today vs the prior window, gmail:* folded), the mix-vs-drift decomposition of turns_per_dispatch, the always-loaded mtime sweep, context-guard runaway candidates with the playbook's runaway-row discriminators already applied, this job own per-run cost series, and job_cost_index comparability. Read that file instead of re-deriving any of it. Compare against the baseline in data/cost-efficiency-review-state.json, attribute any regression to a specific change, and build every concrete cut tonight and land it through self-improve-auto-apply (Face-ID card via self-improve-request on exit 3); put decisions with nothing to sign in questions[] in the state file. NEVER email, ping or push — this job has no delivery step (2026-10-06)." \
+  "$EDVA_INSTALL_TOOLS/agent/ops-agent/jobs/cost-efficiency-review.md" \
+  --task "COST EFFICIENCY REVIEW (daily). Today's measurement is already fetched at data/cost-efficiency-today.json (24h) and data/cost-efficiency-7d.json (7d) — read those, do NOT re-run edva-cost-report. The mechanical derivations are ALSO pre-computed at data/cost-efficiency-derived.json — the per-job ledger rollup (today vs the prior window, gmail:* folded), the mix-vs-drift decomposition of turns_per_dispatch, the always-loaded mtime sweep, context-guard runaway candidates with the playbook's runaway-row discriminators already applied, this job own per-run cost series, and job_cost_index comparability. Read that file instead of re-deriving any of it. Compare against the baseline in data/cost-efficiency-review-state.json, attribute any regression to a specific change, and build every concrete cut tonight and land it through self-improve-auto-apply (Face-ID card via self-improve-request on exit 3); put decisions with nothing to sign in questions[] in the state file. NEVER email, ping or push — this job has no delivery step (2026-10-06)." \
   --timeout-min 25

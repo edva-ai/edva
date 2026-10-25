@@ -1,5 +1,5 @@
 // filter.mjs: decide whether an inbound WhatsApp message should push to
-// the user's phone (merlin-notify) or land silently in the inbox log only.
+// the user's phone (edva-notify) or land silently in the inbox log only.
 //
 // Loaded by index.mjs and consulted on every inbound message. Config lives
 // in filter-config.json next to this file; it's re-read on every call so
@@ -122,7 +122,7 @@ export function classifyForPush(entry) {
   const isNewsletter = typeof entry.chat_id === "string" && entry.chat_id.endsWith("@newsletter");
 
   // (5) 1:1 DMs are not pushed by default: WhatsApp already notifies for direct
-  // messages on the phone, so echoing each one into the Merlin chat would
+  // messages on the phone, so echoing each one into the Edva chat would
   // double it. They stay in whatsapp-inbox.jsonl for the record. Set
   // `push_direct_messages: true` in filter-config.json to push them; use
   // always_push_senders above to force a push for one must-see person.
@@ -132,7 +132,7 @@ export function classifyForPush(entry) {
   }
 
   // From here down: group chats and newsletters, which are usually muted on the
-  // phone. WhatsApp itself stays quiet on those, so Merlin surfaces only the
+  // phone. WhatsApp itself stays quiet on those, so Edva surfaces only the
   // messages that are *relevant* — a host-alias mention or a notify keyword.
 
   // (6) Group + host alias mentioned in text. Use token boundaries so

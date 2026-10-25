@@ -1,6 +1,6 @@
 // self-improve.mjs — WP11: gated runtime self-improvement (the agent extends itself).
 //
-// Goal: when Merlin hits a recurring need with no capability, it can AUTHOR a
+// Goal: when Edva hits a recurring need with no capability, it can AUTHOR a
 // module (a skill, or a read/compute tool) and — ONLY after the owner reviews the
 // actual code and approves — load it live via the WP5 plugin loader, no redeploy.
 //
@@ -46,8 +46,8 @@ export const FORBIDDEN_PATTERNS = [
   /security\s+(find|add|delete)-generic-password/i, /\bop\s+(read|run|item)/i,
   /\.credentials/i, /SUPABASE_SERVICE_ROLE_KEY/, /process\.env/,
   // outbound / privileged capabilities (network, subprocess, identity channels)
-  /email-send/i, /gmail-action/i, /\bimsg\b/i, /whatsapp/i, /merlin-send/i,
-  /sendApnsPush/i, /merlin-notify/i, /\bfetch\s*\(/i, /child_process/i, /\bexec(File|Sync)?\b/i,
+  /email-send/i, /gmail-action/i, /\bimsg\b/i, /whatsapp/i, /edva-send/i,
+  /sendApnsPush/i, /edva-notify/i, /\bfetch\s*\(/i, /child_process/i, /\bexec(File|Sync)?\b/i,
   /\bspawn\b/i,
 ];
 
@@ -194,7 +194,7 @@ export function createSelfImprove({
     // injected notify — email/phone/etc). notify gets (summary, code, meta) so the
     // channel can render the full code + the unguessable approval id (the shared
     // secret an owner reply must echo).
-    const summary = `Merlin wrote a module: "${name}" — ${rationale || "(no rationale given)"}`;
+    const summary = `Edva wrote a module: "${name}" — ${rationale || "(no rationale given)"}`;
     const code = renderDiff(name, files);
     try { await notify?.(summary, code, { approvalId: pend.approval_id, name, rationale }); }
     catch (e) { audit("self_improve.notify_failed", { name, error: e.message }); }

@@ -1,15 +1,15 @@
-name: Merlin Companion - iOS TestFlight
+name: Edva Companion - iOS TestFlight
 
 on:
   workflow_dispatch:
 
-# Allow multiple Merlin builds to queue (don't cancel the earlier one).
+# Allow multiple Edva builds to queue (don't cancel the earlier one).
 # Cross-repo parallelism is naturally supported: each repo's runner agent
 # picks jobs independently, and this workflow now uses per-job ephemeral
 # state (keychain in $RUNNER_TEMP, profiles auto-fetched by Xcode via ASC
 # API) so it does not collide with concurrent builds from other repos.
 concurrency:
-  group: merlin-companion-ios-${{ github.ref }}
+  group: edva-companion-ios-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
 
           # Prepend this keychain to the user search list, under the HOST-WIDE
-          # mutex shared by every signing repo on the host. This used to use /tmp/merlin-ci-keychain.lock — a per-repo lock,
+          # mutex shared by every signing repo on the host. This used to use /tmp/edva-ci-keychain.lock — a per-repo lock,
           # which serialized this repo against itself but NOT against the other
           # signing repos sharing this runner, all of which mutate the same global
           # user search list on this host. A lock nobody else contends for is
@@ -93,7 +93,7 @@ jobs:
       - name: Update build number
         run: |
           BUILD_NUMBER=${{ github.run_number }}
-          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Merlin.xcodeproj/project.pbxproj
+          sed -i '' -E "s/CURRENT_PROJECT_VERSION = [0-9]+;/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/g" Edva.xcodeproj/project.pbxproj
 
       - name: Clean per-job DerivedData
         run: rm -rf "$RUNNER_TEMP/DerivedData"
@@ -101,14 +101,14 @@ jobs:
       - name: Resolve packages
         run: |
           xcodebuild -resolvePackageDependencies \
-            -project Merlin.xcodeproj \
-            -scheme Merlin \
+            -project Edva.xcodeproj \
+            -scheme Edva \
             -derivedDataPath "$RUNNER_TEMP/DerivedData"
 
       - name: Pin distribution profile specifiers in pbxproj
         run: |
           python3 <<'PYEOF'
-          path = 'Merlin.xcodeproj/project.pbxproj'
+          path = 'Edva.xcodeproj/project.pbxproj'
           with open(path) as f:
               c = f.read()
           # Force Manual + Apple Distribution signing. -allowProvisioningUpdates
@@ -118,11 +118,11 @@ jobs:
               'CODE_SIGN_STYLE = Manual; "CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";')
           c = c.replace('PROVISIONING_PROFILE_SPECIFIER = "";', '')
           c = c.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService;',
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "Merlin NotificationService AppStore";')
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService;',
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva.NotificationService; PROVISIONING_PROFILE_SPECIFIER = "Edva NotificationService AppStore";')
           c = c.replace(
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin;',
-              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Merlin; PROVISIONING_PROFILE_SPECIFIER = "Merlin AppStore";')
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva;',
+              'PRODUCT_BUNDLE_IDENTIFIER = com.example.Edva; PROVISIONING_PROFILE_SPECIFIER = "Edva AppStore";')
           with open(path, 'w') as f:
               f.write(c)
           PYEOF
@@ -133,10 +133,10 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcodebuild archive \
-            -project Merlin.xcodeproj \
-            -scheme Merlin \
+            -project Edva.xcodeproj \
+            -scheme Edva \
             -configuration Release \
-            -archivePath "$RUNNER_TEMP/Merlin-iOS.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Edva-iOS.xcarchive" \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             -allowProvisioningUpdates \
@@ -152,7 +152,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Merlin-iOS.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Edva-iOS.xcarchive" \
             -exportPath "$RUNNER_TEMP/export-ios" \
             -exportOptionsPlist ExportOptions.plist \
             -allowProvisioningUpdates \
@@ -186,7 +186,7 @@ jobs:
           if [ -n "$KEYCHAIN" ] && [ -e "$KEYCHAIN" ]; then
             # $REMAINING could come back EMPTY (our keychain the only entry), and
             # `list-keychains -s` with no arguments SETS an empty list rather than
-            # doing nothing — evicting login.keychain-db and taking a Merlin agent
+            # doing nothing — evicting login.keychain-db and taking a Edva agent
             # on this host auth-down. kc_remove guarantees login survives. It also
             # matches the path literally (grep -vxF); "^$KEYCHAIN$" treated the dots
             # in the path as regex wildcards.
@@ -209,6 +209,6 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: merlin-companion-ios-ipa
+          name: edva-companion-ios-ipa
           path: ${{ runner.temp }}/export-ios/*.ipa
           retention-days: 3

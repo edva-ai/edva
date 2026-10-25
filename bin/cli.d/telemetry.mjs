@@ -1,12 +1,12 @@
-// merlin telemetry — show or change the anonymous install-ping setting.
+// edva telemetry — show or change the anonymous install-ping setting.
 //
-//   merlin telemetry [status]   effective setting, endpoint, contexts already pinged
-//   merlin telemetry on|off     write MERLIN_TELEMETRY=on|off to .env
-//   merlin telemetry ping [--ctx C] [--force]
+//   edva telemetry [status]   effective setting, endpoint, contexts already pinged
+//   edva telemetry on|off     write EDVA_TELEMETRY=on|off to .env
+//   edva telemetry ping [--ctx C] [--force]
 //                               send the ping now (still honours every opt-out)
 //
 // What is sent and why: bin/cli.d/_telemetry.mjs and apps/telemetry/README.md.
-// MERLIN_NO_TELEMETRY=1 in the environment always wins.
+// EDVA_NO_TELEMETRY=1 in the environment always wins.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -20,9 +20,9 @@ export default {
     const { c, die, getFlag, hasFlag } = ctx;
     const sub = args.find((a) => !a.startsWith("--")) || "status";
     if (isHelp(args)) {
-      console.log("Usage: merlin telemetry [status] | on | off | ping [--ctx <label>] [--force]");
+      console.log("Usage: edva telemetry [status] | on | off | ping [--ctx <label>] [--force]");
       console.log("One anonymous first-run ping per host and context; no PII, no raw IP.");
-      console.log("MERLIN_NO_TELEMETRY=1 in the environment disables it whatever .env says.");
+      console.log("EDVA_NO_TELEMETRY=1 in the environment disables it whatever .env says.");
       return;
     }
     const envPath = path.join(CHECKOUT, ".env");
@@ -37,9 +37,9 @@ export default {
       return;
     }
     if (sub === "on" || sub === "off") {
-      setDotEnv(envPath, "MERLIN_TELEMETRY", sub);
-      console.log(c.green(`✓ MERLIN_TELEMETRY=${sub} written to .env`));
-      if (sub === "on" && process.env.MERLIN_NO_TELEMETRY === "1") console.log(c.yellow("  note: MERLIN_NO_TELEMETRY=1 in this environment still disables the ping"));
+      setDotEnv(envPath, "EDVA_TELEMETRY", sub);
+      console.log(c.green(`✓ EDVA_TELEMETRY=${sub} written to .env`));
+      if (sub === "on" && process.env.EDVA_NO_TELEMETRY === "1") console.log(c.yellow("  note: EDVA_NO_TELEMETRY=1 in this environment still disables the ping"));
       return;
     }
     if (sub === "ping") {
@@ -49,6 +49,6 @@ export default {
       console.log(r === "sent" ? c.green(`✓ ping sent (ctx=${ctxLabel})`) : c.dim(`not sent — ${r.replace(/^skipped:/, "")}`));
       return;
     }
-    die(`unknown: telemetry ${sub}. Try: merlin telemetry help`);
+    die(`unknown: telemetry ${sub}. Try: edva telemetry help`);
   },
 };

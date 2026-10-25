@@ -6,9 +6,9 @@
 # on an expired OAuth token lets the 30-min cron stack ~20 instances and starve
 # a RAM-constrained host into a hard power-cycle.
 export PATH="/opt/homebrew/bin:$PATH"
-BIN="$HOME/Dev/merlin/bin"
-LOG="$HOME/Dev/merlin/agent/logs/context-sync.log"
-LOCK="$HOME/Dev/merlin/agent/logs/context-sync.lock"
+BIN="$HOME/Dev/edva/bin"
+LOG="$HOME/Dev/edva/agent/logs/context-sync.log"
+LOCK="$HOME/Dev/edva/agent/logs/context-sync.lock"
 
 # The installation's own work that rides this tick (optional hook
 # _ext/context-sync-tick.sh; none in a plain install). Capped at 2 min and

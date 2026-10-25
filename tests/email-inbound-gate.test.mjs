@@ -1,5 +1,5 @@
 // Guards the structural half of email-inbound (lib/email-inbound-gate.mjs):
-// allowlist drop, Worker-retry dedup on Message-ID, reply-to-Merlin lookup,
+// allowlist drop, Worker-retry dedup on Message-ID, reply-to-Edva lookup,
 // and the handled/dropped log rows. None of it reads what the message says.
 // A made-up installation (owner and agent addresses), the same in every checkout.
 import "./synthetic-instance.mjs";

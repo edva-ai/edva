@@ -64,7 +64,7 @@ test("low-confidence Jev → Sonnet decides alone", async () => {
   assert.equal(f.rows()[0].used, "legacy");
 });
 
-test("merlin-model-only intents never reach Jev; input withheld", async () => {
+test("edva-model-only intents never reach Jev; input withheld", async () => {
   // A synthetic installation that adds its own brokerage intent to the kernel's
   // private prefixes (agent/local/config/send-intents.json).
   const local = path.join(f.tmp, "local");
@@ -72,7 +72,7 @@ test("merlin-model-only intents never reach Jev; input withheld", async () => {
   fs.writeFileSync(path.join(local, "config", "send-intents.json"), JSON.stringify({ extend_jev_private_intent_prefixes: ["brokerco"] }));
   for (const intent of ["bank-alert", "hum:finance:dup-charge", "brokerco-snapshot", "health:labs"]) {
     f.reset();
-    const { json } = await run({ intent, jev: choice("send", 0.99, OPTS), sonnet: "send", env: { MERLIN_LOCAL_DIR: local } });
+    const { json } = await run({ intent, jev: choice("send", 0.99, OPTS), sonnet: "send", env: { EDVA_LOCAL_DIR: local } });
     assert.equal(json.decision, "send");
     assert.equal(f.jevCalls().length, 0, `${intent}: Jev not called`);
     const [row] = f.rows();
@@ -87,7 +87,7 @@ function protectedLocal() {
   const local = path.join(f.tmp, "local-protected");
   fs.mkdirSync(path.join(local, "config"), { recursive: true });
   fs.writeFileSync(path.join(local, "config", "hum-lanes.json"), JSON.stringify({ protected_lanes: ["practice", "health"] }));
-  return { MERLIN_LOCAL_DIR: local };
+  return { EDVA_LOCAL_DIR: local };
 }
 
 test("protected intents (p1-email, hum:practice, hum:health) stay on Sonnet", async () => {
@@ -114,7 +114,7 @@ test("after the shadow window a confident Jev send costs zero Sonnet calls", asy
 });
 
 test("no gateway key → exactly the old Sonnet behavior", async () => {
-  // HOME → tmp so jev.mjs's loadEnv can't pick a real key up from ~/Dev/merlin/.env (the host has one).
+  // HOME → tmp so jev.mjs's loadEnv can't pick a real key up from ~/Dev/edva/.env (the host has one).
   const { json } = await run({ jev: choice("send", 0.99, OPTS), sonnet: "suppress", env: { TYPESAFE_API_KEY: "", HOME: f.tmp } });
   assert.equal(json.decision, "suppress");
   assert.equal(f.jevCalls().length, 0);
@@ -158,7 +158,7 @@ test("protected intents stay off Jev even with privacy exclusions disabled", asy
 });
 
 // The same switch must still do its own job: with privacy exclusions ON, a
-// merlin-model-only intent is excluded for PRIVACY, not for protection, and
+// edva-model-only intent is excluded for PRIVACY, not for protection, and
 // its input is withheld from the log. Protection never withholds anything.
 test("privacy exclusions still bite when enabled, and are a separate reason", async () => {
   f.reset();

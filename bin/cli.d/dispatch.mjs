@@ -1,4 +1,4 @@
-// merlin dispatch — hand a job to the ops supervisors by hand.
+// edva dispatch — hand a job to the ops supervisors by hand.
 //
 // POSTs {"job": "<name>"} (plus an optional free-text task) to the webhook of
 // the job's tier, the same routing the cron triggers use
@@ -67,8 +67,8 @@ export default {
     const { c, die, getFlag, hasFlag } = ctx;
     const job = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--task" && args[i - 1] !== "--port");
     if (!job || isHelp(args)) {
-      console.log("Usage: merlin dispatch <job> [--task \"extra instructions\"] [--port N] [--dry-run]");
-      console.log("       merlin dispatch            # list dispatchable jobs");
+      console.log("Usage: edva dispatch <job> [--task \"extra instructions\"] [--port N] [--dry-run]");
+      console.log("       edva dispatch            # list dispatchable jobs");
       if (!job && !isHelp(args)) {
         const files = jobFiles();
         if (files.size) {
@@ -79,7 +79,7 @@ export default {
       return;
     }
     const task = getFlag(args, "--task");
-    const payload = JSON.stringify({ job, source: "merlin-cli", ...(task ? { task } : {}) });
+    const payload = JSON.stringify({ job, source: "edva-cli", ...(task ? { task } : {}) });
     let chain = TIERS[resolveTier(job)];
     const portFlag = getFlag(args, "--port");
     if (portFlag) chain = [["(--port)", Number(portFlag), null]];
@@ -96,10 +96,10 @@ export default {
       if (hport == null || await healthy(hport)) { target = [name, wport]; break; }
       console.log(c.dim(`  ${name} (:${hport}) not healthy — trying the next tier`));
     }
-    if (!target) die("no healthy supervisor for this job. Is the stack running? Try `merlin up`, then `merlin status`.");
+    if (!target) die("no healthy supervisor for this job. Is the stack running? Try `edva up`, then `edva status`.");
 
     const token = webhookToken(KERNEL);
-    if (!token) die("no webhook token (secrets/webhook-token or WEBHOOK_TOKEN) — run `merlin init` first.");
+    if (!token) die("no webhook token (secrets/webhook-token or WEBHOOK_TOKEN) — run `edva init` first.");
     let res;
     try {
       res = await fetch(`http://127.0.0.1:${target[1]}`, {

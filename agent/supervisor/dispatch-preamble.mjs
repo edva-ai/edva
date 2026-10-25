@@ -30,7 +30,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 
 // Home timezone and the operator's name, from lib/instance.cjs
-// (MERLIN_TZ, else agent/local/instance.json, else the host's zone).
+// (EDVA_TZ, else agent/local/instance.json, else the host's zone).
 const { instance } = createRequire(import.meta.url)("../../lib/instance.cjs");
 const INSTANCE = instance();
 const TZ = INSTANCE.tz;

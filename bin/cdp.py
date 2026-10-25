@@ -37,7 +37,7 @@ CDP_PORT = os.environ.get("CDP_PORT", "9222")
 CDP_HOST = "http://localhost:%s" % CDP_PORT
 _STATE_SUFFIX = "" if CDP_PORT == "9222" else "-%s" % CDP_PORT
 STATE = os.path.expanduser(
-    "~/Dev/merlin/data/.cdp-driver-state%s.json" % _STATE_SUFFIX
+    "~/Dev/edva/data/.cdp-driver-state%s.json" % _STATE_SUFFIX
 )
 TIMEOUT = 30
 

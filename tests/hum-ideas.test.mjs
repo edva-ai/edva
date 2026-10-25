@@ -13,7 +13,7 @@ import { routeFor, manualScope, pickAsk, lastAsks, ASK_COOLDOWN_H, ASK_MAX_PER_D
 
 const BIN = resolve(dirname(fileURLToPath(import.meta.url)), "../bin");
 const MANUAL = manualScope();
-const idea = (o) => ({ id: "i", scope: "merlin_autonomous", risk: "low", effort: "quick", status: "proposed", ...o });
+const idea = (o) => ({ id: "i", scope: "edva_autonomous", risk: "low", effort: "quick", status: "proposed", ...o });
 
 test("routeFor: each kind of idea has exactly one home", () => {
   assert.equal(routeFor(idea({})), "build_auto");
@@ -34,8 +34,8 @@ test("manualScope: manual_user by default, manual_<owner_id> per installation", 
   const scopeWith = (inst) => {
     const dir = mkdtempSync(join(tmpdir(), "hum-ideas-local-"));
     if (inst) writeFileSync(join(dir, "instance.json"), JSON.stringify(inst));
-    const env = { ...process.env, MERLIN_LOCAL_DIR: dir };
-    delete env.MERLIN_OWNER_ID; delete env.MERLIN_OWNER_NAME;
+    const env = { ...process.env, EDVA_LOCAL_DIR: dir };
+    delete env.EDVA_OWNER_ID; delete env.EDVA_OWNER_NAME;
     const lib = new URL("../lib/hum-ideas.mjs", import.meta.url).href;
     const r = spawnSync(process.execPath, ["--input-type=module", "-e",
       `const m = await import(${JSON.stringify(lib)}); const s = m.manualScope(); process.stdout.write(s + " " + m.routeFor({ scope: s, status: "proposed", effort: "quick" }) + " " + m.routeFor({ scope: "manual_user", status: "proposed", effort: "quick" }));`], { env, encoding: "utf8" });

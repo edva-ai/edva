@@ -1,4 +1,4 @@
-// merlin review-pr — LLM review of a diff for narrative personal-content leaks.
+// edva review-pr — LLM review of a diff for narrative personal-content leaks.
 //
 // The pattern-based sanitize guard catches explicit identifiers (names,
 // handles, project refs, tokens). It cannot catch content that names nothing
@@ -7,9 +7,9 @@
 // generated docs that paraphrase private context. This asks Claude to look
 // for exactly that.
 //
-//   merlin review-pr <PR#>            diff from `gh pr diff <N>`
-//   merlin review-pr --file <path>    any local text file
-//   merlin review-pr --stdin          a diff on stdin
+//   edva review-pr <PR#>            diff from `gh pr diff <N>`
+//   edva review-pr --file <path>    any local text file
+//   edva review-pr --stdin          a diff on stdin
 //   --json  machine-readable output   --model M  --max-diff-bytes N
 //
 // Needs ANTHROPIC_API_KEY (environment or .env) and @anthropic-ai/sdk (the
@@ -21,7 +21,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { CHECKOUT, readDotEnv, isHelp } from "./_common.mjs";
 
-export const SYSTEM_PROMPT = `You are reviewing a code diff for personal-content leaks that would land in a PUBLIC open-source repository called Merlin. Your job is one thing only: catch personal/identity-coupled content that pattern-based scanners cannot.
+export const SYSTEM_PROMPT = `You are reviewing a code diff for personal-content leaks that would land in a PUBLIC open-source repository called Edva. Your job is one thing only: catch personal/identity-coupled content that pattern-based scanners cannot.
 
 ## What's already screened (do NOT re-flag)
 
@@ -156,11 +156,11 @@ export function filterAndTrimDiff(raw, maxBytes) {
 }
 
 function help(c) {
-  console.log(c.bold("merlin review-pr") + " — LLM review of a diff for narrative personal-content leaks\n");
+  console.log(c.bold("edva review-pr") + " — LLM review of a diff for narrative personal-content leaks\n");
   console.log("Usage:");
-  console.log("  merlin review-pr <PR#>          [--model M] [--max-diff-bytes N] [--json]");
-  console.log("  merlin review-pr --file <path>  [--model M] [--json]");
-  console.log("  merlin review-pr --stdin        [--model M] [--json]\n");
+  console.log("  edva review-pr <PR#>          [--model M] [--max-diff-bytes N] [--json]");
+  console.log("  edva review-pr --file <path>  [--model M] [--json]");
+  console.log("  edva review-pr --stdin        [--model M] [--json]\n");
   console.log(`Defaults: --model ${DEFAULT_MODEL}  --max-diff-bytes ${MAX_DIFF_BYTES}`);
   console.log("Needs ANTHROPIC_API_KEY (environment or .env); a PR number needs the gh CLI.");
   console.log("Exit 1 on a \"block\" verdict.\n");
@@ -193,21 +193,21 @@ export default {
       catch (e) { die(`gh pr diff ${pr} failed: ${String(e.message).split("\n")[0]}`); }
       source = `PR #${pr}`;
     } else {
-      die("usage: merlin review-pr <PR#> | --file <path> | --stdin  (--help for flags)");
+      die("usage: edva review-pr <PR#> | --file <path> | --stdin  (--help for flags)");
     }
     if (!raw.trim()) die(`no content from ${source}`);
     const { body, skipped, truncated } = filterAndTrimDiff(raw, maxBytes);
     if (!body.trim()) die("every file in the diff was skip-listed (lockfiles, binaries, ...)");
 
     const key = apiKey();
-    if (!key) die("no ANTHROPIC_API_KEY in the environment or .env — set it, or run: merlin init");
+    if (!key) die("no ANTHROPIC_API_KEY in the environment or .env — set it, or run: edva init");
     let Anthropic;
     try { ({ default: Anthropic } = await import("@anthropic-ai/sdk")); }
     catch { die(`@anthropic-ai/sdk is not installed — run: npm ci --prefix ${CHECKOUT}`); }
     const client = new Anthropic({ apiKey: key });
 
     if (!json) {
-      console.log(c.bold("merlin review-pr") + c.dim(` — ${source}, model=${model}`));
+      console.log(c.bold("edva review-pr") + c.dim(` — ${source}, model=${model}`));
       if (skipped) console.log(c.dim(`  skipped ${skipped} lockfile/binary file(s)`));
       if (truncated) console.log(c.yellow(`  warning: diff truncated to ${maxBytes} bytes — consider splitting the PR`));
       console.log(c.dim("  calling Claude…\n"));

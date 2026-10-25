@@ -8,7 +8,7 @@
 // The host's ~/.claude/settings.json turns the Claude Code Bash sandbox on and
 // denies reading ~/Library/Keychains. ops-agent/ and chat-agent/ switch it off
 // in gitignored .claude/settings.local.json files; ops-light-agent/ and
-// ops-haiku-agent/ had none. So a merlin-send-curl run from an ops-light turn
+// ops-haiku-agent/ had none. So a edva-send-curl run from an ops-light turn
 // forked the precheck's `claude -p` inside the sandbox, the fork could not
 // read the Max login, printed "Not logged in · Please run /login", and the gate
 // failed open. agent/supervisor/index.mjs now passes

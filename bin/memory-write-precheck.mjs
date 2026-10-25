@@ -25,7 +25,7 @@
 //
 // Usage from an agent or playbook:
 //   echo '{"page_id":"reference_<page>","content":"<person> is now also flying to <city> on <date>","intent":"travel-update"}' \
-//     | ~/Dev/merlin/bin/memory-write-precheck.mjs
+//     | ~/Dev/edva/bin/memory-write-precheck.mjs
 //   # → {"decision":"conflict","conflicts":[...],"resolution":"...","reason":"..."}
 
 import { spawnSync } from "node:child_process";
@@ -183,7 +183,7 @@ const JEV_SITE = "memory-write-precheck";
 // Async (execFile, not spawnSync) so the shadow Sonnet turn and the Jev call
 // genuinely overlap — a spawnSync here would run Sonnet to completion before
 // the Jev request was even sent.
-// Tool-less, Max-only, off the merlin tree's settings — lib/jev-claude.mjs.
+// Tool-less, Max-only, off the edva tree's settings — lib/jev-claude.mjs.
 async function sonnetCheck() {
   const sonnetOut = await runToolless({ bin: CLAUDE_BIN, model: "claude-sonnet-5-5", prompt, timeoutMs: 60000 });
   if (!sonnetOut) throw new Error("precheck_sonnet_unavailable");

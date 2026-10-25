@@ -3,11 +3,11 @@
 # Provides CURL_AUTH array for use in curl calls: curl ... "${CURL_AUTH[@]}" ...
 # If the token file is missing, CURL_AUTH is empty and curl works without auth.
 
-# Where the installation lives and which node to run (MERLIN_INSTALL_TOOLS,
-# MERLIN_NODE).
+# Where the installation lives and which node to run (EDVA_INSTALL_TOOLS,
+# EDVA_NODE).
 source "$(dirname "${BASH_SOURCE[0]}")/root.sh"
 
-WEBHOOK_TOKEN_FILE="$MERLIN_INSTALL_TOOLS/secrets/webhook-token"
+WEBHOOK_TOKEN_FILE="$EDVA_INSTALL_TOOLS/secrets/webhook-token"
 CURL_AUTH=()
 if [ -f "$WEBHOOK_TOKEN_FILE" ]; then
   WEBHOOK_TOKEN=$(cat "$WEBHOOK_TOKEN_FILE")
@@ -27,11 +27,11 @@ fi
 # Each tier has a degrade-UPWARD health fallback (haiku→sonnet→opus) so a
 # scheduled job is never dropped just because a cheaper sibling is flaky.
 # Fail safe: anything the router can't classify defaults to ops.
-NODE_BIN="${NODE_BIN:-$MERLIN_NODE}"
+NODE_BIN="${NODE_BIN:-$EDVA_NODE}"
 # Both registries are the kernel's file (config/job-routing.json,
 # config/chrome-jobs.json) plus this installation's agent/local/<name>.json,
 # merged by lib/registry.cjs.
-REGISTRY_CJS="$MERLIN_INSTALL_TOOLS/lib/registry.cjs"
+REGISTRY_CJS="$EDVA_INSTALL_TOOLS/lib/registry.cjs"
 
 # _resolve_tier <job-name> -> echoes "haiku" | "light" | "heavy"
 _resolve_tier() {
@@ -90,7 +90,7 @@ resolve_tier_ports() {
 dispatch_or_skip() {
   local payload="$1"
   local job_name="${2:-$(basename "$0" .sh)}"
-  local logfile="$MERLIN_INSTALL_TOOLS/agent/logs/watchdog.log"
+  local logfile="$EDVA_INSTALL_TOOLS/agent/logs/watchdog.log"
   local tier; tier=$(_resolve_tier "$job_name")
 
   # webhook:health port pairs, cheapest first.

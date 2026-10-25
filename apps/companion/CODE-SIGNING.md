@@ -6,42 +6,42 @@ The companion app ships with placeholder values where personal identifiers used 
 
 | Token | Replace with | Where it appears |
 |---|---|---|
-| `TEAMID_PLACEHOLDER` | Your 10-character Apple Team ID | 11 places across `Merlin.xcodeproj`, fastlane configs, ExportOptions plists, and both workflow YAMLs |
-| `com.example.Merlin` | Your reverse-DNS bundle ID for the app | xcodeproj, Info.plist, fastlane, ExportOptions |
-| `com.example.Merlin.NotificationService` | Bundle ID for the notification-service extension | xcodeproj, ExportOptions |
-| `com.example.merlin` (lowercase) | The URL-scheme variant | `Merlin/Info.plist` (`CFBundleURLSchemes` + `CFBundleURLName`) |
+| `TEAMID_PLACEHOLDER` | Your 10-character Apple Team ID | 11 places across `Edva.xcodeproj`, fastlane configs, ExportOptions plists, and both workflow YAMLs |
+| `com.example.Edva` | Your reverse-DNS bundle ID for the app | xcodeproj, Info.plist, fastlane, ExportOptions |
+| `com.example.Edva.NotificationService` | Bundle ID for the notification-service extension | xcodeproj, ExportOptions |
+| `com.example.edva` (lowercase) | The URL-scheme variant | `Edva/Info.plist` (`CFBundleURLSchemes` + `CFBundleURLName`) |
 | `<Developer Name>` | The display name on your "Apple Distribution" certificate | `ios-testflight.yml` (used in a `grep` against `security find-identity` output) |
 
 Find your Team ID at https://developer.apple.com/account → Membership.
 
 ## One-shot helper
 
-Replace `ABCDEFGHIJ` with your Team ID and `com.yourname.Merlin` with your bundle ID, then run from the repo root:
+Replace `ABCDEFGHIJ` with your Team ID and `com.yourname.Edva` with your bundle ID, then run from the repo root:
 
 ```bash
 TEAM=ABCDEFGHIJ
-BUNDLE=com.yourname.Merlin
+BUNDLE=com.yourname.Edva
 NAME="Your Name"
 
 git ls-files apps/companion | xargs sed -i '' \
   -e "s/TEAMID_PLACEHOLDER/$TEAM/g" \
-  -e "s/com\\.example\\.Merlin\\.NotificationService/$BUNDLE.NotificationService/g" \
-  -e "s/com\\.example\\.Merlin/$BUNDLE/g" \
-  -e "s/com\\.example\\.merlin/$(echo $BUNDLE | tr A-Z a-z)/g" \
+  -e "s/com\\.example\\.Edva\\.NotificationService/$BUNDLE.NotificationService/g" \
+  -e "s/com\\.example\\.Edva/$BUNDLE/g" \
+  -e "s/com\\.example\\.edva/$(echo $BUNDLE | tr A-Z a-z)/g" \
   -e "s/<Developer Name>/$NAME/g"
 
 git ls-files .github/workflows | xargs sed -i '' \
   -e "s/TEAMID_PLACEHOLDER/$TEAM/g" \
-  -e "s/com\\.example\\.Merlin\\.NotificationService/$BUNDLE.NotificationService/g" \
-  -e "s/com\\.example\\.Merlin/$BUNDLE/g" \
+  -e "s/com\\.example\\.Edva\\.NotificationService/$BUNDLE.NotificationService/g" \
+  -e "s/com\\.example\\.Edva/$BUNDLE/g" \
   -e "s/<Developer Name>/$NAME/g"
 
 # Verify
-git ls-files | xargs grep -lE "TEAMID_PLACEHOLDER|com\\.example\\.Merlin|<Developer Name>"
+git ls-files | xargs grep -lE "TEAMID_PLACEHOLDER|com\\.example\\.Edva|<Developer Name>"
 # Above should print nothing — anything that prints is something the script missed.
 ```
 
-Then commit those changes in your fork. **Do not push them upstream** if you're contributing to the public Merlin repo — keep your signing identity local.
+Then commit those changes in your fork. **Do not push them upstream** if you're contributing to the public Edva repo — keep your signing identity local.
 
 ## GitHub Actions secrets you also need
 

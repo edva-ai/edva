@@ -1,5 +1,5 @@
 // launchd-render.test.mjs — the kernel's launchd plists are templates
-// (__MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__) and render into complete, machine-specific
+// (__EDVA_HOME__ / __EDVA_TOOLS__ / __HOME__) and render into complete, machine-specific
 // plists; agent/launch-agents/install.sh renders the same thing.
 // Run: node --test tests/launchd-render.test.mjs
 import { test } from "node:test";
@@ -33,26 +33,26 @@ test("the kernel ships launchd plists as templates", () => {
   for (const rel of KERNEL_PLISTS) {
     const text = fs.readFileSync(path.join(REPO, rel), "utf8");
     assert.doesNotMatch(text, /\/Users\/[^_<\s]/, `${rel} holds a machine path`);
-    assert.match(text, /__MERLIN_(HOME|TOOLS)__/, `${rel} is not a template`);
+    assert.match(text, /__EDVA_(HOME|TOOLS)__/, `${rel} is not a template`);
   }
 });
 
 test("a rendered plist has no placeholder left and points at the checkout under $HOME", () => {
   for (const rel of KERNEL_PLISTS) {
     const out = render(rel);
-    assert.doesNotMatch(out, /__MERLIN_HOME__|__MERLIN_TOOLS__|__HOME__/, rel);
+    assert.doesNotMatch(out, /__EDVA_HOME__|__EDVA_TOOLS__|__HOME__/, rel);
     const label = path.basename(rel, ".plist");
     assert.match(out, new RegExp(`<key>Label</key>\\s*<string>${label.replace(/\./g, "\\.")}</string>`), rel);
-    const install = `${HOME}/Dev/merlin`, kernel = path.join(install, KERNEL_SUBDIR);
+    const install = `${HOME}/Dev/edva`, kernel = path.join(install, KERNEL_SUBDIR);
     assert.ok(out.includes(`${kernel}/`), rel);
     // Nothing but the placeholders changes.
     const template = fs.readFileSync(path.join(REPO, rel), "utf8");
-    assert.equal(out, template.replaceAll("__MERLIN_TOOLS__", kernel).replaceAll("__MERLIN_HOME__", install).replaceAll("__HOME__", HOME), rel);
+    assert.equal(out, template.replaceAll("__EDVA_TOOLS__", kernel).replaceAll("__EDVA_HOME__", install).replaceAll("__HOME__", HOME), rel);
   }
 });
 
-test("MERLIN_LAUNCHD_ROOT points the plists at another checkout", () => {
-  const out = render(KERNEL_PLISTS[0], { MERLIN_LAUNCHD_ROOT: "/opt/a&b#c" });
+test("EDVA_LAUNCHD_ROOT points the plists at another checkout", () => {
+  const out = render(KERNEL_PLISTS[0], { EDVA_LAUNCHD_ROOT: "/opt/a&b#c" });
   assert.ok(out.includes(`${path.join("/opt/a&b#c", KERNEL_SUBDIR)}/`), "the kernel paths follow the other checkout");
 });
 

@@ -24,13 +24,13 @@
 
 set -euo pipefail
 
-# Claude Code's project slug: the session start path (~/Dev/merlin) with every
+# Claude Code's project slug: the session start path (~/Dev/edva) with every
 # non-alphanumeric character turned into "-" (lib/instance.cjs claudeMemoryDir).
-PROJECT_SLUG="$(printf '%s' "${MERLIN_PROJECT_DIR:-$HOME/Dev/merlin}" | tr -c 'A-Za-z0-9' '-')"
+PROJECT_SLUG="$(printf '%s' "${EDVA_PROJECT_DIR:-$HOME/Dev/edva}" | tr -c 'A-Za-z0-9' '-')"
 MEMORY_DIR="${MEMORY_INDEX_DIR:-$HOME/.claude/projects/$PROJECT_SLUG/memory}"
-# The installation's kernel tree (MERLIN_INSTALL_TOOLS), from root.sh.
+# The installation's kernel tree (EDVA_INSTALL_TOOLS), from root.sh.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../agent/scripts/lib/root.sh"
-TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$MERLIN_INSTALL_TOOLS/data/memory-snapshots}"
+TARBALL_DIR="${MEMORY_SNAPSHOT_DIR:-$EDVA_INSTALL_TOOLS/data/memory-snapshots}"
 
 if [[ ! -d "$MEMORY_DIR/.git" ]]; then
   echo "memory-restore: $MEMORY_DIR is not a git repo" >&2

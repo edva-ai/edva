@@ -1,4 +1,4 @@
-// merlin audit — periodic review of the public/private boundary.
+// edva audit — periodic review of the public/private boundary.
 //
 //   1. .tools/sanitize-guard.py --all (every tracked file vs. the baseline)
 //   2. the last N commit messages against the same patterns (the pre-commit
@@ -9,7 +9,7 @@
 //   5. what none of this can see
 //
 // The identity patterns are not in the public tree: the guard loads them from
-// $MERLIN_SANITIZE_PATTERNS / $MERLIN_SANITIZE_PATTERNS_JSON, else
+// $EDVA_SANITIZE_PATTERNS / $EDVA_SANITIZE_PATTERNS_JSON, else
 // agent/local/sanitize-patterns.json. Without them only the generic detectors
 // run, and this report says so. Exit 1 when the guard or the commit scan
 // finds something, so CI can call it.
@@ -25,7 +25,7 @@ export default {
   async run(args, ctx) {
     const { c, getFlag } = ctx;
     if (isHelp(args)) {
-      console.log("Usage: merlin audit [--commits N]   (default N = 50)");
+      console.log("Usage: edva audit [--commits N]   (default N = 50)");
       console.log("Runs the sanitize guard over every tracked file, scans recent commit");
       console.log("messages, reports the baseline and checks no overlay file is tracked.");
       return;
@@ -33,7 +33,7 @@ export default {
     const n = parseInt(getFlag(args, "--commits", "50"), 10) || 50;
     const guard = path.join(CHECKOUT, ".tools", "sanitize-guard.py");
     const baseline = path.join(CHECKOUT, ".tools", "sanitize-guard-baseline.json");
-    console.log(c.bold("merlin audit") + c.dim(` — public/private boundary review (${new Date().toISOString().slice(0, 10)})\n`));
+    console.log(c.bold("edva audit") + c.dim(` — public/private boundary review (${new Date().toISOString().slice(0, 10)})\n`));
 
     // 1 ──────────────────────────────────────────────────────────────────
     console.log(c.bold("1. sanitize-guard (all tracked files vs. baseline)"));
@@ -63,7 +63,7 @@ export default {
     } catch (e) {
       console.log(c.red(`   couldn't load the guard's patterns: ${e.message.split("\n")[0]}`));
     }
-    if (!overlayLoaded) console.log(c.yellow("   ! no private identity patterns loaded — generic detectors only (set MERLIN_SANITIZE_PATTERNS)"));
+    if (!overlayLoaded) console.log(c.yellow("   ! no private identity patterns loaded — generic detectors only (set EDVA_SANITIZE_PATTERNS)"));
     try {
       const log = execFileSync("git", ["log", "-n", String(n), "--format=%h%x09%s%x09%b%x1e"], { cwd: CHECKOUT }).toString();
       for (const entry of log.split("\x1e").map((s) => s.trim()).filter(Boolean)) {
@@ -114,7 +114,7 @@ export default {
 
     // 5 ──────────────────────────────────────────────────────────────────
     console.log("\n" + c.bold("5. what this audit cannot see"));
-    console.log(c.dim("   • paraphrased or narrative personal content (no pattern fires) — use `merlin review-pr`"));
+    console.log(c.dim("   • paraphrased or narrative personal content (no pattern fires) — use `edva review-pr`"));
     console.log(c.dim("   • past commits: the guard scans the current tree only"));
     console.log(c.dim("   • forks, archives and search caches of anything already published"));
 

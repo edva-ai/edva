@@ -1,9 +1,9 @@
-// merlin-wiki — the wiki site served from the Supabase wiki mirror.
+// edva-wiki — the wiki site served from the Supabase wiki mirror.
 //
 // Same pages, same look, same per-person scopes as the host's `wiki serve`
 // (lib/wiki-serve.js), but with no dependency on the host being up:
 // data comes from the tables bin/wiki-cloud-sync pushes every 5 min.
-// Read-only by design — every wiki write still goes through Merlin so it
+// Read-only by design — every wiki write still goes through Edva so it
 // carries a revision.
 //
 // Security model, in order:
@@ -181,7 +181,7 @@ async function renderSearchFallback(env, q, canRead, who) {
     .map((h) => ({ id: h.id, title: h.title || h.id, type: h.type, snippetHtml: `${snippet(h.snippet)}…` }));
   return page(who, query, portalLib.searchBody({
     query, results, answer: false,
-    offline: "Merlin's memory is offline right now, so these are plain text matches from the cloud copy, with no answer.",
+    offline: "Edva's memory is offline right now, so these are plain text matches from the cloud copy, with no answer.",
   }), { q: query });
 }
 
@@ -239,7 +239,7 @@ export default {
       }
       if (u.pathname.startsWith("/api/")) {
         const res = await viaOrigin(req, u.pathname === "/api/ask" ? 75000 : 12000);
-        return res || new Response(JSON.stringify({ error: "Merlin's memory is offline right now." }), { status: 503, headers: { "content-type": "application/json", ...PRIVATE } });
+        return res || new Response(JSON.stringify({ error: "Edva's memory is offline right now." }), { status: 503, headers: { "content-type": "application/json", ...PRIVATE } });
       }
 
       const pages = (await pageIndex(env)).filter((p) => canRead(p.id) && p.status === "active");
@@ -247,7 +247,7 @@ export default {
         const type = u.searchParams.get("type");
         if (u.searchParams.get("pinned") === "1") {
           const pinned = pages.filter((p) => p.pinned).sort(byTitle);
-          return html(200, page(who, "Always in mind", portalLib.listingBody({ title: "Always in mind", dek: "The pages Merlin keeps in mind in every conversation.", pages: pinned }), { active: "pinned" }));
+          return html(200, page(who, "Always in mind", portalLib.listingBody({ title: "Always in mind", dek: "The pages Edva keeps in mind in every conversation.", pages: pinned }), { active: "pinned" }));
         }
         if (type) {
           const label = portalLib.TYPE_LABEL[type] || type;

@@ -26,7 +26,7 @@ import { localRung, sonnetRung } from "../lib/model-ladder.mjs";
 
 // Rule #0b ladder for the trigger-cue tier: local rung first, Sonnet only when
 // the local one fails validation (embedPendingPages caps how often that runs).
-// Both are Merlin's own models — on-device Ollama and the Max-authenticated
+// Both are Edva's own models — on-device Ollama and the Max-authenticated
 // session (tool-less `claude -p`, lib/jev-claude.mjs) — so a health or
 // finance page is safe on either rung. The Sonnet rung only works where the
 // Max login is readable: the nightly launchd agent (ai.claude.wiki-assoc-nightly),

@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hum-lens-"));
-process.env.MERLIN_LOCAL_DIR = tmp;
+process.env.EDVA_LOCAL_DIR = tmp;
 fs.mkdirSync(path.join(tmp, "config"));
 const { lensOf, lensFields, buildScorecard } = await import("../lib/hum-ideas-scorecard.mjs");
 const setLegacy = (names) => fs.writeFileSync(path.join(tmp, "config", "hum-ideas.json"), JSON.stringify({ extend_lens_fields: names }));

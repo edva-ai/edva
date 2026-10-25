@@ -6,7 +6,7 @@ Out of the box hum has the engine, the sensors, the generic harvesters and its p
 
 ## Ground state
 
-Right after `merlin init` / `merlin up`:
+Right after `edva init` / `edva up`:
 
 | Path | State | What |
 |---|---|---|
@@ -16,9 +16,9 @@ Right after `merlin init` / `merlin up`:
 | `agent/scripts/hum-harvesters/*.mjs` | shipped | `weather`, `news`, `calendar`, `tasks`, `watchdog`, `serendipity`, `ideas`, `open_questions`, `hum_asks`, `dream_asks` (`_common.mjs` is shared code) |
 | `agent/ops-agent/jobs/hum*.md` | shipped | `hum`, `hum-review`, `hum-ideation`, `hum-consolidate`, `hum-daily`, `hum-explore` |
 | `data/hum-sensors.json` | **you create it** | Which sensors run, how often, gate tuning |
-| `data/hum-interests.json` | seeded by `merlin init` | Which harvesters run, on what cadence |
-| `data/hum-intent.md` | seeded by `merlin init` | Hum's north star — what `hum-review` grades against |
-| `data/user-timezone.json` | seeded by `merlin init` | Local-hour gates (the companion app keeps it current) |
+| `data/hum-interests.json` | seeded by `edva init` | Which harvesters run, on what cadence |
+| `data/hum-intent.md` | seeded by `edva init` | Hum's north star — what `hum-review` grades against |
+| `data/user-timezone.json` | seeded by `edva init` | Local-hour gates (the companion app keeps it current) |
 | `data/hum-state.json`, `hum-runs.jsonl`, `hum-feedback.jsonl`, `hum-learnings.jsonl` | written at run time | Counters, tick trace, pings + reactions, answers |
 
 Everything in `data/` is gitignored; the templates live in `examples/`.
@@ -66,12 +66,12 @@ Lanes that are location-bound or operational are listed in `agent/local/config/h
 ## Step 4 — test it
 
 ```bash
-./bin/merlin hum test                # one tick now, bypassing the gates
-./bin/merlin hum status              # next run, pings today, cool-down, pause state
+./bin/edva hum test                # one tick now, bypassing the gates
+./bin/edva hum status              # next run, pings today, cool-down, pause state
 ./bin/hum-sense log --since 6        # events → dispatch → what hum did
 ```
 
-`./bin/merlin hum pause 2h | today | until-morning | weekend` and `hum resume` silence it; `hum feedback last 👍` records a reaction by hand.
+`./bin/edva hum pause 2h | today | until-morning | weekend` and `hum resume` silence it; `hum feedback last 👍` records a reaction by hand.
 
 ## Writing your own harvester
 
@@ -88,7 +88,7 @@ A harvester is a small Node script that reads `{situation, context}` JSON on std
 }
 ```
 
-Start from `agent/scripts/hum-harvesters/news.mjs`. Put yours in `agent/scripts/hum-harvesters/_ext/your-topic.mjs` (gitignored; link it from your overlay repo) and add `{ "name": "your-topic", "enabled": true, "cadence_min": 30 }` to `data/hum-interests.json`. The harness re-reads the registry on every tick; after `merlin hum test`, `tail -n1 data/hum-runs.jsonl | jq .harvest` shows your topic under candidates or errors. A sensor of your own works the same way in `agent/scripts/hum-sensors/_ext/`.
+Start from `agent/scripts/hum-harvesters/news.mjs`. Put yours in `agent/scripts/hum-harvesters/_ext/your-topic.mjs` (gitignored; link it from your overlay repo) and add `{ "name": "your-topic", "enabled": true, "cadence_min": 30 }` to `data/hum-interests.json`. The harness re-reads the registry on every tick; after `edva hum test`, `tail -n1 data/hum-runs.jsonl | jq .harvest` shows your topic under candidates or errors. A sensor of your own works the same way in `agent/scripts/hum-sensors/_ext/`.
 
 ## Hum CLIs
 
@@ -103,7 +103,7 @@ Start from `agent/scripts/hum-harvesters/news.mjs`. Put yours in `agent/scripts/
 
 ## What hum doesn't do out of the box
 
-- **No tastes or projects.** The ranker's `context.tastes` and `context.projects` come from your wiki pages (`type: user`, `type: project`) and from `lib/_ext/merlin-context.cjs` if you add one. Empty until you write them ([`memory.md`](memory.md)).
+- **No tastes or projects.** The ranker's `context.tastes` and `context.projects` come from your wiki pages (`type: user`, `type: project`) and from `lib/_ext/edva-context.cjs` if you add one. Empty until you write them ([`memory.md`](memory.md)).
 - **No personal harvesters.** Stocks, music, dining, fitness and the like are yours to write in `_ext/`.
 - **No presence timeline.** Location- and travel-aware checks fail open until you provide `lib/_ext/presence.mjs` (contract in `lib/_ext/.gitkeep`).
 - **A quiet ideation loop.** `hum-ideation` needs project and taste context before it produces anything worth surfacing.

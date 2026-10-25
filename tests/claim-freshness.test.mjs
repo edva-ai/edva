@@ -50,7 +50,7 @@ test("explicit evidence_as_of wins over created_at", () => {
 });
 
 test("a top-level evidence_as_of is honoured — the CLI's field", () => {
-  // merlin-send-curl --evidence-as-of and hum-ping put the stamp here. It was
+  // edva-send-curl --evidence-as-of and hum-ping put the stamp here. It was
   // forwarded but unread for one revision, which left every ping "undated".
   const at = evidenceAsOf({ evidence_as_of: "2026-01-29T14:10:00Z", created_at: "2026-01-20T00:00:00Z" });
   assert.equal(at.iso, "2026-01-29T14:10:00.000Z");
@@ -281,7 +281,7 @@ await testAsync("an expired deadline never blocks delivery", async () => {
 //    approval — worth checking if you've already answered any of those pings."
 //   "As of when I found it on January 18, the band was touring the city's arena —
 //    worth double-checking it's still on."
-// Both are Merlin asking the user to do Merlin's verification.
+// Both are Edva asking the user to do Edva's verification.
 
 const solicitedPrompt = ADJUDICATE_PROMPT("body", "2026-01-18T00:00:00Z", "2026-02-04T00:00:00Z", "claims", true);
 const proactivePrompt = ADJUDICATE_PROMPT("body", "2026-01-18T00:00:00Z", "2026-02-04T00:00:00Z", "claims", false);
@@ -296,8 +296,8 @@ test("a proactive message loses the vintage-rewrite option", () => {
   assert.ok(proactivePrompt.includes("DO NOT HEDGE A PING NOBODY ASKED FOR"));
 });
 
-test("only the proactive prompt bans asking the user to verify Merlin's own state", () => {
-  const ban = /NEVER ASK THE USER TO VERIFY MERLIN'S OWN STATE/; // lang-regex-ok: matching our own prompt text
+test("only the proactive prompt bans asking the user to verify Edva's own state", () => {
+  const ban = /NEVER ASK THE USER TO VERIFY EDVA'S OWN STATE/; // lang-regex-ok: matching our own prompt text
   assert.ok(ban.test(proactivePrompt));
   // Solicited keeps its existing drop-is-unavailable protection instead.
   assert.ok(solicitedPrompt.includes('"drop" is not available'));

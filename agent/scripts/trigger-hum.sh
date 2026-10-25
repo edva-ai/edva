@@ -11,7 +11,7 @@ source "$(dirname "$0")/lib/webhook-auth.sh"
 #                   path is down and something has to keep hum breathing.
 #
 #   --manual        Dev/testing. Bypasses activity + cap gates; still honors
-#                   the lock. Used by `merlin hum test`.
+#                   the lock. Used by `edva hum test`.
 #
 # No --after-message piggyback or --silence-check modes; see jobs/hum.md.
 #
@@ -33,9 +33,9 @@ case "$1" in
 esac
 
 resolve_tier_ports hum   # tier-routes WEBHOOK_PORT + HEALTH_PORT (hum is sonnet → ops-light; was :9092 Opus)
-LOGFILE="$HOME/Dev/merlin/agent/logs/watchdog.log"
-STATE_FILE="$HOME/Dev/merlin/data/hum-state.json"
-HEARTBEAT_FILE="$HOME/Dev/merlin/data/hum-sense-heartbeat.json"
+LOGFILE="$HOME/Dev/edva/agent/logs/watchdog.log"
+STATE_FILE="$HOME/Dev/edva/data/hum-state.json"
+HEARTBEAT_FILE="$HOME/Dev/edva/data/hum-sense-heartbeat.json"
 # How stale the hum-sense heartbeat must be before this cron considers the
 # event engine dead and takes over. The daemon stamps it every tick (10s), so
 # 5 minutes is ~30 missed ticks — comfortably past a restart or a slow pass.
@@ -64,10 +64,10 @@ dispatch() {
 # Hard quiet window: 00:00-09:00 local, the same span as the hum gate's default
 # quiet_hours (lib/hum-events.mjs). Manual mode bypasses it. No reason to
 # tick while the user is likely asleep.
-USER_TZ_FILE="$HOME/Dev/merlin/data/user-timezone.json"
-# Fallback: the home timezone (lib/instance.cjs tz, as MERLIN_TZ).
+USER_TZ_FILE="$HOME/Dev/edva/data/user-timezone.json"
+# Fallback: the home timezone (lib/instance.cjs tz, as EDVA_TZ).
 source "$(dirname "$0")/lib/instance.sh"
-USER_TZ="${MERLIN_TZ:-UTC}"
+USER_TZ="${EDVA_TZ:-UTC}"
 if [ -f "$USER_TZ_FILE" ]; then
   PARSED_TZ=$(jq -r '.timezone // empty' "$USER_TZ_FILE" 2>/dev/null)
   if [ -n "$PARSED_TZ" ] && TZ="$PARSED_TZ" date +%H >/dev/null 2>&1; then
@@ -81,9 +81,9 @@ fi
 
 # Activity state gate (soft). Skip if the user is sleeping/winding down.
 if [ "$MODE" != "manual" ]; then
-  MERLIN_BIN="$HOME/Dev/merlin/bin/merlin"
-  if [ -x "$MERLIN_BIN" ]; then
-    STATE=$("$MERLIN_BIN" activity --state-only 2>/dev/null)
+  EDVA_BIN="$HOME/Dev/edva/bin/edva"
+  if [ -x "$EDVA_BIN" ]; then
+    STATE=$("$EDVA_BIN" activity --state-only 2>/dev/null)
     if [ "$STATE" = "sleeping" ] || [ "$STATE" = "winding_down" ]; then
       log "skip:activity=$STATE"
       exit 0
@@ -109,7 +109,7 @@ if [ "$MODE" != "manual" ]; then
         try { memo = JSON.parse(fs.readFileSync(process.argv[2], "utf8")).sensors?.calendar?.memo || {}; } catch {}
         const s = cal.calendarSituation(cal.parseEvents(JSON.parse(fs.readFileSync(0, "utf8"))), { nowMs: Date.now(), verdicts: memo.verdicts || {} });
         console.log(s.hold ? 1 : 0);
-      ' "$HOME/Dev/merlin/agent/scripts/hum-sensors/calendar.mjs" "$HOME/Dev/merlin/data/hum-sense-state.json" 2>/dev/null)
+      ' "$HOME/Dev/edva/agent/scripts/hum-sensors/calendar.mjs" "$HOME/Dev/edva/data/hum-sense-state.json" 2>/dev/null)
     if [ "${IN_MEETING:-0}" -gt 0 ]; then
       log "skip:in_meeting"
       exit 0
@@ -165,10 +165,10 @@ esac
 # --- lift the crontab half of a hum pause ---
 # Reaching this line means the pause gate above said "go": hum is NOT paused.
 # But pausing hum switches off two different things, and only one of them
-# comes back by itself. `merlin hum pause` writes hum-state.json, which the gate above
+# comes back by itself. `edva hum pause` writes hum-state.json, which the gate above
 # reads; the eight daily hum jobs are switched off separately, by prefixing
 # their crontab lines with #HUMPAUSE#. Without this, a pause expiring (or
-# `merlin hum resume`) brings this */20 tick back and leaves hum-daily,
+# `edva hum resume`) brings this */20 tick back and leaves hum-daily,
 # ideation, review, canary, consolidate, metrics-collect, weekly-ideation and
 # action-executor commented out for good — with hum looking alive, because the
 # tick is running.
@@ -179,7 +179,7 @@ esac
 # happens when there is something to restore, so this is a no-op on every
 # ordinary tick. Caveat worth knowing: #HUMPAUSE# means "paused with hum", so
 # do not use that marker to disable a hum job long-term — it will come back.
-CRON_UNPAUSE="$HOME/Dev/merlin/bin/cron-unpause"
+CRON_UNPAUSE="$HOME/Dev/edva/bin/cron-unpause"
 if [ -x "$CRON_UNPAUSE" ]; then
   RESTORED=$("$CRON_UNPAUSE" HUMPAUSE 2>&1)
   [ -n "$RESTORED" ] && log "$RESTORED"
@@ -218,7 +218,7 @@ PAYLOAD="{\"job\": \"hum\", \"trigger\": \"watchdog-fallback\"}"
 # fallback tick (the heartbeat gate above exits first), so a queued question
 # waits for one.
 #
-# THROUGH LAUNCHD. The question is sent through merlin-send-curl,
+# THROUGH LAUNCHD. The question is sent through edva-send-curl,
 # whose resolve-first gate and outbound precheck are `claude -p` on the Max
 # login, which this cron script cannot reach: both would fail open, and the
 # question would go out unchecked. A queued question now kicks the
@@ -227,7 +227,7 @@ PAYLOAD="{\"job\": \"hum\", \"trigger\": \"watchdog-fallback\"}"
 # kick returns at once, so this waits (up to 150s: the gate's 90s deadline plus
 # the precheck) for that run to finish before the hum dispatch below, as it
 # did when delivery ran inline: both write hum-state.json and the pending slot.
-QUAL_QUEUE="$HOME/Dev/merlin/data/hum-qual-delivery-queue.json"
+QUAL_QUEUE="$HOME/Dev/edva/data/hum-qual-delivery-queue.json"
 if [ "$MODE" != "manual" ] && [ -s "$QUAL_QUEUE" ]; then
   source "$(dirname "$0")/lib/launchd-kick.sh"
   if launchd_kick ai.claude.hum-deliver-qual hum-deliver-qual; then

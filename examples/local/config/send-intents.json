@@ -1,5 +1,5 @@
 {
-  "_comment": "Outbound message intents that carry private data. Copy to agent/local/config/send-intents.json. `private_data_intents` / `private_hum_intents` (glob patterns) make bin/merlin-send-curl skip the outbound precheck's model call for them; `jev_private_intent_prefixes` keeps them away from the Jev judgment service (lib/jev-gates.mjs). Each list replaces the kernel default; use extend_<key> to append instead.",
+  "_comment": "Outbound message intents that carry private data. Copy to agent/local/config/send-intents.json. `private_data_intents` / `private_hum_intents` (glob patterns) make bin/edva-send-curl skip the outbound precheck's model call for them; `jev_private_intent_prefixes` keeps them away from the Jev judgment service (lib/jev-gates.mjs). Each list replaces the kernel default; use extend_<key> to append instead.",
   "extend_private_data_intents": ["bank-alert", "bank-alert-*"],
   "extend_private_hum_intents": ["hum:budget", "hum:budget:*"],
   "extend_jev_private_intent_prefixes": ["bank-alert", "hum:budget"]

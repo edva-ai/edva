@@ -84,7 +84,7 @@ test("run-ephemeral-opus.sh refuses with exit 78 and never calls the model when 
     assert.equal(r.status, 78);
     const made = fs.readFileSync(calls, "utf8");
     assert.ok(!/(^|\n)-p\b/.test(made) && !made.includes("--model"), `the model must not be called; calls were:\n${made}`);
-    const log = fs.readFileSync(path.join(home, "Dev/merlin/agent/logs/guard-test.log"), "utf8");
+    const log = fs.readFileSync(path.join(home, "Dev/edva/agent/logs/guard-test.log"), "utf8");
     assert.match(log, /REFUSED: not on the Max subscription \(loggedIn=true authMethod=api_key/);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// app-perf — how responsive the Merlin app has been on the user's devices.
+// app-perf — how responsive the Edva app has been on the user's devices.
 //
 // Reads app_perf_events (data/migrations/20261024_app_perf_events.sql),
-// written by client/Merlin/Responsiveness.swift:
+// written by client/Edva/Responsiveness.swift:
 //   hang        main thread blocked >= 250 ms (in-app watchdog), with the screen
 //   metrics     Apple's daily MetricKit report (hang-time histogram, launch,
 //               scroll hitch ratio on iOS)
@@ -72,7 +72,7 @@ if (cmd === "diagnostics") {
 // summary
 const hs = await rows("hang", "occurred_at,platform,build,duration_ms,context");
 const ms = await rows("metrics", "occurred_at,platform,build,payload");
-console.log(`Merlin app responsiveness, last ${days} day(s)\n`);
+console.log(`Edva app responsiveness, last ${days} day(s)\n`);
 const groups = new Map();
 for (const h of hs) {
   const k = `${h.platform} build ${h.build}`;

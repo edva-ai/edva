@@ -1,6 +1,6 @@
 # Trainer
 
-Personal SwiftUI iOS app that follows your 6-page workout guide: Strength A/B (gym), Bodyweight A/B (no-gym), Minimum Effective, and Cardio. It picks today's workout from a weekly default × gym-available toggle, lets you swap per-day, logs every set with reps/weight/duration, and syncs to Supabase so Merlin can query your tracking data.
+Personal SwiftUI iOS app that follows your 6-page workout guide: Strength A/B (gym), Bodyweight A/B (no-gym), Minimum Effective, and Cardio. It picks today's workout from a weekly default × gym-available toggle, lets you swap per-day, logs every set with reps/weight/duration, and syncs to Supabase so Edva can query your tracking data.
 
 ## Stack
 - SwiftUI + SwiftData (iOS 26, Swift 6, strict concurrency)
@@ -79,9 +79,9 @@ xcrun altool --upload-app --type ios --file build/export/Trainer.ipa \
 ```
 (Create `ExportOptions.plist` with `method=app-store`, `teamID=<your team>`, `signingStyle=automatic`.)
 
-## How Merlin reads your data
+## How Edva reads your data
 
-Merlin queries Supabase directly. Give your Merlin service role access and run e.g.:
+Edva queries Supabase directly. Give your Edva service role access and run e.g.:
 ```sql
 select workout_type, count(*) as sessions, sum(coalesce(array_length(string_to_array(notes,' '),1),0))
 from public.sessions

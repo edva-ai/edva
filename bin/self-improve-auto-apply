@@ -239,7 +239,7 @@ for (const [rel, content] of Object.entries(files)) {
 const message = `[auto-impl] ${summary}\n\n${card}${source ? `\n\nReview item: ${source}` : ""}\n\nApplied automatically under rubric schema v4 (${risk} risk, ${category}, ${landing.lines} changed lines). Revert with git revert.`;
 let sha;
 try {
-  await exec(path.join(ROOT, "bin/merlin-commit"), ["-m", message, "--", ...Object.keys(files)], { cwd: ROOT });
+  await exec(path.join(ROOT, "bin/edva-commit"), ["-m", message, "--", ...Object.keys(files)], { cwd: ROOT });
   sha = (await exec("git", ["rev-parse", "--short", "HEAD"], { cwd: ROOT })).stdout.trim();
 } catch (e) {
   restore();
@@ -247,7 +247,7 @@ try {
   process.exit(1);
 }
 try {
-  await exec(path.join(ROOT, "bin/merlin-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
+  await exec(path.join(ROOT, "bin/edva-sync"), ["--quiet"], { cwd: ROOT, timeout: 120_000 });
 } catch {
   // The sync cron reports its own failures; the change is committed either way.
 }

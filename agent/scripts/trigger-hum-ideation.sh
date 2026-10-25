@@ -15,7 +15,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 # Critical rule 8). Best-effort: a gog hiccup must never block the dispatch, and
 # we only overwrite the file on success so the agent never sees a half-written or
 # error-filled file (it treats missing/empty as "tasks unavailable this run").
-TASKS_FILE="$HOME/Dev/merlin/data/hum-ideation-tasks.txt"
+TASKS_FILE="$HOME/Dev/edva/data/hum-ideation-tasks.txt"
 TASKS_TMP="$(mktemp)"
 if gog tasks list @default --plain > "$TASKS_TMP" 2>/dev/null && [ -s "$TASKS_TMP" ]; then
   mv "$TASKS_TMP" "$TASKS_FILE"
@@ -24,7 +24,7 @@ else
 fi
 
 resolve_tier_ports hum-ideation   # tier-routes WEBHOOK_PORT + HEALTH_PORT (was :9092 Opus)
-LOGFILE="$HOME/Dev/merlin/agent/logs/watchdog.log"
+LOGFILE="$HOME/Dev/edva/agent/logs/watchdog.log"
 PAYLOAD='{"job": "hum-ideation"}'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [hum-ideation] $1" >> "$LOGFILE"; }
@@ -34,7 +34,7 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [hum-ideation] $1" >> "$LOGFILE"; }
 # all: skipped only when inventory is healthy AND nothing it reads has changed
 # since the last dispatched run (bin/hum-ideation-prefetch).
 # The scorecard + digest it reads are rebuilt by the nightly hum-reservoir-prune.
-GATE=$("$HOME/Dev/merlin/bin/hum-ideation-prefetch" 2>/dev/null)
+GATE=$("$HOME/Dev/edva/bin/hum-ideation-prefetch" 2>/dev/null)
 if echo "$GATE" | grep -q '"decision":"skip"'; then
   log "skip slot: $GATE"
   exit 0

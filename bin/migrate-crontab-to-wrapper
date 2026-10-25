@@ -47,8 +47,8 @@ const splitTrailingRedirect = (cmd) => {
 
 const INTERPRETERS = new Set(["node", "bash", "sh", "zsh", "python", "python3", "perl", "ruby", "env", "curl"]);
 const deriveLabel = (cmd, comment) => {
-  // 1. Explicit `# tag` (skip `# merlin:` prefix and short directive words)
-  const c = comment.match(/#\s*(?:merlin:\s*)?(\S+)/);
+  // 1. Explicit `# tag` (skip `# edva:` prefix and short directive words)
+  const c = comment.match(/#\s*(?:edva:\s*)?(\S+)/);
   if (c && !/^[a-z]+:/.test(c[1])) return c[1].replace(/[^a-zA-Z0-9_.-]/g, "_");
   // 2. First .sh/.js/.mjs/.py basename anywhere in the cmd
   const f = cmd.match(/(?:^|\s)([^\s]+\.(?:sh|mjs|js|py))\b/);

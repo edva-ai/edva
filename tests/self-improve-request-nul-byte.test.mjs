@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 
 const exec = promisify(execFile);
-const BIN = path.join(os.homedir(), "Dev/merlin/bin/self-improve-request");
+const BIN = path.join(os.homedir(), "Dev/edva/bin/self-improve-request");
 const NUL = String.fromCharCode(0);
 
 // Point the binary at a dead local address. The NUL guard runs long before any

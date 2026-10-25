@@ -1,4 +1,4 @@
-# Jev — decision model for Merlin's classification calls
+# Jev — decision model for Edva's classification calls
 
 **Status (2026-09-23): live on the production host at all ten original sites (`p1-resolution` retired 2026-10-04 with the dispatch it gated; `hum-reply-attribute` added 2026-10-04). Jev is primary at every site, with the pre-existing mechanism running as shadow for one week.** The brief: run Jev as primary for all the recommended use cases, with the current mechanism as shadow for one week; log all results; on disagreement between the two, investigate more deeply and suggest fixes to the Jev implementation through the Improvements channel.
 
@@ -60,7 +60,7 @@ The question wording, criteria and thresholds live in data, `data/jev-questions/
 | `suggestion-classify` | `bin/suggestion-classify` `classifyReply` | is_reaction, disposition, reason, strength | 0.8 | the reaction classification | the old regex rules + Gemma (this also takes regex off the user's words, per Rule #0b) |
 | `hum-reply-attribute` | `lib/hum-reply-segments.mjs` `modelPick`, called by `suggestion-classify` (`splitMultiAnswer` / `soleTarget`) | one choice per reply segment over the open hum items (`i0..iN`) + `none`; questions built per call | 0.8 on the least certain segment | which open item each segment of a reply answers | the local model's JSON pick; **no keyword fallback** (Rule #0b — this replaced keyword-overlap attribution on 2026-10-04). Health/exercise items stay off Jev |
 | *(installation sites)* | the installation's own sites, configured and documented locally | — | — | — | — |
-| `hum-place-repeat` | `lib/hum-vetoes.mjs` `findSamePlacePitch`, in the hum pre-rank filter (`preRankFilter`, commit harvests only, never `--preview`). Candidates and comparison rows are restaurant / place recommendations only: the dining lane and ideas in the `dining` / `taste-match` categories (never reminders, logistics, warnings or closings); rows = those headlines from the last 21 days minus any the user deferred (snooze, or a reply classified snoozed / deferred). A tick's checks (at most a dining and an ideas candidate) run in parallel under one 20 s deadline (`HUM_PLACE_REPEAT_DEADLINE_MS`); Jev and Sonnet get only the time left, and past it the check is skipped: no veto, nothing cached, a stderr line. Verdicts cached per (candidate, rows, question) in `data/.cache/hum-place-repeat.json` (3 days) | `same_place`: choice over the earlier recommendations (p0..pN, from `same_place_template`) + `none`: "is the new suggestion re-recommending a place Merlin already recommended?" (reminders, follow-ups about a planned visit, warnings, last-chance or closing nudges, a different event at a place mentioned before and mere mentions answer none) | 0.85 | vetoing the candidate (`cross_send_dedup`) and retiring a vetoed idea via `hum-reservoir-prune --expire` (motivated by a restaurant recommended twice, nine days apart, under a second idea id) | a tool-less Sonnet read with the same instructions; no answer from either vetoes nothing. Own shadow week (`shadow_until` 2026-10-20 in the question file, via `alwaysShadow`) |
+| `hum-place-repeat` | `lib/hum-vetoes.mjs` `findSamePlacePitch`, in the hum pre-rank filter (`preRankFilter`, commit harvests only, never `--preview`). Candidates and comparison rows are restaurant / place recommendations only: the dining lane and ideas in the `dining` / `taste-match` categories (never reminders, logistics, warnings or closings); rows = those headlines from the last 21 days minus any the user deferred (snooze, or a reply classified snoozed / deferred). A tick's checks (at most a dining and an ideas candidate) run in parallel under one 20 s deadline (`HUM_PLACE_REPEAT_DEADLINE_MS`); Jev and Sonnet get only the time left, and past it the check is skipped: no veto, nothing cached, a stderr line. Verdicts cached per (candidate, rows, question) in `data/.cache/hum-place-repeat.json` (3 days) | `same_place`: choice over the earlier recommendations (p0..pN, from `same_place_template`) + `none`: "is the new suggestion re-recommending a place Edva already recommended?" (reminders, follow-ups about a planned visit, warnings, last-chance or closing nudges, a different event at a place mentioned before and mere mentions answer none) | 0.85 | vetoing the candidate (`cross_send_dedup`) and retiring a vetoed idea via `hum-reservoir-prune --expire` (motivated by a restaurant recommended twice, nine days apart, under a second idea id) | a tool-less Sonnet read with the same instructions; no answer from either vetoes nothing. Own shadow week (`shadow_until` 2026-10-20 in the question file, via `alwaysShadow`) |
 | `outbound-precheck` | `bin/outbound-precheck.mjs` via `lib/jev-gates.mjs` `decideGate` | send / suppress / modify | 0.92 | send or suppress (a modify takes Sonnet's rewrite) | the Sonnet precheck. During the week, a Sonnet suppress beats a Jev send. `p1-email` and `hum:exercise`/`hum:health` intents stay off Jev |
 | `claim-check` | `bin/claim-check` stage 2 via `decideGate` | pass / rewrite / drop | 0.9 | pass or drop (a rewrite takes Sonnet's text) | the Sonnet stage-2 check; during the week a Sonnet drop beats a Jev pass |
 | `claim-freshness` | `lib/claim-freshness.mjs` stage 3 `adjudicate()` | pass / rewrite / drop | 0.9 | pass or drop; on a solicited message a drop needs Sonnet's text (a solicited message can't be dropped) | the Sonnet adjudicator. Stage 1 (claim extraction) stays on Sonnet. Runs inside phone-channel, so it needs a `/restart` to load |
@@ -135,19 +135,19 @@ atomic temp-file + rename, so the breaker never reads a torn file), not only on 
 2026-10-13 it froze during healthy running, and that day's 12:51Z refusal page said "last good
 call 2026-10-11T13:30Z" for a refusal only 16 minutes old.
 
-A 403 of this kind is a billing/entitlement state, not a Merlin bug. Merlin no longer calls
+A 403 of this kind is a billing/entitlement state, not a Edva bug. Edva no longer calls
 the Vercel AI Gateway, so a 403 whose text names Vercel is relayed from TypeSafe's upstream.
-Merlin's own TypeSafe spend is tracked by `jev-budget-check` (`budget.usd` in
+Edva's own TypeSafe spend is tracked by `jev-budget-check` (`budget.usd` in
 `jev-config.json`); the human step is on the TypeSafe account (console.typesafe.ai) or with
 TypeSafe. `JEV_NO_ALERT=1` silences both pages (tests set it).
 Contract pinned by `tests/jev-shadow.test.mjs`.
 
 ## Operating it
 
-- Everything off: `touch ~/Dev/merlin/data/.jev-off`.
+- Everything off: `touch ~/Dev/edva/data/.jev-off`.
 - One site off: `"sites": {"<site>": {"enabled": false}}` in `jev-config.json`.
 - Extend the week: set `shadow_until` in `jev-config.json` (it overrides `jev-shadow/window.json`).
 - `suggestion-classify --dry-run` never calls Jev unless `JEV_DRY_RUN=1` is set.
 - Production host crontab (not in the repo):
-  `*/15 * * * * /opt/homebrew/bin/node $HOME/Dev/merlin/bin/cron-run --label jev-email-reconcile -- /opt/homebrew/bin/node $HOME/Dev/merlin/bin/jev-email-reconcile >> $HOME/Dev/merlin/agent/logs/jev-email-reconcile.log 2>&1`
+  `*/15 * * * * /opt/homebrew/bin/node $HOME/Dev/edva/bin/cron-run --label jev-email-reconcile -- /opt/homebrew/bin/node $HOME/Dev/edva/bin/jev-email-reconcile >> $HOME/Dev/edva/agent/logs/jev-email-reconcile.log 2>&1`
 - launchd: `ai.claude.jev-disagreement-review.plist` → `~/Library/LaunchAgents/`, then `launchctl load` it.

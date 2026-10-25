@@ -55,18 +55,18 @@ const SUPABASE_URL = INSTANCE.supabase_project
 // ── Single-instance guard (a rogue duplicate once caused an outage). A 2nd
 // phone-channel double-processes the channel + Supabase Realtime/acks and can
 // saturate the DB compute. The legit instance is spawned by the chat supervisor's
-// MCP config (supervisor/chat-mcp-config.json), which sets MERLIN_PHONE_PRIMARY=1.
+// MCP config (supervisor/chat-mcp-config.json), which sets EDVA_PHONE_PRIMARY=1.
 // FAIL-SAFE: exit ONLY when this is an unblessed launch (env flag unset — e.g.
 // spawned by Claude Desktop or by hand) AND another phone-channel is already
 // running. A sole instance, or the blessed primary, always proceeds — so a missing
 // env var can never take the channel down.
-if (process.env.MERLIN_PHONE_PRIMARY !== "1") {
+if (process.env.EDVA_PHONE_PRIMARY !== "1") {
   try {
     const { execFileSync } = require("node:child_process");
     const out = execFileSync("pgrep", ["-f", "phone-channel/index.mjs"], { encoding: "utf8" });
     const others = out.split("\n").map((s) => parseInt(s, 10)).filter((p) => p && p !== process.pid);
     if (others.length > 0) {
-      console.error(`[phone-channel] refusing to start: another phone-channel (pid ${others.join(",")}) is already running and this is not the supervisor's primary (MERLIN_PHONE_PRIMARY unset). Exiting to avoid a duplicate Supabase subscriber.`);
+      console.error(`[phone-channel] refusing to start: another phone-channel (pid ${others.join(",")}) is already running and this is not the supervisor's primary (EDVA_PHONE_PRIMARY unset). Exiting to avoid a duplicate Supabase subscriber.`);
       process.exit(0);
     }
   } catch {
@@ -131,7 +131,7 @@ const log = (msg) => {
 const REPLY_GATE_DEADLINE_MS = 45_000;
 
 // The exchange a reply answers, handed to the gate's claim extractor as
-// "<user>: …" / "Merlin: …" lines, oldest first. Read alone, a reply cannot
+// "<user>: …" / "Edva: …" lines, oldest first. Read alone, a reply cannot
 // be told apart from a stale status: a reply confirming a name or address the
 // user had just given gets re-checked against stored data and "corrected"
 // away from the user's own words.
@@ -143,7 +143,7 @@ async function replyExchange(rowId, repliedTo) {
   const fallback = repliedTo ? `${OWNER_LABEL}: ${String(repliedTo).slice(0, 500)}` : "";
   try {
     const { data, error } = await supabase
-      .from("merlin_messages")
+      .from("edva_messages")
       .select("id, role, content, metadata")
       .eq("channel", "chat")
       .neq("id", rowId)
@@ -155,7 +155,7 @@ async function replyExchange(rowId, repliedTo) {
       .slice(0, REPLY_EXCHANGE_ROWS)
       .reverse();
     if (!rows.length) return fallback;
-    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : "Merlin"}: ${m.content.slice(0, 500)}`).join("\n");
+    return rows.map((m) => `${m.role === "user" ? OWNER_LABEL : "Edva"}: ${m.content.slice(0, 500)}`).join("\n");
   } catch {
     return fallback;
   }
@@ -179,7 +179,7 @@ async function correctReplyInPlace(rowId, text, repliedTo = null) {
       details: { reasons: fresh.reasons || [], claims: fresh.claims || [] },
     });
     const { error } = await supabase
-      .from("merlin_messages")
+      .from("edva_messages")
       .update({ content: fresh.corrected_text, metadata: { freshness_rewritten: "1" } })
       .eq("id", rowId);
     if (error) throw new Error(error.message);
@@ -197,11 +197,11 @@ const mcp = new Server(
       tools: {},
       logging: {},
     },
-    instructions: `You are monitoring mobile messages from ${OWNER} via the Merlin app.
+    instructions: `You are monitoring mobile messages from ${OWNER} via the Edva app.
 
-CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Merlin message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
+CRITICAL: \`mcp__phone-channel__reply\` is the ONLY way to deliver text to ${OWNER}. Plain assistant text — anything you "say" without calling the reply tool — is silently dropped; ${OWNER} never sees it. Every Edva message you receive MUST end with at least one reply tool call. One exception: the supervisor's own "Session started" line, sent after every restart, is not from ${OWNER}. If a message of theirs is still unanswered because the restart cut you off, answer that message now; otherwise end the turn without calling reply. If you produce ANY substantive answer text, that text must be the \`message\` argument to a reply tool call, NOT a plain text content block in your turn.
 
-THREADED REPLIES: ${OWNER_LABEL} often reads Merlin in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
+THREADED REPLIES: ${OWNER_LABEL} often reads Edva in between other things, so several messages stack up before they answer. When they tap Reply on a specific bubble, the message you receive opens with a \`[Threaded reply]\` block quoting the message they answered. Treat that quoted message as the subject — NOT the most recent exchange in the "Recent conversation" tail, which is usually about something else by then. Say enough in your reply to make clear which thread you're answering.
 
 If you have nothing to say (e.g. a tool failed), still call reply with a one-line acknowledgement rather than ending the turn silently. The chat-supervisor has a safety net that auto-posts orphaned text — but that's a recovery path for bugs, not the design; never rely on it.
 
@@ -218,7 +218,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "reply",
       description:
-        "Send a response back to " + OWNER + " via the Merlin mobile app. " +
+        "Send a response back to " + OWNER + " via the Edva mobile app. " +
         "For any reply longer than ~80 characters, or that contains structured/multi-section content " +
         "(digests, briefings, lists), you MUST provide a short `summary` — this becomes the push " +
         "notification body (e.g. 'Weekend events ready', 'P1 email: draft ready'). " +
@@ -228,7 +228,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           message: {
             type: "string",
-            description: "The full message body to insert into the Merlin chat. With `message_file`, an optional short lead-in placed above the file's text.",
+            description: "The full message body to insert into the Edva chat. With `message_file`, an optional short lead-in placed above the file's text.",
           },
           message_file: {
             type: "string",
@@ -247,7 +247,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           time_sensitive: {
             type: "boolean",
             description:
-              "Default false. Set TRUE only when this is a direct answer " + OWNER + " is ACTIVELY WAITING FOR and likely can't look at the screen — above all when they voice-summoned Merlin hands-free (\"Hey Siri, Summon Merlin\") or is otherwise driving. True marks the push time-sensitive so it pierces Driving/DND Focus and gets read aloud over AirPods/CarPlay. NEVER set true for anything proactive or ambient (digests, hum pings, ideas, suggestions, FYIs, reminders they didn't just ask about) — those must not interrupt them while driving. Rare genuine urgency (a real P1 they need now) may also use true.",
+              "Default false. Set TRUE only when this is a direct answer " + OWNER + " is ACTIVELY WAITING FOR and likely can't look at the screen — above all when they voice-summoned Edva hands-free (\"Hey Siri, Summon Edva\") or is otherwise driving. True marks the push time-sensitive so it pierces Driving/DND Focus and gets read aloud over AirPods/CarPlay. NEVER set true for anything proactive or ambient (digests, hum pings, ideas, suggestions, FYIs, reminders they didn't just ask about) — those must not interrupt them while driving. Rare genuine urgency (a real P1 they need now) may also use true.",
           },
         },
         // One of message / message_file — checked in the handler.
@@ -320,7 +320,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       await streamed.chain.catch(() => {});
       if (streamed.rowId) {
         if (reuseAckId && reuseAckId !== streamed.rowId) {
-          supabase.from("merlin_messages").delete().eq("id", reuseAckId)
+          supabase.from("edva_messages").delete().eq("id", reuseAckId)
             .then(({ error }) => { if (error) log(`superseded ack delete error: ${error.message}`); });
         }
         reuseAckId = streamed.rowId;
@@ -331,7 +331,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       let inserted;
       if (reuseAckId) {
         const { data, error } = await supabase
-          .from("merlin_messages")
+          .from("edva_messages")
           // Clear is_ack — this row is now a real reply and SHOULD be visible
           // to the next message's ack-history window.
           .update({ content: deliveredMessage, read: false, metadata: {} })
@@ -347,7 +347,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       let error;
       if (!inserted) {
-        ({ data: inserted, error } = await supabase.from("merlin_messages").insert({
+        ({ data: inserted, error } = await supabase.from("edva_messages").insert({
           role: "assistant",
           content: deliveredMessage,
           read: false,
@@ -378,7 +378,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           if (msgId) {
             const { data: row } = await supabase
-              .from("merlin_messages")
+              .from("edva_messages")
               .select("read")
               .eq("id", msgId)
               .single();
@@ -406,7 +406,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }, 1500);
 
       return {
-        content: [{ type: "text", text: "Reply sent to Merlin app" }],
+        content: [{ type: "text", text: "Reply sent to Edva app" }],
       };
     } catch (err) {
       console.error(`[phone-channel] Error: ${err.message}`);
@@ -423,7 +423,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       // Insert a pending command
       const { data: inserted, error: insertError } = await supabase
-        .from("merlin_commands")
+        .from("edva_commands")
         .insert({ command: "get_location", status: "pending" })
         .select()
         .single();
@@ -442,7 +442,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         await new Promise((r) => setTimeout(r, 1000));
 
         const { data: row, error: pollError } = await supabase
-          .from("merlin_commands")
+          .from("edva_commands")
           .select()
           .eq("id", commandId)
           .single();
@@ -530,7 +530,7 @@ const ACK_REFRESH_INTERVAL_MS = 5_000;
 // The "working" status line is CANNED ONLY (a user decision). A local 1B
 // model writing a one-line status from the conversation produced false facts
 // and junk lines that the sanitizer let through. A status line must never
-// state a fact, and fixed copy cannot. State-only: each line says Merlin is
+// state a fact, and fixed copy cannot. State-only: each line says Edva is
 // still working; none promises a reply is imminent.
 const ACK_INITIAL_MESSAGE = "On it…";
 const CANNED_REFRESH_MESSAGES = [
@@ -541,7 +541,7 @@ const CANNED_REFRESH_MESSAGES = [
   "Looking into it…",
 ];
 
-/// Threaded replies. The user often reads Merlin in between other
+/// Threaded replies. The user often reads Edva in between other
 /// things, so several pings stack up before an answer. The app lets
 /// the user tap Reply on a specific bubble, which sets `reply_to` on the message.
 /// Without this block the agent reads the reply against the newest message in
@@ -610,7 +610,7 @@ function decisionReplyHint(parent) {
     if (typeof extHint === "function") return extHint(p) || "";
     if (p?.kind !== "decision" || !p.ref) return "";
     const opts = (p.options || []).map((o, i) => `${i + 1}. ${o.label}`).join("; ");
-    return `[Decision card ${p.ref}] That message was a decision Merlin asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/merlin/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
+    return `[Decision card ${p.ref}] That message was a decision Edva asked them (options: ${opts}). Once you know their answer — an option (by number or meaning) or their own words — file it with \`~/Dev/edva/bin/decision-answer --ref ${p.ref} --option "<that option's label, exactly>"\` or \`--text "<their answer>"\`, then confirm in one short line. If they are asking about it rather than answering, answer and leave it open.\n\n`;
   } catch {
     return "";
   }
@@ -620,7 +620,7 @@ async function buildReplyBlock(row, tz) {
   if (!row?.reply_to) return "";
   try {
     const { data: parent } = await supabase
-      .from("merlin_messages")
+      .from("edva_messages")
       .select("role, content, created_at, metadata")
       .eq("id", row.reply_to)
       .single();
@@ -718,7 +718,7 @@ async function handleIncomingMessage(row) {
   // for me" or "this again?"), it writes a structured `reaction` event
   // to suggestion-history.jsonl so the next dining/music/art lane scout
   // sees the rejection. Tapback reactions take a separate path via
-  // `recordHumReaction` / `merlin hum feedback` and don't double-count
+  // `recordHumReaction` / `edva hum feedback` and don't double-count
   // (the classifier dedups by appending only when its rule/Gemma judgment
   // adds new info, and the deriveState fold keeps the most-specific reason).
   // Tapped a multiple-choice answer? Resolve it here and stop.
@@ -734,7 +734,7 @@ async function handleIncomingMessage(row) {
     const outcome = await handleChoiceReply(supabase, row, text);
     if (outcome.handled) {
       // A null reply is a silent tick (a checklist box): the app's checkmark is the confirmation.
-      if (outcome.reply) await supabase.from("merlin_messages").insert({
+      if (outcome.reply) await supabase.from("edva_messages").insert({
         role: "assistant", content: outcome.reply, read: true,
         channel: row.channel || "chat", reply_to: row.id,
       });
@@ -771,7 +771,7 @@ async function handleIncomingMessage(row) {
   // busy evening (several Jev disagreement notes in two hours) they crowd the
   // actual conversation out of the agent's context.
   const historyP = supabase
-    .from("merlin_messages")
+    .from("edva_messages")
     .select("id, role, content")
     .eq("channel", row.channel || "chat")
     .order("created_at", { ascending: false })
@@ -828,17 +828,17 @@ async function handleIncomingMessage(row) {
       locationLine = `\n[Location: ${metadata.latitude}, ${metadata.longitude} (accuracy: ${metadata.location_accuracy || "unknown"}m)]`;
     }
 
-    // Sent from the iOS/macOS share sheet (client/MerlinShare), not typed: a
-    // photo arrives as its own bare merlin-attachments URL row, the note and
+    // Sent from the iOS/macOS share sheet (client/EdvaShare), not typed: a
+    // photo arrives as its own bare edva-attachments URL row, the note and
     // shared text/links as the following row; shareBundler has already joined
     // them into this one message, photos first.
-    const shareLine = metadata.source === "share" ? "\n[Shared into Merlin from another app via the share sheet]" : "";
+    const shareLine = metadata.source === "share" ? "\n[Shared into Edva from another app via the share sheet]" : "";
 
     const [recallBlock, replyBlock, humBlock, improvementBlock] =
       await Promise.all([recallP, replyBlockP, humBlockP, improvementBlockP]);
     profLog(msgId, "t1b_context", `recall=${recallBlock ? "yes" : "no"}`);
     const builtContent = `${recallBlock}${convoBlock}${replyBlock}${humBlock}${improvementBlock}New message from ${OWNER}:\n\n${text}\n\n[Current time: ${localTimeStr} ${tzAbbr}]${locationLine}${shareLine}`;
-    const DISPATCH_URL = process.env.MERLIN_DISPATCH_URL;
+    const DISPATCH_URL = process.env.EDVA_DISPATCH_URL;
 
     if (DISPATCH_URL) {
       // Supervisor mode: POST to chat supervisor's HTTP dispatch endpoint.
@@ -846,7 +846,7 @@ async function handleIncomingMessage(row) {
         const resp = await fetch(DISPATCH_URL, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ content: builtContent, source: "merlin", priority: "high", msgId }),
+          body: JSON.stringify({ content: builtContent, source: "edva", priority: "high", msgId }),
           signal: AbortSignal.timeout(10_000),
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -856,7 +856,7 @@ async function handleIncomingMessage(row) {
         console.error(`[phone-channel] HTTP dispatch failed (${httpErr.message}), falling back to MCP notification`);
         await mcp.notification({
           method: "notifications/claude/channel",
-          params: { content: builtContent, meta: { source: "merlin", ts: new Date().toISOString(), timezone: tz, _profMsgId: msgId } },
+          params: { content: builtContent, meta: { source: "edva", ts: new Date().toISOString(), timezone: tz, _profMsgId: msgId } },
         });
         profLog(msgId, "t2_notified", "via MCP fallback");
         advanceCursor(row.created_at);
@@ -867,7 +867,7 @@ async function handleIncomingMessage(row) {
         method: "notifications/claude/channel",
         params: {
           content: builtContent,
-          meta: { source: "merlin", ts: new Date().toISOString(), timezone: tz, utcOffset, localTime: localTimeStr, latitude: metadata.latitude, longitude: metadata.longitude, _profMsgId: msgId },
+          meta: { source: "edva", ts: new Date().toISOString(), timezone: tz, utcOffset, localTime: localTimeStr, latitude: metadata.latitude, longitude: metadata.longitude, _profMsgId: msgId },
         },
       });
       profLog(msgId, "t2_notified");
@@ -914,7 +914,7 @@ async function startAck(msgId, row, text) {
     if (ackMsg) {
       log(`ack: "${ackMsg}"`);
       const { data: ackRow, error: ackErr } = await supabase
-        .from("merlin_messages")
+        .from("edva_messages")
         // is_ack marks this row as placeholder copy so the next message's ack
         // history skips it. Cleared when the real reply overwrites the row.
         .insert({ role: "assistant", content: ackMsg, read: false, metadata: { is_ack: "1" } })
@@ -933,7 +933,7 @@ async function startAck(msgId, row, text) {
   if (pending.replied || pending.streaming) {
     if (ackMsgId) {
       log(`ack ${ackMsgId} lost the race to the reply; removing it`);
-      supabase.from("merlin_messages").delete().eq("id", ackMsgId)
+      supabase.from("edva_messages").delete().eq("id", ackMsgId)
         .then(({ error }) => { if (error) log(`orphan ack delete error: ${error.message}`); });
     }
     return;
@@ -960,7 +960,7 @@ async function startAck(msgId, row, text) {
       if (!pending.ackMsgId) return; // real reply already landed, skip update
 
       await supabase
-        .from("merlin_messages")
+        .from("edva_messages")
         .update({ content: updated })
         .eq("id", pending.ackMsgId);
       console.error(`[phone-channel] Ack refresh #${refreshCount}: "${updated}"`);
@@ -1000,7 +1000,7 @@ let streamPollTimer = null;
 let streamTickBusy = false;
 
 function ensureStreamPoll() {
-  if (!STREAM_ENABLED || !process.env.MERLIN_DISPATCH_URL || streamPollTimer) return;
+  if (!STREAM_ENABLED || !process.env.EDVA_DISPATCH_URL || streamPollTimer) return;
   streamPollTimer = setInterval(() => {
     streamTick().catch((err) => log(`stream tick error: ${err.message}`));
   }, STREAM_POLL_MS);
@@ -1025,7 +1025,7 @@ async function streamTick() {
   if (streamTickBusy) return;
   streamTickBusy = true;
   try {
-    const base = process.env.MERLIN_DISPATCH_URL.replace(/\/dispatch$/, "");
+    const base = process.env.EDVA_DISPATCH_URL.replace(/\/dispatch$/, "");
     let draft;
     try {
       draft = await fetch(`${base}/reply-draft`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json());
@@ -1057,11 +1057,11 @@ async function streamTick() {
         const ackId = pending?.ackMsgId || null;
         if (pending) pending.ackMsgId = null;
         entry.chain = (ackId
-          ? supabase.from("merlin_messages").update({ content: shown }).eq("id", ackId).then(({ error }) => {
+          ? supabase.from("edva_messages").update({ content: shown }).eq("id", ackId).then(({ error }) => {
               if (error) throw error;
               entry.rowId = ackId;
             })
-          : supabase.from("merlin_messages")
+          : supabase.from("edva_messages")
               // is_ack keeps it out of the next ack's history until it's final.
               .insert({ role: "assistant", content: shown, read: false, metadata: { is_ack: "1" } })
               .select("id").single().then(({ data, error }) => {
@@ -1077,7 +1077,7 @@ async function streamTick() {
       entry.shown = shown;
       entry.chain = entry.chain.then(() => {
         if (!entry.rowId) return;
-        return supabase.from("merlin_messages").update({ content: entry.shown }).eq("id", entry.rowId)
+        return supabase.from("edva_messages").update({ content: entry.shown }).eq("id", entry.rowId)
           .then(({ error }) => { if (error) log(`stream write error: ${error.message}`); });
       });
     }
@@ -1088,7 +1088,7 @@ async function streamTick() {
       for (const [id, entry] of streamRows) {
         streamRows.delete(id);
         finishedDrafts.add(id);
-        entry.chain.then(() => entry.rowId && supabase.from("merlin_messages")
+        entry.chain.then(() => entry.rowId && supabase.from("edva_messages")
           .update({ content: entry.raw, metadata: {} }).eq("id", entry.rowId))
           .catch(() => {});
         log(`stream: reply ${id.slice(-8)} ended without a reply call; kept its text`);
@@ -1114,11 +1114,11 @@ const REACTION_EMOJI = {
 
 // Hum feedback log path — we resolve tapback reactions back to the ping_id by
 // scanning this file for a matching `message_id` (captured at ping-send time
-// via `merlin-send-curl --capture-id`, see jobs/hum.md step 3).
+// via `edva-send-curl --capture-id`, see jobs/hum.md step 3).
 const HUM_FEEDBACK_PATH = installTools("data/hum-feedback.jsonl");
-const HUM_CLI = installTools("bin/merlin");
+const HUM_CLI = installTools("bin/edva");
 
-/// Look up the hum ping_id for a reacted-to merlin_messages.id. Returns null
+/// Look up the hum ping_id for a reacted-to edva_messages.id. Returns null
 /// if the message isn't a hum ping (or the ping pre-dates message_id capture).
 function findHumPingIdForMessage(messageId) {
   if (!messageId) return null;
@@ -1138,10 +1138,10 @@ function findHumPingIdForMessage(messageId) {
   return null;
 }
 
-/// Record a tapback reaction against a hum ping via the merlin CLI. Runs in
+/// Record a tapback reaction against a hum ping via the edva CLI. Runs in
 /// the background (fire-and-forget) so the forward notification to chat-agent
 /// isn't blocked on shelling out. reactionToken is the raw Supabase value
-/// ("heart"/"thumbs_up"/"thumbs_down"); `merlin hum feedback` accepts those
+/// ("heart"/"thumbs_up"/"thumbs_down"); `edva hum feedback` accepts those
 /// via its HUM_REACTION_ALIASES table.
 function recordHumReaction(pingId, reactionToken) {
   import("node:child_process").then(({ spawn }) => {
@@ -1184,7 +1184,7 @@ function classifySuggestionReply(messageId, text, replyTo) {
 }
 
 // Read on one device → clear its banner on the others (sendClearPush in
-// lib/apns-push.mjs). merlin_messages has default replica identity, so
+// lib/apns-push.mjs). edva_messages has default replica identity, so
 // payload.old carries no `read`: any UPDATE of a read row queues, and
 // `readCleared` keeps a message from clearing twice. The 3 s window batches a
 // scroll that marks several rows and lets a push that is still going out get
@@ -1219,13 +1219,13 @@ function subscribeToMessages() {
   }
 
   const channel = supabase
-    .channel("merlin-user-messages")
+    .channel("edva-user-messages")
     .on(
       "postgres_changes",
       {
         event: "UPDATE",
         schema: "public",
-        table: "merlin_messages",
+        table: "edva_messages",
       },
       async (payload) => {
         const oldRow = payload.old || {};
@@ -1242,7 +1242,7 @@ function subscribeToMessages() {
           : `${OWNER_LABEL} removed their reaction from your previous message:\n\n"${snippet}${newRow.content?.length > 160 ? "…" : ""}"\n\nNo reply required.`;
 
         // If the reacted-to row is a hum ping (has a matching message_id in
-        // hum-feedback.jsonl), route the reaction through `merlin hum
+        // hum-feedback.jsonl), route the reaction through `edva hum
         // feedback` so hum-daily/hum-review can see it. Only record on a real
         // reaction value — don't propagate clears (hum-feedback has no
         // concept of "un-react" today).
@@ -1260,7 +1260,7 @@ function subscribeToMessages() {
             params: {
               content,
               meta: {
-                source: "merlin",
+                source: "edva",
                 kind: "reaction",
                 messageId: newRow.id,
                 reaction: reaction || null,
@@ -1279,7 +1279,7 @@ function subscribeToMessages() {
       {
         event: "INSERT",
         schema: "public",
-        table: "merlin_messages",
+        table: "edva_messages",
         filter: "role=eq.user",
       },
       (payload) => handleIncomingMessage(payload.new)
@@ -1320,7 +1320,7 @@ async function sweepMissedMessages() {
 
   try {
     const { data: missed } = await supabase
-      .from("merlin_messages")
+      .from("edva_messages")
       .select("*")
       .eq("role", "user")
       .eq("read", false)
@@ -1350,7 +1350,7 @@ function subscribeToLocationEdges() {
     locationChannel = null;
   }
   locationChannel = supabase
-    .channel("merlin-location-edges")
+    .channel("edva-location-edges")
     .on("postgres_changes", {
       event: "INSERT", schema: "public", table: "location_history",
       filter: "segment_type=eq.visit",
@@ -1558,9 +1558,9 @@ async function dispatchLocationEdge(event, row) {
   console.error(`[phone-channel] Emitted hum event location.${event} for row=${row.id}`);
 }
 
-// Only monitor incoming messages when running under a supervisor (MERLIN_DISPATCH_URL is set).
+// Only monitor incoming messages when running under a supervisor (EDVA_DISPATCH_URL is set).
 // When loaded standalone (e.g. Claude Desktop), only the reply/get_location tools are available.
-if (process.env.MERLIN_DISPATCH_URL) {
+if (process.env.EDVA_DISPATCH_URL) {
   // Warm auto-recall judge: one resident tool-less `claude -p`
   // instead of a fork per message, so the judgment in front of every chat
   // message costs API latency, not CLI startup. Prewarmed here so the first
@@ -1600,7 +1600,7 @@ if (process.env.MERLIN_DISPATCH_URL) {
   // in the supervisor causes spurious restarts right after respawn.
   const HEARTBEAT_INTERVAL_MS = 60_000;
   async function sendHeartbeat() {
-    const base = process.env.MERLIN_DISPATCH_URL?.replace(/\/dispatch$/, "");
+    const base = process.env.EDVA_DISPATCH_URL?.replace(/\/dispatch$/, "");
     const url = base ? `${base}/heartbeat` : null;
     if (!url) return;
     try {
@@ -1617,7 +1617,7 @@ if (process.env.MERLIN_DISPATCH_URL) {
   setTimeout(sendHeartbeat, 500);
   setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 
-  console.error("[phone-channel] Subscribed to merlin_messages realtime");
+  console.error("[phone-channel] Subscribed to edva_messages realtime");
 } else {
   console.error("[phone-channel] Standalone mode — tools only, no message monitoring");
 }

@@ -70,7 +70,7 @@ fs.writeFileSync(
 name: Email from address
 type: feedback
 ---
-Default agent-originated email to Alex uses Merlin <merlin@example.com> via email-send. Exception: when Alex explicitly asks to email a third party, use alexr@example.com via gmail-action.
+Default agent-originated email to Alex uses Edva <edva@example.com> via email-send. Exception: when Alex explicitly asks to email a third party, use alexr@example.com via gmail-action.
 `,
 );
 

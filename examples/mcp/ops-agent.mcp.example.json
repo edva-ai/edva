@@ -3,9 +3,9 @@
   "mcpServers": {
     "tools": {
       "command": "node",
-      "args": ["${MERLIN_HOME}/agent/tools-mcp/index.mjs"],
+      "args": ["${EDVA_HOME}/agent/tools-mcp/index.mjs"],
       "env": {
-        "MERLIN_AGENT_ID": "ops"
+        "EDVA_AGENT_ID": "ops"
       },
       "alwaysLoad": true
     },
@@ -13,12 +13,12 @@
       "command": "npx",
       "args": ["-y", "chrome-devtools-mcp@0.21.0", "--browserUrl", "http://localhost:9222"]
     },
-    "supabase-merlin": {
+    "supabase-edva": {
       "command": "npx",
       "args": [
         "-y",
         "@supabase/mcp-server-supabase@latest",
-        "--project-ref=${MERLIN_SUPABASE_PROJECT}"
+        "--project-ref=${EDVA_SUPABASE_PROJECT}"
       ],
       "env": {
         "SUPABASE_ACCESS_TOKEN": "${SUPABASE_ACCESS_TOKEN}"

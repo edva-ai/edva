@@ -1,5 +1,5 @@
 {
-  "_comment": "LaunchAgents and long-running processes that make up the Merlin always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs.",
+  "_comment": "LaunchAgents and long-running processes that make up the Edva always-on server (the kernel's). This installation's own services live in agent/local/services.json, merged by lib/registry.cjs.",
   "services": [
     {
       "name": "claude-session",

@@ -7,7 +7,7 @@
   Cron keeps the schedule (12:30 and 17:30 local, clock-jobs.json):
   agent/scripts/trigger-hum-explore.sh only runs
   `launchctl kickstart gui/$(id -u)/ai.claude.hum-explore`. The run
-  (run-hum-explore.sh) sends its pick through merlin-send-curl, whose
+  (run-hum-explore.sh) sends its pick through edva-send-curl, whose
   resolve-first gate and outbound precheck are `claude -p` on the Max
   subscription, and only the GUI session can unlock the keychain holding that
   credential. From cron both gates fail open and the pick would go out
@@ -15,7 +15,7 @@
 
   Install:
     agent/launch-agents/install.sh ai.claude.hum-explore
-    (renders __MERLIN_HOME__ / __MERLIN_TOOLS__ / __HOME__, then launchctl bootstrap)
+    (renders __EDVA_HOME__ / __EDVA_TOOLS__ / __HOME__, then launchctl bootstrap)
 -->
 <plist version="1.0">
 <dict>
@@ -23,31 +23,31 @@
     <string>ai.claude.hum-explore</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__MERLIN_TOOLS__/bin/cron-run</string>
+        <string>__EDVA_TOOLS__/bin/cron-run</string>
         <string>--label</string>
         <string>hum-explore</string>
         <string>--</string>
         <string>/bin/bash</string>
-        <string>__MERLIN_TOOLS__/agent/scripts/run-hum-explore.sh</string>
+        <string>__EDVA_TOOLS__/agent/scripts/run-hum-explore.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>__HOME__</string>
         <key>PATH</key>
-        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__MERLIN_TOOLS__/bin</string>
+        <string>__HOME__/.local/bin:__HOME__/.local/node/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__EDVA_TOOLS__/bin</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
     </dict>
     <key>WorkingDirectory</key>
-    <string>__MERLIN_HOME__</string>
+    <string>__EDVA_HOME__</string>
     <key>RunAtLoad</key>
     <false/>
     <key>KeepAlive</key>
     <false/>
     <key>StandardOutPath</key>
-    <string>__MERLIN_TOOLS__/data/logs/hum-explore-launchd.log</string>
+    <string>__EDVA_TOOLS__/data/logs/hum-explore-launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>__MERLIN_TOOLS__/data/logs/hum-explore-launchd.log</string>
+    <string>__EDVA_TOOLS__/data/logs/hum-explore-launchd.log</string>
 </dict>
 </plist>

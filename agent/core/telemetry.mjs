@@ -3,7 +3,7 @@
 // checklist) are PERSISTED to memory-index.db so a producer (a supervisor turn,
 // a job) and the consumer (the WP12 dashboard on :9098, a separate process) are
 // decoupled — the dashboard reads + streams them. `mobilePush` routes through
-// the existing APNs path (`merlin-notify`) and enforces Conway's one-push-per-
+// the existing APNs path (`edva-notify`) and enforces Conway's one-push-per-
 // task discipline in code (dedupe within a window), so a long task yields ONE
 // completion/blocker push, never incremental spam.
 //
@@ -122,9 +122,9 @@ function parseTodos(json) {
 const _lastPush = new Map();   // dedupeKey -> ts
 const DEFAULT_DEDUPE_WINDOW_MS = 5 * 60_000;
 
-// Default pusher: `merlin-notify --title <title> <body>` (existing APNs sender).
+// Default pusher: `edva-notify --title <title> <body>` (existing APNs sender).
 function defaultPusher(title, body) {
-  const bin = installTools("bin/merlin-notify");
+  const bin = installTools("bin/edva-notify");
   try {
     const child = spawn(bin, ["--title", title, body], { stdio: "ignore", detached: true });
     child.unref?.();
@@ -142,7 +142,7 @@ export function mobilePush(title, body, { dedupeKey = null, dedupeWindowMs = DEF
   if (last != null && t - last < dedupeWindowMs) {
     return { sent: false, reason: "deduped" };
   }
-  const ok = pusher(title || "Merlin", body || "");
+  const ok = pusher(title || "Edva", body || "");
   if (ok) _lastPush.set(key, t);
   return { sent: !!ok, reason: ok ? "sent" : "push-failed" };
 }

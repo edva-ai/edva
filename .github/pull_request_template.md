@@ -10,7 +10,7 @@
 
 ## Public-content review
 
-Merlin is the public kernel; personal/identity-coupled content belongs in
+Edva is the public kernel; personal/identity-coupled content belongs in
 an installation's own files — `agent/local/` and the `_ext/` dirs, kept in a
 private overlay repo (see
 [`docs/architecture-public-private.md`](../docs/architecture-public-private.md)).
@@ -27,7 +27,7 @@ Confirm the following before requesting review:
   (e.g. a specific project ref).
 - [ ] If `.tools/sanitize-guard-baseline.json` changed, the new accepted
   hits are listed in the section below with a one-line rationale per hit.
-- [ ] CLAUDE.md changes apply universally to anyone running Merlin (no
+- [ ] CLAUDE.md changes apply universally to anyone running Edva (no
   rules that only make sense for a specific household, business, or
   property — those go in `agent/local/shared.md`, `chat.md` or `ops.md`).
 

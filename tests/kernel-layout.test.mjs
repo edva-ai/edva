@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 const HERE_TOOLS = path.resolve(import.meta.dirname, "..");
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "kernel-layout-"));
 // The installation under a fake HOME (its spelling follows the distribution).
-const IR = path.join("/home/someone", "Dev/merlin");
+const IR = path.join("/home/someone", "Dev/edva");
 
 // Copy root.cjs and root.sh into a fake tree whose kernel sits at <dir>/<sub>.
 function fakeTree(sub) {
@@ -34,8 +34,8 @@ function fakeTree(sub) {
   return { dir: fs.realpathSync(dir), tools: fs.realpathSync(tools) };
 }
 
-const node = (file, env = {}) => JSON.parse(spawnSync(process.execPath, ["-e", `const r = require(${JSON.stringify(file)}); console.log(JSON.stringify({ root: r.REPO_ROOT, tools: r.TOOLS_DIR, ir: r.installRoot(), it: r.installTools("x") }))`], { encoding: "utf8", env: { ...process.env, MERLIN_HOME: "", ...env } }).stdout);
-const sh = (file, env = {}) => spawnSync("/bin/bash", ["-c", `source "${file}"; printf '%s\\n' "$MERLIN_ROOT" "$MERLIN_TOOLS" "$MERLIN_INSTALL" "$MERLIN_INSTALL_TOOLS" "$MERLIN_KERNEL_SUBDIR"`], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: "/home/someone", ...env } }).stdout.trim().split("\n");
+const node = (file, env = {}) => JSON.parse(spawnSync(process.execPath, ["-e", `const r = require(${JSON.stringify(file)}); console.log(JSON.stringify({ root: r.REPO_ROOT, tools: r.TOOLS_DIR, ir: r.installRoot(), it: r.installTools("x") }))`], { encoding: "utf8", env: { ...process.env, EDVA_HOME: "", ...env } }).stdout);
+const sh = (file, env = {}) => spawnSync("/bin/bash", ["-c", `source "${file}"; printf '%s\\n' "$EDVA_ROOT" "$EDVA_TOOLS" "$EDVA_INSTALL" "$EDVA_INSTALL_TOOLS" "$EDVA_KERNEL_SUBDIR"`], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: "/home/someone", ...env } }).stdout.trim().split("\n");
 
 test("this checkout: the kernel tree is tools/ under the repo root", () => {
   assert.equal(TOOLS_DIR, HERE_TOOLS);
@@ -54,9 +54,9 @@ test("root.cjs: kernel under <repo>/tools and kernel at the repo root", () => {
   assert.equal(r.it, path.join(r.ir, "x"));
 });
 
-test("root.cjs: MERLIN_HOME is the installation and the checkout", () => {
+test("root.cjs: EDVA_HOME is the installation and the checkout", () => {
   const g = fakeTree("tools");
-  assert.deepEqual(node(path.join(g.tools, "lib/root.cjs"), { MERLIN_HOME: "/srv/g" }),
+  assert.deepEqual(node(path.join(g.tools, "lib/root.cjs"), { EDVA_HOME: "/srv/g" }),
     { root: "/srv/g", tools: "/srv/g/tools", ir: "/srv/g", it: "/srv/g/tools/x" });
 });
 
@@ -65,8 +65,8 @@ test("root.sh agrees with root.cjs in both layouts, reading the layout from root
   assert.deepEqual(sh(path.join(g.tools, "agent/scripts/lib/root.sh")), [g.dir, g.tools, IR, [IR, "tools"].join("/"), "tools"]);
   const m = fakeTree("");
   assert.deepEqual(sh(path.join(m.tools, "agent/scripts/lib/root.sh")).slice(0, 4), [m.dir, m.dir, IR, IR]);
-  assert.deepEqual(sh(path.join(g.tools, "agent/scripts/lib/root.sh"), { MERLIN_HOME: "/srv/g" }).slice(0, 4), ["/srv/g", "/srv/g/tools", "/srv/g", "/srv/g/tools"]);
-  assert.deepEqual(sh(path.join(g.tools, "agent/scripts/lib/root.sh"), { MERLIN_ROOT: "/sandbox" }).slice(0, 2), ["/sandbox", "/sandbox/tools"]);
+  assert.deepEqual(sh(path.join(g.tools, "agent/scripts/lib/root.sh"), { EDVA_HOME: "/srv/g" }).slice(0, 4), ["/srv/g", "/srv/g/tools", "/srv/g", "/srv/g/tools"]);
+  assert.deepEqual(sh(path.join(g.tools, "agent/scripts/lib/root.sh"), { EDVA_ROOT: "/sandbox" }).slice(0, 2), ["/sandbox", "/sandbox/tools"]);
 });
 
 test("optionalBin: env override, then bin/_ext/, then bin/; null when none", () => {
@@ -105,12 +105,12 @@ test("cli.d: an installation's subcommand runs, is listed in help, and never sha
   const bin = path.join(dir, "bin");
   fs.mkdirSync(path.join(bin, "cli.d"), { recursive: true });
   fs.symlinkSync(path.join(HERE_TOOLS, "lib"), path.join(dir, "lib"));
-  fs.copyFileSync(path.join(HERE_TOOLS, "bin/merlin"), path.join(bin, "merlin"));
+  fs.copyFileSync(path.join(HERE_TOOLS, "bin/edva"), path.join(bin, "edva"));
   fs.writeFileSync(path.join(bin, "cli.d/hello.mjs"),
     'export default { summary: "say hello", usage: "hello <who>", async run(args, ctx) { console.log(`hello ${args[0]} from ${ctx.TOOLS ? "kernel" : "?"}`); } };\n');
   fs.writeFileSync(path.join(bin, "cli.d/status.mjs"), 'export default { summary: "shadow", run() { console.log("SHADOWED"); } };\n');
   fs.writeFileSync(path.join(bin, "cli.d/broken.mjs"), "export default { summary: 'no run' };\n");
-  const run = (...a) => spawnSync(process.execPath, [path.join(bin, "merlin"), ...a, "--no-color"], { encoding: "utf8", env: { ...process.env, HOME: dir, NO_COLOR: "1" } });
+  const run = (...a) => spawnSync(process.execPath, [path.join(bin, "edva"), ...a, "--no-color"], { encoding: "utf8", env: { ...process.env, HOME: dir, NO_COLOR: "1" } });
   let r = run("hello", "world");
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^hello world from kernel$/m);

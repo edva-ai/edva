@@ -1,12 +1,12 @@
-# merlin-telemetry
+# edva-telemetry
 
-Tiny Vercel edge function powering two anonymous endpoints for the public Merlin
+Tiny Vercel edge function powering two anonymous endpoints for the public Edva
 project:
 
 | URL                                   | What hits it                                      |
 | ------------------------------------- | ------------------------------------------------- |
 | `GET  /px[/anything]?r=<tag>`         | The README tracking pixel (and any docs pixels).  |
-| `POST /install`                       | First-run install ping from `merlin init`.        |
+| `POST /install`                       | First-run install ping from `edva init`.        |
 | `GET  /stats`                         | Aggregate, anonymous install counters (JSON).     |
 | `GET\|POST /usage`                    | Private Claude usage/cost rollup (token-gated).   |
 
@@ -59,23 +59,23 @@ configured, and can be gated behind a `STATS_TOKEN` env var (`/stats?token=…`)
 ## Claude usage/cost monitoring (`/usage`)
 
 Separate from anonymous adoption telemetry, `/usage` is **private operator
-telemetry** for central Claude API usage/cost monitoring across hosts. Merlin's
+telemetry** for central Claude API usage/cost monitoring across hosts. Edva's
 supervisor already writes per-job token/cost rows locally
-(`agent/logs/supervisor-ops/job-costs.ndjson`, read by `bin/merlin-cost-report`);
-`merlin-cost-report --push` rolls those up **per day** and POSTs them here so they
+(`agent/logs/supervisor-ops/job-costs.ndjson`, read by `bin/edva-cost-report`);
+`edva-cost-report --push` rolls those up **per day** and POSTs them here so they
 survive log rotation and are queryable from anywhere.
 
 ```bash
-# on each host (token from .env / MERLIN_USAGE_TOKEN), e.g. from nightly-review:
-merlin-cost-report --since 2d --push
+# on each host (token from .env / EDVA_USAGE_TOKEN), e.g. from nightly-review:
+edva-cost-report --since 2d --push
 ```
 
 - **Always token-gated** (`STATS_TOKEN`, via `?token=` or `Authorization: Bearer`).
   The endpoint returns `503` if no token is configured, so cost data can never be
-  ingested or read anonymously. Public clones leave `MERLIN_USAGE_TOKEN` unset.
+  ingested or read anonymously. Public clones leave `EDVA_USAGE_TOKEN` unset.
 - **Idempotent** per `(host, day)`: re-pushing a day overwrites that host's
   snapshot rather than double-counting, so a cron that pushes a 2-day window is safe.
-- **Cost figures are estimates.** Per merlin's Max-only auth invariant the
+- **Cost figures are estimates.** Per edva's Max-only auth invariant the
   supervisor's `total_cost_usd` is an SDK estimate, not billed spend. `/usage`
   carries a `cost_is_estimated` flag and names the field `est_cost_usd`. The
   signals that matter for cost *reduction* are token volume and `cache_hit_rate`.
@@ -83,7 +83,7 @@ merlin-cost-report --since 2d --push
 Read the rollup (default last 30 days, `?days=N` to widen):
 
 ```bash
-curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$MERLIN_USAGE_TOKEN"
+curl -s "https://edva-telemetry.vercel.app/usage?days=14&token=$EDVA_USAGE_TOKEN"
 ```
 
 ```jsonc
@@ -105,7 +105,7 @@ curl -s "https://merlin-telemetry.vercel.app/usage?days=14&token=$MERLIN_USAGE_T
 ## What is **not** logged
 
 - The raw client IP (only an 8-byte hash, salted per day).
-- Anything from clients that send `DNT: 1` or set `MERLIN_NO_TELEMETRY=1` in
+- Anything from clients that send `DNT: 1` or set `EDVA_NO_TELEMETRY=1` in
   their environment (handled by the CLI, not the server).
 - Anything the CLI didn't choose to send — there is no user-content collection,
   no environment dump, no path enumeration. Look at `bin/cli.d/_telemetry.mjs` to verify.
@@ -128,7 +128,7 @@ The pixel still gives signal for:
 - Mirrors that don't proxy (forks rendered elsewhere, awesome-lists, etc.).
 - `raw.githubusercontent.com` direct viewers.
 
-If you want a stronger "real human is trying merlin" signal, the install ping
+If you want a stronger "real human is trying edva" signal, the install ping
 is the right metric — that requires actually downloading the repo and running
 the installer.
 
@@ -141,7 +141,7 @@ vercel link             # one-time, scope to a Vercel team
 
 # one-time: provision a KV store and attach it to this project. The Upstash
 # Redis marketplace integration injects KV_REST_API_URL / KV_REST_API_TOKEN.
-#   Dashboard → Storage → Create → Upstash Redis → Connect to merlin-telemetry
+#   Dashboard → Storage → Create → Upstash Redis → Connect to edva-telemetry
 # then pull the new env vars locally:
 vercel env pull
 
@@ -156,11 +156,11 @@ back to logs-only and `/stats` returns `503` until a store is attached.
 
 After the first deploy:
 
-1. Take the printed URL (e.g. `https://merlin-telemetry.vercel.app`).
+1. Take the printed URL (e.g. `https://edva-telemetry.vercel.app`).
 2. Insert it as `![](https://<url>/px?r=readme)` near the bottom of the root
    `README.md`.
 3. Point `DEFAULT_TELEMETRY_URL` in `bin/cli.d/_telemetry.mjs` at `https://<url>/install`
-   (or set `MERLIN_TELEMETRY_URL` per host).
+   (or set `EDVA_TELEMETRY_URL` per host).
 
-The URL is the only thing the public Merlin clones learn about your telemetry
+The URL is the only thing the public Edva clones learn about your telemetry
 setup. Everything else is opaque to them.

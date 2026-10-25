@@ -3,7 +3,7 @@
 # run-ephemeral-opus.sh, run-ephemeral-fable.sh and the installation's own
 # fork triggers, right before their `claude -p`.
 #
-# WHY. Builds requested through Merlin must run on the host, on the
+# WHY. Builds requested through Edva must run on the host, on the
 # subscription (a user rule). Stripping only ANTHROPIC_API_KEY and
 # ANTHROPIC_AUTH_TOKEN is not enough: several other variables silently move
 # Claude Code off it: CLAUDE_CODE_USE_BEDROCK / _VERTEX / _FOUNDRY switch provider,
@@ -142,7 +142,7 @@ max_auth_outage_owned_by_watchdog() {
   esac
   [ "$MAX_AUTH_PROBE_FAIL_SEC" -ge "$MAX_AUTH_WATCHDOG_PAGE_SEC" ] || return 1
   # watchdog.sh's INCIDENT_DIR; env-overridable for tests.
-  local incidents="${WATCHDOG_INCIDENT_DIR:-${HOME:-}/Dev/merlin/data/watchdog-incidents}"
+  local incidents="${WATCHDOG_INCIDENT_DIR:-${HOME:-}/Dev/edva/data/watchdog-incidents}"
   [ -f "$incidents/auth-outage.alerted" ] || return 1
   [ -f "$incidents/auth-outage.delivered" ] || return 1
   return 0

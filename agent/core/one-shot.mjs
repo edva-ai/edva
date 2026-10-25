@@ -24,7 +24,7 @@ import { Agent } from "./agent.mjs";
 import { makeStatelessExecutor } from "./stateless-executor.mjs";
 import { localRulesFileForCwd } from "../supervisor/claude-session.mjs";
 
-import { REPO_ROOT as MERLIN_ROOT } from "../../lib/root.cjs";
+import { REPO_ROOT as EDVA_ROOT } from "../../lib/root.cjs";
 
 // A one-shot started inside the agent tree loads that dir's CLAUDE.md files, as
 // the supervised agents do; it gets the instance's local rules beside them
@@ -34,9 +34,9 @@ function defaultLocalRulesFile(cwd) {
   const uid = typeof process.getuid === "function" ? process.getuid() : "u";
   return localRulesFileForCwd({
     cwd: cwd || process.cwd(),
-    root: MERLIN_ROOT,
-    localDir: process.env.MERLIN_LOCAL_DIR || undefined,
-    stateDir: path.join(os.tmpdir(), `merlin-local-rules-${uid}`),
+    root: EDVA_ROOT,
+    localDir: process.env.EDVA_LOCAL_DIR || undefined,
+    stateDir: path.join(os.tmpdir(), `edva-local-rules-${uid}`),
   });
 }
 

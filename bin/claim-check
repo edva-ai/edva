@@ -312,12 +312,12 @@ const recallLines = recallHits.length
   ? recallHits.map((r) => `  - [${r.source}${r.created_at ? " " + String(r.created_at).slice(0, 10) : ""}] ${r.title ? r.title + " — " : ""}${(r.snippet || "").slice(0, 200)}`).join("\n")
   : "  (no memory hits)";
 
-const prompt = `You are Merlin's claim-check adjudicator. A candidate message is about to be sent to ${OWNER}. Decide whether it should be sent as-is, rewritten, or dropped — based ONLY on whether it contradicts known facts or something ${OWNER} already told us.
+const prompt = `You are Edva's claim-check adjudicator. A candidate message is about to be sent to ${OWNER}. Decide whether it should be sent as-is, rewritten, or dropped — based ONLY on whether it contradicts known facts or something ${OWNER} already told us.
 
 CANDIDATE (what would be sent):
 ${workingText.slice(0, 1200)}
 
-AUTHORITATIVE FACTS (from Merlin's own live data — these are GROUND TRUTH, they outrank the candidate's wording).
+AUTHORITATIVE FACTS (from Edva's own live data — these are GROUND TRUTH, they outrank the candidate's wording).
 Each line was resolved by code against the timeline. "SAME METRO: YES" is the verdict and it is ALREADY CORRECT — trust it over your own reading of the place names, and do NOT drop or rewrite a candidate for a location mismatch when it says YES. A neighbourhood, borough, airport or suburb of the same metro reads YES by design:
 ${factLines}
 

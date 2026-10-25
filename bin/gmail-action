@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // gmail-action — CLI for Gmail label / archive / draft / send / query operations.
-// Uses OAuth token from ~/Dev/merlin/credentials/gmail-push-token.json.
+// Uses OAuth token from ~/Dev/edva/credentials/gmail-push-token.json.
 // Run `gmail-action` with no args to see the full command list.
 
 import { createRequire } from "node:module";
@@ -160,14 +160,14 @@ async function unarchive(messageId) {
   console.log(`Unarchived ${messageId} (moved back to inbox)`);
 }
 
-// All Merlin email to the user is P1 and stays UNREAD unless the user adds an
+// All Edva email to the user is P1 and stays UNREAD unless the user adds an
 // exception. Many job playbooks and digest-deliver still say "star + mark read"
 // from an older policy, so the rule is enforced HERE, at the one call they all
 // share, rather than trusted to their prose. The policy source is p1-senders.json via
 // `p1-sender check` — an exception the user adds (`p1-sender add <agent address>
 // --unless-subject <re>`) is honoured automatically. Fail-open on any lookup
 // error (the mark-read proceeds). `--force` bypasses it.
-async function isMerlinP1(messageId) {
+async function isEdvaP1(messageId) {
   try {
     const m = await gmailRequest(`/messages/${messageId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`);
     const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
@@ -191,7 +191,7 @@ async function spamRefusal(messageId) {
   const h = (n) => (m.payload?.headers || []).find((x) => x.name.toLowerCase() === n)?.value || "";
   const addr = (h("from").match(/<([^>]+)>/)?.[1] || h("from")).trim().toLowerCase();
   const labelIds = m.labelIds || [];
-  if (AGENT_ADDR && addr === AGENT_ADDR) return "Merlin's own email";
+  if (AGENT_ADDR && addr === AGENT_ADDR) return "Edva's own email";
   if ((OWNER_ADDR && addr === OWNER_ADDR) || labelIds.includes("SENT")) return `${OWNER_NAME} sent it`;
   if (labelIds.includes("STARRED")) return "it is starred (P1/P2)";
   const { spawnSync } = await import("node:child_process");
@@ -237,9 +237,9 @@ async function markUnread(messageId) {
 }
 
 async function markRead(messageId, { force = false } = {}) {
-  if (!force && (await isMerlinP1(messageId))) {
-    triageLog("MARK-READ-REFUSED", { messageId, reason: "merlin-p1" });
-    console.log(`Left ${messageId} unread — Merlin email is P1 (p1-senders.json); use --force to override`);
+  if (!force && (await isEdvaP1(messageId))) {
+    triageLog("MARK-READ-REFUSED", { messageId, reason: "edva-p1" });
+    console.log(`Left ${messageId} unread — Edva email is P1 (p1-senders.json); use --force to override`);
     return;
   }
   await gmailRequest(`/messages/${messageId}/modify`, "POST", {
@@ -259,7 +259,7 @@ async function star(messageId) {
   console.log(`Starred ${messageId}`);
 }
 
-// Self-unstar ledger: every unstar Merlin makes is recorded so the P1 unstar
+// Self-unstar ledger: every unstar Edva makes is recorded so the P1 unstar
 // sweep (bin/p1-unstar-sweep) can tell its own removals apart from
 // the user's when it reads Gmail history. Written BEFORE the API call, so the
 // ledger row always exists by the time the history event does.
@@ -439,7 +439,7 @@ async function createDraftReply(messageId, body) {
   const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
   // The reply goes back to whoever sent the original, so that From header is
   // the recipient the gate has to judge. The subject is THEIRS, carried forward
-  // verbatim, so rules about what Merlin writes do not judge it (inheritedSubject).
+  // verbatim, so rules about what Edva writes do not judge it (inheritedSubject).
   await assertDraftAllowed(from, replySubject, body, "draft-reply", { inheritedSubject: true });
 
   const raw = Buffer.from(
@@ -575,9 +575,9 @@ async function replyToMe(messageId) {
   // thread on those systems; the machine fact that survives the split is that
   // the user has WRITTEN TO THIS EXACT ADDRESS recently. Same footing as the
   // thread check (labels, addresses, timestamps — no language): SENT mail to the
-  // sender's address in the 30 days before this message. Merlin's and the user's
+  // sender's address in the 30 days before this message. Edva's and the user's
   // own addresses are excluded — the user writes to the agent's address
-  // constantly, and Merlin-initiated mail must stay class 2.
+  // constantly, and Edva-initiated mail must stay class 2.
   const fromAddr = (hdr(msg, "from").match(/<([^>]+)>/)?.[1] || hdr(msg, "from")).trim().toLowerCase();
   const NOT_CORRESPONDENT = selfAddressRe();
   let correspondent = null;
@@ -777,11 +777,11 @@ Commands:
   label <messageId> <labelName>         Add a label ("spam" = the spam command below)
   unlabel <messageId> <labelName>       Remove a label ("spam" = not-spam)
   spam <messageId>                      Move to Gmail's Spam folder + mark read. Refused (exit 3, untouched)
-                                        for Merlin's own mail, mail ${OWNER_NAME} sent, starred mail, a P1 sender
+                                        for Edva's own mail, mail ${OWNER_NAME} sent, starred mail, a P1 sender
   not-spam <messageId>                  Move out of Spam, back to the inbox
   archive <messageId>                   Remove from INBOX
   label-archive <messageId> <label>     Label + archive
-  mark-read <messageId> [--force]       Mark as read (refused for a P1 Merlin email unless --force)
+  mark-read <messageId> [--force]       Mark as read (refused for a P1 Edva email unless --force)
   mark-unread <messageId>               Mark as unread
   star <messageId>                      Add yellow star
   unstar <messageId>                    Remove star

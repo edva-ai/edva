@@ -11,7 +11,7 @@
 
 set -euo pipefail
 AGENT="${1:?usage: load-agent.sh <name>}"
-CONFIG="${AGENT_CONFIG:-$HOME/Dev/merlin/agent/config/agents.json}"
+CONFIG="${AGENT_CONFIG:-$HOME/Dev/edva/agent/config/agents.json}"
 
 exec node -e '
 const cfg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));

@@ -34,7 +34,7 @@ const KID = "test-key-1";
 const publicJwk = { ...publicKey.export({ format: "jwk" }), kid: KID, alg: "RS256", use: "sig" };
 
 const AUDIENCE = "https://push.example.com";
-const SA_EMAIL = "merlin-pubsub@example-project.iam.gserviceaccount.com";
+const SA_EMAIL = "edva-pubsub@example-project.iam.gserviceaccount.com";
 
 function b64url(buf) {
   return Buffer.from(buf).toString("base64url");

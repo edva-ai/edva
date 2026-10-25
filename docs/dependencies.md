@@ -1,4 +1,4 @@
-# Dependencies — what you actually need to run Merlin
+# Dependencies — what you actually need to run Edva
 
 The README's prereqs list is the minimum. This is the complete map: required vs optional, what platform expects what, where to get each piece. Read before committing to a deployment plan.
 
@@ -9,7 +9,7 @@ The README's prereqs list is the minimum. This is the complete map: required vs 
 | **Node.js 22.5+** | Built-in `node:sqlite` requires 22.5+; all kernel code is JS/TS | [nodejs.org](https://nodejs.org) | `node --version` |
 | **npm** | Dependency install across subpackages | ships with Node | `npm --version` |
 | **Claude Max + Claude Code CLI** | Every agent runs as `claude -p` on a Max login; the supervisors hide `ANTHROPIC_API_KEY` from it ([`agent-auth-model.md`](agent-auth-model.md)) | `npm install -g @anthropic-ai/claude-code`, then `claude` once | `claude auth status` |
-| **macOS** (primary target) | launchd jobs, Keychain-held Claude credentials, AppleScript tools, `ioreg`; the kernel also assumes Node at `/opt/homebrew/bin/node` and the install at `~/Dev/merlin` (or `MERLIN_HOME`) — see [`installer.md`](installer.md) | — | — |
+| **macOS** (primary target) | launchd jobs, Keychain-held Claude credentials, AppleScript tools, `ioreg`; the kernel also assumes Node at `/opt/homebrew/bin/node` and the install at `~/Dev/edva` (or `EDVA_HOME`) — see [`installer.md`](installer.md) | — | — |
 | **A POSIX shell** | bash 4+ (macOS users: `brew install bash` for 5.x; the default `/bin/bash` is 3.2 from 2007 and may misbehave) | — | `bash --version` |
 
 ## Tier 2 — strongly recommended
@@ -42,11 +42,11 @@ The README's prereqs list is the minimum. This is the complete map: required vs 
 
 ### Google Calendar / Tasks / Contacts inside agent tools
 
-Several kernel tools and harvesters shell out to the `gog` Google CLI (`gog calendar …`, `gog tasks …`). **It doesn't ship with Merlin** — install it yourself (it needs `GOG_KEYRING_PASSWORD` in `.env` with a file keyring), or replace those calls.
+Several kernel tools and harvesters shell out to the `gog` Google CLI (`gog calendar …`, `gog tasks …`). **It doesn't ship with Edva** — install it yourself (it needs `GOG_KEYRING_PASSWORD` in `.env` with a file keyring), or replace those calls.
 
 Three paths:
 
-1. **Install `gog`** and authorize it for Calendar and Tasks (`gog auth add <account> --services calendar,tasks`). `merlin doctor` checks that it answers.
+1. **Install `gog`** and authorize it for Calendar and Tasks (`gog auth add <account> --services calendar,tasks`). `edva doctor` checks that it answers.
 2. **Write a minimal `gog` shim** matching the call shapes the code uses (`grep -rn '\bgog\b' agent bin lib`) and put it on the agents' `PATH`.
 3. **Use Google MCP servers** instead, wired into your MCP configs, and adapt the playbooks that call `gog` (`morning-digest`, the calendar/tasks harvesters and sensors).
 
@@ -72,7 +72,7 @@ The shipped workflows (`.github/workflows/ios-testflight.yml`, `.github/workflow
 - **Use GitHub-hosted runners**: change `runs-on:` to `macos-latest` in both workflow files. Slower; you may need to add a `setup-xcode` step depending on which Xcode version you target.
 - **Set up a self-hosted runner**: dedicate a Mac (mini, laptop, anything) per [GitHub's docs](https://docs.github.com/en/actions/hosting-your-own-runners). Tag with the labels above. The runner config script generates a LaunchAgent automatically.
 
-**Keep a self-hosted runner off a public repo.** A runner attached to a public fork can be made to run other people's workflow code on that Mac, with access to its keychain and everything Merlin keeps on it. Attach the runner only to a private fork; if your fork is public, use GitHub-hosted runners.
+**Keep a self-hosted runner off a public repo.** A runner attached to a public fork can be made to run other people's workflow code on that Mac, with access to its keychain and everything Edva keeps on it. Attach the runner only to a private fork; if your fork is public, use GitHub-hosted runners.
 
 **Required GitHub Actions secrets** (set under Settings → Secrets and variables → Actions):
 
@@ -94,24 +94,24 @@ See [Apple's docs](https://developer.apple.com/documentation/appstoreconnectapi/
 
 ### Always-on host (launchd / systemd)
 
-If you're putting Merlin on a dedicated machine (Mac mini, Intel NUC, Raspberry Pi if Linux, anything 24/7):
+If you're putting Edva on a dedicated machine (Mac mini, Intel NUC, Raspberry Pi if Linux, anything 24/7):
 
 - **macOS**: `launchctl`, auto-login enabled, FileVault disabled, `pmset` tuned for never-sleep. Full procedure in [`docs/installer.md`](installer.md).
 - **Linux**: `systemctl --user`, `loginctl enable-linger` for the user. Procedure in [`docs/installer.md`](installer.md).
-- **Tailscale** (or equivalent) if you want to reach the host's wiki UI at port 9096 from elsewhere on your network. Optional — Merlin works fine on localhost only.
+- **Tailscale** (or equivalent) if you want to reach the host's wiki UI at port 9096 from elsewhere on your network. Optional — Edva works fine on localhost only.
 
 ## Tier 4 — purely optional convenience
 
 | Dep | What it adds |
 |---|---|
-| `gh` | Some Merlin scripts use `gh` to inspect runs/issues; without it those features short-circuit silently. |
+| `gh` | Some Edva scripts use `gh` to inspect runs/issues; without it those features short-circuit silently. |
 | `op` (1Password CLI) | Resolve secrets from a vault at start-up instead of keeping them in `.env`. See [`docs/hardening.md`](hardening.md). |
 | Chrome + chrome-devtools-mcp | Agent-driven browser automation on the `ops` tier (automation Chrome on :9222; `examples/mcp/ops-agent.mcp.example.json`, `browsing-skills/`). Jobs that need it are listed in `agent/config/chrome-jobs.json`. |
 | Python 3 | Trainer's `ci/distribute_external.py` uses Python. Not needed if you're not building the iOS apps. |
 
 ## Hardware notes
 
-Merlin will run on:
+Edva will run on:
 
 - **Mac mini / iMac / MacBook**, M1 or newer recommended for fastlane build speed. Intel works for everything except the iOS-build CI runner (slower).
 - **Linux server / VPS**, any 64-bit — possible but secondary: the macOS-only pieces stay off and the Node-path convention needs a symlink ([`installer.md`](installer.md)). Memory: 8 GB is comfortable for the supervisors + a small Ollama model.
@@ -124,7 +124,7 @@ What you cannot do:
 
 ## Network notes
 
-The supervisors bind to `127.0.0.1`: ops **9090** (Gmail push, the only port meant to be reachable through your tunnel), **9091** (control), **9092** (webhook), **9093** (health); ops-light **9081–9083**; ops-haiku **9071–9073**; chat health **9094**; the process manager **9095**; the wiki UI **9096**; the WhatsApp channel **9100**. Ports are set in `agent/config/agents.json` (kernel file — override per host only if you must). `merlin up` fails loudly on `EADDRINUSE`.
+The supervisors bind to `127.0.0.1`: ops **9090** (Gmail push, the only port meant to be reachable through your tunnel), **9091** (control), **9092** (webhook), **9093** (health); ops-light **9081–9083**; ops-haiku **9071–9073**; chat health **9094**; the process manager **9095**; the wiki UI **9096**; the WhatsApp channel **9100**. Ports are set in `agent/config/agents.json` (kernel file — override per host only if you must). `edva up` fails loudly on `EADDRINUSE`.
 
 Outbound connections you'll see:
 
@@ -134,6 +134,6 @@ Outbound connections you'll see:
 - `googleapis.com` — if Gmail Pub/Sub wired
 - `api.smtp2go.com` — if outbound mail wired
 - `api.appstoreconnect.apple.com` — only during iOS CI
-- `merlin-telemetry.vercel.app` — the one anonymous install ping `merlin init` asks about (off with `MERLIN_TELEMETRY=off` or `MERLIN_NO_TELEMETRY=1`), and the private `/usage` push only if you set `MERLIN_USAGE_TOKEN`
+- `edva-telemetry.vercel.app` — the one anonymous install ping `edva init` asks about (off with `EDVA_TELEMETRY=off` or `EDVA_NO_TELEMETRY=1`), and the private `/usage` push only if you set `EDVA_USAGE_TOKEN`
 
 Nothing else phones home.

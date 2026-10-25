@@ -1,6 +1,6 @@
 // ping-media.test.mjs — the harvester→hum-ping media hand-off
 // (lib/ping-media.mjs) plus the `--media` append contract in
-// bin/merlin-send-curl.
+// bin/edva-send-curl.
 //
 // What these pin down, and why each one is worth a test:
 //
@@ -10,7 +10,7 @@
 //   - `mediaUrls` orders image-then-map and rejects anything not http(s). The
 //     client renders a bare URL line as an image; a malformed entry would land
 //     in the user's chat as literal text.
-//   - `merlin-send-curl` appends media AFTER the gates and keeps them out of
+//   - `edva-send-curl` appends media AFTER the gates and keeps them out of
 //     the push preview. That ordering is the whole design — a precheck
 //     `modify` replaces the message wholesale, so anything appended earlier is
 //     silently lost.
@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "ping-media-"));
-process.env.MERLIN_PING_MEDIA_FILE = path.join(fixtureDir, "ping-media.json");
+process.env.EDVA_PING_MEDIA_FILE = path.join(fixtureDir, "ping-media.json");
 
 let M;
 before(async () => { M = await import("../lib/ping-media.mjs"); });
@@ -54,7 +54,7 @@ test("a candidate with no media is not stashed at all", () => {
 });
 
 test("entries past the TTL are not served", () => {
-  const file = process.env.MERLIN_PING_MEDIA_FILE;
+  const file = process.env.EDVA_PING_MEDIA_FILE;
   const all = JSON.parse(fs.readFileSync(file, "utf8"));
   all["nearby:stale"] = {
     ts: new Date(Date.now() - 13 * 3600000).toISOString(),
@@ -78,14 +78,14 @@ test("mediaUrls rejects anything that is not an http(s) URL", () => {
   assert.deepEqual(M.mediaUrls(null), []);
 });
 
-// ── merlin-send-curl's --media contract ─────────────────────────────────
+// ── edva-send-curl's --media contract ─────────────────────────────────
 //
 // Read as source rather than executed: running it would insert a real row into
-// merlin_messages and push to the user's phone. What matters is structural and
+// edva_messages and push to the user's phone. What matters is structural and
 // checkable statically — that the append happens after the gates, and that the
 // push reads the pre-media text.
 
-const SEND = fs.readFileSync(path.join(here, "../bin/merlin-send-curl"), "utf8");
+const SEND = fs.readFileSync(path.join(here, "../bin/edva-send-curl"), "utf8");
 
 test("media is appended after the precheck, not before it", () => {
   const precheckAt = SEND.indexOf('MESSAGE="$MODIFIED"');

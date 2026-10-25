@@ -1,7 +1,7 @@
 // precheck-protected-intent.test.mjs — the suppress-override belt only covers
 // the intents whose revocation vocabulary it actually speaks.
 //
-// merlin-send-curl overrides a precheck `suppress` for "protected" intents
+// edva-send-curl overrides a precheck `suppress` for "protected" intents
 // unless the precheck's own reason text cites an explicit user revocation.
 // That test is a regex (REVOCATION_RE) built from the installation's
 // protected_revocation vocabulary (agent/local/config/hum-lanes.json),
@@ -14,12 +14,12 @@
 // `rest`/`stop` are unbounded substrings, so "not inte(rest)ed" matches — but
 // across all 39 p1-email observations in outbound-precheck-log.jsonl it never
 // once tripped, so in practice it force-sent every one. (Read that count as
-// "39 observations", not as a rate: only merlin-send-curl writes the `intent`
+// "39 observations", not as a rate: only edva-send-curl writes the `intent`
 // field, so an intent-tagged row is an override by construction.) 24 of the 39
 // were claim-freshness (Rule #2) verdicts, a rule written ten weeks AFTER the
 // belt.
 // Once that sent a security alert minutes after the user had told
-// Merlin in chat that the activity was their own.
+// Edva in chat that the activity was their own.
 //
 // These tests pin BOTH halves so the pairing cannot silently break again:
 // which intents the belt covers, and the fact that its vocabulary is
@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SEND = path.join(ROOT, "bin/merlin-send-curl");
+const SEND = path.join(ROOT, "bin/edva-send-curl");
 
 // A synthetic installation: a "practice" nudge lane and health are protected,
 // with revocation vocabulary written for the practice pings.
@@ -55,12 +55,12 @@ fs.writeFileSync(path.join(LOCAL, "config", "hum-lanes.json"), JSON.stringify({
 }));
 const EMPTY = fs.mkdtempSync(path.join(os.tmpdir(), "protected-intent-none-"));
 
-// The two regexes exactly as a send builds them (MERLIN_SEND_PRINT_PROTECTION
+// The two regexes exactly as a send builds them (EDVA_SEND_PRINT_PROTECTION
 // prints them and exits before anything is sent).
 function protection(localDir) {
   const out = execFileSync("bash", [SEND], {
     encoding: "utf8", timeout: 20000,
-    env: { ...process.env, MERLIN_SEND_PRINT_PROTECTION: "1", MERLIN_LOCAL_DIR: localDir, MERLIN_OWNER_NAME: "Alex" },
+    env: { ...process.env, EDVA_SEND_PRINT_PROTECTION: "1", EDVA_LOCAL_DIR: localDir, EDVA_OWNER_NAME: "Alex" },
   });
   const get = (k) => (out.split("\n").find((l) => l.startsWith(`${k}=`)) || "").slice(k.length + 1);
   return { protectedRe: get("PROTECTED_INTENT_RE"), revocationRe: get("REVOCATION_RE") };

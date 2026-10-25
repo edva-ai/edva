@@ -15,33 +15,33 @@
 # it for free.
 #
 # Checks, per known signing workflow:
-#   1. the vendored ci-keychain-lock.sh is byte-identical to merlin's canonical
+#   1. the vendored ci-keychain-lock.sh is byte-identical to edva's canonical
 #   2. the workflow actually SOURCES it (a copy nobody calls is not a fix)
 #   3. no blanket `list-keychains -d user -s "$VAR"` outside a guarded fallback
-#      (that is the login-eviction pattern that took Merlin auth down)
+#      (that is the login-eviction pattern that took Edva auth down)
 #
 # Usage:  ci-keychain-lock-audit [--json]
 # Exit:   0 all clean · 1 drift/regression found · 2 could not run (no gh/auth)
 
 set -uo pipefail
 
-CANON="$HOME/Dev/merlin/.github/scripts/ci-keychain-lock.sh"
+CANON="$HOME/Dev/edva/.github/scripts/ci-keychain-lock.sh"
 # Second shared helper: per-job scoping for provisioning profiles + ASC keys.
 # Same defect class, same vendoring discipline, so it gets the same drift check.
-CANON_SA="$HOME/Dev/merlin/.github/scripts/ci-signing-assets.sh"
+CANON_SA="$HOME/Dev/edva/.github/scripts/ci-signing-assets.sh"
 JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
 
-# repo:workflow pairs known to sign on the shared CI host: MERLIN_CI_SIGNING_TARGETS
+# repo:workflow pairs known to sign on the shared CI host: EDVA_CI_SIGNING_TARGETS
 # (whitespace-separated), else `targets` in agent/local/config/ci-signing.json.
-# Repos are looked up under the installation's GitHub owner (MERLIN_OWNER,
+# Repos are looked up under the installation's GitHub owner (EDVA_OWNER,
 # lib/instance.cjs github_owner). No targets → exit 2 (nothing to audit).
 # shellcheck source=/dev/null
-source "$HOME/Dev/merlin/agent/scripts/lib/instance.sh"
-OWNER="${MERLIN_OWNER:-}"
-TARGETS="${MERLIN_CI_SIGNING_TARGETS:-$(node -e 'for (const t of require(process.argv[1]).localConfig("ci-signing", { targets: [] }).targets || []) console.log(t)' "$HOME/Dev/merlin/lib/instance.cjs" 2>/dev/null)}"
-[ -n "$TARGETS" ] || { echo "ci-keychain-lock-audit: no signing targets configured (agent/local/config/ci-signing.json or MERLIN_CI_SIGNING_TARGETS)" >&2; exit 2; }
-[ -n "$OWNER" ] || { echo "ci-keychain-lock-audit: no GitHub owner configured (instance github_owner / MERLIN_OWNER)" >&2; exit 2; }
+source "$HOME/Dev/edva/agent/scripts/lib/instance.sh"
+OWNER="${EDVA_OWNER:-}"
+TARGETS="${EDVA_CI_SIGNING_TARGETS:-$(node -e 'for (const t of require(process.argv[1]).localConfig("ci-signing", { targets: [] }).targets || []) console.log(t)' "$HOME/Dev/edva/lib/instance.cjs" 2>/dev/null)}"
+[ -n "$TARGETS" ] || { echo "ci-keychain-lock-audit: no signing targets configured (agent/local/config/ci-signing.json or EDVA_CI_SIGNING_TARGETS)" >&2; exit 2; }
+[ -n "$OWNER" ] || { echo "ci-keychain-lock-audit: no GitHub owner configured (instance github_owner / EDVA_OWNER)" >&2; exit 2; }
 
 command -v gh >/dev/null 2>&1 || { echo "ci-keychain-lock-audit: gh not installed" >&2; exit 2; }
 gh auth status >/dev/null 2>&1 || { echo "ci-keychain-lock-audit: gh not authenticated" >&2; exit 2; }

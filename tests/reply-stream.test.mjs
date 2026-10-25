@@ -54,7 +54,7 @@ test("displayableDraft hides a half word and unclosed markers", () => {
   assert.equal(displayableDraft("The show is on Net"), "The show is on");
   assert.equal(displayableDraft("Watch **Northern Lights tonight"), "Watch");
   assert.equal(displayableDraft("Watch **Northern Lights** tonight on"), "Watch **Northern Lights** tonight");
-  assert.equal(displayableDraft("Run `merlin hum x"), "Run");
+  assert.equal(displayableDraft("Run `edva hum x"), "Run");
   assert.equal(displayableDraft("Here:\n```\nls -la\nmore"), "Here:");
   assert.equal(displayableDraft("Done:\n```\nls\n```\nthen `x` and more"), "Done:\n```\nls\n```\nthen `x` and");
   assert.equal(displayableDraft(""), "");

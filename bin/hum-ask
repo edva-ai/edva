@@ -2,7 +2,7 @@
 // hum-ask — send a hum QUESTION and hold the pending-question slot, in one step.
 //
 // The question-side twin of hum-ping. A hum question used to go out
-// as a bare `merlin-send-curl --capture-id` from the playbook (jobs/hum.md
+// as a bare `edva-send-curl --capture-id` from the playbook (jobs/hum.md
 // § question) and from hum-tick, and the caller then wrote
 // hum-pending-question.json itself. Two things were wrong with that:
 //   - nothing guaranteed a `hum:` intent, so a question could miss the
@@ -11,7 +11,7 @@
 //   - a precheck suppression still wrote the slot, with the suppression
 //     sentinel JSON stored as `delivered_msg_id`.
 //
-// Now the send always carries `hum:<lane>:question` (so merlin-send-curl runs
+// Now the send always carries `hum:<lane>:question` (so edva-send-curl runs
 // bin/hum-resolve-first on it), and the slot is written only for what
 // actually landed AS A QUESTION:
 //   - sent unchanged, or rewritten by the gate to ask only the remaining gap
@@ -61,7 +61,7 @@ import { recordAsked, recordRetired, getQuestion, relevantUntilFor, stampRows } 
 import { installTools } from "../lib/root.cjs";
 const HOME = os.homedir();
 const PENDING = installTools("data/hum-pending-question.json");
-const SEND = process.env.HUM_SEND_BIN || installTools("bin/merlin-send-curl");
+const SEND = process.env.HUM_SEND_BIN || installTools("bin/edva-send-curl");
 
 const args = process.argv.slice(2);
 function flag(name, hasValue = true) {
@@ -149,7 +149,7 @@ if (res.status !== 0) {
   await done(3, "send_failed", { exit: res.status });
 }
 
-// merlin-send-curl writes a JSON sentinel instead of an id when a gate held the message.
+// edva-send-curl writes a JSON sentinel instead of an id when a gate held the message.
 if (capture.startsWith("{")) {
   let sentinel = {};
   try { sentinel = JSON.parse(capture); } catch {}
