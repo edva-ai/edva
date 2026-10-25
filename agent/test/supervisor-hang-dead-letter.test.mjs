@@ -267,6 +267,7 @@ describe("dead letter: ops supervisor end to end", { skip: !canChildListen() && 
     fs.mkdirSync(stateDir, { recursive: true });
     const env = { ...process.env, HOME: tmp, OPS_HANDOFF_DISABLED: "1", OPS_DISPATCH_PREAMBLE_DISABLED: "1", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db") };
     delete env.EMAIL_INBOUND_HANDLED_FILE;
+    delete env.MERLIN_HOME;   // outranks HOME (lib/root.cjs): the child's installation is the sandbox
     proc = spawn(NODE, [path.join(sup, "index.mjs"), "--agent", "test-ops", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--record", record])], { cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env });
     const stderr = [];

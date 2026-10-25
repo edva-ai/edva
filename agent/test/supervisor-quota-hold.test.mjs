@@ -413,7 +413,8 @@ describe("quota refusal: ops supervisor end to end", { skip: !canChildListen() &
 
   // A throwaway HOME: MERLIN_ROOT, the queue file, the event log and — most
   // importantly — the alert sender all resolve under it, so no alert reaches
-  // the real system channel and no real state is touched.
+  // the real system channel and no real state is touched. MERLIN_HOME
+  // outranks HOME (lib/root.cjs), so the child never inherits it.
   async function boot(mode, env = {}) {
     tmp = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "quota-hold-"));
     const root = path.join(tmp, "Dev/merlin/tools");
@@ -437,10 +438,11 @@ describe("quota refusal: ops supervisor end to end", { skip: !canChildListen() &
     } } }));
     const stateDir = path.join(tmp, "state");
     fs.mkdirSync(stateDir, { recursive: true });
+    const childEnv = { ...process.env, HOME: tmp, OPS_HANDOFF_DISABLED: "1", OPS_DISPATCH_PREAMBLE_DISABLED: "1", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env };
+    delete childEnv.MERLIN_HOME;
     proc = spawn(NODE, [OPS_SUPERVISOR, "--agent", "test-ops", "--config", cfg, "--state-dir", stateDir, "--no-resume",
       "--claude-bin", JSON.stringify([NODE, mock, "--mode", mode, "--record", record])], {
-      cwd: stateDir, stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, HOME: tmp, OPS_HANDOFF_DISABLED: "1", OPS_DISPATCH_PREAMBLE_DISABLED: "1", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env },
+      cwd: stateDir, stdio: ["pipe", "pipe", "pipe"], env: childEnv,
     });
     const stderr = [];
     proc.stderr.on("data", (b) => stderr.push(b.toString()));
