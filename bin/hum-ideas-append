@@ -41,12 +41,15 @@
 //               than final: a place the travel timeline cannot resolve — a
 //               country, a day-trip town — read as contradicting the base
 //               metro. See unresolvablePlace() below.
+//   venue       a named place (venue:{name, near}) must be on the map near
+//               there. See checkVenue() below.
+//   as-of       evidence_as_of "live" is stored as the idea's created_at (Rule #2).
 //
 // Usage:
 //   <ideas as JSONL or a JSON array on stdin> | hum-ideas-append [--dry-run] [--no-claim-check]
-// Stdout: {written:[id], rejected:[{id, rule, detail}], novelty_checked:bool}
+// Stdout: {written:[id], rejected:[{id, rule, detail}], novelty_checked:bool[, venue_unchecked:[id]]}
 // Exit 0 always on a processed batch (rejections are data); 2 on unreadable input.
-// Env (tests): EDVA_DATA_DIR, HUM_IDEAS_DUP_THRESHOLD, HUM_IDEAS_NO_EMBED=1.
+// Env (tests): EDVA_DATA_DIR, HUM_IDEAS_DUP_THRESHOLD, HUM_IDEAS_NO_EMBED=1, HUM_VENUE_HOOK_DIR.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -58,6 +61,7 @@ import { embedAll, nearest, resolvedText, RESOLVED_THRESHOLD, CONSUMED_THRESHOLD
 import { createRequire } from "node:module";
 import { loadTimeline, presenceProvider } from "../lib/claim-facts.mjs";
 import { lensOf } from "../lib/hum-ideas-scorecard.mjs";
+import { loadHook } from "../lib/ext-hooks.mjs";
 
 import { installTools } from "../lib/root.cjs";
 // The installation's presence provider (claim-facts.mjs; lib/_ext/presence.mjs).
@@ -160,6 +164,99 @@ export async function unresolvablePlace(verdict) {
   return { stated: loc.stated, on: loc.on, base };
 }
 
+// WHY A NAMED PLACE IS LOOKED UP (self-improvement review): an idea proposed lunch
+// at a restaurant that does not exist; its verify_question named the same place and
+// claim-check had nothing on file against it. Nothing asked the map. Now an idea
+// naming a place carries venue:{name, near} (the model writes it) and the
+// installation's _ext/venue.mjs lookupVenue returns where `near` is (with the
+// half-diagonal of the box the map draws for it, span_km) and the listings for the
+// name around there. Code owns geometry (within VENUE_NEAR_KM, or span_km when
+// larger) and structure (same listing id, or same name with case/accents/punctuation
+// folded). Whether a DIFFERENTLY named listing is the place is language: Jev site
+// hum-venue-match, then Sonnet, then Opus (Rule #0b; no local rung, a 1B model
+// cannot read names across scripts). During the site's shadow week (shadow_until in
+// its question file) the Claude ladder decides and Jev is only compared.
+//   not there, or permanently closed        → venue-not-found (final)
+//   `near` unknown to the map               → schema (restate it, resubmit)
+//   `near` wider than VENUE_REACH_MAX_KM    → venue-near-too-broad (name the town, resubmit):
+//                                             a country or region cannot be searched as one place
+//   lookup or judge cannot run              → venue-unverified, held unwritten (an
+//                                             unchecked place reaching the phone is the harm)
+//   no lookup installed                     → written, listed in venue_unchecked
+export const VENUE_NEAR_KM = 5;
+export const VENUE_REACH_MAX_KM = 50;
+const VENUE_SITE = "hum-venue-match";
+// The Claude rungs' prompt. Jev's wording lives in the site's question file (venue_template).
+const VENUE_INSTRUCTIONS = "An idea for the user names a place: venue.name, said to be near venue.near. `candidates` are the map listings found for that name around there. Pick the candidate that IS that place: the same business or site under any spelling, transliteration, translation, abbreviation, or a longer or shorter form of its name. A different business, the market, street, port or building the place is said to be in, a similarly spelled but different name, or not sure, is none.";
+// lang-regex-ok: a typographic fold (case, accents, punctuation) so two copies of the SAME name compare equal; whether two different names are one place is the model's call
+const fold = (s) => String(s || "").normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+// Flat-earth distance: well under 1% off at the ≤50 km this compares.
+const kmBetween = (a, b) => Math.hypot(b.lat - a.lat, (b.lon - a.lon) * Math.cos((a.lat * Math.PI) / 180)) * 111.2;
+
+async function claudeVenue(state, ok) {
+  const { runToollessDetailed, parseModelJson } = await import("../lib/jev-claude.mjs");
+  const { MODELS } = createRequire(import.meta.url)("../lib/models.cjs");
+  const prompt = `${VENUE_INSTRUCTIONS}\n\nInput:\n${JSON.stringify(state, null, 1)}\n\nReply with JSON only: {"venue": "<a candidate id, or none>"}`;
+  for (const model of [MODELS.sonnet, MODELS.opus]) {
+    // A short pick-one read (2-7 s measured); 45 s per rung bounds a stuck fork.
+    const { out, error } = await runToollessDetailed({ model, prompt, timeoutMs: 45000 });
+    if (error) throw new Error(`${error.kind}: ${error.message}`); // the next tier would fail the same way
+    const j = parseModelJson(out);
+    if (j && ok.has(j.venue)) return j.venue;
+  }
+  throw new Error("no model tier answered with a listed candidate");
+}
+
+/** Which candidate (index) is the named place, or null for none. Throws when no model could answer. deps (tests): decide, ladder, def. */
+export async function judgeVenue(venue, candidates, deps = {}) {
+  const [{ decide }, { answerConfidence, jevSiteDef }] = await Promise.all([import("../lib/jev-shadow.mjs"), import("../lib/jev.mjs")]);
+  const state = { venue: { name: venue.name, near: venue.near }, candidates: candidates.map((c, i) => ({ id: `c${i}`, name: c.name, address: c.address || null })) };
+  const ok = new Set([...state.candidates.map((c) => c.id), "none"]);
+  let memo = null;
+  const legacy = () => (memo ||= (deps.ladder || claudeVenue)(state, ok));
+  const def = deps.def || jevSiteDef(VENUE_SITE) || {};
+  const tpl = def.venue_template;
+  const inShadow = !!(def.shadow_until && Date.now() < Date.parse(def.shadow_until));
+  let value;
+  if (!tpl?.instructions) value = await legacy(); // no question on file: the Claude ladder alone
+  else {
+    const criteria = { ...tpl.fixed_criteria };
+    for (const c of state.candidates) criteria[c.id] = `the place is the listing "${c.name}"${c.address ? ` at ${c.address}` : ""}`.slice(0, 300);
+    ({ value } = await (deps.decide || decide)({
+      site: VENUE_SITE, id: venue.name, state,
+      questions: { venue: { type: "choice", instructions: tpl.instructions, criteria } },
+      interpret: (a) => (ok.has(a?.venue?.choice) ? { value: a.venue.choice, confidence: answerConfidence(a.venue) } : { value: null, confidence: 0 }),
+      legacy, alwaysShadow: inShadow,
+    }));
+    // Shadow week: a new site's verdict is not final yet, so the ladder's answer stands (it throws if the ladder could not answer).
+    if (inShadow) value = await legacy();
+  }
+  const i = state.candidates.findIndex((c) => c.id === value);
+  return i >= 0 ? i : null;
+}
+
+/** null when the place checks out (venue gains place_id/listing/address/checked_at), else {rule, detail}. */
+export async function checkVenue(venue, { lookup, judge = judgeVenue } = {}) {
+  const held = (why) => ({ rule: "venue-unverified", detail: `could not check "${venue.name}" on the map (${String(why).slice(0, 160)}). Held, not written: resubmit it on a later run.` });
+  let found;
+  try { found = await lookup({ name: venue.name, near: venue.near }); } catch (e) { return held(e?.reason || e?.message || e); }
+  if (!found?.area) return { rule: "schema", detail: `venue.near "${venue.near}" is not on the map. Give the neighbourhood or town the place is in, then resubmit.` };
+  const span = Number(found.area.span_km) || 0;
+  if (span > VENUE_REACH_MAX_KM) return { rule: "venue-near-too-broad", detail: `venue.near "${venue.near}" covers ~${Math.round(span)} km from its centre, too wide to check one place. Set it to the town or neighbourhood the place is in, then resubmit.` };
+  const reach = Math.max(VENUE_NEAR_KM, span);
+  const near = (found.candidates || []).filter((c) => Number.isFinite(c.lat) && Number.isFinite(c.lon) && kmBetween(found.area, c) <= reach);
+  let hit = near.find((c) => (venue.place_id && c.id === venue.place_id) || (fold(c.name) && fold(c.name) === fold(venue.name)));
+  if (!hit && near.length) {
+    let pick;
+    try { pick = await judge(venue, near); } catch (e) { return held(e?.message || e); }
+    hit = Number.isInteger(pick) ? near[pick] || null : null;
+  }
+  if (!hit) return { rule: "venue-not-found", detail: `no place called "${venue.name}" on the map within ${Math.round(reach)} km of ${venue.near} (${near.length} other listing${near.length === 1 ? "" : "s"} there). Do not resubmit it.` };
+  if (hit.status === "CLOSED_PERMANENTLY") return { rule: "venue-not-found", detail: `"${hit.name}" near ${venue.near} is listed as permanently closed. Do not resubmit it.` };
+  Object.assign(venue, { place_id: hit.id, listing: hit.name, address: hit.address || null, checked_at: new Date().toISOString() });
+  return null;
+}
+
 export function validate(idea) {
   const errs = [];
   const str = (k, max) => { if (typeof idea[k] !== "string" || !idea[k].trim()) errs.push(`${k} missing`); else if (max && idea[k].length > max) errs.push(`${k} longer than ${max}`); };
@@ -175,6 +272,8 @@ export function validate(idea) {
   if (!CONFIDENCE.has(idea.confidence)) errs.push("confidence must be high|medium|low");
   if (idea.confidence === "low" && !(typeof idea.verify_question === "string" && idea.verify_question.trim())) errs.push("verify_question required when confidence is low");
   if (Array.isArray(idea.draws_on) && idea.draws_on.includes("tasks") && !idea.supporting_data?.task_id) errs.push("supporting_data.task_id required when draws_on includes tasks");
+  const v = idea.venue, s = (x) => typeof x === "string" && x.trim();
+  if (v != null && !(typeof v === "object" && s(v.name) && s(v.near))) errs.push("venue must be {name, near}: the place's own name and the neighbourhood or town it is in");
   return errs;
 }
 
@@ -217,13 +316,19 @@ async function main() {
   }
 
   const written = [], rejected = [];
-  const accepted = [];
+  const accepted = [], venueUnchecked = [];
+  let venueHook; // loaded on the first idea that names a place; null = none installed
   for (const idea of ideas) {
     const id = idea?.id || null;
     const errs = validate(idea || {});
     if (errs.length) { rejected.push({ id, rule: "schema", detail: errs.join("; ") }); continue; }
     if (existing.has(id) || accepted.some((a) => a.id === id)) { rejected.push({ id, rule: "duplicate-id", detail: "id already in the reservoir" }); continue; }
-    const sd = idea.supporting_data || {};
+    const createdAt = isIso(idea.created_at) ? idea.created_at : new Date().toISOString();
+    // Rule #2: "live" means composed this turn, which a stored row never is; its
+    // real stamp is its creation. Housekeeping for readers of the reservoir (the
+    // ideas harvester does not forward it to the send-time check today).
+    const sd = { ...(idea.supporting_data || {}) };
+    if (sd.evidence_as_of === "live") sd.evidence_as_of = createdAt;
     if (sd.task_id && blockedTasks.has(sd.task_id)) { rejected.push({ id, rule: "rule-9-task-id", detail: `task ${sd.task_id} consumed in 48h or resolved` }); continue; }
     const thread = sd.thread_id || sd.gmail_thread_id;
     if (thread && (blockedThreads.has(thread) || accepted.some((a) => (a.supporting_data?.thread_id || a.supporting_data?.gmail_thread_id) === thread))) {
@@ -251,6 +356,19 @@ async function main() {
         corpus.push({ id, subject: idea.subject, vec: v }); // in-batch dedup
       }
     }
+    let venue;
+    if (idea.venue) {
+      if (venueHook === undefined) {
+        venueHook = await loadHook(process.env.HUM_VENUE_HOOK_DIR || path.join(HERE, "..", "lib"), "venue")
+          .catch((e) => ({ lookupVenue: () => { throw new Error(`venue hook failed to load: ${e.message}`); } }));
+      }
+      if (typeof venueHook?.lookupVenue !== "function") venueUnchecked.push(id);
+      else {
+        venue = { ...idea.venue };
+        const bad = await checkVenue(venue, { lookup: venueHook.lookupVenue });
+        if (bad) { rejected.push({ id, ...bad }); continue; }
+      }
+    }
     if (!noClaim) {
       const cc = spawnSync(path.join(HERE, "claim-check"), ["--json"], {
         input: JSON.stringify({ text: claimCheckText(idea), subject: idea.subject, supporting_data: sd, lane: "ideas" }),
@@ -272,18 +390,25 @@ async function main() {
       }
       // pass, or claim-check unreachable (it is fail-open by contract) → write
     }
-    accepted.push({
+    const row = {
       ...idea,
-      created_at: isIso(idea.created_at) ? idea.created_at : new Date().toISOString(),
+      created_at: createdAt,
+      ...(idea.evidence_as_of === "live" ? { evidence_as_of: createdAt } : {}),
+      ...(venue ? { venue } : {}),
       source: idea.source || "hum-ideation-agent",
       supporting_data: sd,
       consumed: false, consumed_at: null, ping_id: null,
-    });
+    };
+    // Written as each idea clears, not in one append at the end: a batch can take
+    // minutes (claim-check, and the venue judge, fork models per idea), and a run
+    // killed part-way keeps what it had already accepted. A resubmitted batch then
+    // gets duplicate-id for those, which is correct.
+    if (!dry) fs.appendFileSync(RESERVOIR, JSON.stringify(row) + "\n");
+    accepted.push(row);
     written.push(id);
   }
 
-  if (!dry && accepted.length) fs.appendFileSync(RESERVOIR, accepted.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  process.stdout.write(JSON.stringify({ written, rejected, novelty_checked: noveltyChecked, dry_run: dry }) + "\n");
+  process.stdout.write(JSON.stringify({ written, rejected, novelty_checked: noveltyChecked, ...(venueUnchecked.length ? { venue_unchecked: venueUnchecked } : {}), dry_run: dry }) + "\n");
 }
 
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {

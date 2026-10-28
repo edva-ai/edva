@@ -207,7 +207,7 @@ Pipe all of this cycle's ideas — JSONL or one JSON array — to the writer in 
 printf '%s\n' '<idea 1 JSON>' '<idea 2 JSON>' ... | ~/Dev/edva/bin/hum-ideas-append
 ```
 
-It validates the schema below (required fields, enums, `task_id` when `draws_on` has `tasks`, `verify_question` when `confidence` is `low`), refuses an id already in the reservoir, enforces Rules 1 / 9 / 12, runs claim-check, appends the survivors with `consumed:false`, and prints `{written:[…], rejected:[{id, rule, detail}]}`. Rejections are data, not errors: fix and resubmit `schema` and `claim-check-rewrite` refusals once; leave the rest. `--dry-run` checks without writing. Each idea's shape:
+It validates the schema below (required fields, enums, `task_id` when `draws_on` has `tasks`, `verify_question` when `confidence` is `low`), refuses an id already in the reservoir, enforces Rules 1 / 9 / 12, looks up every `venue` on the map, runs claim-check, appends the survivors with `consumed:false`, and prints `{written:[…], rejected:[{id, rule, detail}]}`. A stored idea never says `evidence_as_of: "live"` (Rule #2): the writer stores the idea's `created_at` there instead. That is housekeeping for whoever reads the stored row; the send-time truth check does not see it today, so it does nothing against a made-up place — only the venue lookup below does. Rejections are data, not errors: fix and resubmit `schema`, `venue-near-too-broad` and `claim-check-rewrite` refusals once; leave the rest. `--dry-run` checks without writing. Each idea's shape:
 
 ```json
 {
@@ -232,6 +232,7 @@ It validates the schema below (required fields, enums, `task_id` when `draws_on`
   },
   "confidence": "high|medium|low",
   "verify_question": "<optional — pre-crafted question text when confidence=low>",
+  "venue": {"name": "<the place's own name>", "near": "<neighbourhood or town>, <city>"},
   "consumed": false,
   "consumed_at": null,
   "ping_id": null
@@ -249,6 +250,19 @@ This is the location-shaped instance of the same rule as Step 7 rule 7 (never ba
 (2026-07-29 incident: an idea authored with "you're in <city> till <date>" in its subject kept re-dispatching that wording for days after the trip leg changed, while `travel where` returned the new city the whole time. With `location_claim: {city, on}`, the deterministic gate would have dropped it the moment the leg changed.)
 
 **`city` is a travel-timeline metro — never a country, a region or a day-trip town (2026-10-06).** Write the metro `travel where <on>` names for that date ("Springfield", "Shelbyville"), not a country, and not the town a day trip visits: a day trip is anchored at the base. claim-check compares this field by metro key, so a place the timeline cannot resolve can never match and reads as a contradiction. `hum-ideas-append` returns that case as a `schema` refusal naming the base metro — fix the field (and any "you're in …" wording) and resubmit once. A real metro the user will not be in stays a final `claim-check-drop`. (2026-09-26 → 10-05: 10 of 12 location drops at ideation time were a country or day-trip town against the base metro.)
+
+### `venue` — every idea that names a specific place
+
+**An idea that proposes or depends on one specific restaurant, shop, venue, gallery or site MUST carry a top-level `venue: {name, near}`** — `name` as the place calls itself, `near` the neighbourhood or town it is in, written with its city ("<neighbourhood>, <city>"), so a name shared by several places resolves to the right one (a name a map would know; never a country or region). One place per idea; an idea about no particular place leaves `venue` out. (Not `supporting_data.venue`, which older ideas use as free text.) A written idea's `venue` gains the listing it matched.
+
+`hum-ideas-append` looks the place up on the map near `near` before it writes anything. A web page or a memory that mentions a place is not proof it exists or is still open: a place invented by a search summary once went out as a suggestion and the user went looking for it. A low `confidence` and a `verify_question` do not cover this — the question names the same place. What comes back:
+
+| refusal rule | do |
+|---|---|
+| `venue-not-found` | no such place near there, or it is permanently closed. Do not resubmit it, and do not swap in a name you have not checked. |
+| `venue-unverified` | the map lookup could not run (budget stop, network). The idea is held, not written. Do not resubmit it this run; a later run can propose it again once the map answers. |
+| `venue-near-too-broad` | `near` is a country or region, too wide to check one place in. Set it to the town or neighbourhood and resubmit once. |
+| `schema` naming `venue.near` | the map does not know `near`. Restate it as the neighbourhood or town and resubmit once. |
 
 ### `confidence` field — required on every idea
 
@@ -268,12 +282,12 @@ Target: 8-15 new ideas per run. Acceptable range 3-20. Fewer than 3 → prefer w
 
 Print to stdout a one-line summary: `wrote N ideas across K categories; claim_check_dropped=D; scorecard: top=<cat>(<score>), bottom=<cat>(<score>)`. Nothing else. No Edva ping. No email.
 
-`claim_check_dropped` is the number of `claim-check-drop` refusals `hum-ideas-append` returned. It is the metric that shows the memory gate is doing work rather than silently passing everything — `hum-review` reads it.
+`claim_check_dropped` is the number of `claim-check-drop` refusals `hum-ideas-append` returned. It is the metric that shows the memory gate is doing work rather than silently passing everything — `hum-review` reads it. `venue_refused` is the number of `venue-not-found` and `venue-unverified` refusals.
 
 **Then append the same numbers to `data/hum-ideation-runs.jsonl`** — stdout dies with the dispatch, and a yield that exists only in a supervisor log is a yield nobody measures. Four cycles a day produced 0–3 ideas for a week before the user noticed from the outside that the `ideas` lane had gone quiet; there was no series anyone could have looked at. One line per run:
 
 ```bash
-echo '{"ts":"<ISO now>","wrote":<N>,"categories":<K>,"idea_lenses":<L>,"claim_check_dropped":<D>,"dedup_blocked":<B>,"thin_cycle":<true|false>,"thin_reason":"<why, or null>","digest_unconsumed_live":<from the digest>,"digest_stale":<true|false>}' \
+echo '{"ts":"<ISO now>","wrote":<N>,"categories":<K>,"idea_lenses":<L>,"claim_check_dropped":<D>,"venue_refused":<V>,"dedup_blocked":<B>,"thin_cycle":<true|false>,"thin_reason":"<why, or null>","digest_unconsumed_live":<from the digest>,"digest_stale":<true|false>}' \
   >> ~/Dev/edva/data/hum-ideation-runs.jsonl
 ```
 

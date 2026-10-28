@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 // whatsapp-send: send a WhatsApp message via the local whatsapp-channel runner.
 //
-// The runner (agent/whatsapp-channel/index.mjs) holds a paired Open-WA
-// session for the user's personal WhatsApp account and exposes POST /send on
-// localhost. This CLI is a thin wrapper.
+// The runner (agent/whatsapp-channel/index.mjs) holds a paired Baileys
+// session for the user's personal WhatsApp account and exposes POST /send and
+// GET /groups on localhost. This CLI is a thin wrapper.
 //
 // Usage:
-//   whatsapp-send --to <+E164|chat-id> --text "message"
+//   whatsapp-send --to <+E164|chat-id|"group name"> --text "message"
 //   whatsapp-send --to <+E164> --text-file /path/to/body.txt
+//   whatsapp-send --list-groups [--json]
 //
 // Recipients:
 //   +15551234567        an individual (E.164 with leading +)
 //   15551234567@c.us    same, in WhatsApp's native form
-//   <id>@g.us           a group chat id (get via whatsapp-send --list-groups)
+//   <id>@g.us           a group chat id (list them with --list-groups)
+//   "Group subject"     a group by its name: exact match first, then a unique
+//                       case-insensitive one; an ambiguous name is refused
 //
 // The runner must be live on http://localhost:9100. If it is not, see
 // docs/whatsapp-gateway-setup.md for how to start and pair it.
@@ -21,6 +24,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { installTools } from "../lib/root.cjs";
+import { resolveGroupBySubject } from "../agent/whatsapp-channel/core.mjs";
 const require = createRequire(import.meta.url);
 const { loadEnv } = require("../lib/load-env.js");
 const { localConfig } = require("../lib/instance.cjs");
@@ -44,9 +48,14 @@ function printUsage() {
   console.log(`whatsapp-send: send a WhatsApp message via the local runner
 
 Usage:
-  whatsapp-send --to <+E164|chat-id> --text "message"
+  whatsapp-send --to <+E164|chat-id|"group name"> --text "message"
   whatsapp-send --to <+E164> --text-file <path>
+  whatsapp-send --list-groups [--json]
   whatsapp-send --health
+
+A group can be named by its subject: an exact match first, then a unique
+case-insensitive match. A name that fits more than one group is refused;
+use the <id>@g.us from --list-groups instead.
 
 The runner runs at WHATSAPP_RUNNER_URL (default http://localhost:9100).
 If WHATSAPP_OWNER_NUMBER (the user's own number) is set in .env, the em-dash gate
@@ -54,13 +63,15 @@ fires on messages to that number.`);
 }
 
 function parseArgs(argv) {
-  const a = { to: null, text: null, health: false };
+  const a = { to: null, text: null, health: false, listGroups: false, json: false };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     if (k === "--to") a.to = argv[++i];
     else if (k === "--text") a.text = argv[++i];
     else if (k === "--text-file") a.text = fs.readFileSync(argv[++i], "utf8");
     else if (k === "--health") a.health = true;
+    else if (k === "--list-groups") a.listGroups = true;
+    else if (k === "--json") a.json = true;
     else if (k === "-h" || k === "--help") { printUsage(); process.exit(0); }
     else { console.error(`whatsapp-send: unknown flag: ${k}`); process.exit(2); }
   }
@@ -93,9 +104,55 @@ async function cmdHealth() {
   }
 }
 
+// A recipient that is not a chat id or a phone number is a group's name.
+function isAddress(to) {
+  const s = String(to).trim();
+  if (s.includes("@")) return true;
+  const digits = s.replace(/[\s\-()+]/g, ""); // a phone number's punctuation, not words
+  return digits.length > 0 && /^\d+$/.test(digits);
+}
+
+async function fetchGroups() {
+  let res;
+  try { res = await fetch(`${RUNNER}/groups`); }
+  catch (err) {
+    console.error(`whatsapp-send: runner unreachable at ${RUNNER} (${err.message}). Is whatsapp-channel running? See docs/whatsapp-gateway-setup.md.`);
+    process.exit(1);
+  }
+  const body = await res.text();
+  let json;
+  try { json = JSON.parse(body); } catch { json = { _raw: body }; }
+  if (!res.ok || !json.ok || !Array.isArray(json.groups)) {
+    console.error(`whatsapp-send: group list failed: ${res.status} ${json.error || body}`);
+    process.exit(1);
+  }
+  return json.groups;
+}
+
+async function cmdListGroups(a) {
+  const groups = await fetchGroups();
+  if (a.json) { console.log(JSON.stringify(groups, null, 2)); return; }
+  if (!groups.length) { console.log("(no groups)"); return; }
+  for (const g of groups) console.log(`${g.id}\t${g.subject || "(no subject)"}\t${g.participants ?? "?"} members`);
+}
+
+async function resolveRecipient(to) {
+  if (isAddress(to)) return { to, groupName: null };
+  const r = resolveGroupBySubject(await fetchGroups(), to);
+  if (r.group) return { to: r.group.id, groupName: r.group.subject };
+  if (r.error === "ambiguous") {
+    console.error(`whatsapp-send: ${JSON.stringify(to)} matches ${r.candidates.length} groups; pass the group id instead:`);
+    for (const g of r.candidates) console.error(`  ${g.id}\t${g.subject}`);
+  } else {
+    console.error(`whatsapp-send: no group named ${JSON.stringify(to)} (and it is not a phone number or chat id). See whatsapp-send --list-groups.`);
+  }
+  process.exit(2);
+}
+
 async function cmdSend(a) {
   if (!a.to || !a.text) { printUsage(); process.exit(2); }
   emDashGate({ to: a.to, text: a.text });
+  const { to: target, groupName } = await resolveRecipient(a.to);
 
   let res;
   try {
@@ -103,7 +160,7 @@ async function cmdSend(a) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        to: a.to,
+        to: target,
         text: a.text,
         originating_task: process.env.EDVA_TASK_ID || null,
       }),
@@ -130,7 +187,8 @@ async function cmdSend(a) {
       ts: new Date().toISOString(),
       kind: "sent",
       message_id: json.message_id,
-      to: a.to,
+      to: target,
+      ...(groupName ? { group_name: groupName } : {}),
       text: a.text,
       originating_task: process.env.EDVA_TASK_ID || null,
       via: "cli",
@@ -142,4 +200,5 @@ async function cmdSend(a) {
 
 const args = parseArgs(process.argv);
 if (args.health) cmdHealth();
+else if (args.listGroups) cmdListGroups(args).catch((e) => { console.error(`whatsapp-send fatal: ${e.message}`); process.exit(1); });
 else cmdSend(args).catch((e) => { console.error(`whatsapp-send fatal: ${e.message}`); process.exit(1); });

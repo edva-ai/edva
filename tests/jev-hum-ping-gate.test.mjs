@@ -94,6 +94,7 @@ test("health/exercise/finance lanes, the workout sensor and idle-only bundles ne
     [[ev({ lanes: ["exercise", "situation"] })], "health-excluded"],
     [[ev({ lanes: ["finance"] })], "financial-excluded"],
     [[ev({ sensor: "idle", type: "idle.tick", lanes: [] })], "idle-bundle"],
+    [[ev({ sensor: "questions", type: "questions.waiting", lanes: ["dream_asks"] })], "idle-bundle"],
   ];
   for (const [events, reason] of cases) {
     fs.rmSync(SH, { recursive: true, force: true });

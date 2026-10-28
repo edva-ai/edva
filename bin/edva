@@ -158,7 +158,7 @@ function cmdHelp(extensions = []) {
   console.log(c.bold('CONTROL'));
   console.log('  restart <target>            bounce a supervised process; target:');
   console.log('     ops | chat                 rotate the agent\'s claude session (POST supervisor /restart)');
-  console.log('     whatsapp-channel | wiki-server  SIGTERM the process-manager child; it respawns');
+  console.log('     whatsapp-channel | imessage-channel | slack-channel | wiki-server  SIGTERM the process-manager child; it respawns');
   console.log('     session                    kickstart launchd — restart the whole stack\n');
   console.log(c.bold('DISCOVERY'));
   console.log('  arch                          print architecture.md (+ architecture-local.md, changelog.md)');
@@ -1000,15 +1000,17 @@ function readWebhookToken() {
 //                       process-manager + every child)
 function cmdRestart(args) {
   const raw = args.find(a => !a.startsWith('--'));
-  if (!raw) die('restart: usage: edva restart <ops|chat|whatsapp-channel|wiki-server|session>');
+  if (!raw) die('restart: usage: edva restart <ops|chat|whatsapp-channel|imessage-channel|slack-channel|wiki-server|session>');
 
   const ALIASES = {
     ops: 'ops', chat: 'chat', session: 'session',
     whatsapp: 'whatsapp-channel', wa: 'whatsapp-channel', 'whatsapp-channel': 'whatsapp-channel',
+    imessage: 'imessage-channel', imsg: 'imessage-channel', 'imessage-channel': 'imessage-channel',
+    slack: 'slack-channel', 'slack-channel': 'slack-channel',
     wiki: 'wiki-server', 'wiki-server': 'wiki-server',
   };
   const target = ALIASES[raw];
-  if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, wiki-server, session.`);
+  if (!target) die(`restart: unknown target '${raw}'. Use: ops, chat, whatsapp-channel, imessage-channel, slack-channel, wiki-server, session.`);
 
   const PM = 'http://127.0.0.1:9095/health';
 
@@ -1065,6 +1067,8 @@ function cmdRestart(args) {
   // exit (stopping=false → _scheduleRestart) and respawns it.
   const CHILD = {
     'whatsapp-channel': { verify: 'http://127.0.0.1:9100/health', verifyNote: 'paired + listening' },
+    'imessage-channel': { verify: 'http://127.0.0.1:9107/health', verifyNote: 'tailing chat.db' },
+    'slack-channel':    { verify: 'http://127.0.0.1:9108/health', verifyNote: 'runner up' },
     'wiki-server':      { verify: 'http://127.0.0.1:9096/',       verifyNote: 'serving' },
   };
   const spec = CHILD[target];

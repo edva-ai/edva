@@ -28,6 +28,7 @@ import os from "node:os";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, stampRun, OWNER_NAME } from "./_common.mjs";
 import { dueForReask } from "../../../lib/open-questions.mjs";
+import { reportBacklog, scaledLanePacing } from "../../../lib/question-pacing.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
 await readStdinJson();
@@ -53,18 +54,21 @@ const fmtAgo = (iso, now) => {
 
 try {
   const now = Date.now();
+  reportBacklog("open_questions", dueForReask(now).length);
+  // A long question backlog multiplies the cap and divides the spacing.
+  const { maxPerDay, spacingH } = scaledLanePacing({ maxPerDay: REASK_MAX_PER_DAY, spacingH: REASK_SPACING_H });
   const sent = readJsonl(RUNS)
     .filter((r) => r.outcome?.sent === true && r.sonnet?.based_on_topic === "open_questions")
     .map((r) => Date.parse(r.ts)).filter(Number.isFinite);
   const last = sent.length ? Math.max(...sent) : 0;
-  if (last && now - last < REASK_SPACING_H * 3600e3) {
+  if (last && now - last < spacingH * 3600e3) {
     stampRun("open_questions", false);
-    emitNull(`re-asked ${Math.round((now - last) / 60000)}m ago (spacing ${REASK_SPACING_H}h)`);
+    emitNull(`re-asked ${Math.round((now - last) / 60000)}m ago (spacing ${spacingH}h)`);
     process.exit(0);
   }
-  if (sent.filter((t) => now - t < 24 * 3600e3).length >= REASK_MAX_PER_DAY) {
+  if (sent.filter((t) => now - t < 24 * 3600e3).length >= maxPerDay) {
     stampRun("open_questions", false);
-    emitNull(`${REASK_MAX_PER_DAY} re-asks in the last 24h already`);
+    emitNull(`${maxPerDay} re-asks in the last 24h already`);
     process.exit(0);
   }
 

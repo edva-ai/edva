@@ -932,7 +932,33 @@ fi
 STUCK_EMAILS=$("$HOME/Dev/edva/bin/gmail-action" list-unread-older 5 2>/dev/null || echo "[]")
 STUCK_COUNT=$(echo "$STUCK_EMAILS" | jq 'length' 2>/dev/null || echo 0)
 STUCK_COUNT=${STUCK_COUNT:-0}
-if [ "$STUCK_COUNT" -gt 0 ]; then
+# The ops dispatcher's usage-limit hold (/health rateLimitHoldUntil: an ISO time
+# while supervisor/index.mjs holds the queue for a used-up Claude allowance,
+# null otherwise). Empty when $HEALTH is empty or unparseable (supervisor
+# unreachable), which leaves the sweep exactly as it was. The chat arm above
+# honours the same field for chat.
+OPS_HOLD_UNTIL=$(echo "$HEALTH" | jq -r '.rateLimitHoldUntil // empty' 2>/dev/null)
+if [ "$STUCK_COUNT" -gt 0 ] && [ -n "$OPS_HOLD_UNTIL" ]; then
+  # Held for the usage limit. The ops webhook still accepts a RECLASSIFY
+  # POST (it is queued), so without this arm every tick counted a "delivered"
+  # round the triage agent never saw and, two ticks on, paged "🔴 Email triage
+  # sweep: N stuck message(s) still in inbox after M delivered RECLASSIFY
+  # rounds. Manual triage needed." while nothing on ops could run, and kept
+  # re-posting the same tasks into the frozen queue. Rounds delivered into a
+  # held queue are not evidence about the triage agent, and the queued triage
+  # runs when the hold lifts; the hold has its own alert from the supervisor.
+  # So: no RECLASSIFY dispatch, no change to the landed-rounds file, no page,
+  # and deliberately neither incident_seen nor incident_clear (the same
+  # reasoning as the tunnel's host-offline arm): a held queue is not evidence
+  # that triage is dropping mail, so it must not accumulate toward the 2-tick
+  # page, and not evidence that the inbox is draining, so it must not clear an
+  # incident already in progress. The counter simply holds and resumes when
+  # the hold lifts.
+  # DO NOT "tidy" this branch into symmetry with the one below.
+  ISSUES="$ISSUES gmail-unread-stuck(${STUCK_COUNT},usage-hold)"
+  log_throttled "$EDVA_INSTALL_TOOLS/data/.watchdog-stuck-sweep-hold-log" \
+    "Gmail unread sweep: $STUCK_COUNT message(s) waiting, but the ops dispatcher is holding for the Claude usage limit until $OPS_HOLD_UNTIL; no RECLASSIFY dispatch, not counted, no page"
+elif [ "$STUCK_COUNT" -gt 0 ]; then
   ATTEMPT=$(incident_seen "gmail-unread-stuck")
   log "Gmail unread sweep: $STUCK_COUNT message(s) older than 5min not yet triaged (attempt $ATTEMPT)"
   ISSUES="$ISSUES gmail-unread-stuck(${STUCK_COUNT})"
@@ -1356,6 +1382,66 @@ esac
 # ERROR line that is BOTH newer than any "auth restored" line in the same log
 # AND within the last ~6 min (covering the 2-5 min tick cadence); without this
 # an outage can sit undetected until a manual re-login.
+
+# The sign-in clock, read by § Max sign-in renewal heads-up further down.
+# The Max login's OAuth session runs out some weeks after each manual sign-in,
+# and only a new `claude /login` resets it. Nothing this host can read says
+# when: `claude auth status --json` has no expiry field, and the keychain item's
+# dates move on every token refresh, not on a sign-in. So the clock records the
+# last sign-in watchdog can infer: the close of an auth outage it paged, in
+# which the launchd check read signed out (an expired login does; a supervisor
+# auth error while the login still reads signed in is something else) and the
+# keychain self-heal above did not run (a keychain eviction reads signed out
+# too, and the heal, not a sign-in, ends it). One JSON line, machine structure only:
+#   {"relogin_ts":<epoch>,"note_ts":<epoch of the last heads-up, 0 = none>,"source":"<what set relogin_ts>"}
+# Written only by watchdog.sh, best effort: a missing or broken file costs a
+# heads-up, never a tick. Lives in the installation's data dir (root.sh, via
+# lib/webhook-auth.sh); prints nothing when neither that nor an override is set.
+_max_auth_relogin_file() {
+  if [ -n "${MAX_AUTH_RELOGIN_FILE:-}" ]; then printf '%s' "$MAX_AUTH_RELOGIN_FILE"
+  elif [ -n "${EDVA_INSTALL_TOOLS:-}" ]; then printf '%s' "$EDVA_INSTALL_TOOLS/data/max-auth-relogin.json"
+  fi
+}
+
+# _max_auth_relogin_write <relogin_ts> <note_ts> <source>
+_max_auth_relogin_write() {
+  local f tmp
+  f=$(_max_auth_relogin_file)
+  [ -n "$f" ] || return 0
+  tmp="$f.tmp.$$"
+  if printf '{"relogin_ts":%s,"note_ts":%s,"source":"%s"}\n' "$1" "$2" "$3" 2>/dev/null > "$tmp"; then
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
+  return 0
+}
+
+# max_auth_relogin_mark <outage_start_epoch> — run once, as a paged auth outage
+# closes. Restarts the clock now if this outage was a lapsed sign-in (see above),
+# else leaves it. A missed restart only makes the next heads-up early, which is
+# the safe side; a wrong restart would make it late.
+max_auth_relogin_mark() {
+  local start="${1:-}" now out healed
+  now=$(date +%s)
+  [[ "$start" =~ ^[0-9]+$ ]] || start="$now"
+  out=$(stat -f%m "$INCIDENT_DIR/auth-outage.signed_out" 2>/dev/null || echo 0)
+  healed=$(stat -f%m "$INCIDENT_DIR/auth-outage.keychain_healed" 2>/dev/null || echo 0)
+  [[ "$out" =~ ^[0-9]+$ ]] || out=0
+  [[ "$healed" =~ ^[0-9]+$ ]] || healed=0
+  rm -f "$INCIDENT_DIR/auth-outage.signed_out" 2>/dev/null
+  [ -n "$(_max_auth_relogin_file)" ] || return 0
+  if [ "$out" -lt $(( start - 3600 )) ]; then
+    log "Max sign-in clock: the launchd check never read signed out during this outage, so it was not a lapsed sign-in; clock left as it was"
+  elif [ "$healed" -ge $(( start - 3600 )) ]; then
+    log "Max sign-in clock: the keychain self-heal ran during this outage, so it, not a new sign-in, ended it; clock left as it was"
+  else
+    _max_auth_relogin_write "$now" 0 "outage-recovery"
+    log "Max sign-in clock: restarted at the close of this auth outage (a lapsed sign-in only ends with a new one)"
+  fi
+  return 0
+}
+
 AUTH_CUTOFF_EPOCH=$(( $(date +%s) - 360 ))
 AUTH_HIT=""
 # AUTH_OUTAGE_HELD=1 on every branch below that holds the auth-outage incident
@@ -1374,6 +1460,9 @@ AUTH_RECOVERY_PENDING=0
 # The launchd sign-in check (lib/max-auth-probe.sh). Fresh = under 20 min old,
 # two of live-day's 10-minute checks. Read once and used in the branch below.
 max_auth_probe_read "$(date +%s)" 1200
+# The raw reading, before the overrides below: a signed-out reading marks this
+# outage as a real sign-out for the sign-in clock (max_auth_relogin_mark).
+if [ "$MAX_AUTH_PROBE_STATE" = "fail" ]; then touch "$INCIDENT_DIR/auth-outage.signed_out" 2>/dev/null; fi
 # log timestamps are UTC (Z); parse under TZ=UTC so the epoch is correct.
 _auth_epoch() { local ts="${1%% *}"; ts="${ts%.*}"; TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null || echo 0; }
 for slog in "$HOME"/Dev/edva/agent/logs/{ops,ops-light,ops-haiku,chat}-supervisor.log; do
@@ -1515,8 +1604,21 @@ else
     # is already running: leave it, or a second DAILY SUMMARY run would start.
     _auth_alerted_at=""
     [ -f "$INCIDENT_DIR/auth-outage.alerted" ] && _auth_alerted_at=$(stat -f%m "$INCIDENT_DIR/auth-outage.alerted" 2>/dev/null || echo 0)
+    # When the outage's first page went out, for the sign-in clock; incident_clear removes the file.
+    _auth_first_at=$(stat -f%m "$INCIDENT_DIR/auth-outage.alert_first" 2>/dev/null || echo "")
     incident_clear "auth-outage"
     if [ -n "$_auth_alerted_at" ] && [ ! -f "$INCIDENT_DIR/auth-outage.alerted" ]; then
+      max_auth_relogin_mark "${_auth_first_at:-$_auth_alerted_at}"
+      # Re-run what the outage made miss, but only the jobs on the installation's
+      # approved safe-to-run-late list (bin/auth-outage-replay): queue it
+      # here, run it below. It looks from two hours before the first page: the
+      # page waits for a confirmed failing check, so the first refusals come
+      # before it.
+      _auth_replay_from="${_auth_first_at:-$_auth_alerted_at}"
+      # A re-run still queued from an earlier outage keeps its earlier start.
+      if [[ "$_auth_replay_from" =~ ^[0-9]+$ ]] && [ ! -f "$INCIDENT_DIR/auth-replay.pending" ]; then
+        printf '%s\n' "$(( _auth_replay_from - 7200 ))" > "$INCIDENT_DIR/auth-replay.pending" 2>/dev/null
+      fi
       if [ -f "$DS_HEAL_MARKER" ] && [ "$(stat -f%m "$DS_HEAL_MARKER" 2>/dev/null || echo 0)" -gt "$_auth_alerted_at" ]; then
         log "Max auth recovery: the daily-summary self-heal already ran after the outage's last auth page; not re-arming it"
       else
@@ -1525,6 +1627,38 @@ else
       fi
     elif [ -n "$_auth_alerted_at" ]; then
       AUTH_RECOVERY_PENDING=1   # green, but the incident closes on the 3rd green tick
+    else
+      # No outage page on record: a signed-out reading that never became a paged
+      # outage leaves nothing for the sign-in clock, so drop its marker.
+      rm -f "$INCIDENT_DIR/auth-outage.signed_out" 2>/dev/null
+    fi
+    # The queued re-run waits for the launchd sign-in check itself to read
+    # signed in: the outage can close on a supervisor authenticating, or on
+    # quiet logs, while the scheduled runs still read signed out, and a job
+    # started then only refuses again. It runs once (the marker goes first),
+    # posts its one line to the system channel, and is dropped after 12 hours
+    # without a confirmed sign-in. Best effort: a failure costs a re-run, never a tick.
+    _auth_replay_marker="$INCIDENT_DIR/auth-replay.pending"
+    if [ -f "$_auth_replay_marker" ] && [ "$AUTH_RECOVERY_PENDING" != "1" ]; then
+      _auth_replay_since=$(head -n 1 "$_auth_replay_marker" 2>/dev/null)
+      _auth_replay_age=$(( $(date +%s) - $(stat -f%m "$_auth_replay_marker" 2>/dev/null || echo 0) ))
+      if ! [[ "$_auth_replay_since" =~ ^[0-9]+$ ]] || [ "$_auth_replay_age" -gt 43200 ]; then
+        rm -f "$_auth_replay_marker" 2>/dev/null
+        log "Max auth recovery: re-run of the jobs the outage missed dropped (no confirmed sign-in within 12 hours of it closing)"
+      elif [ "$MAX_AUTH_PROBE_STATE" = "ok" ]; then
+        rm -f "$_auth_replay_marker" 2>/dev/null
+        _auth_replay_bin="${AUTH_OUTAGE_REPLAY_BIN:-${EDVA_INSTALL_TOOLS:-}/bin/auth-outage-replay}"
+        if [ -x "$_auth_replay_bin" ]; then
+          _auth_replay_line=$("$_auth_replay_bin" --since "$_auth_replay_since" 2>> "${LOG:-/dev/null}" | head -n 1)
+          if [ -n "$_auth_replay_line" ]; then
+            if EDVA_INFRA_PROBE=1 "$SEND" --skip-precheck --intent watchdog-alert --channel system "$_auth_replay_line" > /dev/null 2>&1; then
+              log "Max auth recovery: $_auth_replay_line"
+            else
+              log "Max auth recovery: re-run note UNDELIVERED: $_auth_replay_line"
+            fi
+          fi
+        fi
+      fi
     fi
   fi
 fi
@@ -1559,6 +1693,108 @@ if ! curl -sf --max-time 3 http://127.0.0.1:9096/healthz > /dev/null 2>&1; then
   fi
 else
   incident_clear "wiki-server-down"
+fi
+
+# --- Max sign-in renewal heads-up ---
+# The Max login has lapsed some weeks after each manual sign-in ("OAuth session
+# expired and could not be refreshed"), and a lapse stops every scheduled Claude
+# run until someone runs `claude /login` at the host. § Max auth outage pages
+# only once it has happened, which can be overnight or while the user is away
+# from the host. So from MAX_AUTH_RENEW_NOTE_DAYS (22) days after the last
+# sign-in on the clock (§ Max auth outage), this sends ONE note suggesting a
+# sign-in at a convenient moment, then nothing more until the clock moves: the
+# next lapse's recovery restarts it, and a sign-in done by hand with no outage
+# (invisible from here) is covered by the next note, which comes no sooner than
+# 22 days after this one.
+#
+# Channel: system, with --push. It is about Edva's own sign-in, so it is a
+# system row (agent/CLAUDE.md § System Channel), and it asks the user to
+# do something within days, which is what --push is for. No 🔴: nothing is
+# broken. Daytime only (09:00-21:00 home time), so the banner never lands at
+# night. Skipped while an auth outage is open or its recovery is unconfirmed:
+# the 🔴 page covers that.
+
+_max_auth_relogin_num() {   # <key> <file>: an integer field, or nothing
+  grep -oE "\"$1\":[0-9]+" "$2" 2>/dev/null | head -n1 | sed -E 's/^[^:]*://'
+}
+
+# max_auth_relogin_bootstrap — first tick with no clock: seed it from the newest
+# "auth restored" line any supervisor logged (live or rotated logs), the nearest
+# trace of the last sign-in this host keeps. With none, start the clock now, so
+# the scan runs once rather than every tick.
+# The pattern is the supervisors' own log line, nothing looser: supervisor/index.mjs
+# writes "<ISO>Z [supervisor] auth restored — rotating session and resuming
+# dispatcher", chat-supervisor.mjs "<ISO>Z [chat-supervisor] auth restored after
+# <n> failed turn(s)". (Machine-written log structure, not language.)
+MAX_AUTH_RESTORED_LINE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z (\[supervisor\] auth restored .*rotating session and resuming dispatcher|\[chat-supervisor\] auth restored after [0-9]+ failed turn\(s\))$'
+max_auth_relogin_bootstrap() {
+  local logs="${EDVA_INSTALL_TOOLS:-}/agent/logs" lf line epoch newest=0 now
+  now=$(date +%s)
+  for lf in "$logs"/ops-supervisor*.log* "$logs"/ops-light-supervisor*.log* \
+            "$logs"/ops-haiku-supervisor*.log* "$logs"/chat-supervisor*.log*; do
+    [ -f "$lf" ] || continue
+    case "$lf" in
+      *.gz) line=$(gzip -dc "$lf" 2>/dev/null | grep -E "$MAX_AUTH_RESTORED_LINE_RE" | tail -n1) ;;
+      *)    line=$(grep -E "$MAX_AUTH_RESTORED_LINE_RE" "$lf" 2>/dev/null | tail -n1) ;;
+    esac
+    [ -n "$line" ] || continue
+    epoch=$(_auth_epoch "$line")
+    [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+    if [ "$epoch" -le "$now" ] && [ "$epoch" -gt "$newest" ]; then newest="$epoch"; fi
+  done
+  if [ "$newest" -gt 0 ]; then
+    _max_auth_relogin_write "$newest" 0 "supervisor-log"
+    log "Max sign-in clock: no record yet, seeded from the newest supervisor 'auth restored' line ($(date -r "$newest" '+%Y-%m-%d %H:%M'))"
+  else
+    _max_auth_relogin_write "$now" 0 "first-seen"
+    log "Max sign-in clock: no record and no 'auth restored' line in the supervisor logs; starting the clock now"
+  fi
+  return 0
+}
+
+# max_auth_renewal_heads_up <now_epoch> — sends the note when it is due, at
+# most once per call. Never fails the tick.
+max_auth_renewal_heads_up() {
+  local now="${1:-}" f relogin note src anchor days hour host msg push
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  f=$(_max_auth_relogin_file)
+  [ -n "$f" ] || return 0
+  [ -f "$f" ] || max_auth_relogin_bootstrap
+  relogin=$(_max_auth_relogin_num relogin_ts "$f")
+  note=$(_max_auth_relogin_num note_ts "$f")
+  [[ "$relogin" =~ ^[0-9]+$ ]] || return 0
+  [[ "$note" =~ ^[0-9]+$ ]] || note=0
+  anchor="$relogin"
+  [ "$note" -gt "$anchor" ] && anchor="$note"
+  days="${MAX_AUTH_RENEW_NOTE_DAYS:-22}"
+  [[ "$days" =~ ^[0-9]+$ ]] || days=22
+  [ $(( now - anchor )) -ge $(( days * 86400 )) ] || return 0
+  hour=$(TZ="${EDVA_TZ:-UTC}" date -r "$now" '+%H' 2>/dev/null)
+  hour="${hour#0}"
+  [[ "$hour" =~ ^[0-9]+$ ]] || return 0
+  { [ "$hour" -ge 9 ] && [ "$hour" -lt 21 ]; } || return 0
+  host="${EDVA_HOST_LABEL:-the host}"
+  if [ "$note" -lt "$relogin" ]; then
+    msg="As far as I can tell, the Claude sign-in on $host hasn't been renewed in $(( (now - relogin) / 86400 )) days. It tends to run out about four weeks after a sign-in, and when it does, every scheduled Claude job stops until someone signs in again. If you run \`claude /login\` on $host sometime in the next few days, the clock starts over and you skip that outage."
+  else
+    # A sign-in after the last note is invisible here, and if one happened it
+    # was about this long ago, so it is due again either way: say so plainly.
+    msg="It's been $(( (now - note) / 86400 )) days since my last nudge about the Claude sign-in on $host. A sign-in done by hand doesn't show up on my side, so whether or not you renewed it after that note, it's about due again now. Running \`claude /login\` on $host in the next few days keeps every scheduled Claude job from stopping when it runs out."
+  fi
+  # The banner is cut at ~100 characters, before the ask; give it its own line.
+  push="Time to renew the Claude sign-in on $host: run claude /login there in the next few days."
+  src=$(grep -oE '"source":"[A-Za-z0-9._-]*"' "$f" 2>/dev/null | head -n1 | sed -E 's/^"source":"//; s/"$//')
+  if EDVA_INFRA_PROBE=1 "$SEND" --skip-precheck --intent max-auth-renewal --channel system --push --push-body "$push" "$msg" > /dev/null 2>&1; then
+    _max_auth_relogin_write "$relogin" "$now" "${src:-unknown}"
+    log "Max sign-in heads-up sent: $msg"
+  else
+    log_throttled "$EDVA_INSTALL_TOOLS/data/.watchdog-renewal-note-failed" "Max sign-in heads-up could not be delivered; it retries next tick" 3600
+  fi
+  return 0
+}
+
+if [ "${AUTH_OUTAGE_HELD:-0}" != "1" ] && [ "${AUTH_RECOVERY_PENDING:-0}" != "1" ]; then
+  max_auth_renewal_heads_up "$(date +%s)"
 fi
 
 # --- GitHub CLI auth health ---

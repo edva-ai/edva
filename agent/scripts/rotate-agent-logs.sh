@@ -49,3 +49,12 @@ done
 find "$LOGDIR" -type f \( -name "*-????-??-??.log" -o -name "*-????-??-??.log.gz" -o -name "*-????-??-??.err.log" -o -name "*-????-??-??.err.log.gz" \) -mtime +"$KEEP_DAYS" -delete 2>/dev/null
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') rotate-agent-logs: rotated $rotated file(s)" >> "$LOGDIR/claude-launchagent.log"
+
+# Critic scratch copies older than 6 h, and any stray copy of the installation's
+# .env files under the temp dirs (bin/scratch-tree). A copy left in /tmp
+# keeps every key in it readable long after the run that made it.
+source "$(dirname "${BASH_SOURCE[0]}")/lib/root.sh"   # EDVA_NODE, EDVA_INSTALL_TOOLS
+if [ -n "${EDVA_NODE:-}" ]; then
+  "$EDVA_NODE" "$EDVA_INSTALL_TOOLS/bin/scratch-tree" sweep >> "$LOGDIR/scratch-tree-sweep.log" 2>&1 || true
+fi
+

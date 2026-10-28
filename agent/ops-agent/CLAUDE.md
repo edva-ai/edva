@@ -86,7 +86,11 @@ It refuses without an explicit file list, rejects whole-tree spellings, and repo
 
 **Edits you did not make are not yours to commit.** Leave them and say so in your report.
 
-**Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary). Before committing a change to the repo, run `bin/kernel-guard`: narrative goes in `system/changelog.md` or the commit message (never a code comment), this installation's rules in `agent/local/`, its values in `agent/local/config/`, its behaviour in an `_ext/` hook; a new file is added to `system/kernel-manifest.json` (`files` or `personal_globs`). The pre-commit hook refuses what the guard finds and says where it belongs; move it, don't reach for `EDVA_ALLOW_KERNEL_GUARD_SKIP=1`.
+**Kernel files stay generic** (`agent/CLAUDE.md` § Kernel boundary): run `bin/kernel-guard` before committing; when the pre-commit hook refuses, move the content where it says, never `EDVA_ALLOW_KERNEL_GUARD_SKIP=1`.
+
+## Scratch copies of the repo (critics, test runs)
+
+A job or critic that needs a copy of the code to run tests against a change uses a scratch tree. Make it with `bin/scratch-tree make [--label <name>] [--bundle <files.json>]` (tracked files plus the change, nothing gitignored: no `.env`, no `data`), run in it with `scratch-tree run <dir> -- <command>` (sets `EDVA_HOME` to the copy), and delete it with `scratch-tree remove <dir>` when done. Never copy the tree by hand: a hand copy carries `.env` and its backups into `/tmp`. The nightly log rotation deletes scratch trees older than 6 hours and any stray copy of a secrets file under the temp dirs.
 
 ## Catch Up
 
@@ -204,7 +208,7 @@ Nightly (3:20 AM local) fold of durable facts the user states in chat into the g
 
 ## People Pages (2026-10-23 — cross-job invariant for every wiki writer)
 
-Every person the user knows has their own wiki page (`entity: person`, id `user_<first>_<last>`). Group pages (`entity: people-hub`, e.g. `user_family_extended`, `user_cousins`, couple pages) are directories. **A fact about one person goes on that person's page**, not the hub. If the person has no page yet, write the fact on the hub as before, and `wiki-link-weave` moves it when it gives them a page. **Never merge or retire a person page for being thin.** **Never decide who a shared first name means from the name alone** (one first name can be two different people, or an ordinary English word). Settle it from context or ask through the hum. Writers: `jobs/people-email.md` (from email, nightly), `jobs/wiki-link-weave.md` (hub splits and linking, weekly). Design: `system/wiki-architecture.md` § People pages.
+Every person the user knows has their own wiki page (`entity: person`, id `user_<first>_<last>`). Group pages (`entity: people-hub`, e.g. `user_family_extended`, `user_cousins`, couple pages) are directories. **A fact about one person goes on that person's page**, not the hub. If the person has no page yet, write the fact on the hub as before, and `wiki-link-weave` moves it when it gives them a page. **Never merge or retire a person page for being thin.** **Every person page is connected to the people it relates to:** a `## Relations` section of typed lines (`child_of`, `friend_of`, … the fact tokens in `lib/wiki-facts.mjs`) pointing at each related person's own page, on stated evidence only, with the inverse line on the other page. **Never decide who a shared first name means from the name alone** (one first name can be two different people, or an ordinary English word). Settle it from context or ask through the hum. Writers: `jobs/people-email.md` (from email, nightly), `jobs/wiki-link-weave.md` (hub splits and linking, weekly), `jobs/people-watch.md` (the `## Background` block from public web research, only for people the user said yes to; links the Google Contacts card, never copies contact details). Design: `system/wiki-architecture.md` § People pages.
 
 ## Dream
 

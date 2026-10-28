@@ -31,8 +31,12 @@
 // data/open-questions.jsonl (lib/open-questions.mjs) and stays open until
 // answered, so the `open_questions` lane can re-ask it. A re-ask passes the
 // ORIGINAL --id. The chat row is tagged metadata.question_id (+ question_until
-// for a time-bound one) so the app colours it while it is open. A re-ask the
-// resolve-first gate settles from the records (12 / 13) retires the question.
+// for a time-bound one) so the app colours it while it is open, and
+// metadata.finding_key, the dedup_key of the --findings headline, so the row
+// says structurally what it asked about (a hum question carries no choice
+// card): a stop question's key is `location_ask:<visit id>`, which
+// bin/stop-evidence's audit reads. A re-ask the resolve-first gate settles
+// from the records (12 / 13) retires the question.
 // --relevant-until defaults from the lane (location lanes: end of the local day).
 //
 // Prints one JSON line: {status, question_id, message_id, text_sent, decision_id}
@@ -57,6 +61,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { readSidecar } from "../lib/hum-resolve-first.mjs";
 import { recordAsked, recordRetired, getQuestion, relevantUntilFor, stampRows } from "../lib/open-questions.mjs";
+import { recordQuestionSend } from "../lib/question-pacing.mjs";
 
 import { installTools } from "../lib/root.cjs";
 const HOME = os.homedir();
@@ -108,7 +113,10 @@ const captureFile = path.join(os.tmpdir(), `hum-ask-capture.${stamp}`);
 const contextFile = path.join(os.tmpdir(), `hum-ask-context.${stamp}.json`);
 const prior = getQuestion(id);
 const relevantUntil = relevantUntilArg || prior?.relevant_until || relevantUntilFor(lane, new Date().toISOString());
-const rowMeta = { question_id: id, ...(relevantUntil ? { question_until: relevantUntil } : {}) };
+const findingKey = findings && findings[0] && typeof findings[0].dedup_key === "string" && findings[0].dedup_key
+  ? findings[0].dedup_key : null;
+const rowMeta = { question_id: id, ...(relevantUntil ? { question_until: relevantUntil } : {}),
+  ...(findingKey ? { finding_key: findingKey } : {}) };
 const sendArgs = ["--suppress-hook", "--capture-id", captureFile, "--intent", intent, "--metadata-json", JSON.stringify(rowMeta)];
 try {
   fs.writeFileSync(contextFile, JSON.stringify({
@@ -187,6 +195,8 @@ try {
 }
 try {
   recordAsked({ id, question: textSent, subject, lane, memory_hook: memoryHook, rationale, msg_id: messageId, relevant_until: relevantUntil, at: now.toISOString() });
+  // Counts against the question pool (lib/question-pacing.mjs), not the shared ping budget.
+  recordQuestionSend({ lane, id, now });
 } catch (e) {
   console.error(`hum-ask: sent, but the open-questions ledger could not be written (${e.message})`);
 }

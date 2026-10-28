@@ -151,12 +151,21 @@ for (const [f, content] of Object.entries(item.files || {})) {
 // before the card is filed, with what to fix. (A new capability is written
 // under agent/ext/<name>/, which is this installation's own by
 // definition: nothing to check.)
+let cardRemovalNote = "";
 if (type === "code-fix") {
   const { installationRefusals } = await import(path.join(ROOT, "lib/self-improve-landing.mjs"));
   const before = Object.fromEntries(Object.keys(item.files || {}).map((rel) => {
     try { return [rel, fs.readFileSync(path.resolve(ROOT, rel), "utf8")]; } catch { return [rel, null]; }
   }));
-  const refusals = installationRefusals({ files: item.files || {}, before });
+  // The content checks (lib/self-improve-content-check.mjs): a file turned
+  // into a bundle, or one losing most of its lines undeclared. A card the user
+  // signs must not be the place a truncated file is first noticed.
+  const { contentRefusals, removalNote } = await import(path.join(ROOT, "lib/self-improve-content-check.mjs"));
+  const refusals = [
+    ...contentRefusals({ files: item.files || {}, before, allowShrink: item.allow_shrink }),
+    ...installationRefusals({ files: item.files || {}, before }),
+  ];
+  cardRemovalNote = removalNote({ files: item.files || {}, before });
   if (refusals.length) {
     console.error("self-improve-request: refused — redraft the change and file it again:");
     for (const r of refusals) console.error(`  - ${r}`);
@@ -246,6 +255,9 @@ if (inert.length) {
   const which = inert.length === 1 ? inert[0] : `${inert.length} files, including ${inert[0]}`;
   rationaleOut = `${rationale}${rationale ? "\n\n" : ""}\u23f3 Heads up: this one needs a restart before it does anything. It changes ${which}, which the supervisors read once when they start up — so approving it writes the file, but the running processes keep the old code until they come back. \`launchctl kickstart -k gui/$(id -u)/ai.claude.session\` is what brings them back. Restarting just the claude child (POST :9093/restart) will not do it — that leaves the same node process holding the same old code.`;
 }
+
+// A declared large removal is shown on the card, so the signature is given knowing it.
+if (cardRemovalNote) rationaleOut = `${rationaleOut}${rationaleOut ? "\n\n" : ""}${cardRemovalNote}`;
 
 const u = createUnifiedApproval({
   store: {

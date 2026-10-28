@@ -27,6 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { readStdinJson, emit, emitNull, stampRun, OWNER_NAME } from "./_common.mjs";
 import { loadLatest, pickAsk } from "../../../lib/hum-ideas.mjs";
+import { reportBacklog, currentScale, recentlyOffered } from "../../../lib/question-pacing.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
 await readStdinJson();
@@ -37,7 +38,14 @@ let pick;
 try {
   let runs = "";
   try { runs = fs.readFileSync(RUNS_FILE, "utf8"); } catch { /* no runs yet */ }
-  pick = pickAsk(loadLatest(), runs);
+  // One offered in the last few hours and held steps aside for the rest.
+  const offered = recentlyOffered("hum_asks");
+  const ideas = loadLatest();
+  const fresh = ideas.filter((i) => !offered.has(`hum_asks:${i.id}`));
+  const all = pickAsk(ideas, runs, Date.now(), { scale: currentScale() });
+  pick = pickAsk(fresh, runs, Date.now(), { scale: currentScale() });
+  if (!pick.idea) pick = all;
+  reportBacklog("hum_asks", all.waiting || 0);
 } catch (err) {
   process.stderr.write(`hum_asks: ${err?.message || err}\n`);
   stampRun("hum_asks", false);

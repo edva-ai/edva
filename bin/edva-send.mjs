@@ -17,8 +17,16 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { sendApnsPush } from "../lib/apns-push.mjs";
-import { loadEnv } from "../lib/load-env.js";
+import { loadEnv, underTestRunner } from "../lib/load-env.js";
 import { createRequire } from "node:module";
+
+// Inside a test run (node --test sets NODE_TEST_CONTEXT, and what a test spawns
+// inherits it) this tool never posts: its only target is the real chat. See
+// "Test runs" in lib/load-env.js.
+if (underTestRunner()) {
+  console.error("edva-send: not sent — this is a test run (NODE_TEST_CONTEXT is set), and a test never posts to the real chat.");
+  process.exit(9);
+}
 
 loadEnv();
 

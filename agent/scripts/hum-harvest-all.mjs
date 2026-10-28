@@ -38,6 +38,7 @@ import { recallForCandidates } from "./hum-wiki-recall.mjs";
 import { loadTimeline, checkClaims } from "../../lib/claim-facts.mjs";
 import { buildIntent } from "../../lib/hum-intent.mjs";
 import { preRankFilter } from "../../lib/hum-vetoes.mjs";
+import { orderQuestionsFirst, questionBacklog, pacingScale, questionSlotBusy } from "../../lib/question-pacing.mjs";
 import { createRequire } from "node:module";
 
 import { installTools } from "../../lib/root.cjs";
@@ -504,6 +505,22 @@ async function main() {
     console.error(`hum-harvest-all: pre-rank filter failed (fail-open): ${e.message}`);
   }
 
+  // Questions first (lib/question-pacing.mjs): every eligible question goes to
+  // the head of the ranker's list, marked `supporting_data.question_first`, and
+  // jobs/hum.md makes one of them the winner. Code ordering, so the rule holds
+  // whatever the scores say.
+  let questionsFirst = 0;
+  let backlog = { total: 0, lanes: {} };
+  try {
+    const q = orderQuestionsFirst(candidates, { slotBusy: questionSlotBusy() });
+    questionsFirst = q.questions;
+    candidates.length = 0;
+    candidates.push(...q.candidates);
+    backlog = questionBacklog();
+  } catch (e) {
+    console.error(`hum-harvest-all: question ordering failed (fail-open): ${e.message}`);
+  }
+
   // On a PERISHABLE location tick the ping is about where the user is standing
   // or there is no ping (hum.md). If every surviving candidate is a
   // deboosted non-local, non-operational one, the ranker has nothing it is
@@ -558,6 +575,12 @@ async function main() {
       // Pre-rank veto results. `no_eligible` = nothing could ship
       // this tick → the turn writes a silent trace with NO ranking call.
       pre_rank_vetoes: preRankVetoes,
+      // How many eligible candidates are questions (they lead the list), and
+      // the waiting-question backlog that sets their pace.
+      questions_first: questionsFirst,
+      question_backlog: backlog.total,
+      question_backlog_lanes: backlog.lanes,
+      question_scale: pacingScale(backlog.total),
       eligible_count: candidates.length,
       no_eligible: noEligible,
       perishable_no_local: perishableNoLocal,

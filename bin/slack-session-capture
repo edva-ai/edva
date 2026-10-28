@@ -1,0 +1,182 @@
+#!/usr/bin/env node
+// slack-session-capture: copy the user's logged-in Slack web session out of
+// the host's automation Chrome (CDP, default localhost:9222) into .env,
+// for the slack-channel runner.
+//
+//   SLACK_XOXC_TOKEN  the web client token, from app.slack.com localStorage
+//                     `localConfig_v2` → teams[<id>].token
+//   SLACK_D_COOKIE    the `d` cookie on .slack.com (HttpOnly, so read with
+//                     CDP Storage.getCookies, not from the page)
+//   SLACK_TEAM_ID     the workspace id the token belongs to (not secret)
+//
+// Usage:
+//   slack-session-capture --check            is Chrome signed in to Slack? (reads nothing secret)
+//   slack-session-capture [--team <domain|id|name>] [--dry-run] [--no-open]
+//
+// It verifies the pair with auth.test before writing, never prints a token or
+// cookie value, and writes .env with mode 600. If no app.slack.com tab is open
+// it opens one in the background and closes it again (--no-open refuses
+// instead). With several workspaces signed in, pass --team (or set
+// SLACK_TEAM_DOMAIN). CDP_HOST overrides the DevTools endpoint.
+// Setup and lifetime: docs/slack-channel-setup.md.
+
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { cookieHeader, upsertEnv } from "../agent/slack-channel/core.mjs";
+
+const require = createRequire(import.meta.url);
+const { DEFAULT_ENV_PATH } = require("../lib/load-env.js");
+
+const argv = process.argv.slice(2);
+const flag = (n) => argv.includes(n);
+const arg = (n) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : null; };
+if (flag("-h") || flag("--help")) {
+  console.log(fs.readFileSync(new URL(import.meta.url), "utf8").split("\n").slice(1, 22).map((l) => l.replace(/^\/\/ ?/, "")).join("\n"));
+  process.exit(0);
+}
+const CDP_HOST = process.env.CDP_HOST || "localhost:9222";
+const CHECK = flag("--check");
+const DRY = flag("--dry-run");
+const NO_OPEN = flag("--no-open");
+const TEAM = arg("--team") || process.env.SLACK_TEAM_DOMAIN || "";
+
+function die(code, msg) { console.error(`slack-session-capture: ${msg}`); process.exit(code); }
+
+async function httpJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+  return res.json();
+}
+
+// One browser-level CDP connection; page commands go through flattened sessions.
+class Cdp {
+  static async open(wsUrl) {
+    const c = new Cdp();
+    c.ws = new WebSocket(wsUrl);
+    c.id = 0;
+    c.pending = new Map();
+    c.ws.addEventListener("message", (m) => {
+      let msg;
+      try { msg = JSON.parse(m.data); } catch { return; }
+      const p = msg.id && c.pending.get(msg.id);
+      if (!p) return;
+      c.pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(`${p.method}: ${msg.error.message}`));
+      else p.resolve(msg.result || {});
+    });
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("CDP websocket open timeout")), 10000);
+      c.ws.addEventListener("open", () => { clearTimeout(t); resolve(); });
+      c.ws.addEventListener("error", (e) => { clearTimeout(t); reject(new Error(e.message || "CDP websocket error")); });
+    });
+    return c;
+  }
+  send(method, params = {}, sessionId) {
+    const id = ++this.id;
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => { this.pending.delete(id); reject(new Error(`${method} timed out`)); }, 30000);
+      this.pending.set(id, { method, resolve: (v) => { clearTimeout(t); resolve(v); }, reject: (e) => { clearTimeout(t); reject(e); } });
+      this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+  }
+  close() { try { this.ws.close(); } catch {} }
+}
+
+const isSlackPage = (t) => t.type === "page" && String(t.url || "").startsWith("https://app.slack.com/");
+
+async function readLocalConfig(cdp, targetId) {
+  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+  try {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const r = await cdp.send("Runtime.evaluate", {
+        expression: "(() => { try { return location.origin === 'https://app.slack.com' ? localStorage.getItem('localConfig_v2') : null } catch (e) { return null } })()",
+        returnByValue: true,
+      }, sessionId);
+      const v = r.result?.value;
+      if (v) return JSON.parse(v);
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    return null;
+  } finally {
+    await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+  }
+}
+
+function pickTeam(teams) {
+  const list = Object.values(teams || {}).filter((t) => t && String(t.token || "").startsWith("xoxc-"));
+  if (!list.length) return { error: "no workspace with an xoxc token in localConfig_v2" };
+  if (TEAM) {
+    const want = TEAM.toLowerCase();
+    const hit = list.find((t) => [t.id, t.domain, t.name].filter(Boolean).map((s) => String(s).toLowerCase()).includes(want));
+    return hit ? { team: hit } : { error: `no signed-in workspace matches --team ${TEAM} (have: ${list.map((t) => t.domain || t.id).join(", ")})` };
+  }
+  if (list.length === 1) return { team: list[0] };
+  return { error: `several workspaces signed in (${list.map((t) => t.domain || t.id).join(", ")}); pass --team <domain>` };
+}
+
+async function main() {
+  let version;
+  try { version = await httpJson(`http://${CDP_HOST}/json/version`); }
+  catch (err) { die(1, `Chrome DevTools not reachable at ${CDP_HOST} (${err.message})`); }
+  const cdp = await Cdp.open(version.webSocketDebuggerUrl);
+  let createdTarget = null;
+  try {
+    const { cookies = [] } = await cdp.send("Storage.getCookies");
+    const d = cookies.find((c) => c.name === "d" && String(c.domain).endsWith("slack.com"));
+    const targets = await httpJson(`http://${CDP_HOST}/json/list`);
+    const tab = targets.find(isSlackPage);
+
+    if (CHECK || !d) {
+      const exp = d && d.expires > 0 ? new Date(d.expires * 1000).toISOString().slice(0, 10) : d ? "session" : "-";
+      console.log(JSON.stringify({
+        browser: version.Browser, signed_in: !!d, d_cookie: d ? { domain: d.domain, http_only: !!d.httpOnly, expires: exp } : null,
+        slack_tab_open: !!tab,
+      }, null, 2));
+      if (!d) die(3, "Chrome at " + CDP_HOST + " has no Slack session (no `d` cookie on .slack.com). Sign in at https://app.slack.com in that Chrome profile, then rerun.");
+      return;
+    }
+
+    let targetId = tab?.id;
+    if (!targetId) {
+      if (NO_OPEN) die(3, "no app.slack.com tab open (and --no-open given)");
+      const r = await cdp.send("Target.createTarget", { url: "https://app.slack.com/client", background: true });
+      targetId = createdTarget = r.targetId;
+    }
+    const lc = await readLocalConfig(cdp, targetId);
+    if (!lc) die(3, "app.slack.com did not expose localConfig_v2 (not signed in in this profile, or the page did not load)");
+    const { team, error } = pickTeam(lc.teams);
+    if (error) die(2, error);
+
+    const token = team.token;
+    const cookie = d.value;
+    const res = await fetch("https://slack.com/api/auth.test", {
+      method: "POST",
+      headers: { Cookie: cookieHeader(cookie), "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token }),
+    });
+    const who = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
+    if (!who.ok) die(4, `auth.test rejected the captured session (${who.error}); nothing written`);
+    console.log(`auth.test ok: team=${who.team} (${who.team_id}) user=${who.user} (${who.user_id})`);
+    console.log(`token: xoxc (${token.length} chars)  d cookie: ${cookie.length} chars, expires ${d.expires > 0 ? new Date(d.expires * 1000).toISOString().slice(0, 10) : "with the browser session"}`);
+
+    if (DRY) { console.log("--dry-run: .env not changed"); return; }
+    let current = "";
+    try { current = fs.readFileSync(DEFAULT_ENV_PATH, "utf8"); } catch {}
+    const next = upsertEnv(current, { SLACK_XOXC_TOKEN: token, SLACK_D_COOKIE: cookie, SLACK_TEAM_ID: who.team_id });
+    // Temp file in the (gitignored) data dir, same filesystem, so the rename is atomic.
+    const tmp = path.join(path.dirname(DEFAULT_ENV_PATH), "data", `.slack-env.${process.pid}.tmp`);
+    fs.mkdirSync(path.dirname(tmp), { recursive: true });
+    fs.writeFileSync(tmp, next, { mode: 0o600 });
+    fs.renameSync(tmp, DEFAULT_ENV_PATH);
+    fs.chmodSync(DEFAULT_ENV_PATH, 0o600);
+    console.log(`wrote SLACK_XOXC_TOKEN, SLACK_D_COOKIE, SLACK_TEAM_ID to ${DEFAULT_ENV_PATH}`);
+    console.log("The runner re-reads .env on its next connect; no restart needed. Mirror the pair into 1Password (see docs/slack-channel-setup.md).");
+  } finally {
+    if (createdTarget) await cdp.send("Target.closeTarget", { targetId: createdTarget }).catch(() => {});
+    cdp.close();
+  }
+}
+
+main().catch((err) => die(1, err.message));

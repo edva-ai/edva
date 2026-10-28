@@ -447,6 +447,24 @@ test("...but a perishable moment is judged on its own merit, not the tally", () 
   assert.equal(v.threshold, CONFIG.base_salience_threshold);
 });
 
+test("a no_ramp event (questions waiting) is held to the base bar, not the tally", () => {
+  const state = emptyState();
+  state.dispatches = Array.from({ length: 4 }, (_, i) => new Date(NOW - (i + 1) * 60_000).toISOString());
+  const v = run([ev({ sensor: "questions", type: "questions.waiting", salience: 0.45, lanes: ["dream_asks"], dedup_key: "questions:waiting", no_ramp: true })], { state });
+  assert.equal(v.decision, "dispatch", "the question pool already paces questions");
+  assert.equal(v.threshold, CONFIG.base_salience_threshold);
+  assert.equal(normalizeEvent({ type: "x.y" }).no_ramp, false);
+});
+
+test("a questions-only bundle waits the 5-minute question refractory, not the global one", () => {
+  const state = emptyState();
+  state.last_dispatch_at = new Date(NOW - 6 * 60_000).toISOString();
+  const q = ev({ sensor: "questions", type: "questions.waiting", salience: 0.45, lanes: ["dream_asks"], dedup_key: "questions:waiting", no_ramp: true });
+  assert.equal(run([q], { state }).decision, "dispatch");
+  state.last_dispatch_at = new Date(NOW - 3 * 60_000).toISOString();
+  assert.match(run([q], { state }).reason, /refractory \(3m < 5m\)/);
+});
+
 test("the refractory window still stops two pings landing on top of each other", () => {
   const state = emptyState();
   state.last_dispatch_at = new Date(NOW - 60_000).toISOString();

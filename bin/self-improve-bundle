@@ -1,0 +1,83 @@
+#!/usr/bin/env node
+// self-improve-bundle — build the --files-json bundle for self-improve-request /
+// self-improve-auto-apply from files in the working tree.
+//
+// Every job that files a change used to assemble {"files": {path: content}} with
+// its own hand-written command, and on 2026-10-25 one of those commands wrote the
+// bundle over the changelog instead of to its output file (see
+// lib/self-improve-content-check.mjs). This is the one way to build it:
+// it reads each path from the repo, refuses an output path that is one of them
+// or inside the repo, and runs the content checks against the committed version
+// before anything is written.
+//
+// Usage:
+//   self-improve-bundle --out <file outside the repo> [--base-rev <commit>] [--allow-shrink <path>]... <path>...
+//
+//   <path>          repo-relative path of a file you changed (its current content is bundled)
+//   --base-rev      the commit you read the files at; records base_sha256 for each path
+//                   that existed there, so a file that moved on is refused at apply
+//   --allow-shrink  this path is meant to lose most of its lines (repeatable)
+//
+// Exit: 0 written · 64 usage · 65 refused by the content checks (nothing written)
+
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import rootPaths from "../lib/root.cjs";
+import { contentRefusals } from "../lib/self-improve-content-check.mjs";
+
+// The checkout this code runs from (EDVA_HOME when set): the tree the change was made in.
+const ROOT = rootPaths.REPO_ROOT;
+
+const USAGE = "usage: self-improve-bundle --out <file outside the repo> [--base-rev <commit>] [--allow-shrink <path>]... <path>...";
+function usage(msg) { console.error(`self-improve-bundle: ${msg}\n${USAGE}`); process.exit(64); }
+
+let out = null, baseRev = null;
+const allowShrink = [], paths = [];
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--out") out = argv[++i];
+  else if (a === "--base-rev") baseRev = argv[++i];
+  else if (a === "--allow-shrink") allowShrink.push(argv[++i]);
+  else if (a === "-h" || a === "--help") { console.log(USAGE); process.exit(0); }
+  else if (a.startsWith("--")) usage(`unknown flag ${a}`);
+  else paths.push(a);
+}
+if (!out) usage("--out is required");
+if (!paths.length) usage("no files given");
+
+// Real paths on both sides, so a symlinked spelling (/var vs /private/var) cannot slip through.
+let outAbs;
+try { outAbs = path.join(fs.realpathSync(path.dirname(path.resolve(out))), path.basename(out)); }
+catch { usage(`--out directory does not exist: ${path.dirname(out)}`); }
+const REAL_ROOT = fs.realpathSync(ROOT);
+if (outAbs === REAL_ROOT || outAbs.startsWith(REAL_ROOT + path.sep)) usage(`--out must be outside the repo (got ${out})`);
+
+const git = (args) => execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+const atRev = (rev, rel) => { try { return git(["show", `${rev}:${rel}`]); } catch { return null; } };
+
+const files = {}, before = {}, base = {};
+for (const p of paths) {
+  const abs = path.resolve(ROOT, p);
+  if (!abs.startsWith(ROOT + path.sep)) usage(`path outside the repo: ${p}`);
+  const rel = path.relative(ROOT, abs).split(path.sep).join("/");
+  if (path.join(REAL_ROOT, path.relative(ROOT, abs)) === outAbs) usage(`--out is one of the files being bundled: ${rel}`);
+  try { files[rel] = fs.readFileSync(abs, "utf8"); } catch (e) { usage(`cannot read ${rel}: ${e.code || e.message}`); }
+  before[rel] = atRev(baseRev || "HEAD", rel);
+  if (baseRev && before[rel] !== null) base[rel] = createHash("sha256").update(before[rel]).digest("hex");
+}
+
+const refusals = contentRefusals({ files, before, allowShrink });
+if (refusals.length) {
+  console.error("self-improve-bundle: refused, nothing written:");
+  for (const r of refusals) console.error(`  - ${r}`);
+  process.exit(65);
+}
+
+const item = { files };
+if (baseRev) item.base_sha256 = base;
+if (allowShrink.length) item.allow_shrink = allowShrink;
+fs.writeFileSync(outAbs, JSON.stringify(item));
+console.log(`self-improve-bundle: ${Object.keys(files).length} file(s) -> ${out}`);

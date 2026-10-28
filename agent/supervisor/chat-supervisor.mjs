@@ -43,7 +43,7 @@ import { State } from "./state.mjs";
 import { Instrumentation } from "./instrumentation.mjs";
 import { attachClaudeMdWatcher } from "./graceful-restart.mjs";
 import { authFailureText, CHAT_AUTH_OFFLINE_REPLY } from "./auth-result.mjs";
-import { isQuotaRefusal, rateLimitHoldUntil } from "./dispatcher.mjs";
+import { isQuotaRefusal, rateLimitHoldUntil, RATE_LIMIT_REPROBE_MS } from "./dispatcher.mjs";
 import { isCliQuotaMessage, chatQuotaNotice, chatQuotaDroppedNotice, QUOTA_RETRY_HEADER } from "./chat-quota.mjs";
 import { userTz } from "../../lib/hum-events.mjs";
 import * as substrateStore from "../core/message-store.mjs";
@@ -55,6 +55,7 @@ import { makeStatelessExecutor } from "../core/stateless-executor.mjs";
 import * as forkQueue from "../core/fork-queue.mjs";
 import { ReplyDraftTracker } from "../../lib/reply-stream.mjs";
 import { installRoot, installTools } from "../../lib/root.cjs";
+import { underTestRunner } from "../../lib/load-env.js";
 const { instanceValue } = createRequire(import.meta.url)("../../lib/instance.cjs");
 
 // Conway-substrate integration (WP4/WP0), flag-gated + additive. CHAT_SUBSTRATE:
@@ -333,6 +334,7 @@ class ChatSupervisor {
     // "set aside" line. The outage is also saved in session.json, so a new
     // supervisor process keeps the hold and does not announce it again.
     this.quotaHoldUntil = 0;
+    this._quotaHoldTo = 0;   // the live hold: quotaHoldUntil capped to the next re-check
     this._quotaHoldTimer = null;
     this.quotaInfo = null;
     this.quotaOutage = false;
@@ -484,9 +486,19 @@ class ChatSupervisor {
                   + (u.cache_read_input_tokens ?? u.cacheReadInputTokens ?? 0)
                   + (u.cache_creation_input_tokens ?? u.cacheCreationInputTokens ?? 0);
         if (ctx > 0) this.contextTokens = ctx;
-        if (ctx > 0 && this.floorSessionId !== this.state.sessionId) {
+        // A resumed session keeps the floor its own first call measured (same
+        // as index.mjs): after a restart the first call carries the whole
+        // resumed conversation, which is not floor.
+        const keptFloor = ctx > 0 && this.floorSessionId !== this.state.sessionId
+          ? this.state.floorFor(this.state.sessionId) : 0;
+        if (keptFloor > 0) {
+          this.floorSessionId = this.state.sessionId;
+          this.sessionFloorTokens = Math.min(keptFloor, ctx);
+          this.eventLog.append({ kind: "context.floor_restored", sessionId: this.state.sessionId, floorTokens: keptFloor, contextTokens: ctx });
+        } else if (ctx > 0 && this.floorSessionId !== this.state.sessionId) {
           this.floorSessionId = this.state.sessionId;
           this.sessionFloorTokens = ctx;
+          this.state.recordFloor(this.state.sessionId, ctx);
           this.eventLog.append({
             kind: "context.floor_measured", sessionId: this.state.sessionId, floorTokens: ctx,
             compactThreshold: CHAT_COMPACT_THRESHOLD_TOKENS, rotateThreshold: CHAT_ROTATE_THRESHOLD_TOKENS,
@@ -582,6 +594,10 @@ class ChatSupervisor {
         console.error(`[chat-supervisor] quota cleared — ${t.source} turn completed after the hold`);
         this.eventLog.append({ kind: "quota_cleared", source: t.source });
         this.quotaOutage = false;
+        // The window may have come back before the reset it named; the next
+        // outage must not inherit that reset (the notice and restart record read it).
+        this.quotaHoldUntil = 0;
+        this._quotaHoldTo = 0;
         this.quotaNoticeSent = false;
         this.quotaDroppedNoticeSent = false;
         this._saveQuotaState();
@@ -660,7 +676,7 @@ class ChatSupervisor {
     // Transfer pending queue from old dispatcher.
     const pendingItems = this.dispatcher ? [...this.dispatcher.queue] : [];
     this.dispatcher = new PriorityDispatcher(this.session, { sendFn: loopSendFn });
-    if (this.quotaHoldUntil > Date.now()) this.dispatcher.hold(this.quotaHoldUntil);   // a hold outlives a restart
+    if (this._quotaHoldTo > Date.now()) this.dispatcher.hold(this._quotaHoldTo);   // a hold outlives a restart
     for (const item of pendingItems) this.dispatcher.queue.push(item);
     if (pendingItems.length) console.error(`[chat-supervisor] transferred ${pendingItems.length} queued item(s)`);
 
@@ -1131,11 +1147,17 @@ class ChatSupervisor {
     this._holdForQuota(until);
     const item = this.dispatcher?.inFlight;
     const noWork = !!item && (ev.num_turns || 0) <= 1 && !t.toolUsed;
-    const requeued = noWork && !item.quotaRetried;
+    // Refused before the named reset, a retry is the hourly re-check finding
+    // the window still shut, so the item keeps its place; refused again once
+    // that reset has passed, it is dropped.
+    const stillShut = Number(info.resetsAt) * 1000 > now;
+    const requeued = noWork && (!item.quotaRetried || stillShut);
     if (requeued) {
-      item.quotaRetried = true;
-      item.quotaSeveral = (item.mergedCount || 0) > 0;   // mergedCount is recomputed when it drains again
-      if (item.source === "edva") item.content = `${QUOTA_RETRY_HEADER}\n\n${item.content}`;   // never in front of a /compact
+      if (!item.quotaRetried) {
+        item.quotaRetried = true;
+        item.quotaSeveral = (item.mergedCount || 0) > 0;   // mergedCount is recomputed when it drains again
+        if (item.source === "edva") item.content = `${QUOTA_RETRY_HEADER}\n\n${item.content}`;   // never in front of a /compact
+      }
       this.dispatcher.requeueInFlight({ front: true });
     }
     const dropped = noWork && !requeued;
@@ -1190,10 +1212,15 @@ class ChatSupervisor {
     this.eventLog.append({ kind: "quota_restored", holdUntil: new Date(holdUntil).toISOString(), noticeSent: this.quotaNoticeSent, droppedNoticeSent: this.quotaDroppedNoticeSent });
   }
 
+  // quotaHoldUntil is the reset the limit named (the notice and the restart
+  // record carry it); the hold itself re-checks at least every
+  // RATE_LIMIT_REPROBE_MS, since a window can come back before that reset.
   _holdForQuota(until) {
-    if (!(until > this.quotaHoldUntil)) return;   // extends, never shortens
-    this.quotaHoldUntil = until;
-    this.dispatcher?.hold(until);
+    if (until > this.quotaHoldUntil) this.quotaHoldUntil = until;   // extends, never shortens
+    const holdTo = Math.min(this.quotaHoldUntil, Date.now() + RATE_LIMIT_REPROBE_MS);
+    if (!(holdTo > Date.now()) || !(holdTo > this._quotaHoldTo)) return;
+    this._quotaHoldTo = holdTo;
+    this.dispatcher?.hold(holdTo);
     clearTimeout(this._quotaHoldTimer);
     const release = () => {
       // Mid-restart the replacement dispatcher may already carry the expired
@@ -1202,7 +1229,7 @@ class ChatSupervisor {
       console.error(`[chat-supervisor] quota hold released — resuming dispatch (queue=${this.dispatcher?.queue.length ?? 0})`);
       this.dispatcher?.releaseHold();
     };
-    this._quotaHoldTimer = setTimeout(release, Math.max(0, until - Date.now()));
+    this._quotaHoldTimer = setTimeout(release, Math.max(0, holdTo - Date.now()));
   }
 
   // The one line per outage, in their own time zone. Posted the way the auth
@@ -1234,6 +1261,11 @@ class ChatSupervisor {
   }
 
   _getSupabaseKey() {
+    // Inside a test run (node --test) the safety net never holds the live key,
+    // whatever the environment or the installation's .env carries, so a
+    // test-started supervisor cannot post its fake replies into the real chat.
+    // See "Test runs" in lib/load-env.js.
+    if (underTestRunner()) return null;
     if (process.env.SUPABASE_SERVICE_ROLE_KEY) return process.env.SUPABASE_SERVICE_ROLE_KEY;
     try {
       const env = fs.readFileSync(path.join(EDVA_ROOT, ".env"), "utf8");
@@ -1246,7 +1278,7 @@ class ChatSupervisor {
   async _postOrphanedReply(message) {
     const key = this._getSupabaseKey();
     if (!key) {
-      console.error(`[chat-supervisor] safety net: SUPABASE_SERVICE_ROLE_KEY not available — orphaned text lost: ${message.slice(0, 80)}`);
+      console.error(`[chat-supervisor] safety net: SUPABASE_SERVICE_ROLE_KEY not available${underTestRunner() ? " (withheld in a test run)" : ""} — orphaned text lost: ${message.slice(0, 80)}`);
       return;
     }
     // SUPABASE_URL env, else this installation's project (lib/instance.cjs).

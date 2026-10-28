@@ -58,6 +58,21 @@ export class State {
     this.save();
   }
 
+  // The context floor measured when this session started, kept with the
+  // session so a supervisor restart that resumes it reuses that floor instead
+  // of re-measuring it from the whole resumed conversation. A re-measured
+  // floor reads every token of the conversation as uncompactable, which turns
+  // off both /compact and the idle-cold rotation for the rest of the session.
+  recordFloor(sessionId, tokens) {
+    this.data.floor = { sessionId, tokens };
+    this.save();
+  }
+
+  floorFor(sessionId) {
+    const f = this.data.floor;
+    return f && f.sessionId === sessionId && f.tokens > 0 ? f.tokens : 0;
+  }
+
   markResumed() {
     this.data.lastResumeAt = new Date().toISOString();
     this.save();

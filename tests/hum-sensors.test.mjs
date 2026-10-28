@@ -131,3 +131,46 @@ test("a healthy sensor with no error history logs nothing", () => {
   assert.equal(lines.length, 0);
   assert.equal(entry.error_key, null);
 });
+
+// ── questions: turns a waiting queue into ticks, backs off when they send nothing ──
+
+async function questionsSensor({ waiting = 0, sends = [], pending = null, memo = {}, hour = 14, nowMs = Date.now() } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "q-sensor-"));
+  process.env.HUM_QUESTION_BACKLOG_DIR = path.join(dir, "backlog");
+  process.env.HUM_QUESTION_SENDS_PATH = path.join(dir, "sends.jsonl");
+  process.env.HUM_PENDING_QUESTION_PATH = path.join(dir, "pending.json");
+  process.env.HUM_QUESTION_SCALE = "3";
+  fs.mkdirSync(process.env.HUM_QUESTION_BACKLOG_DIR);
+  fs.writeFileSync(path.join(process.env.HUM_QUESTION_BACKLOG_DIR, "dream_asks.json"),
+    JSON.stringify({ lane: "dream_asks", waiting, at: new Date(nowMs).toISOString() }));
+  fs.writeFileSync(process.env.HUM_QUESTION_SENDS_PATH, sends.map((t) => JSON.stringify({ sent_at: new Date(t).toISOString() })).join("\n"));
+  if (pending) fs.writeFileSync(process.env.HUM_PENDING_QUESTION_PATH, JSON.stringify(pending));
+  const mod = await import(pathToFileURL(path.join(SENSOR_DIR, "questions.mjs")).href);
+  let saved = null;
+  const events = await mod.default({ config: { quiet_hours: { end: 9 } }, local: { hour }, nowMs, memo, setMemo: (m) => { saved = m; } });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { events, memo: saved };
+}
+
+test("questions fires when questions wait and the pool has room, unramped and focused on the waiting lanes", async () => {
+  assert.equal((await questionsSensor({ waiting: 0 })).events.length, 0, "an empty queue is quiet");
+  const { events, memo } = await questionsSensor({ waiting: 5 });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "questions.waiting");
+  assert.equal(events[0].no_ramp, true);
+  assert.deepEqual(events[0].lanes, ["dream_asks"]);
+  assert.ok(memo.fired_at);
+});
+
+test("questions stays quiet overnight and while a question holds the slot", async () => {
+  assert.equal((await questionsSensor({ waiting: 5, hour: 7 })).events.length, 0);
+  const pending = { id: "q1", expires_at: new Date(Date.now() + 600_000).toISOString() };
+  assert.equal((await questionsSensor({ waiting: 5, pending })).events.length, 0);
+});
+
+test("questions ticks every 5 minutes while anything waits", async () => {
+  const now = Date.now();
+  assert.equal((await questionsSensor({ waiting: 5, nowMs: now, memo: { fired_at: new Date(now - 3 * 60_000).toISOString() } })).events.length, 0);
+  const again = await questionsSensor({ waiting: 5, nowMs: now, memo: { fired_at: new Date(now - 5 * 60_000).toISOString() } });
+  assert.equal(again.events.length, 1);
+});

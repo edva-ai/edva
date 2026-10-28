@@ -117,6 +117,28 @@ test("hum-ask: a precheck hold is 14 and never takes the slot (it used to, with 
   assert.equal(pendingOf(env), null);
 });
 
+// A hum question carries no choice card, so the row's metadata is its only
+// structural record of what it asked about (the stop-evidence audit reads it).
+test("hum-ask: the chat row carries the finding's key (finding_key) beside question_id; none without --findings", () => {
+  const run = (id, lane, extra, message) => {
+    const env = home();
+    const r = spawnSync(process.execPath, [HUM_ASK, "--id", id, "--lane", lane, ...extra, "--message", message], {
+      encoding: "utf8", env: { ...process.env, PATH, HOME: env.h, HUM_SEND_BIN: env.sender, FAKE_MODE: "ok", FAKE_RECORD: env.record },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const rec = JSON.parse(fs.readFileSync(env.record, "utf8"));
+    return JSON.parse(rec.argv[rec.argv.indexOf("--metadata-json") + 1]);
+  };
+  const key = "location_ask:0000aaaa-1111-4222-8333-444455556666";
+  const meta = run("q-loc", "location_context", ["--findings", JSON.stringify([{ topic: "location_context", dedup_key: key }])],
+    "Was that a walk, or did you stop somewhere?");
+  assert.equal(meta.question_id, "q-loc");
+  assert.equal(meta.finding_key, key);
+  assert.ok(meta.question_until, "a location question is time-bound");
+  assert.ok(Object.values(meta).every((v) => typeof v === "string"), "the app decodes row metadata as [String: String]");
+  assert.deepEqual(Object.keys(run("q-bare", "ideas", [], "Still keen on the exhibit?")), ["question_id"]);
+});
+
 test("hum-ask: send failure is 3; usage errors are 2", () => {
   const env = home();
   assert.equal(ask(env, "fail").status, 3);

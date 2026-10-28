@@ -1,0 +1,204 @@
+#!/usr/bin/env node
+// auth-outage-replay — after a Max sign-in outage, re-run the scheduled jobs it
+// made miss, but only the ones on the installation's approved "safe to run late"
+// list, and say in one line what ran.
+//
+// WHY. When the Claude Code login lapses (it has, roughly every four weeks,
+// usually overnight), every launchd job that starts an ephemeral `claude -p`
+// refuses to start (lib/max-auth-guard.sh, exit 78) and logs one line. Nothing
+// re-runs them: cron-catchup reads only the crontab, so it re-runs everything
+// cron had due in the window (jobs that already finished fine included) and
+// none of the launchd runs that were actually refused. Some of those are worth
+// running a few hours late (a nightly review); others are not (anything that
+// works out "today" as it runs, or touches money). Which is which is the
+// owner's call, made once: the list lives in the installation's config, and a
+// job not on it is only named, never run.
+//
+// HOW. Called once by watchdog.sh, as the auth-outage incident it paged closes.
+// For each `<job>.log` under agent/logs (the ephemeral runners write
+// `YYYY-MM-DD HH:MM:SS [<job>] ...` in the host's local time), a job MISSED a
+// run when it logged a signed-out refusal ("REFUSED: not on the Max
+// subscription (loggedIn=false ...") at or after --since and has logged no
+// "start (" since its last refusal. A refusal for any other reason (wrong plan,
+// API-key login) is not an outage and is ignored. For a missed job on the list
+// whose refusal is under its `max_late_hours` old, it asks launchd to start the
+// job's agent once (`launchctl kickstart gui/<uid>/<label>`, never -k, so a run
+// already in flight is left alone). Every decision is appended to
+// data/auth-outage-replay.jsonl, which also stops a second call from
+// starting the same missed run twice.
+//
+// The list: agent/local/config/auth-outage-replay.json
+//   {"jobs": [{"job": "<log name>", "label": "<launchd label>", "name": "<plain name>",
+//              "max_late_hours": 12}]}
+// The kernel default is an empty list: nothing is re-run until the owner names it.
+//
+// Usage:
+//   auth-outage-replay --since <epoch seconds> [--now <epoch seconds>] [--dry-run] [--json]
+// Prints one plain line for the system channel, or nothing when the outage made
+// nothing miss a run. Exit 0 (also when it could not start a job: the line says
+// so), 64 usage.
+//
+// Test hooks: AUTH_OUTAGE_REPLAY_LAUNCHCTL (the launchctl to call).
+
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { installTools } = require("../lib/root.cjs");
+const { localConfig } = require("../lib/instance.cjs");
+
+const USAGE = "usage: auth-outage-replay --since <epoch seconds> [--now <epoch seconds>] [--dry-run] [--json]";
+const args = process.argv.slice(2);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
+const flag = (name) => args.includes(name);
+const epochArg = (name) => { const v = opt(name); return v != null && /^\d+$/.test(v) ? Number(v) : null; }; // lang-regex-ok: a numeric CLI argument, not a person's words
+
+const since = epochArg("--since");
+if (since == null) { console.error(USAGE); process.exit(64); }
+const now = epochArg("--now") ?? Math.floor(Date.now() / 1000);
+const dryRun = flag("--dry-run");
+
+const LOG_DIR = installTools("agent", "logs");
+const LEDGER = installTools("data", "auth-outage-replay.jsonl");
+const LAUNCHCTL = process.env.AUTH_OUTAGE_REPLAY_LAUNCHCTL || "launchctl";
+const READ_TAIL = 256 * 1024;   // the newest part of a log is all a recent outage can be in
+
+// `YYYY-MM-DD HH:MM:SS [<job>] <rest>` — the ephemeral runners' own log stamp
+// (date '+%Y-%m-%d %H:%M:%S', local time). Machine-written structure.
+const LINE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) \[([^\]]+)\] (.*)$/; // lang-regex-ok: our own log stamp format, not a person's words
+const REFUSED = "REFUSED: not on the Max subscription (";
+const SIGNED_OUT = "loggedIn=false ";
+const STARTED = "start (";
+
+function tail(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, READ_TAIL);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// What one job's log says about the outage window: its last signed-out refusal
+// at or after `since`, and its last start.
+function readJobLog(job) {
+  let lastRefusal = null;
+  let lastStart = null;
+  for (const line of tail(path.join(LOG_DIR, `${job}.log`)).split("\n")) {
+    const m = LINE.exec(line);
+    if (!m || m[7] !== job) continue;
+    const t = Math.floor(new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() / 1000);
+    if (!Number.isFinite(t) || t > now) continue;   // --now bounds it, so a past outage can be replayed dry
+    const rest = m[8];
+    if (rest.startsWith(STARTED)) { if (lastStart == null || t > lastStart) lastStart = t; continue; }
+    if (rest.startsWith(REFUSED) && rest.includes(SIGNED_OUT) && t >= since) {
+      if (lastRefusal == null || t > lastRefusal) lastRefusal = t;
+    }
+  }
+  const missed = lastRefusal != null && (lastStart == null || lastStart < lastRefusal);
+  return { lastRefusal, lastStart, missed };
+}
+
+function readLedger() {
+  try {
+    return fs.readFileSync(LEDGER, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function record(row) {
+  if (dryRun) return;
+  try {
+    fs.mkdirSync(path.dirname(LEDGER), { recursive: true });
+    fs.appendFileSync(LEDGER, JSON.stringify({ ts: new Date(now * 1000).toISOString(), since, ...row }) + "\n");
+  } catch { /* the ledger is best effort; the line still says what happened */ }
+}
+
+const list = (names) => names.length <= 1 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+
+const cfg = localConfig("auth-outage-replay", { jobs: [] });
+const approved = new Map();
+for (const j of Array.isArray(cfg.jobs) ? cfg.jobs : []) {
+  if (j && typeof j.job === "string" && typeof j.label === "string" && j.job && j.label) approved.set(j.job, j);
+}
+
+let logNames = [];
+try { logNames = fs.readdirSync(LOG_DIR).filter((f) => f.endsWith(".log")).map((f) => f.slice(0, -4)); } catch { /* no logs, nothing missed */ }
+for (const job of approved.keys()) if (!logNames.includes(job)) logNames.push(job);
+
+const ledger = readLedger();
+const ran = [];
+const failed = [];
+const tooLate = [];
+const leftAlone = [];
+const results = [];
+
+for (const job of logNames.sort()) {
+  const seen = readJobLog(job);
+  if (!seen.missed) continue;
+  const entry = approved.get(job);
+  const name = (entry && typeof entry.name === "string" && entry.name) || job;
+  const refusedAt = new Date(seen.lastRefusal * 1000).toISOString();
+  if (!entry) {
+    leftAlone.push(name);
+    results.push({ job, action: "not_listed", refused_at: refusedAt });
+    record({ job, action: "not_listed", refused_at: refusedAt });
+    continue;
+  }
+  if (ledger.some((r) => r.job === job && r.refused_at === refusedAt && r.action === "kickstarted")) {
+    results.push({ job, action: "already_kickstarted", refused_at: refusedAt });
+    continue;
+  }
+  const maxLate = Number.isFinite(Number(entry.max_late_hours)) && Number(entry.max_late_hours) > 0 ? Number(entry.max_late_hours) : 12;
+  if (now - seen.lastRefusal > maxLate * 3600) {
+    tooLate.push(name);
+    results.push({ job, action: "too_late", refused_at: refusedAt, max_late_hours: maxLate });
+    record({ job, label: entry.label, action: "too_late", refused_at: refusedAt, max_late_hours: maxLate });
+    continue;
+  }
+  if (dryRun) {
+    ran.push(name);
+    results.push({ job, action: "would_kickstart", label: entry.label, refused_at: refusedAt });
+    continue;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : 501;
+  const r = spawnSync(LAUNCHCTL, ["kickstart", `gui/${uid}/${entry.label}`], { encoding: "utf8", timeout: 15_000 });
+  const ok = r.status === 0;
+  (ok ? ran : failed).push(name);
+  const row = { job, label: entry.label, action: ok ? "kickstarted" : "kickstart_failed", refused_at: refusedAt, rc: r.status };
+  if (!ok) row.error = String(r.stderr || r.error?.message || "").trim().slice(0, 200);
+  results.push(row);
+  record(row);
+}
+
+// One line for the system channel, plain words (watchdog.sh posts it). A
+// green check only when something was actually started again. "Started" is
+// what is known: launchd accepted the start; the job may still skip itself.
+const pl = (names, one, many) => (names.length > 1 ? many : one);
+let line = "";
+const parts = [];
+if (ran.length) parts.push(`✅ The Claude sign-in outage made ${list(ran)} miss ${pl(ran, "its run", "their runs")}, so I ${dryRun ? "would start" : "started"} ${pl(ran, "it", "them")} again just now.`);
+if (failed.length) parts.push(`${ran.length ? "It also made" : "The Claude sign-in outage made"} ${list(failed)} miss ${pl(failed, "its run", "their runs")}, and I couldn't start ${pl(failed, "it", "them")} again, so ${pl(failed, "it waits", "they wait")} for the next scheduled run.`);
+if (tooLate.length) parts.push(`${ran.length || failed.length ? `${list(tooLate)} missed` : `The Claude sign-in outage made ${list(tooLate)} miss`} ${pl(tooLate, "its run", "their runs")} too long ago to re-run safely, so ${pl(tooLate, "it waits", "they wait")} for the next one.`);
+if (leftAlone.length) {
+  parts.push(ran.length || failed.length || tooLate.length
+    ? `Also missed, and not on your safe-to-run-late list, so left for the next scheduled run: ${list(leftAlone)}.`
+    : `The Claude sign-in outage made ${list(leftAlone)} miss a run; ${leftAlone.length > 1 ? "none of them is" : "it isn't"} on your safe-to-run-late list, so ${pl(leftAlone, "it waits", "they wait")} for the next scheduled run.`);
+}
+line = parts.join(" ");
+
+if (flag("--json")) {
+  process.stdout.write(JSON.stringify({ since, now, dry_run: dryRun, line, results }, null, 2) + "\n");
+} else if (line) {
+  process.stdout.write(line + "\n");
+}

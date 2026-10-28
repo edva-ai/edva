@@ -34,8 +34,9 @@ JSON=0
 
 # repo:workflow pairs known to sign on the shared CI host: EDVA_CI_SIGNING_TARGETS
 # (whitespace-separated), else `targets` in agent/local/config/ci-signing.json.
-# Repos are looked up under the installation's GitHub owner (EDVA_OWNER,
-# lib/instance.cjs github_owner). No targets → exit 2 (nothing to audit).
+# A bare repo is looked up under the installation's GitHub owner (EDVA_OWNER,
+# lib/instance.cjs github_owner); `owner/repo:workflow` names another owner.
+# No targets → exit 2 (nothing to audit).
 # shellcheck source=/dev/null
 source "$HOME/Dev/edva/agent/scripts/lib/instance.sh"
 OWNER="${EDVA_OWNER:-}"
@@ -61,11 +62,13 @@ ROWS=""
 # in a subshell evaporate — the array version silently re-fetched every time.
 CACHE=$(mktemp -d)
 trap 'rm -rf "$CACHE"' EXIT
+# A target's repo is `name` (under $OWNER) or `owner/name`.
+repo_path() { case "$1" in */*) printf '%s' "$1" ;; *) printf '%s/%s' "$OWNER" "$1" ;; esac; }
 repo_script_sha() {
   local repo="$1" script="${2:-ci-keychain-lock.sh}" f content
-  f="$CACHE/$repo.${script}.sha"
+  f="$CACHE/${repo//\//_}.${script}.sha"
   [ -f "$f" ] && { cat "$f"; return; }
-  content=$(gh api "repos/$OWNER/$repo/contents/.github/scripts/$script" \
+  content=$(gh api "repos/$(repo_path "$repo")/contents/.github/scripts/$script" \
               --jq '.content' 2>/dev/null | base64 -d 2>/dev/null)
   # Test emptiness BEFORE hashing: `shasum` of no input returns the sha of the
   # empty string, so a MISSING file would otherwise look like a drifted one.
@@ -79,7 +82,7 @@ repo_script_sha() {
 
 for t in $TARGETS; do
   repo="${t%%:*}"; wf="${t##*:}"
-  body=$(gh api "repos/$OWNER/$repo/contents/.github/workflows/$wf" --jq '.content' 2>/dev/null \
+  body=$(gh api "repos/$(repo_path "$repo")/contents/.github/workflows/$wf" --jq '.content' 2>/dev/null \
          | base64 -d 2>/dev/null)
   if [ -z "$body" ]; then
     ROWS="$ROWS$repo/$wf|workflow-unreadable|FAIL\n"; FAILURES=$((FAILURES+1)); continue

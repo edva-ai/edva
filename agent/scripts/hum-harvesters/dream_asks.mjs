@@ -27,6 +27,7 @@ import { spawnSync } from "node:child_process";
 import { readStdinJson, emit, emitNull, stampRun, OWNER_NAME, HOME_TZ } from "./_common.mjs";
 
 import { installTools } from "../../../lib/root.cjs";
+import { reportBacklog, scaledLanePacing, recentlyOffered, rotateOffered } from "../../../lib/question-pacing.mjs";
 await readStdinJson();
 
 const DATA = process.env.EDVA_DATA_DIR || installTools("data");
@@ -62,23 +63,6 @@ try {
   const day = localToday();
   if (!day) throw new Error("local-day unavailable");
 
-  // Pacing, from what hum actually SENT on this lane.
-  const sent = readJsonl(RUNS)
-    .filter((r) => r.outcome?.sent === true && r.sonnet?.based_on_topic === "dream_asks")
-    .map((r) => Date.parse(r.ts)).filter(Number.isFinite);
-  const last = sent.length ? Math.max(...sent) : 0;
-  if (last && now - last < DREAM_ASK_SPACING_H * 3600e3) {
-    stampRun("dream_asks", false);
-    emitNull(`asked ${Math.round((now - last) / 60000)}m ago (spacing ${DREAM_ASK_SPACING_H}h)`);
-    process.exit(0);
-  }
-  const today = sent.filter((t) => now - t < 24 * 3600e3).length;
-  if (today >= DREAM_ASK_MAX_PER_DAY) {
-    stampRun("dream_asks", false);
-    emitNull(`${today} dream questions in the last 24h (max ${DREAM_ASK_MAX_PER_DAY})`);
-    process.exit(0);
-  }
-
   const byId = new Map();
   for (const r of readJsonl(IDEAS)) if (r.id) byId.set(r.id, { ...(byId.get(r.id) || {}), ...r });
   const waiting = [...byId.values()].filter((i) =>
@@ -87,6 +71,27 @@ try {
     && !(i.time_sensitive_until && Date.parse(i.time_sensitive_until) < now)
     // "the next day": written on an earlier local day than today.
     && i.created_at && localDateOf(i.created_at, day.tz) < day.today);
+
+  reportBacklog("dream_asks", waiting.length);
+  // A long question backlog multiplies the cap and divides the spacing.
+  const { maxPerDay, spacingH } = scaledLanePacing({ maxPerDay: DREAM_ASK_MAX_PER_DAY, spacingH: DREAM_ASK_SPACING_H });
+
+  // Pacing, from what hum actually SENT on this lane.
+  const sent = readJsonl(RUNS)
+    .filter((r) => r.outcome?.sent === true && r.sonnet?.based_on_topic === "dream_asks")
+    .map((r) => Date.parse(r.ts)).filter(Number.isFinite);
+  const last = sent.length ? Math.max(...sent) : 0;
+  if (last && now - last < spacingH * 3600e3) {
+    stampRun("dream_asks", false);
+    emitNull(`asked ${Math.round((now - last) / 60000)}m ago (spacing ${spacingH}h)`);
+    process.exit(0);
+  }
+  const today = sent.filter((t) => now - t < 24 * 3600e3).length;
+  if (today >= maxPerDay) {
+    stampRun("dream_asks", false);
+    emitNull(`${today} dream questions in the last 24h (max ${maxPerDay})`);
+    process.exit(0);
+  }
 
   if (!waiting.length) {
     stampRun("dream_asks", false);
@@ -97,7 +102,8 @@ try {
   // Newest dream first (fresher in the user's mind), then the order they were written.
   const dreamDate = (i) => i.supporting_data?.dream_date || String(i.created_at).slice(0, 10);
   waiting.sort((a, b) => dreamDate(b).localeCompare(dreamDate(a)) || String(a.created_at).localeCompare(String(b.created_at)));
-  const i = waiting[0];
+  // One offered in the last few hours and held steps behind the rest.
+  const i = rotateOffered(waiting, (x) => x.id, recentlyOffered("dream_asks", { now }))[0];
 
   const signal = [
     `The dream (Edva's nightly whole-day review) had a question it could not settle from the evidence, and ${OWNER_NAME} asked for these to be floated the day after. Ask it as ONE warm, specific question — the wording below is a draft; keep its meaning and any open-endedness, freshen relative time words to today, and never assert its premise as fact.`,

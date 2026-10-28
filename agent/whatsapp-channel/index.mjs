@@ -1,8 +1,10 @@
 // whatsapp-channel: Baileys runner. Pairs with the user's personal WhatsApp via
 // QR scan + Linked Devices, holds the WebSocket session open, persists
 // session state to disk, routes inbound messages into data/whatsapp-inbox.jsonl
-// plus an APNs push via edva-notify, and exposes a tiny localhost HTTP
-// server for outbound sends.
+// (other people's messages, and the user's own messages typed on their phone or
+// another linked device, marked from_me), pushes filter-passing inbound to the
+// chat channel, and exposes a tiny localhost HTTP server: POST /send,
+// GET /groups, GET /health. Pure pieces live in core.mjs.
 //
 // This is an unofficial-protocol client (Baileys speaks WhatsApp's binary
 // WebSocket protocol directly). See docs/whatsapp-gateway-setup.md
@@ -17,11 +19,14 @@ import {
   isJidGroup,
   jidNormalizedUser,
   Browsers,
+  generateMessageIDV2,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 import pino from "pino";
 import { createServer } from "node:http";
 import { classifyForPush } from "./filter.mjs";
+import { queueAlert, recentFromInbox } from "../../lib/message-alert.mjs";
+import { acceptUpsert, isOwnMachinery, messageType, extractText, createRecentIds, createGroupCache, summarizeGroups } from "./core.mjs";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -50,6 +55,12 @@ function log(msg) {
 }
 
 if (!existsSync(SESSION_DIR)) mkdirSync(SESSION_DIR, { recursive: true });
+
+// Ids /send has just sent: their own-device echo (an "append" upsert) is
+// already logged as kind "sent" and must not be logged again as a message.
+const sentIds = createRecentIds({ ttlMs: 10 * 60 * 1000 });
+// The user's own messages already logged (one can arrive as notify and append).
+const ownLogged = createRecentIds({ ttlMs: 6 * 60 * 60 * 1000, max: 5000 });
 
 function appendInbox(entry) {
   if (!existsSync(path.dirname(INBOX))) mkdirSync(path.dirname(INBOX), { recursive: true });
@@ -87,25 +98,7 @@ function normalizeJid(to) {
   return `${digits}@s.whatsapp.net`;
 }
 
-function extractText(message) {
-  const m = message.message;
-  if (!m) return null;
-  if (m.conversation) return m.conversation;
-  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text;
-  if (m.imageMessage?.caption) return `[image]: ${m.imageMessage.caption}`;
-  if (m.imageMessage) return "[image]";
-  if (m.videoMessage?.caption) return `[video]: ${m.videoMessage.caption}`;
-  if (m.videoMessage) return "[video]";
-  if (m.audioMessage) return "[voice note]";
-  if (m.documentMessage) return `[document: ${m.documentMessage.fileName || "file"}]`;
-  if (m.locationMessage) return "[location]";
-  if (m.contactMessage) return `[contact: ${m.contactMessage.displayName || ""}]`;
-  if (m.stickerMessage) return "[sticker]";
-  const types = Object.keys(m).filter((k) => k !== "messageContextInfo");
-  return `[${types[0] || "unknown"}]`;
-}
-
-function buildHttpServer(socketRef) {
+function buildHttpServer(socketRef, groupsRef) {
   return createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     if (req.method === "GET" && url.pathname === "/health") {
@@ -118,6 +111,21 @@ function buildHttpServer(socketRef) {
         host_jid: host,
         host_name: sock?.user?.name || null,
       }));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/groups") {
+      const sock = socketRef.current;
+      if (!sock || !sock.user) { res.writeHead(503); res.end("socket not connected"); return; }
+      try {
+        const all = await sock.groupFetchAllParticipating();
+        for (const meta of Object.values(all || {})) groupsRef.cache?.set(meta.id, meta);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, groups: summarizeGroups(all) }));
+      } catch (err) {
+        log(`groups fetch failed: ${err.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
       return;
     }
     if (req.method === "POST" && url.pathname === "/send") {
@@ -134,13 +142,21 @@ function buildHttpServer(socketRef) {
         const sock = socketRef.current;
         if (!sock || !sock.user) { res.writeHead(503); res.end("socket not connected"); return; }
         try {
-          const result = await sock.sendMessage(jid, { text: payload.text });
-          const messageId = result?.key?.id || null;
+          // The id is made here, before the send, so the echo Baileys emits for
+          // our own send is recognised whichever of the two lands first.
+          const preId = generateMessageIDV2(sock.user.id);
+          sentIds.add(preId);
+          const result = await sock.sendMessage(jid, { text: payload.text }, { messageId: preId });
+          const messageId = result?.key?.id || preId;
+          sentIds.add(messageId);
+          const groupName = isJidGroup(jid) ? groupsRef.cache?.peek(jid)?.subject || null : null;
           appendInbox({
             ts: new Date().toISOString(),
             kind: "sent",
             message_id: messageId,
             chat_id: jid,
+            is_group: isJidGroup(jid),
+            ...(groupName ? { group_name: groupName } : {}),
             text: payload.text,
             originating_task: payload.originating_task || null,
           });
@@ -160,45 +176,99 @@ function buildHttpServer(socketRef) {
   });
 }
 
-async function onMessagesUpsert(socketRef, { messages }) {
+function isLidUser(jid) {
+  return typeof jid === "string" && jid.endsWith("@lid");
+}
+
+// `<n>@lid` -> `<phone>@s.whatsapp.net` when resolvable; anything else as is.
+async function toPhoneJid(socketRef, jid, altJid) {
+  if (!isLidUser(jid)) return jid;
+  if (typeof altJid === "string" && altJid.endsWith("@s.whatsapp.net")) return jidNormalizedUser(altJid);
+  try {
+    const pn = await socketRef.current?.signalRepository?.lidMapping?.getPNForLID(jid);
+    if (pn) return jidNormalizedUser(pn);
+  } catch {}
+  return jid;
+}
+
+async function onMessagesUpsert(socketRef, groupCache, { messages, type: upsertType }) {
   for (const message of messages) {
     if (!message.message) continue;
-    if (message.key.fromMe) continue; // skip our own echoed sends
+    const fromMe = !!message.key.fromMe;
+    if (!acceptUpsert(upsertType, fromMe)) continue;
+    if (fromMe) {
+      // Our own /send, echoed back: already logged as kind "sent".
+      if (sentIds.has(message.key.id)) continue;
+      if (ownLogged.has(message.key.id)) continue;
+      if (isOwnMachinery(message)) continue;
+      ownLogged.add(message.key.id);
+    }
 
+    const sock = socketRef.current;
     const chatJid = message.key.remoteJid;
     const isGroup = isJidGroup(chatJid);
-    const senderJid = isGroup ? (message.key.participant || chatJid) : chatJid;
+    const hostJid = sock?.user?.id ? jidNormalizedUser(sock.user.id) : null;
+    // WhatsApp now addresses many 1:1 chats by a privacy id (`<n>@lid`) while
+    // our sends use the phone JID, so log the phone form whenever it is known
+    // (the key's *Alt field, else the session's LID mapping) and keep the LID
+    // beside it. One contact then has one chat_id across inbound and sent.
+    let chatId, senderJid, rawSenderJid;
+    if (fromMe) {
+      // The user wrote it: the sender is the host; in a 1:1 chat the chat is
+      // the other party, whose phone form is resolved the same way.
+      chatId = isGroup ? chatJid : await toPhoneJid(socketRef, chatJid, message.key.remoteJidAlt);
+      senderJid = hostJid;
+      rawSenderJid = hostJid;
+    } else {
+      rawSenderJid = isGroup ? (message.key.participant || chatJid) : chatJid;
+      senderJid = await toPhoneJid(socketRef, rawSenderJid, isGroup ? message.key.participantAlt : message.key.remoteJidAlt);
+      chatId = isGroup ? chatJid : senderJid;
+    }
     const senderNumber = senderJid?.split("@")[0] || null;
     const text = extractText(message) || "[no-content]";
+
+    // Group name first, so it is stored on the entry (cached, so one lookup per
+    // group per TTL rather than one per message).
+    const groupName = isGroup ? (await groupCache.get(chatJid))?.subject || null : null;
 
     const entry = {
       ts: new Date().toISOString(),
       kind: "message",
       message_id: message.key.id,
-      chat_id: chatJid,
+      chat_id: chatId,
+      ...(isLidUser(chatJid) && chatId !== chatJid ? { chat_lid: chatJid } : {}),
       is_group: isGroup,
+      ...(groupName ? { group_name: groupName } : {}),
+      ...(fromMe ? { from_me: true } : {}),
       sender: senderNumber,
-      sender_name: message.pushName || null,
-      type: Object.keys(message.message).find((k) => k !== "messageContextInfo") || "unknown",
+      ...(isLidUser(rawSenderJid) && senderJid !== rawSenderJid ? { sender_lid: rawSenderJid.split("@")[0] } : {}),
+      sender_name: fromMe ? (sock?.user?.name || null) : (message.pushName || null),
+      type: messageType(message),
       text,
       timestamp: message.messageTimestamp,
     };
     appendInbox(entry);
 
-    // Resolve group name once if applicable; used for both filter logging
-    // context and the chat-channel ping body.
-    let groupName = null;
-    if (isGroup) {
-      try {
-        const meta = await socketRef.current.groupMetadata(chatJid).catch(() => null);
-        groupName = meta?.subject || null;
-      } catch {}
+    if (fromMe) {
+      log(`own message chat=${chatJid} upsert=${upsertType}`);
+      continue; // the user's own words are never pushed back to them
     }
 
     const decision = classifyForPush(entry);
     log(`message from=${entry.sender} chat=${chatJid} push=${decision.push} reason=${decision.reason} preview=${JSON.stringify(text.slice(0, 80))}`);
 
-    if (!decision.push) continue;
+    if (!decision.push) {
+      // Not pushed by the channel's own filter: a model still judges whether
+      // it is important or urgent (lib/message-alert.mjs). A chat in
+      // block_chats stays silent.
+      if (decision.reason !== "block-chats") queueAlert({
+        channel: "whatsapp",
+        message: { ...entry, chat_name: entry.group_name || null },
+        recent: recentFromInbox(INBOX, "chat_id", entry.chat_id),
+        log,
+      });
+      continue;
+    }
 
     const who = entry.sender_name || entry.sender;
     const ctx = isGroup ? ` (in ${groupName || "group"})` : "";
@@ -215,6 +285,11 @@ async function start() {
   const baileysLogger = pino({ level: process.env.WHATSAPP_LOG_LEVEL || "warn" });
 
   const socketRef = { current: null };
+  // One cache across reconnects; it fetches through whichever socket is live.
+  const groupCache = createGroupCache({
+    fetch: (jid) => socketRef.current ? socketRef.current.groupMetadata(jid) : null,
+  });
+  const groupsRef = { cache: groupCache };
 
   const connect = () => {
     const sock = makeWASocket({
@@ -237,6 +312,9 @@ async function start() {
       browser: Browsers.macOS("Chrome"),
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      // Lets Baileys reuse our cache when it sends to a group instead of
+      // querying the group's metadata on every send.
+      cachedGroupMetadata: async (jid) => groupCache.peek(jid),
     });
     socketRef.current = sock;
 
@@ -294,14 +372,20 @@ async function start() {
     });
 
     sock.ev.on("messages.upsert", (upsert) => {
-      if (upsert.type !== "notify") return;
-      onMessagesUpsert(socketRef, upsert).catch((err) => log(`onMessagesUpsert error: ${err.message}`));
+      if (upsert.type !== "notify" && upsert.type !== "append") return;
+      onMessagesUpsert(socketRef, groupCache, upsert).catch((err) => log(`onMessagesUpsert error: ${err.message}`));
     });
+
+    // Keep the group cache honest: a renamed group, a joined group, a changed
+    // member list.
+    sock.ev.on("groups.update", (updates) => { for (const u of updates || []) groupCache.update(u); });
+    sock.ev.on("groups.upsert", (metas) => { for (const m of metas || []) groupCache.set(m.id, m); });
+    sock.ev.on("group-participants.update", ({ id }) => { if (id) groupCache.invalidate(id); });
   };
 
   connect();
 
-  const server = buildHttpServer(socketRef);
+  const server = buildHttpServer(socketRef, groupsRef);
   server.listen(PORT, () => log(`HTTP send-server on :${PORT}`));
 
   const shutdown = (signal) => {

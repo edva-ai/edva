@@ -91,6 +91,7 @@ export function event(sensor, type, fields = {}) {
     ttl_min: fields.ttl_min ?? null,
     cooldown_min: fields.cooldown_min ?? null,
     override_quiet: fields.override_quiet === true,
+    no_ramp: fields.no_ramp === true,
     data: fields.data ?? {},
     ts: fields.ts ?? new Date().toISOString(),
   };

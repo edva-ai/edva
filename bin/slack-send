@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+// slack-send: post a Slack message as the user via the local slack-channel
+// runner (agent/slack-channel/index.mjs, POST /send on localhost).
+//
+// Usage:
+//   slack-send --to <#channel|@user|id> --text "message" [--thread <ts>]
+//   slack-send --to <#channel|@user|id> --text-file <path> [--thread <ts>]
+//   slack-send --list [--json]        conversations the user is in (id, type, name)
+//   slack-send --health               the runner's /health
+//
+// Messages go out under the user's own Slack identity to other people, so em
+// and en dashes are refused (SLACK_ALLOW_DASHES=1 overrides, for verbatim
+// paste-through only). Each send is appended to data/slack-inbox.jsonl
+// as kind "sent".
+//
+// Runner: SLACK_RUNNER_URL (default http://127.0.0.1:9108). Setup:
+// docs/slack-channel-setup.md.
+
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+import { parseSendArgs, parseTarget, findDash } from "../agent/slack-channel/core.mjs";
+
+const RUNNER = process.env.SLACK_RUNNER_URL || "http://127.0.0.1:9108";
+const INBOX = installTools("data/slack-inbox.jsonl");
+
+function usage() {
+  console.log(`slack-send: post to Slack as the user via the local slack-channel runner
+
+Usage:
+  slack-send --to <#channel|@user|id> --text "message" [--thread <ts>]
+  slack-send --to <#channel|@user|id> --text-file <path> [--thread <ts>]
+  slack-send --list [--json]
+  slack-send --health
+
+Runner: ${RUNNER} (SLACK_RUNNER_URL). Em/en dashes are refused unless SLACK_ALLOW_DASHES=1.`);
+}
+
+function unreachable(err) {
+  console.error(`slack-send: runner unreachable at ${RUNNER} (${err.message}). Is slack-channel running? See docs/slack-channel-setup.md.`);
+  process.exit(1);
+}
+
+async function getJson(p) {
+  let res;
+  try { res = await fetch(`${RUNNER}${p}`); } catch (err) { unreachable(err); }
+  const text = await res.text();
+  try { return { res, json: JSON.parse(text) }; } catch { return { res, json: { ok: false, error: text } }; }
+}
+
+async function main() {
+  const a = parseSendArgs(process.argv.slice(2), (p) => fs.readFileSync(p, "utf8"));
+  if (a.error) { console.error(`slack-send: ${a.error}`); usage(); process.exit(2); }
+  if (a.help) { usage(); return; }
+
+  if (a.health) {
+    const { res, json } = await getJson("/health");
+    console.log(JSON.stringify(json, null, 2));
+    process.exit(res.ok && json.ok ? 0 : 1);
+  }
+
+  if (a.list) {
+    const { res, json } = await getJson("/conversations");
+    if (!res.ok || !json.ok) { console.error(`slack-send: ${json.error || res.status}`); process.exit(1); }
+    if (a.json) { for (const c of json.conversations) console.log(JSON.stringify(c)); return; }
+    const order = { channel: 0, private: 1, mpim: 2, im: 3 };
+    const rows = [...json.conversations].sort((x, y) => (order[x.type] ?? 9) - (order[y.type] ?? 9) || String(x.name).localeCompare(String(y.name)));
+    for (const c of rows) console.log(`${(c.type || "?").padEnd(8)} ${c.id.padEnd(12)} ${c.type === "im" ? "@" : c.type === "mpim" ? "" : "#"}${c.name || ""}`);
+    console.log(`\n${rows.length} conversation(s).`);
+    return;
+  }
+
+  const dash = findDash(a.text);
+  if (dash && !process.env.SLACK_ALLOW_DASHES) {
+    console.error(`slack-send: em/en dash found in --text (Slack messages go out as the user; the no-dash rule applies). Example: ${JSON.stringify(dash)}. Replace with comma/semicolon/period/parens/hyphen, or set SLACK_ALLOW_DASHES=1 for a verbatim paste-through.`);
+    process.exit(1);
+  }
+
+  const t = parseTarget(a.to);
+  const body = {
+    ...(t.channel || t.channel_name ? { channel: a.to } : { user: a.to }),
+    text: a.text,
+    thread_ts: a.thread || undefined,
+    originating_task: process.env.EDVA_TASK_ID || null,
+    logged_by_caller: true,
+  };
+  let res;
+  try {
+    res = await fetch(`${RUNNER}/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch (err) { unreachable(err); }
+  const raw = await res.text();
+  let json;
+  try { json = JSON.parse(raw); } catch { json = { ok: false, error: raw }; }
+  if (!res.ok || !json.ok) { console.error(`slack-send: ${res.status} ${json.error || raw}`); process.exit(1); }
+  console.log(`Sent: channel=${json.channel} ts=${json.ts}`);
+
+  try {
+    fs.mkdirSync(path.dirname(INBOX), { recursive: true });
+    fs.appendFileSync(INBOX, JSON.stringify({
+      ts: new Date().toISOString(), kind: "sent", source: "cli", channel_id: json.channel,
+      channel_name: json.channel_name || null, channel_type: json.channel_type || null,
+      user_id: json.user_id || null, user_name: json.user_name || null, from_me: true, reason: null,
+      slack_ts: json.ts, thread_ts: a.thread || null, text: a.text, to: a.to,
+      originating_task: process.env.EDVA_TASK_ID || null,
+    }) + "\n");
+  } catch (err) {
+    console.error(`slack-send: inbox append failed: ${err.message}`);
+  }
+}
+
+main().catch((e) => { console.error(`slack-send fatal: ${e.message}`); process.exit(1); });
