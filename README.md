@@ -1,5 +1,7 @@
 # Edva (formerly known as Merlin)
 
+> **Edva is now Jori.** As of 2026-10-28 this project lives at **[github.com/jori-ai/jori](https://github.com/jori-ai/jori)** ([getjori.ai](https://getjori.ai)), with this repository's full history. This repository is archived and read-only. Existing installs: follow the migration note in the Jori README.
+
 **An assistant that pays attention — even when you're not asking.**
 
 Most assistants wait. You type, they reply, the moment passes. Edva stays on. It learns what you like, watches what matters, and quietly handles the things you'd rather not think about.
