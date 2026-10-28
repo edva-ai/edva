@@ -1,0 +1,12 @@
+{
+  "_doc": "bin/hum-ideas-append judgeVenue — the venue check on a hum idea that names a place (venue: {name, near}), asked only when no map listing near `near` has the same name or listing id. Questions are built per call from venue_template (one choice over the listings c0..cN + none). The costly error is a false match (an invented place passes), so while the installation's shadow_until is ahead the Claude ladder decides and Jev is only compared. Kernel definition; an installation's own data/jev-questions/hum-venue-match.json replaces it (lib/jev.mjs jevSiteDef).",
+  "threshold": 0.85,
+  "questions": {},
+  "venue_template": {
+    "type": "choice",
+    "instructions": "`venue` is a place named in a suggestion for the user: its name and the area it is said to be in. `candidates` are the map listings found for that name around there. Is one of them that same place? Pick a candidate ONLY when it is the same business or site under any spelling, script, transliteration, translation, abbreviation, or a longer or shorter form of its name. The market, street, port, building or neighbourhood the place is said to be in, a different business, a similarly spelled but different name, or not sure, is none.",
+    "fixed_criteria": {
+      "none": "none of the listings is the named place: a different business, the area or building it is said to be in, a similar but different name, or not sure"
+    }
+  }
+}

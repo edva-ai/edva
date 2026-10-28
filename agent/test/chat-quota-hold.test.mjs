@@ -256,7 +256,10 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
       model: "mock", cwd: "agent/chat-agent", runtime: "supervisor", devChannels: [], permissionMode: "bypassPermissions",
       allowedTools: ["Bash"], remoteControlPrefix: "test-chat", supervisor: { healthPort: port },
     } } }));
-    const childEnv = { ...process.env, HOME: tmp, SUPABASE_SERVICE_ROLE_KEY: "", SUPABASE_URL: "http://127.0.0.1:9", CHAT_SUBSTRATE: "loop", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"), ...env };
+    const childEnv = { ...process.env, HOME: tmp, SUPABASE_SERVICE_ROLE_KEY: "", SUPABASE_URL: "http://127.0.0.1:9", CHAT_SUBSTRATE: "loop", MEMORY_INDEX_DB: path.join(stateDir, "event-index.db"),
+      // These cases pin the hold to the named reset; the hourly re-check cap
+      // (RATE_LIMIT_REPROBE_MS) is exercised in supervisor-quota-hold.test.mjs.
+      DISPATCHER_RATE_LIMIT_REPROBE_MS: String(4 * 3_600_000), ...env };
     // Never the caller's installation, even when a test passes one in.
     delete childEnv.EDVA_HOME;
     proc = spawn(NODE, [CHAT_SUPERVISOR, "--agent", "test-chat", "--config", cfg, "--state-dir", stateDir, "--no-resume",
@@ -392,6 +395,32 @@ describe("chat quota: supervisor end to end", { skip: !canChildListen() && "chil
       sink.closeAllConnections?.();
       await new Promise((r) => sink.close(r));
       fs.rmSync(decoy, { recursive: true, force: true });
+    }
+  });
+
+  it("never posts from inside a test run, even handed a live-shaped key and a reachable endpoint", async () => {
+    // The guard on its own, with the sandbox's own seals taken away: node
+    // --test's NODE_TEST_CONTEXT reaches the supervisor, so its safety net holds
+    // no key (see "Test runs" in lib/load-env.js) and the notice goes
+    // nowhere, though a key shaped like the live one sits in its environment.
+    const posts = [];
+    const sink = http.createServer((req, res) => {
+      let b = ""; req.on("data", (c) => (b += c));
+      req.on("end", () => { posts.push({ url: req.url, body: b }); res.writeHead(201, { "content-type": "application/json" }); res.end("[]"); });
+    });
+    await new Promise((r) => sink.listen(0, "127.0.0.1", r));
+    const liveShaped = [{ alg: "HS256", typ: "JWT" }, { iss: "supabase", ref: "example", role: "service_role" }]
+      .map((o) => Buffer.from(JSON.stringify(o)).toString("base64url")).join(".") + ".not-a-signature";
+    try {
+      const { log, notices, dispatch } = await boot(["--mode", "reset"], { SUPABASE_SERVICE_ROLE_KEY: liveShaped, SUPABASE_URL: `http://127.0.0.1:${sink.address().port}` });
+      await dispatch("QUOTA-TEST pick up groceries on the way home", "m1");
+      assert.ok(await waitFor(() => notices().length === 1, 8000), `no notice: ${log().slice(-2000)}`);
+      await sleep(500);
+      assert.deepEqual(posts, [], "a test-run supervisor posted with the key it was handed");
+      assert.ok(log().includes("SUPABASE_SERVICE_ROLE_KEY not available (withheld in a test run)"), "the safety net did not say why it held back");
+    } finally {
+      sink.closeAllConnections?.();
+      await new Promise((r) => sink.close(r));
     }
   });
 

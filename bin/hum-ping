@@ -90,6 +90,7 @@ import {
   dedupBypassable,
 } from "../lib/hum-vetoes.mjs";
 import { checkPingBudget, isLocalHistoryRow } from "../lib/ping-budget.mjs";
+import { checkQuestionBudget, recordQuestionSend, currentScale } from "../lib/question-pacing.mjs";
 import { alreadyTold, deliveryVerdict, latestFix, recordTold, rememberPending, PROXIMITY_M } from "../lib/local-history-ledger.mjs";
 import { readSidecar } from "../lib/hum-resolve-first.mjs";
 import { optionalBin } from "../lib/ext-hooks.mjs";
@@ -292,7 +293,8 @@ if (findings && findings.length > 0) {
 //     ("One message per run") is exactly what produced 46 asks in a week — a
 //     per-run limit with no per-day limit is not a limit.
 // ---------------------------------------------------------------------------
-const ASK_CAP = askCap();
+// The ask cap scales with the question backlog (lib/question-pacing.mjs).
+const ASK_CAP = askCap() * currentScale();
 const headlineIsRetrospectiveAsk = Boolean(findings && findings[0] && isRetrospectiveAsk(findings[0]));
 if (headlineIsRetrospectiveAsk && ASK_CAP > 0) {
   const sentToday = countRetrospectiveAsksToday({ feedbackPath: FEEDBACK_PATH });
@@ -311,14 +313,19 @@ if (headlineIsRetrospectiveAsk && ASK_CAP > 0) {
 {
   const budgetBypass = isProtectedIntent(intent) || score >= 0.9;
   let budget = { ok: true };
-  try { budget = checkPingBudget({ bypass: budgetBypass, feedbackPath: FEEDBACK_PATH, pool: isLocalHistoryPing ? "local_history" : "shared" }); }
+  try {
+    // A location ask is a question: it draws on the question pool, not the shared one.
+    budget = headlineIsRetrospectiveAsk
+      ? (budgetBypass ? { ok: true } : checkQuestionBudget())
+      : checkPingBudget({ bypass: budgetBypass, feedbackPath: FEEDBACK_PATH, pool: isLocalHistoryPing ? "local_history" : "shared" });
+  }
   catch (e) { console.error(`hum-ping: ping-budget check failed (${e.message}) — failing open`); }
   // A location ask is perishable — the user wants these while they are still
   // there — so the 45-min spacing never holds one. It still counts
   // and the daily cap still applies (plus its own exit-10 ask cap).
   if (!budget.ok && budget.gate === "min_interval" && headlineIsRetrospectiveAsk) budget = { ok: true };
   if (!budget.ok) {
-    console.error(`hum-ping: REFUSED (exit 11) — ${isLocalHistoryPing ? "local-history pool " : ""}${budget.gate}: ${budget.detail}; score ${score} < 0.9 and not a protected lane. Daily ping budget.`);
+    console.error(`hum-ping: REFUSED (exit 11) — ${isLocalHistoryPing ? "local-history pool " : headlineIsRetrospectiveAsk ? "question pool " : ""}${budget.gate}: ${budget.detail}; score ${score} < 0.9 and not a protected lane. Daily ping budget.`);
     process.exit(11);
   }
 }
@@ -614,6 +621,10 @@ const entry = {
 };
 if (messageId) entry.message_id = messageId;
 else entry.capture_id_missing = true;
+if (headlineIsRetrospectiveAsk) {
+  entry.budget_pool = "question";
+  recordQuestionSend({ lane, id: pingId });
+}
 if (isLocalHistoryPing) {
   entry.budget_pool = "local_history";
   // Told, so never again — and remembered by message id so ping-flush can

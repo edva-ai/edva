@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+// sms-send: send one plain SMS text through Twilio's REST API (Messages
+// resource), on the user's explicit ask only.
+//
+// Usage:
+//   sms-send --to <+E164> --text "message" --authorized "<the user's words>" [--wait <sec>] [--json]
+//   sms-send --to <+E164> --text-file <path> --authorized "..." [--wait <sec>] [--json]
+//   sms-send --to <+E164> --text "..." --authorized "..." --dry-run
+//   sms-send status <message sid> [--json]
+//
+// Guards, all in code:
+//   - --authorized is required: what the user actually said when they asked
+//     for this text (a quote, not a flag). It is logged with the send.
+//   - the text must open with the Edva identity line the outbound policy
+//     fixes for anyone other than the user ("Hi <Name>, this is Edva,
+//     <owner>'s AI assistant. …" or "This is Edva on behalf of <owner> …").
+//   - --to must be E.164; the text at most 1600 characters.
+//   - inside a test run (NODE_TEST_CONTEXT) nothing is sent unless the test
+//     names a stand-in API (SMS_TWILIO_API_BASE).
+//
+// Credentials are read at run time and never printed, logged or passed on:
+// from the 1Password item named in agent/local/config/sms-send.json
+// (`onepassword`, read with the @1password/sdk Node SDK under
+// OP_SERVICE_ACCOUNT_TOKEN), else from TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN.
+// The sending number is that config's `from`, else the item's from field,
+// else SMS_FROM_NUMBER.
+//
+// Every send, refusal by Twilio and status read is appended to
+// data/sms-sent.jsonl (to, from, time, sid, status, the text and the
+// authorizing quote; never a credential).
+//
+// Exit codes: 0 sent (with --wait: not undelivered/failed), 1 Twilio or
+// network error or a failed delivery, 2 usage, 3 refused by a guard,
+// 9 test run without a stand-in API, 78 no credentials.
+//
+// Policy and setup: docs/sms-send.md.
+
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { installTools } from "../lib/root.cjs";
+import { parseArgs, isE164, isMessageSid, hasIdentityOpener, twilioForm, describe, FINAL_STATUSES, MAX_TEXT } from "../lib/sms-core.mjs";
+
+const require = createRequire(import.meta.url);
+const { loadEnv } = require("../lib/load-env.js");
+const { instance, localConfig } = require("../lib/instance.cjs");
+
+loadEnv();
+
+const API = (process.env.SMS_TWILIO_API_BASE || "https://api.twilio.com").replace(/\/+$/, "");
+const SENT_LOG = installTools("data/sms-sent.jsonl");
+const CONFIG = localConfig("sms-send", {
+  from: "",
+  onepassword: null, // { vault: "<id or title>", item: "<id>", fields: { account_sid, auth_token, from } }
+});
+const FIELD_DEFAULTS = { account_sid: "account sid", auth_token: "auth token", from: "from number" };
+
+function usage() {
+  console.log(`sms-send: send one SMS through Twilio, on the user's explicit ask only
+
+Usage:
+  sms-send --to <+E164> --text "message" --authorized "<the user's words>" [--wait <sec>] [--json]
+  sms-send --to <+E164> --text-file <path> --authorized "..." [--wait <sec>] [--json]
+  sms-send --to <+E164> --text "..." --authorized "..." --dry-run
+  sms-send status <message sid> [--json]
+
+The text must open with the Edva identity line ("Hi <Name>, this is Edva,
+<owner>'s AI assistant. ..." or "This is Edva on behalf of <owner> ...").
+--wait polls Twilio until the message is delivered or fails (at most 300 s).
+Sends are logged to data/sms-sent.jsonl. See docs/sms-send.md.`);
+}
+
+function fail(code, msg) {
+  console.error(`sms-send: ${msg}`);
+  process.exit(code);
+}
+
+function log(row) {
+  try {
+    fs.mkdirSync(path.dirname(SENT_LOG), { recursive: true });
+    fs.appendFileSync(SENT_LOG, JSON.stringify({ ts: new Date().toISOString(), ...row }) + "\n");
+  } catch (err) {
+    console.error(`sms-send: log append failed: ${err.message}`);
+  }
+}
+
+// { accountSid, authToken, from } — read here, used for the request, never echoed.
+async function credentials() {
+  const op = CONFIG.onepassword;
+  if (op && op.item) {
+    const token = process.env.OP_SERVICE_ACCOUNT_TOKEN;
+    if (!token) fail(78, "OP_SERVICE_ACCOUNT_TOKEN is not set (.env); cannot read the Twilio item from 1Password.");
+    let sdk;
+    try { sdk = await import(require.resolve("@1password/sdk")); }
+    catch (err) { fail(78, `the @1password/sdk package is not installed next to this script (${err.message}).`); }
+    try {
+      const client = await sdk.createClient({ auth: token, integrationName: "edva-sms-send", integrationVersion: "1.0.0" });
+      const vaults = await client.vaults.list();
+      const vault = vaults.find((v) => v.id === op.vault || v.title === op.vault);
+      if (!vault) fail(78, `1Password vault ${JSON.stringify(op.vault)} is not visible to the service account.`);
+      const item = await client.items.get(vault.id, op.item);
+      const names = { ...FIELD_DEFAULTS, ...(op.fields || {}) };
+      const field = (k) => String((item.fields.find((f) => f.title === names[k] || f.id === names[k]) || {}).value || "").trim();
+      const creds = { accountSid: field("account_sid"), authToken: field("auth_token"), from: CONFIG.from || field("from") };
+      if (!creds.accountSid || !creds.authToken) fail(78, `the 1Password item has no "${names.account_sid}" / "${names.auth_token}" value.`);
+      return creds;
+    } catch (err) {
+      fail(78, `could not read the Twilio item from 1Password (${err && err.message ? err.message : "unknown error"}).`);
+    }
+  }
+  const creds = {
+    accountSid: (process.env.TWILIO_ACCOUNT_SID || "").trim(),
+    authToken: (process.env.TWILIO_AUTH_TOKEN || "").trim(),
+    from: CONFIG.from || (process.env.SMS_FROM_NUMBER || "").trim(),
+  };
+  if (!creds.accountSid || !creds.authToken) {
+    fail(78, "no Twilio credentials: name a 1Password item in agent/local/config/sms-send.json, or set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.");
+  }
+  return creds;
+}
+
+function authHeader(c) {
+  return "Basic " + Buffer.from(`${c.accountSid}:${c.authToken}`).toString("base64");
+}
+
+async function twilio(c, method, p, form) {
+  const url = `${API}/2010-04-01/Accounts/${encodeURIComponent(c.accountSid)}${p}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: { Authorization: authHeader(c), ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) },
+      body: form ? form.toString() : undefined,
+    });
+  } catch (err) {
+    return { ok: false, status: 0, json: { message: `network error: ${err.message}` } };
+  }
+  const raw = await res.text();
+  let json;
+  try { json = JSON.parse(raw); } catch { json = { message: raw.slice(0, 300) }; }
+  // Twilio's error text can quote the account id; keep it out of stderr and the log.
+  if (!res.ok && typeof json.message === "string") json.message = json.message.split(c.accountSid).join("AC…");
+  return { ok: res.ok, status: res.status, json };
+}
+
+const fetchMessage = (c, sid) => twilio(c, "GET", `/Messages/${sid}.json`);
+
+async function waitForFinal(c, msg, seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  let last = msg;
+  while (!FINAL_STATUSES.has(last.status) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, Math.min(3000, Math.max(250, deadline - Date.now()))));
+    const r = await fetchMessage(c, msg.sid);
+    if (r.ok) last = r.json;
+  }
+  return last;
+}
+
+function statusRow(m) {
+  return { kind: "status", sid: m.sid, to: m.to, from: m.from, status: m.status, error_code: m.error_code || null, error_message: m.error_message || null };
+}
+
+function print(a, m) {
+  if (a.json) console.log(JSON.stringify({ sid: m.sid, to: m.to, from: m.from, status: m.status, error_code: m.error_code || null, error_message: m.error_message || null, date_sent: m.date_sent || null }));
+  else console.log(describe(m));
+}
+
+function testRunGuard() {
+  if (process.env.NODE_TEST_CONTEXT && !process.env.SMS_TWILIO_API_BASE) {
+    fail(9, "inside a test run; nothing is sent without a stand-in SMS_TWILIO_API_BASE.");
+  }
+}
+
+async function cmdStatus(a) {
+  if (!isMessageSid(a.sid)) fail(2, "status needs a Twilio message sid (SM… or MM…).");
+  testRunGuard();
+  const c = await credentials();
+  const r = await fetchMessage(c, a.sid);
+  if (!r.ok) fail(1, `Twilio status lookup failed (${r.status}${r.json.code ? `, code ${r.json.code}` : ""}): ${r.json.message || "no detail"}`);
+  log(statusRow(r.json));
+  print(a, r.json);
+}
+
+async function cmdSend(a) {
+  if (!a.to || !a.text) { usage(); process.exit(2); }
+  if (!isE164(a.to)) fail(3, `--to must be an E.164 number like +15551234567, got ${JSON.stringify(a.to)}.`);
+  if (!a.authorized || !a.authorized.trim()) {
+    fail(3, "refused: --authorized is required, with what the user actually said when they asked for this text. SMS goes out only on their explicit ask.");
+  }
+  const owner = instance().owner_name;
+  if (!hasIdentityOpener(a.text, owner)) {
+    fail(3, `refused: the text must open with the Edva identity line, e.g. "Hi <Name>, this is Edva, ${owner}'s AI assistant. ${owner} asked me to ..." or "This is Edva on behalf of ${owner} ...".`);
+  }
+  if (a.text.length > MAX_TEXT) fail(3, `the text is ${a.text.length} characters; Twilio takes at most ${MAX_TEXT}.`);
+
+  if (a.dryRun) {
+    const out = { dry_run: true, to: a.to, text: a.text, authorized: a.authorized, credentials: CONFIG.onepassword?.item ? "1password" : "env" };
+    console.log(a.json ? JSON.stringify(out) : `dry run: would text ${a.to} (${a.text.length} chars): ${a.text}`);
+    return;
+  }
+
+  testRunGuard();
+  const c = await credentials();
+  if (!isE164(c.from)) fail(78, "no sending number: set `from` in agent/local/config/sms-send.json (or SMS_FROM_NUMBER).");
+
+  const r = await twilio(c, "POST", "/Messages.json", twilioForm({ to: a.to, from: c.from, text: a.text }));
+  if (!r.ok) {
+    log({ kind: "refused", to: a.to, from: c.from, http_status: r.status, code: r.json.code || null, error: r.json.message || null, text: a.text, authorized: a.authorized, originating_task: process.env.EDVA_TASK_ID || null, via: "cli" });
+    fail(1, `Twilio refused the message (${r.status}${r.json.code ? `, code ${r.json.code}` : ""}): ${r.json.message || "no detail"}`);
+  }
+  const msg = r.json;
+  log({ kind: "sent", sid: msg.sid, to: a.to, from: c.from, status: msg.status, text: a.text, authorized: a.authorized, originating_task: process.env.EDVA_TASK_ID || null, via: "cli" });
+
+  if (!a.wait) { print(a, msg); return; }
+  const final = await waitForFinal(c, msg, a.wait);
+  log(statusRow(final));
+  print(a, final);
+  if (final.status === "failed" || final.status === "undelivered") process.exit(1);
+}
+
+async function main() {
+  const a = parseArgs(process.argv.slice(2), (p) => fs.readFileSync(p, "utf8"));
+  if (a.help) { usage(); return; }
+  if (a.error) { console.error(`sms-send: ${a.error}`); usage(); process.exit(2); }
+  if (a.cmd === "status") return cmdStatus(a);
+  return cmdSend(a);
+}
+
+main().catch((e) => fail(1, `fatal: ${e.message}`));

@@ -76,3 +76,27 @@ describe("State dispatch counting (rotation cap)", () => {
     assert.equal(new State(TMP).dispatches, 0, "legacy totalTurns must not count as dispatches");
   });
 });
+
+describe("State floor (kept across a restart that resumes the session)", () => {
+  after(() => { try { fs.unlinkSync(TMP); } catch {} });
+
+  it("a recorded floor survives a reload for the same session", () => {
+    const s = fresh();
+    s.recordFloor(s.sessionId, 118043);
+    const reloaded = new State(TMP);
+    assert.equal(reloaded.floorFor(reloaded.sessionId), 118043);
+  });
+
+  it("a rotated session does not inherit the old floor", () => {
+    const s = fresh();
+    s.recordFloor(s.sessionId, 118043);
+    s.rotateSession();
+    assert.equal(s.floorFor(s.sessionId), 0, "a new session measures its own floor");
+  });
+
+  it("no recorded floor reads as unmeasured", () => {
+    const s = fresh();
+    assert.equal(s.floorFor(s.sessionId), 0);
+    assert.equal(s.floorFor("some-other-session"), 0);
+  });
+});

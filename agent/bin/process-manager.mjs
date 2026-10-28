@@ -175,6 +175,36 @@ function createProcesses() {
     })
   );
 
+  // 5. iMessage channel — tails the Messages store (chat.db, read-only) and
+  // logs every new message, 1:1 and group, both directions, to
+  // imessage-inbox.jsonl within seconds; health on :9107. Needs Full Disk
+  // Access for the node binary. Sending stays with `imsg send`.
+  children.push(
+    new ManagedProcess({
+      name: "imessage-channel",
+      command: NODE,
+      args: [path.join(AGENT_DIR, "imessage-channel/index.mjs")],
+      cwd: path.join(AGENT_DIR, "imessage-channel"),
+      logFile: path.join(LOG_DIR, "imessage-channel.log"),
+      log,
+    })
+  );
+
+  // 6. Slack channel — realtime runner on the user's own Slack web session
+  // (xoxc token + d cookie from .env). Holds one RTM websocket, logs to
+  // slack-inbox.jsonl; HTTP send API on 127.0.0.1:9108. With no or dead
+  // credentials it idles (one system notice) and picks up a re-capture itself.
+  children.push(
+    new ManagedProcess({
+      name: "slack-channel",
+      command: NODE,
+      args: [path.join(AGENT_DIR, "slack-channel/index.mjs")],
+      cwd: path.join(AGENT_DIR, "slack-channel"),
+      logFile: path.join(LOG_DIR, "slack-channel.log"),
+      log,
+    })
+  );
+
   return children;
 }
 

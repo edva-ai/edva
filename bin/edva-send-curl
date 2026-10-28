@@ -807,6 +807,26 @@ except: print("")' 2>/dev/null)
   fi
 fi
 
+# ─── Test runs never reach the real chat ─────────────────────────────────
+# `node --test` sets NODE_TEST_CONTEXT in every test process, and whatever a
+# test spawns inherits it. A test's message must never land in the user's
+# real chat, so inside a test run this script runs every gate above and stops
+# here: before the P1 fold claim, the insert, the push and the email fallback.
+# A test that exercises those steps names a stand-in for curl with
+# EDVA_SEND_TEST_CURL; the push and the email fallback still never run.
+# Outside a test run none of this executes. See "Test runs" in
+# lib/load-env.js.
+TEST_RUN=false
+if [ -n "${NODE_TEST_CONTEXT:-}" ]; then
+  if [ -z "${EDVA_SEND_TEST_CURL:-}" ]; then
+    echo "edva-send-curl: not sent — this is a test run (NODE_TEST_CONTEXT is set), and a test never posts to the real chat. To exercise the insert, point EDVA_SEND_TEST_CURL at a stand-in curl." >&2
+    exit 9
+  fi
+  TEST_RUN=true
+  NO_PUSH=true
+  curl() { "$EDVA_SEND_TEST_CURL" "$@"; }
+fi
+
 # ─── P1 push fold ─────────────────────────────────────────────────────────
 # Two P1 pings seconds apart about one email: it was triaged twice (the
 # watchdog's stuck-unread RECLASSIFY and the delayed Gmail push dispatch), and
@@ -1002,6 +1022,9 @@ except Exception:
     fi
   fi
 
+  # A test run's stand-in insert sent nothing real: no stamp, no replay.
+  if [ "$TEST_RUN" = true ]; then exit 0; fi
+
   # Stamp the last-outbound-message timestamp. Consumed by pulse's context
   # harvest (time since the user last heard from Edva).
   NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -1024,6 +1047,12 @@ else
   fi
   # Park the row BEFORE the email fallback. The email tells the user; the spool is
   # what keeps the channel (and system-issue-review's only input) complete.
+  # A test run's stand-in insert "failed": nothing to park or replay later
+  # (a parked row would be flushed into the real system channel), no email.
+  if [ "$TEST_RUN" = true ]; then
+    echo "Edva push failed (HTTP $HTTP_CODE) — test run, nothing parked, no fallback email" >&2
+    exit 1
+  fi
   _spool_append "$HTTP_CODE"
   echo "Edva push failed (HTTP $HTTP_CODE) — falling back to email" >&2
   EMAIL_SEND="$EDVA_INSTALL_TOOLS/bin/email-send"

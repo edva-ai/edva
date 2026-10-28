@@ -88,6 +88,14 @@ const POST_COMPACT_DRAIN_DELAY_MS   = Number(process.env.DISPATCHER_POST_COMPACT
 const RATE_LIMIT_RESUME_GRACE_MS    = 60_000;
 const RATE_LIMIT_FALLBACK_HOLD_MS   = Number(process.env.DISPATCHER_RATE_LIMIT_FALLBACK_HOLD_MS) || 15 * 60_000;
 const RATE_LIMIT_MAX_HOLD_MS        = 8 * 86_400_000;
+// The reset a refusal names is when the window is due back, not a promise that
+// it stays shut until then: an allowance can come back early, and a hold that
+// trusts the named reset keeps every job dark with the allowance available. So
+// no single hold runs longer than this. When a capped hold runs out, the next
+// real job is the probe (see the refusal guard below): refused again, it goes
+// back to the head of the queue and the hold re-arms (a refused turn bills
+// nothing); served, dispatch resumes. Shared by the chat supervisor.
+export const RATE_LIMIT_REPROBE_MS  = Number(process.env.DISPATCHER_RATE_LIMIT_REPROBE_MS) || 60 * 60_000;
 
 /** True when a rate_limit_info means this turn was refused, not merely warned. */
 export function isQuotaRefusal(info) {
@@ -189,6 +197,11 @@ export class Dispatcher extends EventEmitter {
     this._probing = false;   // true from a hold's release until the next real result
     this._lastCost = null;   // last result's cumulative total_cost_usd (this CLI process)
     this.rateLimitFallbackHoldMs = options.rateLimitFallbackHoldMs ?? RATE_LIMIT_FALLBACK_HOLD_MS;
+    this.rateLimitReprobeMs = options.rateLimitReprobeMs ?? RATE_LIMIT_REPROBE_MS;
+    // The last refusal that named its window. A silent refusal on a probe
+    // (no event, see isSilentRefusal) re-holds against that window's reset
+    // rather than the short fallback, while that reset is still ahead.
+    this._lastRefusalInfo = null;
 
     session.on("rate_limit", (ev) => {
       const info = ev?.rate_limit_info;
@@ -244,8 +257,11 @@ export class Dispatcher extends EventEmitter {
       const prevCost = this._lastCost;
       if (Number.isFinite(Number(ev?.total_cost_usd))) this._lastCost = Number(ev.total_cost_usd);
       const refused = done && ((refusal && refusal.itemId === done.id) || (probe && isSilentRefusal(ev, prevCost)));
+      if (probe && !refused) this._lastRefusalInfo = null;
       if (refused) {
-        const info = refusal?.info || { status: "rejected", inferred: true };
+        if (refusal?.info) this._lastRefusalInfo = refusal.info;
+        const last = this._lastRefusalInfo;
+        const info = refusal?.info || (Number(last?.resetsAt) * 1000 > Date.now() ? { ...last, inferred: true } : null) || { status: "rejected", inferred: true };
         const until = rateLimitHoldUntil(info, Date.now(), this.rateLimitFallbackHoldMs);
         this.hold(until);
         if ((ev.num_turns || 0) <= 1) {
@@ -415,14 +431,16 @@ export class Dispatcher extends EventEmitter {
     return this.holdUntil > now;
   }
 
-  // Hold dispatch until `until` (epoch ms), then drain. Extends, never
-  // shortens, an existing hold. Also used by the supervisor to carry a hold
-  // onto the replacement dispatcher after a restart.
+  // Hold dispatch until `until` (epoch ms), but never longer than
+  // rateLimitReprobeMs at a stretch (see RATE_LIMIT_REPROBE_MS), then drain.
+  // Extends, never shortens, an existing hold. Also used by the supervisor to
+  // carry a hold onto the replacement dispatcher after a restart.
   hold(until) {
-    if (!(until > Date.now()) || until <= this.holdUntil) return;
-    this.holdUntil = until;
+    const capped = Math.min(until, Date.now() + this.rateLimitReprobeMs);
+    if (!(capped > Date.now()) || capped <= this.holdUntil) return;
+    this.holdUntil = capped;
     clearTimeout(this._holdTimer);
-    this._holdTimer = setTimeout(() => this.releaseHold(), until - Date.now());
+    this._holdTimer = setTimeout(() => this.releaseHold(), capped - Date.now());
     this._holdTimer.unref?.();
   }
 

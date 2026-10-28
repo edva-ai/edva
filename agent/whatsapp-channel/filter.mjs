@@ -1,5 +1,9 @@
 // filter.mjs: decide whether an inbound WhatsApp message should push to
-// the user's phone (edva-notify) or land silently in the inbox log only.
+// the user's phone straight away (structural rules and config overrides only)
+// or not. A message this filter does not push, apart from block_chats, goes
+// to message-alert (lib/message-alert.mjs), where Jev judges whether it
+// is important or urgent from the chat's recent messages. No keyword or name
+// matching here: what a message means is a model's call (Rule #0b).
 //
 // Loaded by index.mjs and consulted on every inbound message. Config lives
 // in filter-config.json next to this file; it's re-read on every call so
@@ -31,8 +35,6 @@ function loadConfig() {
   } catch (err) {
     // Fail safe: if config is missing or unparseable, push 1:1 DMs only.
     return {
-      host_aliases: [],
-      notify_keywords: [],
       always_push_senders: [],
       block_chats: [],
       silent_protocol_types: ["senderKeyDistributionMessage", "reactionMessage", "protocolMessage"],
@@ -62,17 +64,6 @@ function logDecision(entry, decision) {
     // non-fatal
     console.error(`[whatsapp-filter] log append failed: ${err.message}`);
   }
-}
-
-function lower(s) { return (s || "").toString().toLowerCase(); }
-
-// Word-boundary check so a keyword like "art" doesn't false-match inside "party". The
-// boundary is generous: any non-word char OR start/end of string counts.
-function containsAsToken(haystack, needle) {
-  if (!needle) return false;
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}([^\\p{L}\\p{N}]|$)`, "iu");
-  return re.test(haystack);
 }
 
 export function classifyForPush(entry) {
@@ -131,25 +122,8 @@ export function classifyForPush(entry) {
     return decide(false, "dm-silent");
   }
 
-  // From here down: group chats and newsletters, which are usually muted on the
-  // phone. WhatsApp itself stays quiet on those, so Edva surfaces only the
-  // messages that are *relevant* — a host-alias mention or a notify keyword.
-
-  // (6) Group + host alias mentioned in text. Use token boundaries so
-  // the user's name matches but a substring inside another word doesn't.
-  for (const alias of config.host_aliases || []) {
-    if (containsAsToken(text, alias)) {
-      return decide(true, `host-mention:${alias}`);
-    }
-  }
-
-  // (7) Group + notify_keyword in text.
-  for (const kw of config.notify_keywords || []) {
-    if (containsAsToken(text, kw)) {
-      return decide(true, `keyword:${kw}`);
-    }
-  }
-
-  // (8) Default for groups + newsletters: silent. Still logged to inbox.jsonl.
-  return decide(false, isNewsletter ? "newsletter" : "group-noise");
+  // (6) Groups and newsletters: never pushed by rule. A group message goes on
+  // to message-alert, where Jev decides importance from the chat's recent
+  // messages; newsletters are not alert candidates there.
+  return decide(false, isNewsletter ? "newsletter" : "group-to-judge");
 }

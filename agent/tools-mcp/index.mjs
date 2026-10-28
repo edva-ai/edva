@@ -319,13 +319,9 @@ const TOOLS = [
   // ── Notify the user ──
   {
     name: TEXT.notify_tool,
-    description: "Send a notification to " + OWNER + " via Slack DM. Use for P1 email alerts, scheduled task results, and anything that needs their attention. Keep messages short.",
-    schema: { type: "object", properties: { message: { type: "string", description: "Notification text — keep short, " + OWNER + " reads on phone" } }, required: ["message"] },
-    run: async (a) => {
-      // This is a placeholder — the CLI agent should use the Slack connector (mcp__claude_ai_Slack) directly.
-      // This tool exists so the agent has a named action for "notify the user".
-      return `NOTIFY_VIA_SLACK: ${a.message}`;
-    },
+    description: "Push a short message to " + OWNER + "'s phone (the app) via edva-send-curl. Use for things that need their attention now: P1 email alerts, a result they asked to hear about. `chat` (default) is their conversation and passes the outbound precheck; `system` is the silent infrastructure tab. Not for long-form content (email it with email-send and push a one-line pointer).",
+    schema: { type: "object", properties: { message: { type: "string", description: "Notification text — keep short, " + OWNER + " reads on phone" }, channel: { type: "string", enum: ["chat", "system"], description: "Default chat" }, intent: { type: "string", description: "Optional topic for the outbound precheck" } }, required: ["message"] },
+    run: (a) => run(`${BIN}/edva-send-curl`, [...(a.channel === "system" ? ["--channel", "system"] : []), ...(a.intent ? ["--intent", a.intent] : []), a.message]),
   },
 
   // ── Wiki (long-term context memory in DB) ──

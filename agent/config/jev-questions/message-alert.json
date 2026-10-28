@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev site for cross-channel message alerts (lib/message-alert.mjs): is an inbound iMessage / WhatsApp / Slack message important or urgent enough that {{owner_name}} should be pinged by Edva? Legacy (shadow + fallback) is a toolless Sonnet judgment with the same rubric. Kernel definition; an installation's own data/jev-questions/message-alert.json replaces it.",
+  "threshold": 0.8,
+  "questions": {
+    "level": {
+      "type": "choice",
+      "instructions": "`message` is one message {{owner_name}} just received on a messaging channel (`channel`), in a 1:1 chat or a group (`is_group`, `chat`). `recent` is the few messages before it in the same chat, oldest first, for context only: judge ONLY `message`. Decide how much {{owner_name}} needs a ping from their assistant about it, on top of whatever their phone already does. Most messages are normal: chatter, greetings, thanks, reactions, jokes, photos, forwarded content, group banter, news, marketing, automated texts, verification codes. A group message is important only when it is addressed to {{owner_name}} or needs something from them, or is significant news about their own people. Never inflate: when in doubt, normal.",
+      "criteria": {
+        "urgent": "needs {{owner_name}} within the hour: an emergency, safety or health scare about them or their people, someone stuck or waiting on them right now, a time-critical problem at one of their properties or with a guest or tenant, a deadline today that only they can meet",
+        "important": "{{owner_name}} should see it today: a direct question or request that needs their answer or decision, a change of plans that affects them, significant personal news from family or close friends, a work matter that needs them, a vendor/tenant/guest issue that is not an emergency",
+        "normal": "everything else, including anything that can wait for them to open the chat themselves"
+      }
+    }
+  }
+}

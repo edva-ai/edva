@@ -1,0 +1,15 @@
+{
+  "_doc": "Jev site for ordinary channel traffic (lib/message-alert.mjs, rubric \"channel\"): a message in a many-member channel, such as a Slack channel, that does not @-mention {{owner_name}}. That traffic is low priority, so it pings only when it calls {{owner_name}} by name or reports a really major issue. Direct messages, group DMs and @-mentions stay on site message-alert. Legacy (fallback, and shadow while a shadow window is open) is a toolless Sonnet judgment built from this file's own wording (rubricPrompt). Kernel definition; an installation's own data/jev-questions/message-alert-channel.json replaces it.",
+  "threshold": 0.8,
+  "questions": {
+    "level": {
+      "type": "choice",
+      "instructions": "`message` is one message posted in a shared channel (`chat`, on `channel`) that {{owner_name}} belongs to. It does not @-mention them. `owner_names` are the names {{owner_name}} goes by there. `recent` is the few messages before it in the same channel, oldest first, for context only: judge ONLY `message`. Channel traffic is low priority for {{owner_name}}: they want a ping only when the message calls them by name, or when it reports a really major issue. A person written as @Name is the one being addressed; unless that name is one of `owner_names`, the message is not addressed to {{owner_name}}. Questions, requests, follow-ups, tickets, shipping, device and account logistics, deploy and release notes, metrics, greetings and thanks addressed to other people or to the team are normal, however urgent they sound to whoever wrote them. When in doubt, normal.",
+      "criteria": {
+        "urgent": "a really major issue: an outage or incident that stops the organisation's work, a security breach or data leak, a crisis with a major customer, a large sum of money or a legal matter, a safety emergency; or the message calls {{owner_name}} by name and needs them within the hour",
+        "important": "the message calls {{owner_name}} by name (one of owner_names, or their first name) and asks them something, needs their decision, or tells them something that affects them",
+        "normal": "everything else: messages addressed to other people or to the whole channel, routine operations, one customer's or one person's request, status updates, and a passing mention of or thanks to {{owner_name}}"
+      }
+    }
+  }
+}

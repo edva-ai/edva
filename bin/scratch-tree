@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+// scratch-tree — a throwaway copy of the repo for a critic or a test run, with
+// none of the installation's secrets or data in it.
+//
+// Critics that wanted to run tests against a change used to copy the whole tree
+// by hand (cp -R), which carries .env and every .env backup beside it into
+// /tmp, and then ran the tests from it with EDVA_HOME unset, so code that
+// resolves the installation still found the real one. On 2026-10-25 such a copy
+// (226 MB, .env plus nine backups) was found left in /tmp after its run.
+//
+// A scratch tree is a local git clone: tracked files only, so nothing gitignored
+// (.env, data, logs, auth state) is in it. The change under review is laid
+// over it: the bundle given with --bundle, or else the source checkout's
+// uncommitted changes to tracked files plus its untracked, not-ignored files.
+// `run` executes a command inside it with EDVA_HOME pointed at the copy and
+// the installation's secrets taken out of the command's environment.
+//
+// A copy with no .env file is not enough on its own: the agents that run critics
+// and builders carry the live .env in their environment (the ephemeral
+// runners source it with `set -a`), and a child inherits it. On 2026-10-27 a
+// builder's "scratch" replay read live Supabase through a key inherited that way.
+// So `run` drops every variable that the installation's .env (or a backup
+// beside it) assigns, by name, and any variable named like a credential (*_KEY,
+// *_TOKEN, *_SECRET, *_PASSWORD, *_PASS). Only names are read from those files;
+// nothing in them is printed or logged. Everything else passes through (PATH,
+// HOME, LANG, NODE_*, ...). A read-only replay that genuinely needs one of them
+// names it with --keep-env, which says so on stderr and appends a line (names
+// and the program, no values) to agent/logs/scratch-tree.log.
+//
+// Usage:
+//   scratch-tree make [--label <name>] [--bundle <files.json>]   prints the new directory
+//   scratch-tree run <dir> [--keep-env NAME[,NAME]] -- <command> [args...]
+//       runs in <dir>, EDVA_HOME=<dir>, without the installation's secrets
+//       (--keep-env, repeatable: pass these through anyway, logged)
+//   scratch-tree remove <dir>                                     deletes a scratch tree
+//   scratch-tree sweep [--max-age-hours N] [--dry-run]            nightly: delete scratch trees older
+//       than N hours (default 6), and delete any copy of the installation's
+//       .env* files found under the temp directories (/tmp, os.tmpdir(), $TMPDIR)
+//
+// Exit: 0 ok · 64 usage · 1 failure
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import rootPaths from "../lib/root.cjs";
+
+const ROOT = rootPaths.REPO_ROOT;
+const MARKER = ".scratch-tree";
+const PREFIX = "scratch-tree-";
+const USAGE = "usage: scratch-tree make [--label <name>] [--bundle <files.json>] | run <dir> [--keep-env NAME[,NAME]] -- <cmd...> | remove <dir> | sweep [--max-age-hours N] [--dry-run]";
+function usage(msg) { if (msg) console.error(`scratch-tree: ${msg}`); console.error(USAGE); process.exit(64); }
+const opt = (args, name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
+const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+
+function isScratch(dir) {
+  try { return fs.statSync(path.join(dir, MARKER)).isFile(); } catch { return false; }
+}
+
+function make(args) {
+  const label = (opt(args, "--label") || "run").replace(/[^a-z0-9-]/gi, "").slice(0, 32) || "run";
+  const bundlePath = opt(args, "--bundle");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${PREFIX}${label}-`));
+  try {
+    git(dir, "clone", "-q", "--local", "--no-hardlinks", ROOT, ".");
+    git(dir, "checkout", "-q", "--detach", git(ROOT, "rev-parse", "HEAD").trim());
+    const lay = (rel, content) => {
+      const fp = path.resolve(dir, rel);
+      if (!fp.startsWith(dir + path.sep)) throw new Error(`path outside the tree: ${rel}`);
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, content);
+    };
+    if (bundlePath) {
+      const item = JSON.parse(fs.readFileSync(bundlePath, "utf8"));
+      for (const [rel, content] of Object.entries(item.files || item)) lay(rel, String(content));
+    } else {
+      // Tracked files changed in the source, and new files git does not ignore.
+      const changed = git(ROOT, "diff", "--name-only", "HEAD").split("\n").filter(Boolean);
+      const added = git(ROOT, "ls-files", "--others", "--exclude-standard").split("\n").filter(Boolean);
+      for (const rel of [...changed, ...added]) {
+        const src = path.join(ROOT, rel);
+        if (fs.existsSync(src)) { if (fs.statSync(src).isFile()) lay(rel, fs.readFileSync(src)); }
+        else fs.rmSync(path.join(dir, rel), { force: true });
+      }
+    }
+    fs.writeFileSync(path.join(dir, MARKER), JSON.stringify({ created_at: new Date().toISOString(), source: ROOT, label }) + "\n");
+    fs.appendFileSync(path.join(dir, ".git", "info", "exclude"), `\n${MARKER}\n`);   // not part of any diff a critic reads
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.error(`scratch-tree: could not make the tree: ${e.stderr || e.message}`);
+    process.exit(1);
+  }
+  console.log(dir);
+}
+
+const isEnvFile = (n) => n === ".env" || n.startsWith(".env.") || n.startsWith(".env-");
+// A dotenv assignment, `NAME=` or `export NAME =`: machine syntax, not language.
+const ASSIGNMENT = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;   // lang-regex-ok: dotenv assignment syntax
+// Variable names shaped like a credential, wherever they came from.
+const CREDENTIAL_NAME = /_(KEY|TOKEN|SECRET|PASSWORD|PASS)$/;          // lang-regex-ok: environment variable names
+// Never dropped, whatever a secrets file assigns: a command cannot run without them.
+const ALWAYS_KEEP = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "PWD"]);
+
+// The names (only the names) every installation secrets file assigns: .env
+// and the backups beside it, in the installation and in the checkout this runs from.
+function secretNames() {
+  const names = new Set();
+  for (const d of new Set([rootPaths.installTools(), rootPaths.TOOLS_DIR])) {
+    let files = [];
+    try { files = fs.readdirSync(d).filter(isEnvFile); } catch {}
+    for (const f of files) {
+      let lines = [];
+      try { lines = fs.readFileSync(path.join(d, f), "utf8").split("\n"); } catch {}
+      for (const l of lines) { const m = ASSIGNMENT.exec(l); if (m) names.add(m[1]); }
+    }
+  }
+  return names;
+}
+
+function run(args) {
+  const dir = args[0];
+  const sep = args.indexOf("--");
+  if (!dir || sep < 0 || sep === args.length - 1) usage("run needs <dir> -- <command>");
+  if (!isScratch(dir)) usage(`${dir} is not a scratch tree (make one with: scratch-tree make)`);
+  const keep = new Set();
+  const opts = args.slice(1, sep);
+  for (let i = 0; i < opts.length; i++) {
+    if (opts[i] === "--keep-env" && opts[i + 1]) { for (const n of opts[++i].split(",")) if (n.trim()) keep.add(n.trim()); }
+    else usage(`run: unexpected ${opts[i]} before --`);
+  }
+  const secret = secretNames();
+  const env = {};
+  const kept = [];
+  for (const [k, v] of Object.entries(process.env)) {
+    const strip = !ALWAYS_KEEP.has(k) && (secret.has(k) || CREDENTIAL_NAME.test(k));
+    if (strip && !keep.has(k)) continue;
+    if (strip) kept.push(k);
+    env[k] = v;
+  }
+  env.EDVA_HOME = path.resolve(dir);
+  if (keep.size) {
+    for (const n of keep) if (!kept.includes(n)) console.error(`scratch-tree: --keep-env ${n}: not a secret here, or not set; nothing to keep`);
+    if (kept.length) {
+      console.error(`scratch-tree: passing ${kept.join(", ")} through to this run (--keep-env); it can reach whatever ${kept.length > 1 ? "those reach" : "that reaches"}`);
+      try {
+        const log = rootPaths.installTools("agent", "logs", "scratch-tree.log");
+        fs.mkdirSync(path.dirname(log), { recursive: true });
+        fs.appendFileSync(log, JSON.stringify({ ts: new Date().toISOString(), event: "keep-env", names: kept, dir: path.resolve(dir), program: args[sep + 1] }) + "\n");
+      } catch {}
+    }
+  }
+  const r = spawnSync(args[sep + 1], args.slice(sep + 2), { cwd: dir, env, stdio: "inherit" });
+  process.exit(r.status ?? 1);
+}
+
+function remove(args) {
+  const dir = args[0];
+  if (!dir) usage("remove needs <dir>");
+  if (!isScratch(dir)) usage(`${dir} is not a scratch tree; not deleting it`);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// The installation's secrets files, by content hash.
+function secretHashes() {
+  const tools = rootPaths.installTools();
+  const out = new Set();
+  let names = [];
+  try { names = fs.readdirSync(tools).filter(isEnvFile); } catch {}
+  for (const n of names) {
+    try { const st = fs.statSync(path.join(tools, n)); if (st.isFile() && st.size > 0) out.add(createHash("sha256").update(fs.readFileSync(path.join(tools, n))).digest("hex")); } catch {}
+  }
+  return { tools, hashes: out };
+}
+
+function walk(dir, depth, visit) {
+  if (depth < 0) return;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory() && !e.isSymbolicLink()) { if (e.name !== "node_modules" && e.name !== ".git") walk(p, depth - 1, visit); }
+    else if (e.isFile()) visit(p, e.name);
+  }
+}
+
+function sweep(args) {
+  const maxAgeH = Number(opt(args, "--max-age-hours") || 6);
+  const dry = args.includes("--dry-run");
+  // SCRATCH_TREE_TMP_ROOTS (colon-separated) replaces the default temp dirs, for tests.
+  const bases = process.env.SCRATCH_TREE_TMP_ROOTS ? process.env.SCRATCH_TREE_TMP_ROOTS.split(":") : ["/tmp", os.tmpdir(), process.env.TMPDIR];
+  const roots = [...new Set(bases.filter(Boolean).map((d) => { try { return fs.realpathSync(d); } catch { return null; } }).filter(Boolean))];
+  const act = (what, p) => { console.log(`${dry ? "would delete" : "deleted"} ${what}: ${p}`); if (!dry) fs.rmSync(p, { recursive: true, force: true }); };
+  let n = 0;
+  // 1. Scratch trees past their age.
+  for (const r of roots) {
+    let names = [];
+    try { names = fs.readdirSync(r).filter((x) => x.startsWith(PREFIX)); } catch {}
+    for (const x of names) {
+      const d = path.join(r, x);
+      if (!isScratch(d)) continue;
+      const age = (Date.now() - fs.statSync(path.join(d, MARKER)).mtimeMs) / 3_600_000;
+      if (age >= maxAgeH) { act("scratch tree", d); n++; }
+    }
+  }
+  // 2. Copies of the installation's secrets files anywhere under the temp dirs,
+  // whoever made them. Only a file whose bytes equal one of the real ones is touched.
+  const { tools, hashes } = secretHashes();
+  const realTools = (() => { try { return fs.realpathSync(tools); } catch { return tools; } })();
+  if (hashes.size) {
+    for (const r of roots) {
+      walk(r, 5, (p, name) => {
+        if (!isEnvFile(name)) return;
+        if (path.dirname(p) === realTools) return;
+        try { if (hashes.has(createHash("sha256").update(fs.readFileSync(p)).digest("hex"))) { act("copy of a secrets file", p); n++; } } catch {}
+      });
+    }
+  }
+  console.log(`scratch-tree sweep: ${n} item(s) ${dry ? "found" : "removed"}`);
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (cmd === "make") make(rest);
+else if (cmd === "run") run(rest);
+else if (cmd === "remove") remove(rest);
+else if (cmd === "sweep") sweep(rest);
+else if (cmd === "-h" || cmd === "--help") console.log(USAGE);
+else usage(cmd ? `unknown command ${cmd}` : "");

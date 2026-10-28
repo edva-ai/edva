@@ -33,6 +33,7 @@ const EXT = path.join(ROOT, "agent/ext");
 const { createUnifiedApproval } = await import(path.join(ROOT, "agent/core/self-improve-unified.mjs"));
 const { writebackApprovalOutcome } = await import(path.join(ROOT, "lib/system-issue-writeback.mjs"));
 const { rebaseDrifted, isLegacyArchCard } = await import(path.join(ROOT, "lib/self-improve-rebase.mjs"));
+const { contentRefusals } = await import(path.join(ROOT, "lib/self-improve-content-check.mjs"));
 // The installation's rebuild queue for a card whose apply hit a conflict
 // (optional: without it the "ask me in chat to rebuild it" notice stands).
 const REBUILD_LIB = path.join(ROOT, "lib/self-improve-rebuild.mjs");
@@ -265,6 +266,18 @@ async function applyItem(row) {
     const files = item.files || {};
     if (!files || typeof files !== "object" || Object.keys(files).length === 0) {
       return { ok: false, error: "code-fix item_json has no files — nothing to write" };
+    }
+    // The content checks (lib/self-improve-content-check.mjs), against the
+    // files as they are now. A signature does not make a truncated file right: on
+    // 2026-10-25 a signed card replaced the whole changelog with one line of JSON.
+    // Refused before anything is written; main() posts the failure to Improvements.
+    {
+      const now = {};
+      for (const rel of Object.keys(files)) {
+        try { now[rel] = fs.readFileSync(path.resolve(ROOT, rel), "utf8"); } catch { now[rel] = null; }
+      }
+      const reasons = contentRefusals({ files, before: now, allowShrink: item.allow_shrink });
+      if (reasons.length) return { ok: false, error: `refused by the content check, nothing was written: ${reasons.join(" ")}` };
     }
     // STALE-BASE CHECK — see the long note in self-improve-request.
     // item.base_sha256[rel] is the hash the file had when this card was AUTHORED.

@@ -615,9 +615,20 @@ class Supervisor {
         // same session — keeps the original floor rather than re-baselining to
         // a post-compact number, which would make the floor look like it fell
         // when nothing structural changed.
-        if (ctx > 0 && this.floorSessionId !== this.state.sessionId) {
+        // A session resumed after a supervisor restart keeps the floor its
+        // own first call measured (State.floorFor): its first call now carries
+        // the whole resumed conversation, which is not floor.
+        const keptFloor = ctx > 0 && this.floorSessionId !== this.state.sessionId
+          ? this.state.floorFor(this.state.sessionId) : 0;
+        if (keptFloor > 0) {
+          this.floorSessionId = this.state.sessionId;
+          this.sessionFloorTokens = Math.min(keptFloor, ctx);
+          this.eventLog.append({ kind: "context.floor_restored", sessionId: this.state.sessionId, floorTokens: keptFloor, contextTokens: ctx });
+          console.error(`[supervisor] context floor restored for resumed session: ${keptFloor} tokens (context now ${ctx})`);
+        } else if (ctx > 0 && this.floorSessionId !== this.state.sessionId) {
           this.floorSessionId = this.state.sessionId;
           this.sessionFloorTokens = ctx;
+          this.state.recordFloor(this.state.sessionId, ctx);
           this.eventLog.append({
             kind: "context.floor_measured",
             sessionId: this.state.sessionId,

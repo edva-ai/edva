@@ -113,6 +113,15 @@ const before = Object.fromEntries(
   })
 );
 
+// 0. The content checks (lib/self-improve-content-check.mjs): a file turned
+// into a bundle, or one losing most of its lines undeclared, is redrafted, never landed.
+const { contentRefusals } = await import(path.join(ROOT, "lib/self-improve-content-check.mjs"));
+const contentReasons = contentRefusals({ files, before, allowShrink: item?.allow_shrink });
+if (contentReasons.length) {
+  out({ applied: false, route: "redraft", reasons: contentReasons });
+  process.exit(8);
+}
+
 // 1. The boundary — decided from the real file set and diff, not the caller's say-so.
 const landing = decideLanding({ files, before, risk, category, critic });
 if (landing.mode !== "auto") {

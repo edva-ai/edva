@@ -192,6 +192,8 @@ Only if no prior failure. Spawn another `Agent` with the git diff and the implem
 >
 > Read the DIFF first. Then read the RATIONALE. Ask: does the diff do what the item says? Are there regressions? Is any untouched guardrail weakened?
 >
+> If you need to run tests against the change, use a scratch tree: Make it with `bin/scratch-tree make [--label <name>] [--bundle <files.json>]` (tracked files plus the change, nothing gitignored: no `.env`, no `data`), run in it with `scratch-tree run <dir> -- <command>` (sets `EDVA_HOME` to the copy), and delete it with `scratch-tree remove <dir>` when done. Never copy the tree by hand: a hand copy carries `.env` and its backups into `/tmp`.
+>
 > Output EXACTLY ONE of these three lines, nothing else:
 >   SAFE
 >   REVERT: <one-sentence reason>
@@ -205,9 +207,9 @@ Only if no prior failure. Spawn another `Agent` with the git diff and the implem
 > ACTION ITEM: <paste item text>
 
 - `SAFE` **or** `DEFER_TO_OPERATOR` → **stage for approval, never commit.** (The two verdicts now take the same path — with everything gated on their signature already, `DEFER_TO_OPERATOR`'s only remaining effect is that its stated concern gets folded into the card's rationale so the user knows what to weigh.)
-  1. Read the final content of every file in `$OWN_FILES` into a `{ "<repo-relative-path>": "<full content>", ... }` map.
+  1. Build the bundle from every file in `$OWN_FILES`: `~/Dev/edva/bin/self-improve-bundle --out /tmp/si-<id>-files.json --base-rev "$PRE_SHA" <each file>`. Never assemble the bundle with a hand-written command: on 2026-10-25 one wrote it over the changelog, and a signed card shipped that.
   2. **Scoped-revert `$OWN_FILES` back to `$PRE_SHA`** — the same loop the block path uses (`git restore --staged`, `git checkout "$PRE_SHA" -- <path>` for pre-existing files, `rm -f` for implementer-created ones). The working tree must be clean of this item's diff once this step finishes; the diff lives in the files-json payload, not on disk.
-  3. Write the map to a temp file and stage it:
+  3. Stage the bundle:
      ```bash
      # schema v4: try self-improve-auto-apply first (same four parts, plus
      # --risk/--category/--critic, and since v5 --base-rev "$PRE_SHA" — exit 7

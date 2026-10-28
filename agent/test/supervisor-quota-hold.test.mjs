@@ -104,7 +104,7 @@ describe("quota refusal: dispatcher", () => {
     assert.equal(events.limited.length, 1);
     assert.equal(events.limited[0].until, reset * 1000 + 60_000);
     assert.equal(d.isHeld(), true);
-    assert.equal(d.snapshot().holdUntil, reset * 1000 + 60_000);
+    assert.ok(d.snapshot().holdUntil <= reset * 1000 + 60_000 && d.snapshot().holdUntil > Date.now() + 3500_000, "held up to the reset, at most the re-check interval");
 
     // Nothing else goes out while held — new work queues behind.
     d.dispatch("newsletter digest", "newsletter-digest");
@@ -151,6 +151,35 @@ describe("quota refusal: dispatcher", () => {
     s.complete();
     assert.equal(complete, 1);
     assert.equal(d.isHeld(), false);
+  });
+
+  it("never holds longer than the re-check interval, even when the named reset is days away", async () => {
+    const { s, d } = make({ rateLimitReprobeMs: 60 });
+    const limited = [];
+    d.on("rate_limited", (e) => limited.push(e));
+    let released = 0;
+    d.on("hold_released", () => released++);
+    d.dispatch("triage email 1", "gmail:1");
+    const reset = Math.floor(Date.now() / 1000) + 2 * 86400;
+    s.refuse(REJECTED_WEEKLY(reset));
+    assert.equal(limited[0].until, reset * 1000 + 60_000, "the event still names the real reset (the alert text reads it)");
+    assert.ok(d.holdUntil <= Date.now() + 60, "the hold itself is capped");
+    await sleep(120);
+    assert.equal(released, 1, "the capped hold ran out and released on its own");
+    assert.equal(s.sent.length, 2, "the refused item was re-sent as the probe");
+    // Still shut: a silent refusal (no event) re-holds against the remembered
+    // reset, capped again, and the item keeps its place.
+    s.silentRefuse();
+    assert.equal(limited.length, 2);
+    assert.equal(limited[1].until, reset * 1000 + 60_000, "a silent refusal re-holds against the remembered reset, not the short fallback");
+    assert.equal(d.isHeld(), true);
+    assert.deepEqual(d.queue.map((q) => q.source), ["gmail:1"]);
+    await sleep(120);
+    assert.equal(s.sent.length, 3, "re-checked again after the next interval");
+    // The window came back early: the probe is served and dispatch resumes.
+    s.complete();
+    assert.equal(d.isHeld(), false);
+    assert.equal(d.completed, 1);
   });
 
   it("resumes on its own when the hold runs out, refused item first", async () => {
